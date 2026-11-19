@@ -135,6 +135,12 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
                                         const char *own_module, const char *const *imp_qns,
                                         int imp_count, int *out_count, bool *out_success);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Work counter for the growth tests: module-entry defs walked and identities
+ * followed by the per-file selection's worklist. Test builds only. */
+uint64_t cbm_pxc_test_reach_work(void);
+#endif
+
 /* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
  *
  * Each non-NULL registry is built ONCE in pipeline.c (in a dedicated

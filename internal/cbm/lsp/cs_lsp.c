@@ -40,6 +40,8 @@
  */
 
 #include "cs_lsp.h"
+#include "lsp_name_rows.h"
+#include "lsp_work.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -2856,15 +2858,18 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
      * whether it sits inside a namespace declaration: a block namespace's
      * body, or the compilation-unit siblings after a file-scoped namespace
      * (the grammar may attach those either way). */
-    enum { CS_IMPORT_WALK_MAX = 256 };
-    TSNode stack[CS_IMPORT_WALK_MAX];
-    bool in_ns[CS_IMPORT_WALK_MAX];
-    int top = 0;
-    in_ns[top] = false;
-    stack[top++] = root;
+    typedef struct {
+        TSNode node;
+        bool in_ns;
+    } cs_import_walk_t;
+    enum { CS_IMPORT_WALK_INLINE = 256 };
+    cs_import_walk_t held[CS_IMPORT_WALK_INLINE];
+    cs_import_walk_t *stack = held;
+    int top = 0, capacity = CS_IMPORT_WALK_INLINE;
+    stack[top++] = (cs_import_walk_t){.node = root, .in_ns = false};
     while (top > 0) {
-        TSNode n = stack[--top];
-        bool n_in_ns = in_ns[top];
+        TSNode n = stack[--top].node;
+        bool n_in_ns = stack[top].in_ns;
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -2964,7 +2969,7 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
         bool child_in_ns = n_in_ns || strcmp(k, "namespace_declaration") == 0 ||
                            strcmp(k, "file_scoped_namespace_declaration") == 0;
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top < CS_IMPORT_WALK_MAX; i++) {
+        for (uint32_t i = 0; i < cnc; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
@@ -2973,8 +2978,16 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
                 strcmp(ck, "constructor_declaration") == 0 || strcmp(ck, "block") == 0) {
                 continue;
             }
-            in_ns[top] = child_in_ns;
-            stack[top++] = c;
+            if (top == capacity) {
+                cs_import_walk_t *grown =
+                    cbm_arena_alloc(ctx->arena, (size_t)capacity * 2 * sizeof(*grown));
+                if (!grown)
+                    return;
+                memcpy(grown, stack, (size_t)top * sizeof(*grown));
+                stack = grown;
+                capacity *= 2;
+            }
+            stack[top++] = (cs_import_walk_t){.node = c, .in_ns = child_in_ns};
             /* A file-scoped namespace covers the siblings that follow it. */
             if (strcmp(ck, "file_scoped_namespace_declaration") == 0)
                 child_in_ns = true;
@@ -3432,20 +3445,38 @@ typedef struct {
     const CBMType *rt;
 } cs_method_rt_entry_t;
 
+enum { CS_SCRATCH_ARENA_BLOCK = 4096 };
+
 typedef struct {
     cs_method_rt_entry_t *items;
     int count;
     int cap;
+    /* The rows by QN (lsp_name_rows.h), when the caller gives a scratch arena;
+     * without one, or once a row could not be filed, the dedup scans. */
+    CBMNameRows by_qn;
+    CBMArena *rows_arena;
+    bool rows_failed;
 } cs_method_rt_table_t;
+
+static bool cs_method_rt_seen(const cs_method_rt_table_t *tab, const char *qn) {
+    if (tab->rows_arena && !tab->rows_failed) {
+        CBM_LSP_WORK(1);
+        return cbm_name_rows_lookup(&tab->by_qn, NULL, qn) >= 0;
+    }
+    for (int i = 0; i < tab->count; i++) {
+        CBM_LSP_WORK(1);
+        if (strcmp(tab->items[i].qn, qn) == 0)
+            return true;
+    }
+    return false;
+}
 
 static void cs_method_rt_add(CBMArena *arena, cs_method_rt_table_t *tab, const char *qn,
                              const CBMType *rt) {
     if (!qn || !rt)
         return;
-    for (int i = 0; i < tab->count; i++) {
-        if (strcmp(tab->items[i].qn, qn) == 0)
-            return;
-    }
+    if (cs_method_rt_seen(tab, qn))
+        return;
     if (tab->count + 1 >= tab->cap) {
         int new_cap = tab->cap ? tab->cap * 2 : 16;
         cs_method_rt_entry_t *ne =
@@ -3459,7 +3490,47 @@ static void cs_method_rt_add(CBMArena *arena, cs_method_rt_table_t *tab, const c
     }
     tab->items[tab->count].qn = qn;
     tab->items[tab->count].rt = rt;
+    if (tab->rows_arena && !tab->rows_failed &&
+        !cbm_name_rows_add(tab->rows_arena, &tab->by_qn, NULL, qn, tab->count))
+        tab->rows_failed = true;
     tab->count++;
+}
+
+/* The first registration of `qn` among reg's functions or types. `qns` is a
+ * snapshot of their QNs, chained by name (lsp_name_rows.h); nothing registers
+ * while a caller uses it. Without a snapshot this is the scan it replaces. */
+static int cs_first_func_row(const CBMTypeRegistry *reg, CBMNameRows *rows, CBMArena *arena,
+                             const char **qns, const char *qn) {
+    if (qns)
+        return cbm_name_rows_first(rows, arena, qns, reg->func_count, qn);
+    for (int j = 0; j < reg->func_count; j++) {
+        CBM_LSP_WORK(1);
+        if (reg->funcs[j].qualified_name && strcmp(reg->funcs[j].qualified_name, qn) == 0)
+            return j;
+    }
+    return -1;
+}
+
+static int cs_first_type_row(const CBMTypeRegistry *reg, CBMNameRows *rows, CBMArena *arena,
+                             const char **qns, const char *qn) {
+    if (qns)
+        return cbm_name_rows_first(rows, arena, qns, reg->type_count, qn);
+    for (int t = 0; t < reg->type_count; t++) {
+        CBM_LSP_WORK(1);
+        if (reg->types[t].qualified_name && strcmp(reg->types[t].qualified_name, qn) == 0)
+            return t;
+    }
+    return -1;
+}
+
+/* The QNs of reg's functions (types: false -> functions), in a scratch arena. */
+static const char **cs_qn_snapshot(CBMArena *arena, const CBMTypeRegistry *reg, bool types) {
+    int count = types ? reg->type_count : reg->func_count;
+    const char **qns =
+        count > 0 ? (const char **)cbm_arena_alloc(arena, (size_t)count * sizeof(*qns)) : NULL;
+    for (int i = 0; qns && i < count; i++)
+        qns[i] = types ? reg->types[i].qualified_name : reg->funcs[i].qualified_name;
+    return qns;
 }
 
 /* Walk the tree, finding method_declaration / property_declaration nodes
@@ -3574,13 +3645,20 @@ void cbm_cs_refine_ast_return_types(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
     if (!ctx || !reg || ts_node_is_null(root))
         return;
 
+    /* Each method patches the first registration of its QN; the loop starts there. */
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, CS_SCRATCH_ARENA_BLOCK);
     cs_method_rt_table_t mtab = {0};
+    mtab.rows_arena = &scratch;
     cs_collect_method_return_types(ctx, root, &mtab);
+    const char **func_qns = mtab.count > 0 ? cs_qn_snapshot(&scratch, reg, false) : NULL;
+    CBMNameRows func_rows = {0};
     for (int i = 0; i < mtab.count; i++) {
         const char *qn = mtab.items[i].qn;
         const CBMType *rt = mtab.items[i].rt;
         bool patched = false;
-        for (int j = 0; j < reg->func_count; j++) {
+        int first = cs_first_func_row(reg, &func_rows, &scratch, func_qns, qn);
+        for (int j = first >= 0 ? first : reg->func_count; j < reg->func_count; j++) {
             if (strcmp(reg->funcs[j].qualified_name, qn) == 0) {
                 const CBMType **rets =
                     (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const CBMType *));
@@ -3596,6 +3674,7 @@ void cbm_cs_refine_ast_return_types(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
         }
         (void)patched;
     }
+    cbm_arena_destroy(&scratch);
 }
 
 /* ── parse return type from CBMDefinition.return_type ──────────── */
@@ -3708,6 +3787,15 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         }
     }
 
+    /* The registrations are complete: each patch below finds the first registration
+     * of its QN by name instead of scanning them all per definition. */
+    CBMArena scratch;
+    cbm_arena_init_lazy(&scratch, CS_SCRATCH_ARENA_BLOCK);
+    const char **func_qns = cs_qn_snapshot(&scratch, &reg, false);
+    const char **type_qns = cs_qn_snapshot(&scratch, &reg, true);
+    CBMNameRows func_rows = {0};
+    CBMNameRows type_rows = {0};
+
     /* Phase C: build context for type resolution + run the resolver. */
     CSLSPContext ctx;
     cs_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
@@ -3730,7 +3818,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         const CBMType **param_types = cbm_type_materialize_signature_params(
             arena, d->signature_param_types, d->signature_param_count,
             cs_signature_param_type_adapter, &ctx);
-        for (int j = 0; j < reg.func_count; j++) {
+        int first = cs_first_func_row(&reg, &func_rows, &scratch, func_qns, d->qualified_name);
+        for (int j = first >= 0 ? first : reg.func_count; j < reg.func_count; j++) {
             if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) != 0)
                 continue;
             const CBMType **return_types = NULL;
@@ -3752,7 +3841,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             continue;
         const CBMType *rt = cs_parse_return_type_text(&ctx, d->return_type);
         /* Find the registered func and patch its signature. */
-        for (int j = 0; j < reg.func_count; j++) {
+        int first = cs_first_func_row(&reg, &func_rows, &scratch, func_qns, d->qualified_name);
+        for (int j = first >= 0 ? first : reg.func_count; j < reg.func_count; j++) {
             if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) == 0) {
                 const CBMType **rets =
                     (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
@@ -3780,7 +3870,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             cs_fields_t *f = &tab.items[i];
             if (f->count == 0)
                 continue;
-            for (int t = 0; t < reg.type_count; t++) {
+            int first = cs_first_type_row(&reg, &type_rows, &scratch, type_qns, f->class_qn);
+            for (int t = first >= 0 ? first : reg.type_count; t < reg.type_count; t++) {
                 if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
                     reg.types[t].field_names = f->field_names;
                     reg.types[t].field_types = f->field_types;
@@ -3789,6 +3880,7 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             }
         }
     }
+    cbm_arena_destroy(&scratch);
 
     /* Re-bind ctx state since collect_class_fields may have temporarily
      * adjusted namespace stack (it doesn't, but be safe). */

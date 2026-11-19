@@ -248,14 +248,29 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+/* Freeze Swift declaration/extension ownership after all definitions are registered. */
+void cbm_registry_build_swift_owners(cbm_registry_t *registry, const cbm_gbuf_t *graph,
+                                     const char *repo_path, char **excluded_dirs,
+                                     int excluded_count);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang);
+/* As cbm_registry_resolve_lang, for a reference made by a definition (USAGE,
+ * READS, WRITES): `caller_test` is that definition's test verdict
+ * (cbm_pipeline_caller_is_test). Test or test-double code may use test code
+ * as freely as real code, so for it no candidate takes the registry's test
+ * penalty; a production reference keeps the full rule. */
+cbm_resolution_t cbm_registry_resolve_ref(const cbm_registry_t *r, const char *ref_name,
+                                          const char *module_qn, const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          CBMLanguage lang, bool caller_test);
 /* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call
  * (no `.` / `->`) does not consider Field or Method nodes, which it can never
- * call. */
+ * call, and that in a C# file a built-in type keyword root (`int.TryParse`)
+ * names a type for the receiver chain check (#2121). */
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
@@ -263,13 +278,21 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
 /* The registry step of BOTH call resolvers once the LSP has not answered:
  * for Python, the def or class `callee_name` binds in the nearest def enclosing
  * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); otherwise, or
- * when there is no such local, cbm_registry_resolve_call_lang. */
+ * when there is no such local, cbm_registry_resolve_call_lang. `caller_test`:
+ * the calling definition's test verdict, as for cbm_registry_resolve_ref. */
 cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
                                                   const char *module_qn,
                                                   const char **import_map_keys,
                                                   const char **import_map_vals,
                                                   int import_map_count, CBMLanguage lang,
-                                                  const char *scope_qn);
+                                                  const char *scope_qn, bool caller_test);
+/* The test verdict of the code making a reference, by the same three rules the
+ * registry ranks candidates with: the extractor's verdict stored on the
+ * caller's node (cbm_node_is_test), the extractor's file rule
+ * (cbm_is_test_file on `rel` and `lang`) and the test-double path rule
+ * (cbm_registry_test_double_path). Both call resolvers and both reference
+ * resolvers ask it, so full and incremental indexes agree. */
+bool cbm_pipeline_caller_is_test(const cbm_gbuf_node_t *source, const char *rel, CBMLanguage lang);
 /* Python: the bare base `base` of the class `class_qn` nested in a class body
  * binds the sibling class of that body (`<enclosing class>.<base>`) when the
  * sibling is defined earlier in the same file (Python evaluates the bases in
@@ -362,8 +385,11 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 
 /* Per-worker manifest collection entry. */
 typedef struct {
-    char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
-    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    char *pkg_name;     /* heap: "@myorg/pkg", "github.com/foo/bar" */
+    char *entry_rel;    /* heap: "packages/pkg/src/index" (no extension) */
+    char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
+    char *source_rel;   /* heap: the manifest file that yielded this entry; NULL if hand-built */
+    int source_seq;     /* position among that manifest's entries, in the parser's order */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -375,6 +401,16 @@ typedef struct {
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
+
+/* A file's declared namespace/package clause, as persisted on its File node
+ * (`package` property) by the previous index generation. */
+typedef struct {
+    char *rel_path;       /* heap */
+    char *namespace_name; /* heap, raw (un-normalized) clause */
+} cbm_file_namespace_t;
+
+/* Scala top-level index (pass_pkgmap.c); see cbm_pipeline_import_maps_build. */
+typedef struct cbm_scala_index cbm_scala_index_t;
 
 /* The env join's inputs held by the unchanged files of an incremental
  * repair (pass_envjoin.c), read from the store before the K8s pass; ids are
@@ -422,6 +458,10 @@ typedef struct cbm_tf_release {
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
+    /* The rel_path of every file of the run's whole discovery (keys borrowed
+     * from its file list), also when a pass is handed only some of them: the
+     * files a C-family #include may resolve to (#2993). NULL: none resolves. */
+    const CBMHashTable *indexed_files;
     /* An incremental run: the unchanged files whose earlier run declared
      * image builds (docker build ...), read again by the shell pass, as
      * those edges are recomputed whole. Borrowed; NULL in a full run. */
@@ -461,6 +501,16 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Package clauses of the files this run does NOT re-extract, read back
+     * from their File nodes by the incremental routes. The import maps
+     * (namespace map, Scala index) are built from the files handed to a pass,
+     * and an incremental pass receives only the changed files; without these
+     * the maps would know only the changed files' packages and an import into
+     * an unchanged package would resolve differently than in a full build.
+     * NULL/0 on a full build. Owned by pipeline_incremental.c. */
+    const cbm_file_namespace_t *stored_namespaces;
+    int stored_namespace_count;
 
     /* Stem collisions of the discovered files: which Module definitions take
      * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
@@ -530,6 +580,13 @@ typedef struct {
     int tf_release_n;
     int tf_release_cap;
 } cbm_pipeline_ctx_t;
+
+/* The set for cbm_pipeline_ctx_t.indexed_files: every rel_path of `files`
+ * (keys borrowed; free with cbm_ht_free). NULL on allocation failure. */
+CBMHashTable *cbm_pipeline_indexed_files_new(const cbm_file_info_t *files, int file_count);
+/* The #include scope of a pass's C-family extraction: the run's repository
+ * root and its indexed files. */
+CBMIncludeScope cbm_pipeline_include_scope(const cbm_pipeline_ctx_t *ctx);
 
 /* Origin-aware LSP returns only success/failure. Never retain partial output
  * when its configured owner proof cannot be applied to current source. */
@@ -650,6 +707,12 @@ static inline bool cbm_pipeline_test_force_def_modules_null(const cbm_pipeline_c
 typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
 CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
                                            int i, cbm_result_want_fn want, bool *loaded);
+/* True when a graph-buffer node carries is_test:true in its properties JSON.
+ * The incremental registry seed has only the persisted node, not the
+ * CBMDefinition the definition passes hand to cbm_registry_add, and both must
+ * give the registry the same verdict for the same symbol. */
+bool cbm_node_is_test(const cbm_gbuf_node_t *n);
+
 void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 
 /* Log the store counters, close and delete the store, drop the latch. */
@@ -878,19 +941,48 @@ void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, co
  *   1. Module-path resolution (relative / pkgmap / fqn_module) → existing node.
  *      This preserves the behavior for Python/TS/Go whose module path maps
  *      directly to a sibling Module/File QN.
- *   2. namespace_map[module_path-prefix] → File node QN (Java/Kotlin/C#/PHP
+ *   2. namespace_map[module_path-prefix] → File/symbol node QN (Java/Kotlin/Scala/C#/PHP
  *      `using`/`import` of a NAMESPACE that the path-based QN cannot express).
  *   3. Symbol-name fallback: the import's last path segment matched against an
  *      in-graph definition node of the same simple name in a different file
  *      (Rust `use crate::util::helper`, Java `import com.example.Util`, ...).
  *
- * `namespace_map` may be NULL (skips step 2).  `source_file_qn` is the importing
- * file's __file__ QN, used to avoid self-imports in step 3. */
+ * `namespace_map` may be NULL (skips step 2).  `scala_index` is the Scala
+ * top-level index from cbm_pipeline_import_maps_build (NULL when no Scala
+ * file is among the importers).  `source_file_qn` is the importing file's
+ * __file__ QN, used to avoid self-imports in step 3. */
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
-                                                        CBMHashTable *namespace_map);
+                                                        CBMLanguage language, const CBMImport *imp,
+                                                        CBMHashTable *namespace_map,
+                                                        const cbm_scala_index_t *scala_index);
+
+/* The import-resolution maps of one definitions/registry pass, built after
+ * all definition nodes are in the graph buffer:
+ *
+ *   namespace_map: namespace → '\n'-separated File-node QNs of every file
+ *     declaring it (e.g. "App.Utils", "com.example"), for C# `using`, Java/
+ *     Kotlin `import`, PHP `use`. NULL when no file declares a namespace.
+ *   scala_index: "<package>.<Name>" → the node declaring a top-level `Name`
+ *     in a file whose package clause is `<package>`, plus the package's
+ *     wildcard target, so the Scala resolver does every step in O(1). A name
+ *     declared at top level by two files of a split package is recorded as
+ *     ambiguous and never binds. NULL unless a Scala file is among `files`
+ *     (only the Scala resolver reads it).
+ *
+ * `namespaces[i]` is the clause of files[i] or NULL — a caller that spilled
+ * results must still supply it (cbm_result_spill_namespace): a file missing
+ * from the map does not fail to resolve, it resolves through the looser
+ * fallback, so an incomplete map CHANGES the graph instead of shrinking it.
+ * ctx->stored_namespaces complete the maps on an incremental run. Each
+ * declaring file's clause is also recorded as the `package` property of its
+ * File node, which is where a later incremental run reads it from. Frees via
+ * cbm_pipeline_import_maps_free. */
+void cbm_pipeline_import_maps_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, const char *const *namespaces,
+                                    CBMHashTable **namespace_map, cbm_scala_index_t **scala_index);
+void cbm_pipeline_import_maps_free(CBMHashTable *namespace_map, cbm_scala_index_t *scala_index);
 
 /* PHP binding arrays borrow current result and graph strings. Free before
  * releasing/reloading the result; never cache this state across files. */
@@ -935,6 +1027,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
+/* Swift target roots plus package boundaries (pkg_name == NULL), using the literal parser. */
+int cbm_pkgmap_scan_swift_targets(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);
@@ -975,6 +1070,23 @@ bool cbm_python_import_path_matches_qn(const char *module_path, const char *name
 bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
+
+/* #1128: true when a JS/TS-family member call resolved by `same_module` only
+ * through the lookup that drops its receiver (`resolved_qn` does not end in the
+ * whole callee), while that receiver is bound to an import of the file
+ * (`file_imports`: ES import or CommonJS require), to an AMD dependency
+ * (`receiver_is_amd_dependency`, the extractor's per-call fact), or is a
+ * builtin global of the JS runtime (`console`, `Math`, `JSON`, ...):
+ * `axios.get()` must not bind the `get` this file happens to define. Any other
+ * receiver keeps the edge (`context.push()` onto an object-literal method
+ * stored at module level). The language list is inside the helper, so
+ * pass_calls.c and pass_parallel.c cannot drift. Only the plain-CALLS
+ * fall-through is dropped. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_same_module_bound_receiver(CBMLanguage lang, bool is_method,
+                                             const char *callee_name, const char *resolved_qn,
+                                             const char *strategy,
+                                             const CBMImportArray *file_imports,
+                                             bool receiver_is_amd_dependency);
 
 /* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
  * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
@@ -1980,6 +2092,16 @@ void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_ho
                                                             void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
+/* The last closure plan: an accepted plan's re-parse set size, surface-changed
+ * files and dependents (decline NULL), or a declined plan's reason (counters
+ * -1). All -1 / NULL after a reset and when no plan ran. */
+typedef struct {
+    int files;
+    int surface_changed;
+    int dependents;
+    const char *decline;
+} cbm_incremental_closure_plan_t;
+cbm_incremental_closure_plan_t cbm_pipeline_incremental_test_last_closure_plan(void);
 
 /* Shared persistence-hook plumbing. Tests use the incremental facade above so
  * one reset covers route, extraction, and publication faults. */

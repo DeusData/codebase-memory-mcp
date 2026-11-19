@@ -1,0 +1,70 @@
+diff --git a/src/scanner.c b/src/scanner.c
+index 8334fdb..b3473d1 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -191,6 +191,17 @@ static bool is_name_start(int32_t c) {
+   return iswalpha((wint_t)c) || c == '_';
+ }
+ 
++// cbm: what may appear inside an element tag outside a quoted value: name
++// characters, blanks and '='. Anything else is not XML, so the scan stops
++// there. A '<' where a declaration or member starts opens a VB attribute
++// (`<Serializable()> _`); without this check the scan took `<Serializable`
++// for an element and read the rest of the file looking for its closing tag,
++// once per attribute.
++static bool is_tag_char(int32_t c) {
++  return iswalnum((wint_t)c) || c == '_' || c == '-' || c == '.' || c == ':' ||
++         c == '=' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c >= 0x80;
++}
++
+ static bool scan_xml_literal(TSLexer *lexer) {
+   // Only same-line blanks are skipped: a leading newline must stay unconsumed
+   // so it can serve as a statement/block terminator (a successful scan would
+@@ -227,7 +238,7 @@ static bool scan_xml_literal(TSLexer *lexer) {
+           if (!consume_embedded_expression(lexer)) return false;
+           continue;
+         }
+-        continue; // stray < in a tag: malformed, keep consuming
++        return false; // cbm: a stray < in a tag is not XML
+       }
+       if (c == '/') {
+         advance(lexer);
+@@ -238,7 +249,7 @@ static bool scan_xml_literal(TSLexer *lexer) {
+           if (depth == 0) break; // single self-closed root: done
+           continue;
+         }
+-        continue;
++        return false; // cbm: '/' in a tag only closes it
+       }
+       if (c == '>') {
+         advance(lexer);
+@@ -251,6 +262,7 @@ static bool scan_xml_literal(TSLexer *lexer) {
+         in_tag = false;
+         continue;
+       }
++      if (!is_tag_char(c)) return false; // cbm: e.g. the '(' of `<Obsolete("x")>`
+       advance(lexer);
+       continue;
+     }
+@@ -272,10 +284,21 @@ static bool scan_xml_literal(TSLexer *lexer) {
+         if (!consume_processing_instruction(lexer)) return false;
+         continue;
+       }
++      // cbm: otherwise only an element name (or `<<%= %>`) may follow; a
++      // comparison such as `x < y` in code after an attribute is not XML.
++      if (!is_name_start(d) && d != '<' && d < 0x80) return false;
+       closing = false;
+       in_tag = true; // opening tag
+       continue;
+     }
++    if (c == '&') {
++      // cbm: '&' in XML text starts a reference (`&amp;`, `&#38;`); VB's
++      // concatenation `a & b` in code after an attribute is not XML.
++      advance(lexer);
++      int32_t d = lexer->lookahead;
++      if (d != '#' && !is_name_start(d) && d < 0x80) return false;
++      continue;
++    }
+     advance(lexer);
+   }
+ 

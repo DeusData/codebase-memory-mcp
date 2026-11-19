@@ -265,7 +265,7 @@ jobs:
           sbom-path: 'sbom.json'
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign artifacts
         run: |
@@ -303,7 +303,7 @@ jobs:
           git tag -f "pkg/go/$VERSION" "$GITHUB_SHA"
           git push origin "pkg/go/$VERSION" --force
 
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ inputs.version }}
           draft: true
@@ -498,7 +498,7 @@ jobs:
 
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'

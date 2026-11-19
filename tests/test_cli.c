@@ -13,9 +13,11 @@
 #include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "test_image_probe.h"
 #include <cli/agent_profiles.h>
 #include <cli/activation_transaction.h>
 #include <cli/cli.h>
+#include <cli/agent_clients.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
 #include <daemon/ipc.h>
@@ -916,6 +918,25 @@ static int cli_test_cmd_install(int argc, char **argv) {
     return cli_test_cmd_dispatch(cbm_cmd_install, argc, argv);
 }
 
+/* An install whose running binary is the image probe (tests/test_image_probe.h),
+ * not this runner. These tests need a real executable to stage, verify (it is
+ * run with --version) and publish, never this one: each install of the ~800 MB
+ * sanitized runner made up to five full SHA-256 passes and two fsync'd staged
+ * copies of it, and one such hash costs 70-95 s on some hosted x86 CPUs. -1,
+ * said on stderr, when the probe was not built. */
+static int cli_test_cmd_install_probe(int argc, char **argv) {
+    static char probe[1024];
+    if (!probe[0] && !th_image_probe_path(probe, sizeof(probe))) {
+        (void)fprintf(stderr, "cli: no image probe beside this runner; it is built with the "
+                              "runner (Makefile.cbm, <runner>-image-probe)\n");
+        return -1;
+    }
+    cbm_cli_set_self_path_override_for_test(probe);
+    int rc = cli_test_cmd_install(argc, argv);
+    cbm_cli_set_self_path_override_for_test(NULL);
+    return rc;
+}
+
 static int cli_test_cmd_uninstall(int argc, char **argv) {
     return cli_test_cmd_dispatch(cbm_cmd_uninstall, argc, argv);
 }
@@ -1016,6 +1037,24 @@ static unsigned char *create_test_targz(const char *filename, const unsigned cha
     free(tar);
     return gz;
 }
+
+/* Two update tests package a native executable as the release, and on macOS
+ * that executable is this test runner. An ASan runner that carries every
+ * vendored grammar sits right at the updater's 500 MiB decompression limit;
+ * the ObjectScript v1.11.0 parse tables took the CI runners past it, and the
+ * archive was refused ("binary not found in archive") before the step under
+ * test ran. The limit has its own test; these tests only need their archive
+ * accepted, so the limit is sized to the fixture. Twice the inflated tar can
+ * never refuse it: the decompression buffer only doubles from below the
+ * inflated size. cbm_cli_set_decompress_max_for_test(0) restores the limit.
+ * Both tests use the tar path, which is POSIX-only. */
+#ifndef _WIN32
+static void cli_update_fit_decompress_limit(long fixture_size) {
+    /* create_test_targz adds a header block, block padding and two end blocks. */
+    enum { TARGZ_OVERHEAD = 4 * 512 };
+    cbm_cli_set_decompress_max_for_test(((size_t)fixture_size + TARGZ_OVERHEAD) * 2U);
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Mandatory daemon activation safety
@@ -1429,7 +1468,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = child_ready ? cli_test_cmd_install_probe(4, install_argv) : -1;
     close(install_done_pipe[1]); /* the child's watch ends here at the latest */
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
@@ -1540,7 +1579,7 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
     char dir_arg[640];
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
-    int install_rc = orphan_created ? cli_test_cmd_install(4, install_argv) : -1;
+    int install_rc = orphan_created ? cli_test_cmd_install_probe(4, install_argv) : -1;
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
@@ -1950,7 +1989,7 @@ static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, con
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
     char *install_argv[] = {skip_binary ? "--skip-binary" : "--force", "--skip-config", "--yes",
                             dir_arg};
-    int rc = cli_test_cmd_install(4, install_argv);
+    int rc = cli_test_cmd_install_probe(4, install_argv);
     cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
     return rc;
@@ -2374,7 +2413,7 @@ TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force"};
-    int rc = cli_test_cmd_install(1, argv);
+    int rc = cli_test_cmd_install_probe(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
 
     const char *installed = read_test_file(bin_target);
@@ -2426,11 +2465,11 @@ TEST(cli_install_dir_and_skip_config_stage_first_install_safely) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--skip-config", "--yes", "--dir", install_dir};
-    int rc = cli_test_cmd_install(5, argv);
+    int rc = cli_test_cmd_install_probe(5, argv);
     char equals_arg[640];
     snprintf(equals_arg, sizeof(equals_arg), "--dir=%s", install_dir);
     char *dry_argv[] = {"--force", "--skip-config", "--dry-run", equals_arg};
-    int dry_rc = cli_test_cmd_install(4, dry_argv);
+    int dry_rc = cli_test_cmd_install_probe(4, dry_argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -2834,12 +2873,12 @@ TEST(cli_no_hooks_removes_codex_pretool_hook) {
     size_t owned = 0U;
     size_t foreign = 0U;
     char *default_args[] = {"--skip-binary", "--clients=codex", "--yes"};
-    int default_rc = cli_test_cmd_install(3, default_args);
+    int default_rc = cli_test_cmd_install_probe(3, default_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     bool default_json = default_rc == 0 && owned == 1U && foreign == 1U;
 
     char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=codex", "--yes"};
-    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    int no_hooks_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     char *json_state = read_test_file_alloc(hooks_path);
     char *toml_state = read_test_file_alloc(config_path);
@@ -2850,26 +2889,26 @@ TEST(cli_no_hooks_removes_codex_pretool_hook) {
     free(json_state);
     free(toml_state);
 
-    int bare_rc = cli_test_cmd_install(3, default_args);
+    int bare_rc = cli_test_cmd_install_probe(3, default_args);
     test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
     bool bare_disabled = bare_rc == 0 && owned == 0U && foreign == 1U;
 
     /* Without hooks.json the config.toml managed block carries the hooks. */
     (void)remove(hooks_path);
     char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=codex", "--yes"};
-    int toml_enable_rc = cli_test_cmd_install(4, hooks_args);
+    int toml_enable_rc = cli_test_cmd_install_probe(4, hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool toml_enabled = toml_enable_rc == 0 && toml_state &&
                         test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
     free(toml_state);
-    int toml_disable_rc = cli_test_cmd_install(4, no_hooks_args);
+    int toml_disable_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool toml_disabled = toml_disable_rc == 0 && toml_state &&
                          !strstr(toml_state, "hooks.PreToolUse") &&
                          !strstr(toml_state, "hook-augment") &&
                          strstr(toml_state, "[mcp_servers.codebase-memory-mcp]");
     free(toml_state);
-    int restore_rc = cli_test_cmd_install(4, hooks_args);
+    int restore_rc = cli_test_cmd_install_probe(4, hooks_args);
     toml_state = read_test_file_alloc(config_path);
     bool restored = restore_rc == 0 && toml_state &&
                     test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
@@ -2950,12 +2989,12 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
     cbm_cli_set_activation_ops_for_test(&ops);
 
     char *default_args[] = {"--skip-binary", "--clients=augment", "--yes"};
-    int default_rc = cli_test_cmd_install(3, default_args);
+    int default_rc = cli_test_cmd_install_probe(3, default_args);
     bool default_scripts =
         default_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
 
     char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=augment", "--yes"};
-    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    int no_hooks_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     bool scripts_removed =
         no_hooks_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
     char *settings = read_test_file_alloc(settings_path);
@@ -2965,12 +3004,12 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
                     !strstr(settings, "codebase-memory-coverage");
     free(settings);
 
-    int bare_rc = cli_test_cmd_install(3, default_args);
+    int bare_rc = cli_test_cmd_install_probe(3, default_args);
     bool bare_disabled =
         bare_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
 
     char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=augment", "--yes"};
-    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    int hooks_rc = cli_test_cmd_install_probe(4, hooks_args);
     settings = read_test_file_alloc(settings_path);
     bool restored = hooks_rc == 0 && cbm_file_exists(session_path) &&
                     cbm_file_exists(coverage_path) && settings &&
@@ -2986,7 +3025,7 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
              owned_session ? owned_session : "");
     free(owned_session);
     write_test_file(session_path, user_session);
-    int user_rc = cli_test_cmd_install(4, no_hooks_args);
+    int user_rc = cli_test_cmd_install_probe(4, no_hooks_args);
     char *kept_session = read_test_file_alloc(session_path);
     bool user_script_kept = user_rc == 0 && kept_session &&
                             strcmp(kept_session, user_session) == 0 &&
@@ -2996,7 +3035,7 @@ TEST(cli_no_hooks_removes_augment_owned_scripts) {
     /* End on --hooks, as the Codex case does: the opt-out is process state,
      * and later tests install without the command line. */
     (void)remove(session_path);
-    int final_rc = cli_test_cmd_install(4, hooks_args);
+    int final_rc = cli_test_cmd_install_probe(4, hooks_args);
     bool final_restored =
         final_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
 
@@ -3056,7 +3095,7 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--reset-indexes", "--yes"};
-    int rc = cli_test_cmd_install(3, argv);
+    int rc = cli_test_cmd_install_probe(3, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3374,7 +3413,7 @@ TEST(cli_install_config_failure_keeps_published_binary) {
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
     char *argv[] = {"--force", "--yes"};
-    int rc = cli_test_cmd_install(2, argv);
+    int rc = cli_test_cmd_install_probe(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3617,6 +3656,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     char *argv[] = {"--force"};
     int rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -3642,6 +3682,7 @@ TEST(cli_update_agent_configs_finish_before_guard_release) {
     cbm_cli_set_activation_ops_for_test(&failure_ops);
     int config_failure_rc = cli_test_cmd_update(1, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     struct stat updated_status;
     bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
                             updated_status.st_size != (off_t)(sizeof(old_binary) - 1U);
@@ -3759,6 +3800,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
+    cli_update_fit_decompress_limit(native_size);
     FILE *capture = tmpfile();
     int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
     int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
@@ -3784,6 +3826,7 @@ TEST(cli_update_names_the_failing_staging_step_and_os_error) {
         close(saved_stderr);
     }
     cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_cli_set_decompress_max_for_test(0);
     char output[16384] = {0};
     if (capture) {
         rewind(capture);
@@ -7120,6 +7163,36 @@ TEST(cli_extract_binary_from_targz_invalid_data) {
     PASS();
 }
 
+/* The decompression limit keeps a hostile archive from inflating without end.
+ * The same archive is refused over a lowered limit and accepted under the real
+ * one, so the limit is the only reason for the refusal. */
+TEST(cli_update_refuses_an_archive_over_the_decompression_limit) {
+    enum { PAYLOAD = 1 << 20, LIMIT = 1 << 16 };
+    unsigned char *payload = calloc(1, PAYLOAD);
+    ASSERT_NOT_NULL(payload);
+    int archive_len = 0;
+    unsigned char *archive =
+        create_test_targz("codebase-memory-mcp", payload, PAYLOAD, &archive_len);
+    free(payload);
+    ASSERT_NOT_NULL(archive);
+
+    cbm_cli_set_decompress_max_for_test(LIMIT);
+    int over_len = 0;
+    unsigned char *over = cbm_extract_binary_from_targz(archive, archive_len, &over_len);
+    cbm_cli_set_decompress_max_for_test(0);
+    int under_len = 0;
+    unsigned char *under = cbm_extract_binary_from_targz(archive, archive_len, &under_len);
+    free(archive);
+
+    bool refused = over == NULL;
+    free(over);
+    bool accepted = under != NULL && under_len == PAYLOAD;
+    free(under);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(accepted);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Zip extraction tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -7988,6 +8061,101 @@ TEST(cli_detect_agents_finds_cursor_issue222) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_agentty) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* agentty lives in the table-driven registry, not the legacy detector. */
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_stable_id("agentty");
+    ASSERT_NOT_NULL(profile);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.agentty", tmpdir);
+    test_mkdirp(dir);
+
+    cbm_agent_client_resolve_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.home_dir = tmpdir;
+    ASSERT_TRUE(cbm_agent_client_detect(CBM_AGENT_CLIENT_AGENTTY, &options));
+
+    char config_path[512];
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    char expected[512];
+    snprintf(expected, sizeof(expected), "%s/.agentty/mcp.json", tmpdir);
+    ASSERT_STR_EQ(config_path, expected);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_agentty_mcp_config_env_override) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-agentty-env-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char agentty_dir[512];
+    snprintf(agentty_dir, sizeof(agentty_dir), "%s/.agentty", tmpdir);
+    test_mkdirp(agentty_dir);
+    char *saved = save_test_env("AGENTTY_MCP_CONFIG");
+    char override_path[512];
+    snprintf(override_path, sizeof(override_path), "%s/override.json", tmpdir);
+    char default_path[512];
+    snprintf(default_path, sizeof(default_path), "%s/.agentty/mcp.json", tmpdir);
+
+    /* The registry option is the only input the resolver reads. */
+    cbm_agent_client_resolve_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.home_dir = tmpdir;
+    options.agentty_mcp_config = override_path;
+    char config_path[512];
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    ASSERT_STR_EQ(config_path, override_path);
+    options.agentty_mcp_config = NULL;
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    ASSERT_STR_EQ(config_path, default_path);
+
+    /* The install plan reads $AGENTTY_MCP_CONFIG through the same registry
+     * env path as every other client override: an absolute or ~ value is
+     * honored, a relative one is ignored instead of landing in whatever
+     * directory install happens to run from. */
+    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool absolute_honored = json && strstr(json, override_path) != NULL;
+    free(json);
+
+    cbm_setenv("AGENTTY_MCP_CONFIG", "~/agentty-override.json", 1);
+    char tilde_path[512];
+    snprintf(tilde_path, sizeof(tilde_path), "%s/agentty-override.json", tmpdir);
+    json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool tilde_honored = json && strstr(json, tilde_path) != NULL;
+    free(json);
+
+    cbm_setenv("AGENTTY_MCP_CONFIG", "agentty-relative.json", 1);
+    json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool relative_ignored =
+        json && strstr(json, default_path) != NULL && strstr(json, "agentty-relative.json") == NULL;
+    free(json);
+
+    restore_test_env("AGENTTY_MCP_CONFIG", saved);
+    test_rmdir_r(tmpdir);
+    if (!absolute_honored)
+        FAIL("install plan must target an absolute $AGENTTY_MCP_CONFIG");
+    if (!tilde_honored)
+        FAIL("install plan must expand a leading ~ in $AGENTTY_MCP_CONFIG");
+    if (!relative_ignored)
+        FAIL("install plan must ignore a relative $AGENTTY_MCP_CONFIG");
+    PASS();
+}
+
 /* issue #388: `install --plan` must emit a machine-readable receipt of planned
  * writes WITHOUT mutating any config (the pre-mutation trust primitive). */
 TEST(cli_install_plan_receipt_no_mutation_issue388) {
@@ -8105,14 +8273,18 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pi",
         "Sourcegraph Cody",
         "Oh My Pi (omp)",
+        "agentty",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 45U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 46U);
+    /* The table-driven registry must carry agentty too — the legacy detector no
+     * longer knows about it. */
+    ASSERT_NOT_NULL(cbm_agent_client_by_stable_id("agentty"));
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -8125,9 +8297,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -8140,9 +8312,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 45 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 46 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -8161,7 +8333,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (45)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (46)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -8170,10 +8342,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "45 automatic/conditional client surfaces") ||
-        !strstr(data, "39 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "46 automatic/conditional client surfaces") ||
+        !strstr(data, "40 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 45-surface 39+6 support matrix accurately");
+        FAIL("llms.txt must describe the 46-surface 40+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -8221,6 +8393,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
 #endif
         ".vibe",
         ".grok",
+        ".agentty",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -8271,6 +8444,9 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "/.grok/rules/codebase-memory.md",
         "/.grok/skills/codebase-memory/SKILL.md",
         "/.grok/agents/codebase-memory.md",
+        "\"agentty\"",
+        "/.agentty/mcp.json",
+        "/.agentty/skills/codebase-memory/SKILL.md",
     };
     const char *missing = NULL;
     for (size_t i = 0; json && i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -8330,6 +8506,7 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
 #endif
         ".vibe",
         ".grok",
+        ".agentty",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -8438,12 +8615,137 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     snprintf(path, sizeof(path), "%s/.grok/rules/codebase-memory.md", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
 
+    /* agentty consumes the standard mcpServers shape and Claude-compatible
+     * SKILL.md — same fixtures as OpenHands/Cline. */
+    snprintf(path, sizeof(path), "%s/.agentty/mcp.json", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, standard_json, 3);
+    snprintf(path, sizeof(path), "%s/.agentty/skills/codebase-memory/SKILL.md", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, shared_skill, 3);
+
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         restore_test_env(env_names[i], saved_env[i]);
     }
     test_rmdir_r(tmpdir);
     if (!schemas_ok)
         FAIL("new agent installs must write every documented MCP schema");
+    PASS();
+}
+
+TEST(cli_agentty_install_then_uninstall_roundtrip) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-agentty-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    char *saved_override = save_test_env("AGENTTY_MCP_CONFIG");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CBM_CACHE_DIR");
+
+    char agentty_dir[512];
+    char mcp_path[512];
+    char skills_dir[512];
+    char skill_path[640];
+    char user_dir[512];
+    char user_file[640];
+    char binary[512];
+    snprintf(agentty_dir, sizeof(agentty_dir), "%s/.agentty", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agentty_dir);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", agentty_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/codebase-memory/SKILL.md", skills_dir);
+    snprintf(user_dir, sizeof(user_dir), "%s/keepme", skills_dir);
+    snprintf(user_file, sizeof(user_file), "%s/SKILL.md", user_dir);
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+
+    test_mkdirp(agentty_dir);
+    test_mkdirp(user_dir);
+    write_test_file(user_file, "user-owned skill\n");
+    write_test_file(binary, "");
+    /* Seed a foreign server so install/uninstall must preserve it. */
+    write_test_file(mcp_path, "{\"mcpServers\":{\"other-mcp\":{\"command\":\"/opt/other\"}}}\n");
+
+    cbm_install_agent_configs(tmpdir, binary, false, false);
+
+    struct stat state;
+    const char *const installed_markers[] = {"mcpServers", "codebase-memory-mcp", binary};
+    bool installed = test_file_contains_all(mcp_path, installed_markers, 3) &&
+                     stat(skill_path, &state) == 0;
+    char *mcp_after_install = read_test_file_alloc(mcp_path);
+    bool foreign_survives_install = mcp_after_install &&
+                                    strstr(mcp_after_install, "\"other-mcp\"") != NULL;
+
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+
+    bool skill_removed = stat(skill_path, &state) != 0;
+    char *mcp_after_uninstall = read_test_file_alloc(mcp_path);
+    bool mcp_entry_removed =
+        mcp_after_uninstall && strstr(mcp_after_uninstall, "codebase-memory-mcp") == NULL;
+    bool user_kept = stat(user_file, &state) == 0;
+    bool foreign_kept = mcp_after_uninstall && strstr(mcp_after_uninstall, "\"other-mcp\"") != NULL;
+
+    /* $AGENTTY_MCP_CONFIG redirects both install and uninstall: agentty never
+     * reads ~/.agentty/mcp.json while the variable points at an explicit
+     * file, so writing there would silently no-op on the agent's side. */
+    char override_path[640];
+    snprintf(override_path, sizeof(override_path), "%s/override-mcp.json", tmpdir);
+    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+    cbm_install_agent_configs(tmpdir, binary, false, false);
+    struct stat override_state;
+    const char *const override_markers[] = {"mcpServers", "codebase-memory-mcp", binary};
+    bool override_written = test_file_contains_all(override_path, override_markers, 3) &&
+                            stat(override_path, &override_state) == 0;
+    char *default_after_override = read_test_file_alloc(mcp_path);
+    bool default_untouched =
+        !default_after_override || strstr(default_after_override, "codebase-memory-mcp") == NULL;
+    free(default_after_override);
+    argv[0] = "uninstall";
+    int override_uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *override_after_uninstall = read_test_file_alloc(override_path);
+    bool override_entry_removed =
+        override_after_uninstall && strstr(override_after_uninstall, "codebase-memory-mcp") == NULL;
+    free(override_after_uninstall);
+
+    /* Restore HOME/PATH before any FAIL: a failure here must not leave the
+     * rest of the suite running without git on PATH. */
+    free(mcp_after_install);
+    free(mcp_after_uninstall);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    restore_test_env("AGENTTY_MCP_CONFIG", saved_override);
+    test_rmdir_r(tmpdir);
+
+    if (!override_written)
+        FAIL("install must honor $AGENTTY_MCP_CONFIG and write the override file");
+    if (!default_untouched)
+        FAIL("install must not re-add the entry to ~/.agentty/mcp.json while "
+             "$AGENTTY_MCP_CONFIG is set");
+    if (!override_entry_removed)
+        FAIL("uninstall must honor $AGENTTY_MCP_CONFIG and clean the override file");
+    if (override_uninstall_rc != 0)
+        FAIL("uninstall must exit successfully when $AGENTTY_MCP_CONFIG is set");
+    if (!installed)
+        FAIL("install must register the codebase-memory server and skill for agentty");
+    if (!foreign_survives_install)
+        FAIL("install must preserve a pre-existing foreign server in ~/.agentty/mcp.json");
+    if (!skill_removed)
+        FAIL("uninstall must remove the codebase-memory skill directory");
+    if (!mcp_entry_removed)
+        FAIL("uninstall must remove the owned codebase-memory MCP entry");
+    if (!user_kept)
+        FAIL("uninstall must not touch user-owned skills in ~/.agentty/skills/");
+    if (!foreign_kept)
+        FAIL("uninstall must preserve foreign servers in ~/.agentty/mcp.json");
+    if (uninstall_rc != 0)
+        FAIL("uninstall must exit successfully for the agentty roundtrip");
     PASS();
 }
 
@@ -18434,19 +18736,31 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
 
     int fds[2];
+    int errfds[2];
     if (pipe(fds) != 0) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
+    }
+    if (pipe(errfds) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("stderr pipe failed");
     }
 
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
         /* Child: hook-augment with a 60ms deadline and stdin that blocks
-         * forever (parent keeps the write end open, sends nothing). */
+         * forever (parent keeps the write end open, sends nothing). Its stderr
+         * is redirected so the parent can prove the deadline is also announced
+         * there, not only in the timeouts log. */
         close(fds[1]);
         dup2(fds[0], 0);
         close(fds[0]);
+        close(errfds[0]);
+        dup2(errfds[1], 2);
+        close(errfds[1]);
         setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
         setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
         alarm(10); /* backstop: never hang the suite */
@@ -18454,6 +18768,19 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     }
     ASSERT_GT(pid, 0);
     close(fds[0]);
+    close(errfds[1]);
+
+    /* Drain the child's stderr before reaping, so a full pipe can never wedge
+     * it. EOF arrives once the child's deadline handler has run and _exit()ed. */
+    char errbuf[4096] = "";
+    size_t errlen = 0;
+    ssize_t rd;
+    while (errlen + 1 < sizeof(errbuf) &&
+           (rd = read(errfds[0], errbuf + errlen, sizeof(errbuf) - 1 - errlen)) > 0) {
+        errlen += (size_t)rd;
+    }
+    errbuf[errlen] = '\0';
+    close(errfds[0]);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -18464,8 +18791,8 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_EQ(WEXITSTATUS(status), 0);
 
     /* RED before the fix: no breadcrumb existed — a fired deadline was
-     * indistinguishable from a no-match run. GREEN: the log names the
-     * deadline and the knob. */
+     * indistinguishable from a no-match run. GREEN: it is announced on BOTH
+     * the timeouts log and stderr, each naming the deadline and the knob. */
     FILE *f = fopen(logpath, "r");
     if (!f) {
         fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
@@ -18477,6 +18804,9 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_NOT_NULL(got);
     ASSERT(strstr(line, "deadline_exceeded") != NULL);
     ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    ASSERT(strstr(errbuf, "deadline_exceeded") != NULL);
+    ASSERT(strstr(errbuf, "CBM_HOOK_DEADLINE_MS") != NULL);
 
     cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
     cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
@@ -20346,6 +20676,19 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     ASSERT_FALSE(registry.claude_code);
     ASSERT_FALSE(registry.cursor);
 
+    /* agentty is a registry client: selectable through the shared selector
+     * vocabulary, and a selection that omits it must drop it (a registry
+     * install only ever runs when cli_clients_selects_registry_client passes). */
+    cbm_detected_agents_t agentty = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("agentty", &agentty));
+    cbm_detected_agents_t leak = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("claude,codex", &leak));
+    cbm_cli_set_client_selection_for_testing("agentty");
+    ASSERT_TRUE(cbm_cli_selects_registry_client_for_testing("agentty"));
+    cbm_cli_set_client_selection_for_testing("claude,codex");
+    ASSERT_FALSE(cbm_cli_selects_registry_client_for_testing("agentty"));
+    cbm_cli_set_client_selection_for_testing(NULL);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -21178,6 +21521,7 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_targz);
     RUN_TEST(cli_extract_binary_from_targz_not_found);
     RUN_TEST(cli_extract_binary_from_targz_invalid_data);
+    RUN_TEST(cli_update_refuses_an_archive_over_the_decompression_limit);
     RUN_TEST(cli_extract_binary_from_zip);
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);
@@ -21207,7 +21551,7 @@ SUITE(cli) {
     RUN_TEST(cli_yaml_parse_empty);
     RUN_TEST(cli_yaml_has);
 
-    /* Agent detection (6 tests — group A) */
+    /* Agent detection */
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_claude_empty_dir_not_detected_issue1180);
@@ -21220,6 +21564,9 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
+    RUN_TEST(cli_detect_agents_finds_agentty);
+    RUN_TEST(cli_agentty_mcp_config_env_override);
+    RUN_TEST(cli_agentty_install_then_uninstall_roundtrip);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);

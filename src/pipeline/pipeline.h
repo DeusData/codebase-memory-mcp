@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "cbm.h"                   /* CBMCall for overload selection */
 #include "discover/discover.h"     /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h"  /* CBM_SZ_512 */
 #include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
@@ -282,17 +283,50 @@ cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
 /* Register a function/method/class. All strings are copied. The entry's
- * language is unknown, so name-based resolution never filters it out. */
+ * language is unknown, so name-based resolution never filters it out.
+ * `is_test` is the caller's test verdict for this symbol: the seeders pass the
+ * extractor's (CBMDefinition.is_test: a definition's own test attributes, and
+ * for functions, methods and the module the file's test-ness) OR the
+ * extractor's file rule (cbm_is_test_file) OR cbm_registry_test_double_path.
+ * The registry stores it and scores with it; it does not derive test-ness
+ * from the QN. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label);
+                      const char *label, bool is_test);
 
+/* The test-double path rule, for the registry's ranking only: true when the
+ * repo-relative path of a symbol's defining file has a directory segment named
+ * exactly `fake`, `mock`, `mocks`, `testing` or `testutil`, or its file name
+ * matches `mock_*.go` or `fake_*.go`. Go projects keep generated fake
+ * clientsets and mock packages in ordinary files the extractor rightly does
+ * not call tests; a call should still prefer real code over them. The three
+ * registry seeders (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) pass the extractor's verdict OR its file rule
+ * (cbm_is_test_file, so every definition in a test file ranks as test, not
+ * only its callables) OR this, so full and incremental indexes rank alike.
+ * Neither path rule decides what a node is: the stored
+ * is_test property, TESTS edges and importance stay with cbm_is_test_path. */
+bool cbm_registry_test_double_path(const char *rel_path);
+
+/* Swift-only metadata and label-compatible overload selection. The returned
+ * QNs are borrowed from the registry and all belong to one base callable.
+ * -1 means this name has Swift definitions but no compatible overload. */
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count,
+                                      const char *selector);
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap);
+int cbm_registry_swift_candidates_in_file(const cbm_registry_t *r, const CBMCall *call,
+                                          const CBMFileResult *file, const cbm_gbuf_t *graph,
+                                          const char *module_qn, const char **import_vals,
+                                          int import_count, const char **out, int out_cap);
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
  * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no
  * function-local symbols: that needs the defining file's module QN, see
  * cbm_registry_add_lang_in_module. */
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
-                           const char *label, CBMLanguage lang);
+                           const char *label, CBMLanguage lang, bool is_test);
 
 /* As cbm_registry_add_lang. A Python symbol declared inside a function body of
  * its own file (cbm_registry_qn_is_function_local, bounded by
@@ -304,7 +338,7 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
  * indexes agree. 0 = no local detection. */
 void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
                                      const char *qualified_name, const char *label,
-                                     CBMLanguage lang, size_t module_prefix_len);
+                                     CBMLanguage lang, size_t module_prefix_len, bool is_test);
 
 /* Register a symbol for exact (qualified-name) lookups only: it is never
  * offered to the short-name strategies (unique_name, suffix_match,

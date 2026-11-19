@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_GO_LSP_H
 #define CBM_LSP_GO_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -18,9 +19,13 @@ typedef struct {
     const char** import_local_names;   // NULL-terminated
     const char** import_package_qns;   // NULL-terminated
     int import_count;
+    CBMNameRows import_rows; // import_local_names by name, rows in table order
 
     // Current function context
     const char* enclosing_func_qn;
+    // Walking a function body: a type declaration met there shadows the
+    // package's type of its name in the current block (go_shadow_add).
+    bool in_function;
     const char* package_qn;  // module QN for this file
     const char* rel_path;    // repo-relative file path: init() QN suffix (#1910); NULL = flat
 
@@ -114,6 +119,11 @@ typedef struct {
      * p or e). See CBMDefinition. */
     bool is_singleton;
     const char *mixin_refs;
+    /* Identities of the type names this def's declared types write, resolved
+     * once in the scope of the file that wrote them (src/pipeline/type_scope.h):
+     * "spelling=QN|spelling=QN". Read with cbm_type_scope_find (type_rep.h).
+     * NULL = no name needs one; the engine then qualifies as before. */
+    const char *type_scope;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

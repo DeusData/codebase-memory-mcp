@@ -7518,6 +7518,14 @@ int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run)
  */
 #ifdef CBM_CLI_ENABLE_TEST_API
 
+/* The most an archive may decompress to. A test lowers it to pin the refusal
+ * without building an archive of hundreds of megabytes. */
+static size_t g_cli_decompress_max = DECOMPRESS_MAX_BYTES;
+
+void cbm_cli_set_decompress_max_for_test(size_t max_bytes) {
+    g_cli_decompress_max = max_bytes ? max_bytes : DECOMPRESS_MAX_BYTES;
+}
+
 /* Decompress gzip data into a malloc'd buffer. Returns NULL on failure.
  * *out_total receives the decompressed size. Caller must free the result. */
 static unsigned char *gzip_decompress(const unsigned char *data, int data_len, size_t *out_total) {
@@ -7535,8 +7543,8 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     if (buf_cap < CLI_BUF_4K) {
         buf_cap = CLI_BUF_4K;
     }
-    if (buf_cap > DECOMPRESS_MAX_BYTES) {
-        buf_cap = DECOMPRESS_MAX_BYTES;
+    if (buf_cap > g_cli_decompress_max) {
+        buf_cap = g_cli_decompress_max;
     }
     unsigned char *decompressed = malloc(buf_cap);
     if (!decompressed) {
@@ -7549,7 +7557,7 @@ static unsigned char *gzip_decompress(const unsigned char *data, int data_len, s
     do {
         if (total >= buf_cap) {
             size_t new_cap = buf_cap * GROWTH_FACTOR;
-            if (new_cap > DECOMPRESS_MAX_BYTES) {
+            if (new_cap > g_cli_decompress_max) {
                 free(decompressed);
                 inflateEnd(&strm);
                 return NULL;
@@ -10063,6 +10071,7 @@ typedef struct {
     char roo_config_path[CLI_BUF_1K];
     char cody_config_path[CLI_BUF_1K];
     char omp_agent_dir[CLI_BUF_1K];
+    char agentty_mcp_config[CLI_BUF_1K];
 } cbm_agent_registry_context_t;
 
 static const char *cbm_agent_registry_env_path(const char *env_name, const char *home,
@@ -10117,6 +10126,9 @@ static void cbm_init_agent_registry_context(const char *home,
     if (cbm_omp_agent_dir(home, registry->omp_agent_dir, sizeof(registry->omp_agent_dir))) {
         registry->options.omp_agent_dir = registry->omp_agent_dir;
     }
+    registry->options.agentty_mcp_config =
+        cbm_agent_registry_env_path("AGENTTY_MCP_CONFIG", home, registry->agentty_mcp_config,
+                                    sizeof(registry->agentty_mcp_config));
 #ifdef _WIN32
     registry->options.is_windows = true;
 #else
@@ -10649,6 +10661,10 @@ static void install_agent_client_registry(const char *home, const char *binary_p
             install_pi_durable_context(home, binary_path, force, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             install_omp_durable_context(&registry, force, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_AGENTTY) {
+            char skills_dir[CLI_BUF_1K];
+            snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+            install_agent_skill(profile->display_name, skills_dir, force, dry_run);
         }
     }
 }
@@ -11901,6 +11917,10 @@ const char *cbm_cli_clients_token_for_testing(size_t index) {
 }
 void cbm_cli_set_client_selection_for_testing(const char *spec) {
     g_client_selection = spec;
+}
+bool cbm_cli_selects_registry_client_for_testing(const char *stable_id) {
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_stable_id(stable_id);
+    return profile && cli_clients_selects_registry_client(g_client_selection, profile->id);
 }
 #endif
 
@@ -13291,6 +13311,10 @@ static void uninstall_agent_client_registry(const char *home, bool dry_run) {
             uninstall_pi_durable_context(home, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             uninstall_omp_durable_context(&registry, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_AGENTTY) {
+            char skills_dir[CLI_BUF_1K];
+            snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+            uninstall_agent_skill(profile->display_name, skills_dir, dry_run);
         }
     }
 }

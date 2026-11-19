@@ -67,6 +67,17 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
     return 0;
 }
 
+static const CBMImport *find_import(CBMFileResult *r, const char *local, const char *path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, path) == 0) {
+            return imp;
+        }
+    }
+    return NULL;
+}
+
 /* Count definitions with a given label. */
 /* Check for a definition with the given qualified name. Distinct from
  * find_def_by_name, which returns the first match by NAME and so cannot tell two
@@ -397,6 +408,140 @@ TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
                                CBM_LANG_CPP, "t", "broken.cpp");
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(r->parse_incomplete); /* real gap stays reported */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1546: the grammars built on tree-sitter-c read a backslash line splice
+ * inside a string literal as `\` plus one character. With CRLF line endings
+ * that character was the CR, the LF then ended the literal, and every
+ * function after it was lost to one ERROR region. */
+static const CBMDefinition *splice_def(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* The reporter's file, byte for byte. */
+TEST(extract_cpp_crlf_string_splice_keeps_later_functions_issue1546) {
+    CBMFileResult *r = extract("void Head()\r\n"
+                               "{\r\n"
+                               "    int h = 0;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void Middle()\r\n"
+                               "{\r\n"
+                               "    const wchar_t* s = L\"line 0\\r\\n\\\r\n"
+                               "line 1\\r\\n\";\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void TrailerOne()\r\n"
+                               "{\r\n"
+                               "    int a = 1;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "void TrailerTwo()\r\n"
+                               "{\r\n"
+                               "    int b = 2;\r\n"
+                               "}\r\n",
+                               CBM_LANG_CPP, "t", "repro.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    const CBMDefinition *middle = splice_def(r, "Middle");
+    const CBMDefinition *one = splice_def(r, "TrailerOne");
+    const CBMDefinition *two = splice_def(r, "TrailerTwo");
+    ASSERT_NOT_NULL(middle);
+    ASSERT_NOT_NULL(one);
+    ASSERT_NOT_NULL(two);
+    ASSERT_EQ((int)middle->start_line, 6);
+    ASSERT_EQ((int)middle->end_line, 10);
+    ASSERT_EQ((int)one->start_line, 12);
+    ASSERT_EQ((int)two->start_line, 17);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every grammar built on tree-sitter-c has the same escape rule. */
+TEST(extract_c_family_crlf_string_splice_parses_clean_issue1546) {
+    static const CBMLanguage langs[] = {CBM_LANG_C,    CBM_LANG_CPP,  CBM_LANG_CUDA,
+                                        CBM_LANG_OBJC, CBM_LANG_GLSL, CBM_LANG_HLSL,
+                                        CBM_LANG_ISPC, CBM_LANG_SLANG};
+    const char *src = "void Head()\r\n"
+                      "{\r\n"
+                      "    int h = 0;\r\n"
+                      "}\r\n"
+                      "\r\n"
+                      "void Middle()\r\n"
+                      "{\r\n"
+                      "    const char *s = \"line 0\\\r\n"
+                      "line 1\";\r\n"
+                      "}\r\n"
+                      "\r\n"
+                      "void TrailerOne()\r\n"
+                      "{\r\n"
+                      "    int a = 1;\r\n"
+                      "}\r\n";
+    for (size_t i = 0; i < sizeof(langs) / sizeof(langs[0]); i++) {
+        CBMFileResult *r = extract(src, langs[i], "t", "splice.c");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        const CBMDefinition *middle = splice_def(r, "Middle");
+        const CBMDefinition *tail = splice_def(r, "TrailerOne");
+        ASSERT_NOT_NULL(middle);
+        ASSERT_NOT_NULL(tail);
+        ASSERT_EQ((int)middle->end_line, 10);
+        ASSERT_EQ((int)tail->start_line, 12);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Splices in a macro and a line comment, which the grammar already read with
+ * CRLF, still do; the preprocessed second pass sees the rewritten bytes too. */
+TEST(extract_c_crlf_splices_in_macro_comment_and_string_issue1546) {
+    CBMFileResult *r = extract("#define LOG2(a, b) \\\r\n"
+                               "    do { log_it(a); \\\r\n"
+                               "         log_it(b); } while (0)\r\n"
+                               "\r\n"
+                               "// a comment that ends with a splice \\\r\n"
+                               "   and goes on here\r\n"
+                               "\r\n"
+                               "static const char *usage = \"usage: tool\\n\\\r\n"
+                               "  -h  help\\n\";\r\n"
+                               "\r\n"
+                               "int helper(int x)\r\n"
+                               "{\r\n"
+                               "    return x + 1;\r\n"
+                               "}\r\n"
+                               "\r\n"
+                               "int main(void)\r\n"
+                               "{\r\n"
+                               "    LOG2(\"a\", \"b\");\r\n"
+                               "    return helper(2);\r\n"
+                               "}\r\n",
+                               CBM_LANG_C, "t", "mix.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT(has_def(r, "Macro", "LOG2"));
+    const CBMDefinition *usage = splice_def(r, "usage");
+    const CBMDefinition *helper = splice_def(r, "helper");
+    ASSERT_NOT_NULL(usage);
+    ASSERT_NOT_NULL(helper);
+    ASSERT_EQ((int)usage->end_line, 9);
+    ASSERT_EQ((int)helper->start_line, 11);
+    ASSERT_EQ((int)helper->end_line, 14);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_NOT_NULL(c->enclosing_func_qn);
+            ASSERT_NOT_NULL(strstr(c->enclosing_func_qn, "main"));
+        }
+    }
+    ASSERT(has_call(r, "log_it"));
     cbm_free_result(r);
     PASS();
 }
@@ -3142,6 +3287,81 @@ TEST(haskell_infix_definition_name) {
     PASS();
 }
 
+/* #2439: the vendored grammar lexes an escaped char literal with
+ * /'\\[^ ]*'/, whose `[^ ]*` also matches newlines and quotes. With only
+ * newlines between `'\n'` and the next definition's primed name, the char
+ * token runs from `'\n` through `g'`, so `f` swallows `g'` and `g'` gets no
+ * node. Each top-level definition must keep its own node and span. */
+TEST(haskell_escaped_char_does_not_swallow_primed_def) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "f = '\\n'\n"
+                               "\n"
+                               "g' = 2\n"
+                               "\n"
+                               "h = 3\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *f = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "f") == 0) {
+            f = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ((int)f->end_line, 3);
+    ASSERT(has_def(r, "Function", "g'"));
+    ASSERT(has_def(r, "Function", "h"));
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Append the text of every `char` node under root to out, space-separated. */
+static void haskell_char_texts(TSNode root, const char *src, char *out, size_t out_sz) {
+    TSTreeCursor c = ts_tree_cursor_new(root);
+    size_t len = 0;
+    for (;;) {
+        TSNode n = ts_tree_cursor_current_node(&c);
+        if (strcmp(ts_node_type(n), "char") == 0 && len < out_sz) {
+            uint32_t s = ts_node_start_byte(n);
+            uint32_t e = ts_node_end_byte(n);
+            len += (size_t)snprintf(out + len, out_sz - len, "%.*s ", (int)(e - s), src + s);
+        }
+        if (ts_tree_cursor_goto_first_child(&c)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&c)) {
+            if (!ts_tree_cursor_goto_parent(&c)) {
+                ts_tree_cursor_delete(&c);
+                return;
+            }
+        }
+    }
+}
+
+/* #2439, same-line form: the old regex ran from the first `'\` to the last
+ * `'` before a space, so `['\n','\t']` lexed as ONE char token with no parse
+ * error. Each literal must be its own token, and the escapes that contain a
+ * quote or a backslash (`'\''`, `'\\'`) must still lex whole. */
+TEST(haskell_escaped_char_list_lexes_each_literal) {
+    const char *src = "x = ['\\n','\\t','\\'','\\\\','\\x41','\\SOH','a']\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HASKELL)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    char got[128] = "";
+    haskell_char_texts(root, src, got, sizeof(got));
+    bool has_error = ts_node_has_error(root);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_FALSE(has_error);
+    ASSERT_STR_EQ(got, "'\\n' '\\t' '\\'' '\\\\' '\\x41' '\\SOH' 'a' ");
+    PASS();
+}
+
 /* --- OCaml --- */
 TEST(ocaml_function) {
     CBMFileResult *r =
@@ -3823,6 +4043,291 @@ TEST(swift_method_call) {
     PASS();
 }
 
+TEST(swift_type_imports_preserve_markers_and_complete_file_imports) {
+    CBMFileResult *r = extract("struct Service {}\n"
+                               "extension Service { func run() {} }\n"
+                               "import NIOCore\n"
+                               "@testable import NIOFS\n"
+                               "@_exported import struct Alpha.Service\n",
+                               CBM_LANG_SWIFT, "t", "Types.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 3);
+    ASSERT_STR_EQ(r->imports.items[1].module_path, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[1].local_name, "NIOFS");
+    ASSERT_STR_EQ(r->imports.items[2].module_path, "Alpha.Service");
+    int types = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        bool marker = false;
+        const char *imports = NULL;
+        for (const char **kv = def->extra_props; kv && kv[0] && kv[1]; kv += 2) {
+            marker |=
+                strcmp(kv[0], "swift_type_path") == 0 || strcmp(kv[0], "swift_extension") == 0;
+            if (strcmp(kv[0], "swift_imports") == 0) {
+                imports = kv[1];
+            }
+        }
+        if (marker) {
+            types++;
+            ASSERT_NOT_NULL(imports);
+            ASSERT_STR_EQ(imports, "NIOCore|NIOFS|Alpha.Service");
+        } else {
+            ASSERT_NULL(imports);
+        }
+    }
+    ASSERT_EQ(types, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_conditional_type_members_keep_owners_and_source_lines) {
+    const char *source = "open class Session {\n"
+                         "#if canImport(Darwin) /* conditional\n"
+                         " * comment */\n"
+                         "open func request(_ value: Int) { called() }\n"
+                         "#if FEATURE\n"
+                         "open func nested() {}\n"
+                         "#else\n"
+                         "open func alternate() {}\n"
+                         "#endif\n"
+                         "#elseif canImport(FoundationNetworking)\n"
+                         "open func portable() {}\n"
+                         "#else\n"
+                         "open func fallback() {}\n"
+                         "#endif\n"
+                         "open func upload(_ value: Int) {}\n"
+                         "}\n"
+                         "let literal = #\"\"\"\n"
+                         "#if RAW\n"
+                         "func phantom() {}\n"
+                         "#endif\n"
+                         "\"\"\"#\n"
+                         "/* outer\n"
+                         "#if COMMENT\n"
+                         "/* nested */\n"
+                         "func fake() {}\n"
+                         "#endif\n"
+                         "*/\n"
+                         "func outside() {}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Session.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    const char *members[] = {"Session.request(_:Int)", "Session.nested()",
+                             "Session.alternate()",    "Session.portable()",
+                             "Session.fallback()",     "Session.upload(_:Int)"};
+    for (size_t i = 0; i < sizeof(members) / sizeof(members[0]); i++) {
+        const CBMDefinition *def = find_def_in_module(r, members[i]);
+        ASSERT_NOT_NULL(def);
+        ASSERT_STR_EQ(def->label, "Method");
+        ASSERT_STR_EQ(def->parent_class, "t.Session.Session");
+    }
+    ASSERT_EQ(find_def_in_module(r, "Session.request(_:Int)")->start_line, 4);
+    ASSERT_EQ(find_def_in_module(r, "Session.upload(_:Int)")->start_line, 15);
+    const CBMDefinition *outside = find_def_in_module(r, "outside()");
+    ASSERT_NOT_NULL(outside);
+    ASSERT_EQ(outside->start_line, 28);
+    ASSERT_FALSE(has_def_any(r, "phantom"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    const CBMCall *call = find_call_by_callee(r, "called");
+    ASSERT_NOT_NULL(call);
+    ASSERT_STR_EQ(call->enclosing_func_qn, "t.Session.Session.request(_:Int)");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2061: masking the directives leaves the `#error` line of the dropped
+ * branch in the class body. That re-parse reads less of the file than the
+ * first one (the type and its initializer disappear), so the first parse is
+ * kept. */
+TEST(swift_conditional_retry_keeps_the_better_parse_issue2061) {
+    const char *source = "protocol Locking {\n"
+                         "    func lock()\n"
+                         "    func unlock()\n"
+                         "}\n"
+                         "\n"
+                         "#if canImport(Darwin)\n"
+                         "final class SpinLock: Locking {\n"
+                         "    init() {}\n"
+                         "    func lock() {}\n"
+                         "    func unlock() {}\n"
+                         "}\n"
+                         "#elseif canImport(Foundation)\n"
+                         "extension NSLock: Locking {}\n"
+                         "#else\n"
+                         "#error(\"No lock is available on this platform.\")\n"
+                         "#endif\n"
+                         "\n"
+                         "final class Guarded<Value> {\n"
+                         "    #if canImport(Darwin)\n"
+                         "    private let lock = SpinLock()\n"
+                         "    #elseif canImport(Foundation)\n"
+                         "    private let lock = NSLock()\n"
+                         "    #else\n"
+                         "    #error(\"No lock is available on this platform.\")\n"
+                         "    #endif\n"
+                         "\n"
+                         "    private nonisolated(unsafe) var value: Value\n"
+                         "\n"
+                         "    init(_ value: Value) {\n"
+                         "        self.value = value\n"
+                         "    }\n"
+                         "\n"
+                         "    func read<U>(_ closure: (Value) throws -> U) rethrows -> U { "
+                         "try closure(value) }\n"
+                         "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Guarded.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_def_in_module(r, "Guarded"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "init(_:Value)"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "SpinLock.init()"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_uncapped_selectors_keep_nested_return_types) {
+    CBMFileResult *r = extract("func generic(_ value: Int) -> Box<Result> { fatalError() }\n"
+                               "func callback() -> (Int) -> Result { fatalError() }\n",
+                               CBM_LANG_SWIFT, "t", "Returns.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *generic = find_def_in_module(r, "generic(_:Int)=>Box<Result>");
+    const CBMDefinition *callback = find_def_in_module(r, "callback()=>(Int)=>Result");
+    ASSERT_NOT_NULL(generic);
+    ASSERT_NOT_NULL(callback);
+    ASSERT_STR_EQ(generic->call_selector, "(_:Int)=>Box<Result>");
+    ASSERT_STR_EQ(callback->call_selector, "()=>(Int)=>Result");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_wrapped_trailing_closure_keeps_one_complete_call) {
+    const char *source =
+        "func invoke() async throws {\n"
+        "let request = session.request(.default).responseDecodable(of: Value.self) { value in\n"
+        "    consume(value)\n"
+        "}\n"
+        "let storedSession = stored(Session())\n"
+        "let awaitedSession = try await stored(Session())\n"
+        "factory()(flag: true)\n"
+        "}\n";
+    CBMFileResult *r = extract(source, CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int responses = 0;
+    int factories = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (strcmp(call->callee_name, "session.request(.default).responseDecodable") == 0) {
+            responses++;
+            ASSERT_EQ(call->arg_count, 1);
+            ASSERT_STR_EQ(call->args[0].keyword, "of");
+            ASSERT_EQ(call->trailing_closure_count, 1);
+            ASSERT_TRUE(call->has_trailing_closure);
+            ASSERT_FALSE(call->trailing_closure_truncated);
+            ASSERT_EQ(source[call->site_end_byte - 1], '}');
+        } else if (strcmp(call->callee_name, "factory") == 0) {
+            factories++;
+            ASSERT_EQ(call->arg_count, 0);
+            ASSERT_FALSE(call->has_trailing_closure);
+        }
+    }
+    ASSERT_EQ(responses, 1);
+    ASSERT_EQ(factories, 1);
+    ASSERT_NOT_NULL(find_call_by_callee(r, "session.request"));
+    ASSERT_NOT_NULL(find_call_by_callee(r, "consume"));
+    const char *names[] = {"storedSession", "awaitedSession"};
+    const char *values[] = {"stored(Session())", "try await stored(Session())"};
+    for (int compact = 0; compact < 2; compact++) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const CBMTypeAssign *assignment = NULL;
+            for (int j = 0; j < r->type_assigns.count; j++) {
+                if (strcmp(r->type_assigns.items[j].var_name, names[i]) == 0) {
+                    assignment = &r->type_assigns.items[j];
+                }
+            }
+            ASSERT_NOT_NULL(assignment);
+            ASSERT_NULL(assignment->type_name);
+            size_t start = (size_t)(strstr(source, values[i]) - source);
+            ASSERT_EQ(assignment->value_start_byte, start);
+            ASSERT_EQ(assignment->value_end_byte, start + strlen(values[i]));
+        }
+        if (!compact) {
+            cbm_result_compact(r);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_selector_expands_only_lexical_function_aliases) {
+    CBMFileResult *r =
+        extract("typealias Plain = () -> Void\nstruct Payload {}\n"
+                "class Stream {\n"
+                "typealias Handler<T> = @Sendable (T) throws -> Void\n"
+                "func response(on queue: Int = 0, stream: Handler<Payload>) -> Self { self }\n}\n"
+                "class Wrong {\ntypealias Handler<T> = [T]\n"
+                "func response(stream: Handler<Payload>) {}\n}\n"
+                "class Top { func use(done: Plain) {} }\n",
+                CBM_LANG_SWIFT, "t", "Aliases.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *stream =
+        find_def_in_module(r, "Stream.response(on:Int,stream:Handler<Payload>)=>Self");
+    const CBMDefinition *wrong = find_def_in_module(r, "Wrong.response(stream:Handler<Payload>)");
+    const CBMDefinition *top = find_def_in_module(r, "Top.use(done:Plain)");
+    ASSERT_NOT_NULL(stream);
+    ASSERT_NOT_NULL(wrong);
+    ASSERT_NOT_NULL(top);
+    ASSERT_NOT_NULL(strstr(stream->call_selector, "stream:(T)throws=>Void"));
+    ASSERT_STR_EQ(wrong->call_selector, "(stream:Handler<Payload>)");
+    ASSERT_STR_EQ(top->call_selector, "(done:()=>Void)");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_multiple_trailing_closure_extraction) {
+    CBMFileResult *r =
+        extract("func outer() { service.handle { nested() } onError: { recover() } }\n"
+                "func one() { service.run { nested() } }\n"
+                "func incomplete() { service.handle { } onError: { recover( } }\n",
+                CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMCall *multi = NULL;
+    CBMCall *single = NULL;
+    CBMCall *incomplete = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "service.handle") == 0) {
+            if (call->start_line == 1) {
+                multi = call;
+            } else {
+                incomplete = call;
+            }
+        } else if (call->callee_name && strcmp(call->callee_name, "service.run") == 0) {
+            single = call;
+        }
+    }
+    ASSERT_NOT_NULL(multi);
+    ASSERT_NOT_NULL(single);
+    ASSERT_NOT_NULL(incomplete);
+    ASSERT_EQ(multi->trailing_closure_count, 2);
+    ASSERT_TRUE(multi->has_trailing_closure);
+    ASSERT_FALSE(multi->trailing_closure_truncated);
+    ASSERT_NOT_NULL(multi->trailing_closure_labels);
+    ASSERT_NULL(multi->trailing_closure_labels[0]);
+    ASSERT_STR_EQ(multi->trailing_closure_labels[1], "onError");
+    ASSERT_EQ(single->trailing_closure_count, 1);
+    ASSERT_FALSE(single->trailing_closure_truncated);
+    ASSERT_EQ(incomplete->trailing_closure_count, 2);
+    ASSERT_TRUE(incomplete->trailing_closure_truncated);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_constructor_call) {
     CBMFileResult *r =
         extract("func create() { let x = MyClass() }\n", CBM_LANG_SWIFT, "t", "create.swift");
@@ -3876,7 +4381,7 @@ TEST(swift_init_struct_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Box.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init()");
     ASSERT_NOT_NULL(init_def);
     ASSERT_STR_EQ(init_def->label, "Method");
     ASSERT_STR_EQ(init_def->name, "init");
@@ -3905,7 +4410,7 @@ TEST(swift_init_class_designated_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init(seed:Int)");
     ASSERT_NOT_NULL(init_def);
     ASSERT_STR_EQ(init_def->label, "Method");
 
@@ -3937,12 +4442,11 @@ TEST(swift_init_convenience_delegates_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init()");
     ASSERT_NOT_NULL(init_def);
 
-    /* self.init(...) delegates to another overload of Holder.init, which
-     * shares this node (#2061): it forms no call, because the only edge it
-     * could produce is a self-loop. Its argument call stays. */
+    /* Keep #2395's self.init suppression; its argument call still belongs
+     * to this initializer. */
     ASSERT_FALSE(has_call(r, "self.init"));
     ASSERT_FALSE(has_call(r, "Holder.init"));
 
@@ -3956,13 +4460,8 @@ TEST(swift_init_convenience_delegates_issue2379) {
     PASS();
 }
 
-/* #2379: two initializers in the same type calling the SAME callee must both
- * attribute to the type's init, not to the file's Module scope. Both share
- * the QN `Holder.init` -- codebase-memory-mcp already collapses overloaded
- * Swift methods onto one node (DeusData/codebase-memory-mcp#2061), and an
- * init is no exception; distinguishing overloads by signature is that
- * issue's concern, not this one's. */
-TEST(swift_init_overloads_share_one_node_issue2379) {
+/* Each initializer keeps its own identity and outgoing calls. */
+TEST(swift_init_overloads_keep_separate_nodes_issue2061) {
     CBMFileResult *r = extract("func shared() -> Int { 3 }\n"
                                "final class Holder {\n"
                                "    let value: Int\n"
@@ -3977,20 +4476,29 @@ TEST(swift_init_overloads_share_one_node_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Holder.init");
-    ASSERT_NOT_NULL(init_def);
+    const CBMDefinition *seeded = find_def_in_module(r, "Holder.init(seed:Int)");
+    const CBMDefinition *empty = find_def_in_module(r, "Holder.init()");
+    ASSERT_NOT_NULL(seeded);
+    ASSERT_NOT_NULL(empty);
+    ASSERT_STR_NEQ(seeded->qualified_name, empty->qualified_name);
 
-    int from_init = 0;
+    int from_seeded = 0;
+    int from_empty = 0;
     for (int i = 0; i < r->calls.count; i++) {
         const CBMCall *c = &r->calls.items[i];
         if (!c->callee_name || strcmp(c->callee_name, "shared") != 0 || !c->enclosing_func_qn) {
             continue;
         }
-        ASSERT_STR_EQ(c->enclosing_func_qn, init_def->qualified_name);
+        if (strcmp(c->enclosing_func_qn, seeded->qualified_name) == 0) {
+            from_seeded++;
+        } else {
+            ASSERT_STR_EQ(c->enclosing_func_qn, empty->qualified_name);
+            from_empty++;
+        }
         ASSERT_STR_NEQ(c->enclosing_func_qn, r->module_qn);
-        from_init++;
     }
-    ASSERT_EQ(from_init, 2);
+    ASSERT_EQ(from_seeded, 1);
+    ASSERT_EQ(from_empty, 1);
 
     cbm_free_result(r);
     PASS();
@@ -4009,7 +4517,7 @@ TEST(swift_init_failable_enum_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Mode.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Mode.init(flag:Bool)");
     ASSERT_NOT_NULL(init_def);
 
     const CBMCall *call = find_call_by_callee(r, "helper");
@@ -4036,7 +4544,7 @@ TEST(swift_init_extension_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Box.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Box.init(raw:Int)");
     ASSERT_NOT_NULL(init_def);
 
     const CBMCall *call = find_call_by_callee(r, "other");
@@ -4064,7 +4572,7 @@ TEST(swift_method_still_attributed_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *read_def = find_def_in_module(r, "Box.read");
+    const CBMDefinition *read_def = find_def_in_module(r, "Box.read()=>Int");
     ASSERT_NOT_NULL(read_def);
 
     const CBMCall *call = find_call_by_callee(r, "other");
@@ -4090,7 +4598,7 @@ TEST(swift_deinit_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *deinit_def = find_def_in_module(r, "Deinitable.deinit");
+    const CBMDefinition *deinit_def = find_def_in_module(r, "Deinitable.deinit()");
     ASSERT_NOT_NULL(deinit_def);
     ASSERT_STR_EQ(deinit_def->name, "deinit");
 
@@ -4119,7 +4627,7 @@ TEST(swift_super_init_names_superclass_issue2379) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
 
-    const CBMDefinition *init_def = find_def_in_module(r, "Sub.init");
+    const CBMDefinition *init_def = find_def_in_module(r, "Sub.init()");
     ASSERT_NOT_NULL(init_def);
     ASSERT_FALSE(has_call(r, "super.init"));
     const CBMCall *call = find_call_by_callee(r, "Base.init");
@@ -4148,8 +4656,8 @@ TEST(swift_super_init_without_superclass_no_call_issue2379) {
                                "}\n",
                                CBM_LANG_SWIFT, "t", "Root.swift");
     ASSERT_NOT_NULL(r);
-    ASSERT_NOT_NULL(find_def_in_module(r, "Root.init"));
-    ASSERT_NOT_NULL(find_def_in_module(r, "Odd.init"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "Root.init()"));
+    ASSERT_NOT_NULL(find_def_in_module(r, "Odd.init()"));
     for (int i = 0; i < r->calls.count; i++) {
         const char *callee = r->calls.items[i].callee_name;
         ASSERT(!callee || !strstr(callee, "init"));
@@ -5764,15 +6272,47 @@ TEST(java_imports) {
     PASS();
 }
 
+static const CBMImport *rust_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+static int assert_rust_import(const CBMFileResult *r, const char *local,
+                              const char *module_path) {
+    const CBMImport *imp = rust_find_import(r, local);
+    ASSERT_NOT_NULL(imp);
+    ASSERT_NOT_NULL(imp->module_path);
+    ASSERT_STR_EQ(imp->module_path, module_path);
+    return 0;
+}
+
 TEST(rust_imports) {
     CBMFileResult *r = extract(
-        "use std::collections::HashMap;\nuse std::io::{self, Write};\nuse serde::Serialize;\n"
+        "use std::collections::HashMap;\n"
+        "use std::io::{self, Write};\n"
+        "use serde::Serialize;\n"
+        "use crate::h::{Handler, Other as O};\n"
+        "use a::{b::{C, D}, E};\n"
+        "use crate::ops::*;\n"
         "fn main() {}\n",
         CBM_LANG_RUST, "t", "main.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    ASSERT_GT(r->imports.count, 0);
-    ASSERT(has_import(r, "std::collections::HashMap"));
+    ASSERT_EQ(r->imports.count, 10);
+    ASSERT_EQ(assert_rust_import(r, "HashMap", "std::collections::HashMap"), 0);
+    ASSERT_EQ(assert_rust_import(r, "io", "std::io"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Write", "std::io::Write"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Serialize", "serde::Serialize"), 0);
+    ASSERT_EQ(assert_rust_import(r, "Handler", "crate::h::Handler"), 0);
+    ASSERT_EQ(assert_rust_import(r, "O", "crate::h::Other"), 0);
+    ASSERT_EQ(assert_rust_import(r, "C", "a::b::C"), 0);
+    ASSERT_EQ(assert_rust_import(r, "D", "a::b::D"), 0);
+    ASSERT_EQ(assert_rust_import(r, "E", "a::E"), 0);
+    ASSERT_EQ(assert_rust_import(r, "*", "crate::ops::*"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -9920,6 +10460,65 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_import_selectors_and_aliases) {
+    CBMFileResult *r = extract("import foo.Direct\n"
+                               "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
+                               "import modern.{Source as ModernAlias, *}\n"
+                               "import alpha.One, beta.Two\n",
+                               CBM_LANG_SCALA, "t", "Imports.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_import(r, "Direct", "foo.Direct"));
+    ASSERT_NOT_NULL(find_import(r, "Selected", "foo.Selected"));
+    ASSERT_NOT_NULL(find_import(r, "Alias", "foo.Original"));
+    ASSERT_NULL(find_import(r, "Hidden", "foo.Hidden"));
+    ASSERT_NOT_NULL(find_import(r, "*", "foo"));
+    ASSERT_NOT_NULL(find_import(r, "ModernAlias", "modern.Source"));
+    ASSERT_NOT_NULL(find_import(r, "*", "modern"));
+    ASSERT_NOT_NULL(find_import(r, "One", "alpha.One"));
+    ASSERT_NOT_NULL(find_import(r, "Two", "beta.Two"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_package_namespace) {
+    CBMFileResult *r = extract("package com.example.app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_chained_package_clauses) {
+    CBMFileResult *r = extract("package com.example\n"
+                               "// chained clause below\n"
+                               "package app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
+    cbm_free_result(r);
+
+    /* A braced clause scopes only its body; the file namespace stays the outer one. */
+    r = extract("package com.example\n"
+                "package braced { object Inner }\n"
+                "object Outer\n",
+                CBM_LANG_SCALA, "t", "Outer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* this/super receivers keep the enclosing-class target, where a weak
  * namespace-proximity match is usually correct — so they are NOT flagged. A
  * new_expression has no member receiver and is never flagged either. */
@@ -10387,22 +10986,23 @@ TEST(extract_cpp_preprocessed_rescue_skips_raw_def_on_same_line) {
 TEST(extract_cpp_rescue_keeps_expanded_class_when_raw_qn_is_taken) {
     /* Minimized from holder.h (delta debugging against the rule with and
      * without this check). */
-    CBMFileResult *r = extract(
-        "class BaseWrapper : public BaseHolder<TYPE, BASE, DEFAULTVALUE, IS_NULL>\n"
-        "{\n"
-        "    class AddressInitHolder\n"
-        "    {\n"
-        "        FORCEINLINE AddressInitHolder(BaseWrapper<TYPE,BASE,DEFAULTVALUE,IS_NULL> &holder)\n"
-        "        {\n"
-        "            unknown = static_cast<IUnknown*>(m_holder.m_value);\n"
-        "        }\n"
-        "#if defined(FEATURE_COMINTEROP) && !defined(STRIKE)\n"
-        "        FORCEINLINE operator IInspectable **()\n"
-        "#endif // FEATURE_COMINTEROP\n"
-        "    {\n"
-        "    }\n"
-        "    }\n",
-        CBM_LANG_CPP, "t", "holder.h");
+    CBMFileResult *r =
+        extract("class BaseWrapper : public BaseHolder<TYPE, BASE, DEFAULTVALUE, IS_NULL>\n"
+                "{\n"
+                "    class AddressInitHolder\n"
+                "    {\n"
+                "        FORCEINLINE AddressInitHolder(BaseWrapper<TYPE,BASE,DEFAULTVALUE,IS_NULL> "
+                "&holder)\n"
+                "        {\n"
+                "            unknown = static_cast<IUnknown*>(m_holder.m_value);\n"
+                "        }\n"
+                "#if defined(FEATURE_COMINTEROP) && !defined(STRIKE)\n"
+                "        FORCEINLINE operator IInspectable **()\n"
+                "#endif // FEATURE_COMINTEROP\n"
+                "    {\n"
+                "    }\n"
+                "    }\n",
+                CBM_LANG_CPP, "t", "holder.h");
     ASSERT_NOT_NULL(r);
     bool scoped_class = false;
     for (int i = 0; i < r->defs.count; i++) {
@@ -14047,6 +14647,97 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
+TEST(swift_trailing_closure_boundaries_survive_compact_and_spill) {
+    const char *src = "func eight() { service.eight { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } }\n"
+                      "func nine() { service.nine { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } eighth: { } }\n";
+    const char *callees[] = {"service.eight", "service.nine"};
+    const char *labels[] = {NULL,     "first", "second", "third",
+                            "fourth", "fifth", "sixth",  "seventh"};
+    CBMFileResult *r = extract(src, CBM_LANG_SWIFT, "t", "TrailingBounds.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->cached_tree);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(r->cached_tree)));
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *sp = cbm_result_spill_open(dir, 1, 1);
+    ASSERT_NOT_NULL(sp);
+    CBMFileResult *loaded[2] = {NULL, NULL};
+    const CBMCall *loaded_calls[2][2] = {{NULL, NULL}, {NULL, NULL}};
+
+    /* Check real extraction, compaction, and both independently loaded copies. */
+    for (int stage = 0; stage < 4; stage++) {
+        CBMFileResult *current = r;
+        if (stage == 1) {
+            cbm_result_compact(r);
+        } else if (stage >= 2) {
+            loaded[stage - 2] = cbm_result_spill_load(sp, 0);
+            current = loaded[stage - 2];
+        }
+        ASSERT_NOT_NULL(current);
+        ASSERT_FALSE(current->has_error);
+        if (stage > 0) {
+            ASSERT_EQ(current->arena.nblocks, 1);
+        }
+        for (int c = 0; c < 2; c++) {
+            ASSERT_EQ(count_calls_named(current, callees[c]), 1);
+            const CBMCall *call = find_call_by_callee(current, callees[c]);
+            ASSERT_NOT_NULL(call);
+            ASSERT_EQ(call->trailing_closure_count, 8);
+            ASSERT_TRUE(call->has_trailing_closure);
+            ASSERT_EQ(call->trailing_closure_truncated, c == 1);
+            ASSERT_NOT_NULL(call->trailing_closure_labels);
+            if (stage > 0) {
+                uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                uintptr_t array = (uintptr_t)call->trailing_closure_labels;
+                size_t bytes = 8 * sizeof(*call->trailing_closure_labels);
+                ASSERT(current->arena.used >= bytes);
+                ASSERT(array >= lo && array - lo <= current->arena.used - bytes);
+            }
+            ASSERT_NULL(call->trailing_closure_labels[0]);
+            for (int i = 1; i < 8; i++) {
+                ASSERT_NOT_NULL(call->trailing_closure_labels[i]);
+                size_t label_bytes = strlen(labels[i]) + 1;
+                if (stage > 0) {
+                    uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                    uintptr_t label = (uintptr_t)call->trailing_closure_labels[i];
+                    ASSERT(label >= lo && label - lo < current->arena.used);
+                    ASSERT(label_bytes <= current->arena.used - (label - lo));
+                }
+                ASSERT_MEM_EQ(call->trailing_closure_labels[i], labels[i], label_bytes);
+            }
+            if (stage >= 2) {
+                loaded_calls[stage - 2][c] = call;
+            }
+        }
+        if (stage == 1) {
+            ASSERT_TRUE(cbm_result_spill_park(sp, 0, 0, r));
+            r = NULL; /* Park owns and frees the compacted result. */
+        }
+    }
+
+    ASSERT(loaded[0] != loaded[1]);
+    ASSERT(loaded[0]->arena.blocks[0] != loaded[1]->arena.blocks[0]);
+    for (int c = 0; c < 2; c++) {
+        ASSERT(loaded_calls[0][c]->trailing_closure_labels !=
+               loaded_calls[1][c]->trailing_closure_labels);
+        for (int i = 1; i < 8; i++) {
+            ASSERT(loaded_calls[0][c]->trailing_closure_labels[i] !=
+                   loaded_calls[1][c]->trailing_closure_labels[i]);
+        }
+    }
+
+    cbm_free_result(loaded[1]);
+    cbm_free_result(loaded[0]);
+    cbm_result_spill_close(sp);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* The low-disk guard, pinned through the free-space seam rather than the host
  * disk: one byte under the floor refuses (spilling onto a nearly full disk is
  * a worse failure than the memory pressure it relieves), the floor itself
@@ -15284,6 +15975,9 @@ SUITE(extraction) {
     RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_import_selectors_and_aliases);
+    RUN_TEST(extract_scala_package_namespace);
+    RUN_TEST(extract_scala_chained_package_clauses);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
 
@@ -15333,6 +16027,9 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
+    RUN_TEST(extract_cpp_crlf_string_splice_keeps_later_functions_issue1546);
+    RUN_TEST(extract_c_family_crlf_string_splice_parses_clean_issue1546);
+    RUN_TEST(extract_c_crlf_splices_in_macro_comment_and_string_issue1546);
     RUN_TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735);
     RUN_TEST(macro_check_locates_lines_with_one_table_issue1735);
     RUN_TEST(extract_gdscript_issue186);
@@ -15436,6 +16133,8 @@ SUITE(extraction) {
     RUN_TEST(elixir_complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
+    RUN_TEST(haskell_escaped_char_does_not_swallow_primed_def);
+    RUN_TEST(haskell_escaped_char_list_lexes_each_literal);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 
@@ -15486,13 +16185,21 @@ SUITE(extraction) {
     RUN_TEST(swift_struct);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
+    RUN_TEST(swift_type_imports_preserve_markers_and_complete_file_imports);
+    RUN_TEST(swift_conditional_type_members_keep_owners_and_source_lines);
+    RUN_TEST(swift_conditional_retry_keeps_the_better_parse_issue2061);
+    RUN_TEST(swift_uncapped_selectors_keep_nested_return_types);
+    RUN_TEST(swift_wrapped_trailing_closure_keeps_one_complete_call);
+    RUN_TEST(swift_selector_expands_only_lexical_function_aliases);
+    RUN_TEST(swift_multiple_trailing_closure_extraction);
+    RUN_TEST(swift_trailing_closure_boundaries_survive_compact_and_spill);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
     RUN_TEST(swift_init_struct_issue2379);
     RUN_TEST(swift_init_class_designated_issue2379);
     RUN_TEST(swift_init_convenience_delegates_issue2379);
-    RUN_TEST(swift_init_overloads_share_one_node_issue2379);
+    RUN_TEST(swift_init_overloads_keep_separate_nodes_issue2061);
     RUN_TEST(swift_init_failable_enum_issue2379);
     RUN_TEST(swift_init_extension_issue2379);
     RUN_TEST(swift_method_still_attributed_issue2379);

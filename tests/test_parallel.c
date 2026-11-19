@@ -307,6 +307,8 @@ static bool g_harness_spill = false;
 static int64_t g_harness_parked = -1;
 /* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
 static bool g_harness_cs_registry = false;
+/* Opt-in: the same for the Tier-2 C/C++ registry. */
+static bool g_harness_c_registry = false;
 
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
@@ -385,10 +387,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     if (g_harness_cs_registry && all_defs) {
         harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
     }
+    if (g_harness_c_registry && all_defs) {
+        harness_registries.c = cbm_c_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         g_harness_cs_registry ? &harness_registries
-                                               : NULL /* tests use per-file path */);
+                         g_harness_cs_registry || g_harness_c_registry
+                             ? &harness_registries
+                             : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -3331,6 +3337,100 @@ TEST(parallel_csharp_parse_damaged_namespace_is_not_global) {
     PASS();
 }
 
+/* #2121, the issue's own two files: C# spells its built-in types as lower-case
+ * keywords, so `int.TryParse(...)` calls the BCL, never the project's only
+ * TryParse. The LSP's answer (System.Int32.TryParse) has no graph node, so the
+ * call falls through to the registry, whose receiver chain check used to skip
+ * every lower-case root. Both resolvers must refuse the name guess (also for
+ * the C# 9 `nint`), and a real call to the project type must still bind. */
+TEST(parallel_csharp_keyword_receiver_no_name_guess_issue2121) {
+    static const char decoys_src[] =
+        "namespace Contoso.App;\n"
+        "\n"
+        "public class TsidNode\n"
+        "{\n"
+        "    public static bool TryParse(string text, out TsidNode n)\n"
+        "    {\n"
+        "        n = null;\n"
+        "        return false;\n"
+        "    }\n"
+        "}\n";
+    static const char demo_src[] = "using Microsoft.Extensions.Options;\n"
+                                   "\n"
+                                   "namespace Contoso.App;\n"
+                                   "\n"
+                                   "public class Demo\n"
+                                   "{\n"
+                                   "    public string M(string input)\n"
+                                   "    {\n"
+                                   "        _ = int.TryParse(input, out _);\n"
+                                   "        _ = nint.TryParse(input, out _);\n"
+                                   "        return input;\n"
+                                   "    }\n"
+                                   "\n"
+                                   "    public string Control(string input)\n"
+                                   "    {\n"
+                                   "        _ = TsidNode.TryParse(input, out _);\n"
+                                   "        return input;\n"
+                                   "    }\n"
+                                   "}\n";
+    const char *project = "cbm_cs_2121";
+    static const char *rels[] = {"src/Decoys.cs", "src/Demo.cs"};
+    const char *srcs[] = {decoys_src, demo_src};
+    enum { N_FILES = 2 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_2121_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write #2121 fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *tsid = "cbm_cs_2121.src.Decoys.TsidNode.TryParse";
+    bool ok[2][4];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        /* The negative below must not pass because a node went missing. */
+        ok[g][0] = cbm_gbuf_find_by_qn(gb, tsid) != NULL;
+        ok[g][1] = find_unique_callable_node_by_tail(gb, "Demo.M") != NULL;
+        ok[g][2] = !has_edge_from_callable_to_qn(gb, "Demo.M", tsid, "CALLS");
+        ok[g][3] = has_edge_from_callable_to_qn(gb, "Demo.Control", tsid, "CALLS");
+        for (int k = 0; k < 4; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  #2121 diagnostic %s: target=%d caller=%d no_keyword_guess=%d control=%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -4785,6 +4885,115 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     PASS();
 }
 
+/* #1546: the per-file extract parses a C-family file with each `\` CR LF line
+ * splice rewritten as space `\` LF. The cross-file C/C++ LSP pass reads the
+ * file again (the parallel driver from its retained copy, the sequential one
+ * from disk) and must read it the same way. o->run() after the string splice
+ * is a call only that pass resolves: the struct is declared in another file.
+ * LF is the control; with CRLF the cross pass used to see the rest of main.cpp
+ * as one ERROR region and lose the edge in both drivers. */
+static const char *const crlf_splice_files[][2] = {
+    {"other.h", "#ifndef OTHER_H\n"
+                "#define OTHER_H\n"
+                "struct ops { int (*run)(int); };\n"
+                "struct ops *get_ops(void);\n"
+                "#endif\n"},
+    {"other.cpp", "#include \"other.h\"\n"
+                  "static int run_impl(int x) { return x; }\n"
+                  "static struct ops the_ops = { run_impl };\n"
+                  "struct ops *get_ops(void)\n"
+                  "{\n"
+                  "    return &the_ops;\n"
+                  "}\n"},
+    {"main.cpp", "#include \"other.h\"\n"
+                 "void Middle(void)\n"
+                 "{\n"
+                 "    const wchar_t* s = L\"line 0\\r\\n\\\n"
+                 "line 1\\r\\n\";\n"
+                 "}\n"
+                 "\n"
+                 "int after_one(void)\n"
+                 "{\n"
+                 "    struct ops *o = get_ops();\n"
+                 "    return o->run(3);\n"
+                 "}\n"},
+};
+
+static int write_with_line_endings(const char *path, const char *lf_text, bool crlf) {
+    char *text = malloc(strlen(lf_text) * 2 + 1);
+    if (!text) {
+        return -1;
+    }
+    size_t n = 0;
+    for (const char *p = lf_text; *p; p++) {
+        if (crlf && *p == '\n') {
+            text[n++] = '\r';
+        }
+        text[n++] = *p;
+    }
+    text[n] = '\0';
+    int rc = th_write_file(path, text);
+    free(text);
+    return rc;
+}
+
+static bool crlf_splice_has_lsp_edge(const cbm_gbuf_t *gbuf) {
+    const cbm_gbuf_edge_t *edge =
+        gbuf ? find_call_edge_to_target_fragment(gbuf, "main.after_one", "ops.run") : NULL;
+    return edge && edge->properties_json &&
+           strstr(edge->properties_json, "\"strategy\":\"lsp") != NULL;
+}
+
+TEST(cross_file_cpp_lsp_after_crlf_string_splice_issue1546) {
+    enum { CRLF_SPLICE_FILES = 3 };
+    bool seq_edge[2] = {false};
+    bool par_edge[2] = {false};
+    for (int crlf = 0; crlf < 2; crlf++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_crlf_XXXXXX");
+        if (!cbm_mkdtemp(tmpdir)) {
+            FAIL("mkdtemp failed");
+        }
+        char paths[CRLF_SPLICE_FILES][512];
+        cbm_file_info_t files[CRLF_SPLICE_FILES] = {0};
+        bool written = true;
+        for (int i = 0; i < CRLF_SPLICE_FILES; i++) {
+            snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, crlf_splice_files[i][0]);
+            written = written &&
+                      write_with_line_endings(paths[i], crlf_splice_files[i][1], crlf != 0) == 0;
+            files[i].path = paths[i];
+            files[i].rel_path = (char *)crlf_splice_files[i][0];
+            files[i].language = CBM_LANG_CPP;
+        }
+        if (!written) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write the CRLF splice fixture");
+        }
+        /* Both drivers resolve C/C++ against the shared Tier-2 registry, as
+         * production does; tests/test_c_lsp.c covers the per-file entry. */
+        cbm_gbuf_t *seq =
+            run_sequential_with_lsp_cross("cbm_crlf", tmpdir, files, CRLF_SPLICE_FILES);
+        g_harness_c_registry = true;
+        cbm_gbuf_t *par = run_parallel("cbm_crlf", tmpdir, files, CRLF_SPLICE_FILES, 2);
+        g_harness_c_registry = false;
+        seq_edge[crlf] = crlf_splice_has_lsp_edge(seq);
+        par_edge[crlf] = crlf_splice_has_lsp_edge(par);
+        if (!seq_edge[crlf] || !par_edge[crlf]) {
+            printf("  CRLF splice diagnostic (%s): sequential=%s parallel=%s\n",
+                   crlf ? "CRLF" : "LF", seq_edge[crlf] ? "present" : "absent",
+                   par_edge[crlf] ? "present" : "absent");
+        }
+        cbm_gbuf_free(seq);
+        cbm_gbuf_free(par);
+        th_rmtree(tmpdir);
+    }
+    ASSERT_TRUE(seq_edge[0]);
+    ASSERT_TRUE(par_edge[0]);
+    ASSERT_TRUE(seq_edge[1]);
+    ASSERT_TRUE(par_edge[1]);
+    PASS();
+}
+
 /* issue #294: gRPC service-name extraction must (a) preserve the canonical
  * proto service name (FooServiceClient → FooService, not Foo) and (b) only
  * match real stub/client types — ordinary receiver vars must NOT produce
@@ -6031,6 +6240,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
     RUN_TEST(parallel_csharp_nested_type_and_global_namespace_binding);
     RUN_TEST(parallel_csharp_parse_damaged_namespace_is_not_global);
+    RUN_TEST(parallel_csharp_keyword_receiver_no_name_guess_issue2121);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
@@ -6043,6 +6253,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
+    RUN_TEST(cross_file_cpp_lsp_after_crlf_string_splice_issue1546);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_java_external_target_contract);
