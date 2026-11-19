@@ -6995,34 +6995,39 @@ static const char *py_type_param_names(CBMArena *a, TSNode node, const char *sou
 static const char *java_type_param_names(CBMArena *a, TSNode node, const char *source) {
     TSNode list = ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
     uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    /* Two passes over the list (length, then copy): every parameter, no cap. */
     size_t total = 0;
-    TSNode ids[CBM_SZ_64];
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < n && count < CBM_SZ_64; i++) {
-        TSNode param = ts_node_named_child(list, i);
-        uint32_t m = ts_node_named_child_count(param);
-        for (uint32_t j = 0; j < m; j++) {
-            TSNode c = ts_node_named_child(param, j);
-            const char *k = ts_node_type(c);
-            if (strcmp(k, "type_identifier") == 0 || strcmp(k, "identifier") == 0) {
-                ids[count++] = c;
-                total += ts_node_end_byte(c) - ts_node_start_byte(c) + 1;
+    char *out = NULL;
+    size_t at = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+            if (!out) {
+                return NULL;
+            }
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode param = ts_node_named_child(list, i);
+            uint32_t m = ts_node_named_child_count(param);
+            for (uint32_t k = 0; k < m; k++) {
+                TSNode c = ts_node_named_child(param, k);
+                const char *kind = ts_node_type(c);
+                if (strcmp(kind, "type_identifier") != 0 && strcmp(kind, "identifier") != 0) {
+                    continue;
+                }
+                size_t len = ts_node_end_byte(c) - ts_node_start_byte(c);
+                if (pass == 0) {
+                    total += len + 1;
+                } else {
+                    if (at) {
+                        out[at++] = '|';
+                    }
+                    memcpy(out + at, source + ts_node_start_byte(c), len);
+                    at += len;
+                }
                 break;
             }
         }
-    }
-    char *out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
-    if (!out) {
-        return NULL;
-    }
-    size_t at = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (at) {
-            out[at++] = '|';
-        }
-        size_t len = ts_node_end_byte(ids[i]) - ts_node_start_byte(ids[i]);
-        memcpy(out + at, source + ts_node_start_byte(ids[i]), len);
-        at += len;
     }
     out[at] = '\0';
     return at ? out : NULL;
