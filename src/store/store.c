@@ -428,6 +428,7 @@ static int init_schema(cbm_store_t *s) {
         "  defs_json TEXT NOT NULL,"
         "  ref_bloom BLOB,"
         "  config_ctx TEXT NOT NULL DEFAULT '',"
+        "  included_files TEXT NOT NULL DEFAULT '',"
         "  PRIMARY KEY (project, rel_path)"
         ");"
         /* Best-effort indexing-coverage signal (#963). One row per file the
@@ -6551,11 +6552,11 @@ int cbm_store_upsert_file_hash_batch(cbm_store_t *s, const cbm_file_hash_t *hash
 
 static int upsert_lsp_surface_row(cbm_store_t *s, const cbm_lsp_surface_row_t *row) {
     const char *sql =
-        "INSERT INTO lsp_surface (project, rel_path, surface_sha, defs_json, ref_bloom, config_ctx)"
-        " VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT INTO lsp_surface (project, rel_path, surface_sha, defs_json, ref_bloom, config_ctx,"
+        " included_files) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         " ON CONFLICT(project, rel_path) DO UPDATE SET surface_sha = excluded.surface_sha,"
         " defs_json = excluded.defs_json, ref_bloom = excluded.ref_bloom,"
-        " config_ctx = excluded.config_ctx";
+        " config_ctx = excluded.config_ctx, included_files = excluded.included_files";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "lsp_surface upsert prepare");
@@ -6571,6 +6572,7 @@ static int upsert_lsp_surface_row(cbm_store_t *s, const cbm_lsp_surface_row_t *r
         sqlite3_bind_null(stmt, ST_COL_5);
     }
     bind_text(stmt, ST_COL_6, row->config_ctx ? row->config_ctx : "");
+    bind_text(stmt, ST_COL_7, row->included_files ? row->included_files : "");
     int rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
@@ -6606,8 +6608,8 @@ int cbm_store_get_lsp_surfaces(cbm_store_t *s, const char *project, cbm_lsp_surf
                                int *count) {
     *out = NULL;
     *count = 0;
-    const char *sql = "SELECT project, rel_path, surface_sha, defs_json, ref_bloom, config_ctx"
-                      " FROM lsp_surface WHERE project = ?1 ORDER BY rel_path";
+    const char *sql = "SELECT project, rel_path, surface_sha, defs_json, ref_bloom, config_ctx,"
+                      " included_files FROM lsp_surface WHERE project = ?1 ORDER BY rel_path";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "lsp_surface get prepare");
@@ -6644,11 +6646,13 @@ int cbm_store_get_lsp_surfaces(cbm_store_t *s, const char *project, cbm_lsp_surf
         const void *bloom = sqlite3_column_blob(stmt, ST_COL_4);
         int bloom_len = sqlite3_column_bytes(stmt, ST_COL_4);
         const char *cfg = (const char *)sqlite3_column_text(stmt, ST_COL_5);
+        const char *inc = (const char *)sqlite3_column_text(stmt, ST_COL_6);
         r->project = strdup(proj ? proj : "");
         r->rel_path = strdup(rel ? rel : "");
         r->surface_sha = strdup(sha ? sha : "");
         r->defs_json = strdup(defs ? defs : "[]");
         r->config_ctx = strdup(cfg ? cfg : "");
+        r->included_files = strdup(inc ? inc : "");
         if (bloom && bloom_len > 0) {
             void *copy = malloc((size_t)bloom_len);
             if (copy) {
@@ -6658,7 +6662,7 @@ int cbm_store_get_lsp_surfaces(cbm_store_t *s, const char *project, cbm_lsp_surf
             }
         }
         if (!r->project || !r->rel_path || !r->surface_sha || !r->defs_json || !r->config_ctx ||
-            (bloom && bloom_len > 0 && !r->ref_bloom)) {
+            !r->included_files || (bloom && bloom_len > 0 && !r->ref_bloom)) {
             n++; /* count the partial row so the free below releases it */
             oom = true;
             break;
@@ -6707,6 +6711,7 @@ void cbm_store_free_lsp_surfaces(cbm_lsp_surface_row_t *rows, int count) {
         free((void *)rows[i].defs_json);
         free((void *)rows[i].ref_bloom);
         free((void *)rows[i].config_ctx);
+        free((void *)rows[i].included_files);
     }
     free(rows);
 }

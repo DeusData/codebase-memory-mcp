@@ -1,0 +1,14 @@
+--- a/grammar/literal.js
++++ b/grammar/literal.js
+@@ -29,7 +29,10 @@
+   char: _ => magic_hash(
+     choice(
+       /'[^']'/,
+-      /'\\[^ ]*'/,
++      // cbm fork (#2439): upstream's /'\\[^ ]*'/ also matched newlines and quotes,
++      // so an escaped char literal ran on to the last `'` before the next space and
++      // swallowed the following definition. Stop at the closing quote instead.
++      /'\\('|[^'\s]+)'/,
+     ),
+   ),
+ 

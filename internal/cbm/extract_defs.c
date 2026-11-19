@@ -16,6 +16,7 @@
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <limits.h>          // INT_MAX
+#include <stdatomic.h>       // test-seam work counters
 #include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf (ObjectScript storage/trigger sidecars)
 #include <stdlib.h>          // malloc/free (child-collection scratch)
@@ -6939,6 +6940,543 @@ static bool make_rule_sets_variable(TSNode rule, const char *src) {
                        (strchr("+?!", src[p]) && p + SKIP_ONE < end && src[p + SKIP_ONE] == '='));
 }
 
+/* Python: the names a PEP 695 type parameter list declares on a function or
+ * class definition (`def f[T, *Ts, **P]`, `class C[T: Base]`), '|'-joined, or
+ * NULL. Each parameter is a `type` whose first identifier is its name. */
+static TSNode py_type_param_ident(TSNode param) {
+    while (!ts_node_is_null(param) && strcmp(ts_node_type(param), "identifier") != 0) {
+        param = ts_node_named_child_count(param) ? ts_node_named_child(param, 0) : (TSNode){0};
+    }
+    return param;
+}
+
+static const char *py_type_param_names(CBMArena *a, TSNode node, const char *source) {
+    if (strcmp(ts_node_type(node), "decorated_definition") == 0) {
+        node = ts_node_child_by_field_name(node, TS_FIELD("definition"));
+    }
+    TSNode list = ts_node_is_null(node)
+                      ? node
+                      : ts_node_child_by_field_name(node, TS_FIELD("type_parameters"));
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    size_t total = 0; /* every name plus one separator or the terminator */
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode id = py_type_param_ident(ts_node_named_child(list, i));
+        total += ts_node_is_null(id) ? 0 : ts_node_end_byte(id) - ts_node_start_byte(id) + 1;
+    }
+    char *out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode id = py_type_param_ident(ts_node_named_child(list, i));
+        if (ts_node_is_null(id)) {
+            continue;
+        }
+        if (at) {
+            out[at++] = '|';
+        }
+        size_t len = ts_node_end_byte(id) - ts_node_start_byte(id);
+        memcpy(out + at, source + ts_node_start_byte(id), len);
+        at += len;
+    }
+    out[at] = '\0';
+    return at ? out : NULL;
+}
+
+/* ── Facts only the declared-type scope step reads (CBMDefTypeFacts) ── */
+
+/* The record of a definition being built, allocated on first use. */
+static CBMDefTypeFacts *def_type_facts(CBMArena *a, CBMDefinition *def) {
+    if (!def->type_facts) {
+        CBMDefTypeFacts *f = (CBMDefTypeFacts *)cbm_arena_alloc(a, sizeof(*f));
+        if (!f) {
+            return NULL;
+        }
+        memset(f, 0, sizeof(*f));
+        def->type_facts = f;
+    }
+    return (CBMDefTypeFacts *)def->type_facts;
+}
+
+static void def_set_type_params(CBMArena *a, CBMDefinition *def, const char *names) {
+    CBMDefTypeFacts *f = names && names[0] ? def_type_facts(a, def) : NULL;
+    if (f) {
+        f->type_params = names;
+    }
+}
+
+static void def_set_global_names(CBMArena *a, CBMDefinition *def, const char *names) {
+    CBMDefTypeFacts *f = names && names[0] ? def_type_facts(a, def) : NULL;
+    if (f) {
+        f->global_names = names;
+    }
+}
+
+/* A '|'-joined list of names built in the arena (the grown buffers stay in
+ * the arena: at most twice the final size). */
+typedef struct {
+    CBMArena *a;
+    char *buf;
+    size_t len;
+    size_t cap;
+    /* Python binding walks: what a body binds in the module through names it
+     * declares `global` (py_body_global_names) -- `del`, `except ... as`, a
+     * nested def's or class's name bind; the declaration itself does not. */
+    bool module;
+} tf_names_t;
+
+static void tf_names_add(tf_names_t *b, const char *s, size_t n) {
+    if (!s || n == 0) {
+        return;
+    }
+    size_t need = b->len + n + 2;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 64;
+        while (cap < need) {
+            cap *= 2;
+        }
+        char *grown = (char *)cbm_arena_alloc(b->a, cap);
+        if (!grown) {
+            return;
+        }
+        if (b->len) {
+            memcpy(grown, b->buf, b->len);
+        }
+        b->buf = grown;
+        b->cap = cap;
+    }
+    if (b->len) {
+        b->buf[b->len++] = '|';
+    }
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+}
+
+static void tf_names_node(tf_names_t *b, TSNode node, const char *source) {
+    if (!ts_node_is_null(node)) {
+        tf_names_add(b, source + ts_node_start_byte(node),
+                     ts_node_end_byte(node) - ts_node_start_byte(node));
+    }
+}
+
+enum { TF_BIND_DEPTH = 64 }; /* statement and pattern nesting the binders follow */
+
+/* Go: `[K comparable, V any]` declares K and V (every `name` of every
+ * type_parameter_declaration). */
+static void go_type_param_list(tf_names_t *b, TSNode list, const char *source) {
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode decl = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(decl), "type_parameter_declaration") != 0) {
+            continue;
+        }
+        uint32_t cc = ts_node_child_count(decl);
+        for (uint32_t k = 0; k < cc; k++) {
+            const char *field = ts_node_field_name_for_child(decl, k);
+            if (field && strcmp(field, "name") == 0) {
+                tf_names_node(b, ts_node_child(decl, k), source);
+            }
+        }
+    }
+}
+
+/* Go: a generic receiver `(s *Set[K, V])` declares K and V. */
+static void go_receiver_type_params(tf_names_t *b, TSNode node, bool in_args, int depth,
+                                    const char *source) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (in_args && strcmp(kind, "type_identifier") == 0) {
+        tf_names_node(b, node, source);
+        return;
+    }
+    bool args = in_args || strcmp(kind, "type_arguments") == 0;
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        go_receiver_type_params(b, ts_node_named_child(node, i), args, depth + 1, source);
+    }
+}
+
+/* Go: the type parameter names of a function, a method (its receiver's) or
+ * a type spec, '|'-joined, or NULL. */
+static const char *go_type_param_names(CBMArena *a, TSNode node, const char *source) {
+    tf_names_t b = {.a = a};
+    go_type_param_list(&b, ts_node_child_by_field_name(node, TS_FIELD("type_parameters")), source);
+    if (strcmp(ts_node_type(node), "method_declaration") == 0) {
+        go_receiver_type_params(&b, ts_node_child_by_field_name(node, TS_FIELD("receiver")), false,
+                                0, source);
+    }
+    return b.len ? b.buf : NULL;
+}
+
+/* Python: the identifiers a binding target binds (`a`, `a, (b, *c)`,
+ * `[d]`); an attribute or subscript target binds no name of the scope. */
+static void py_bind_target(tf_names_t *b, TSNode t, const char *source, int depth) {
+    if (ts_node_is_null(t) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(t);
+    if (strcmp(kind, "identifier") == 0) {
+        tf_names_node(b, t, source);
+        return;
+    }
+    if (strcmp(kind, "attribute") == 0 || strcmp(kind, "subscript") == 0) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(t);
+    for (uint32_t i = 0; i < n; i++) {
+        py_bind_target(b, ts_node_named_child(t, i), source, depth + 1);
+    }
+}
+
+/* Python: walrus names (`(x := ...)`) inside an expression of the class body
+ * itself, not inside a nested scope (lambda, comprehension, def, class). */
+static void py_bind_walrus(tf_names_t *b, TSNode e, const char *source, int depth) {
+    if (ts_node_is_null(e) || depth > TF_BIND_DEPTH * 2) {
+        return;
+    }
+    const char *kind = ts_node_type(e);
+    if (strcmp(kind, "lambda") == 0 || strcmp(kind, "list_comprehension") == 0 ||
+        strcmp(kind, "set_comprehension") == 0 || strcmp(kind, "dictionary_comprehension") == 0 ||
+        strcmp(kind, "generator_expression") == 0 || strcmp(kind, "function_definition") == 0 ||
+        strcmp(kind, "class_definition") == 0 || strcmp(kind, "decorated_definition") == 0) {
+        return;
+    }
+    if (strcmp(kind, "named_expression") == 0) {
+        tf_names_node(b, ts_node_child_by_field_name(e, TS_FIELD("name")), source);
+    }
+    uint32_t n = ts_node_named_child_count(e);
+    for (uint32_t i = 0; i < n; i++) {
+        py_bind_walrus(b, ts_node_named_child(e, i), source, depth + 1);
+    }
+}
+
+/* Python: the targets after an `as` among a node's children (with items,
+ * except clauses, as-patterns), and every identifier of a match pattern. */
+static void py_bind_as_targets(tf_names_t *b, TSNode node, const char *source, int depth) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "block") == 0) {
+        return; /* a clause body: its statements are walked as statements */
+    }
+    if (strcmp(kind, "case_pattern") == 0) {
+        py_bind_target(b, node, source, depth + 1); /* captures: every name, over-listed */
+        return;
+    }
+    bool after_as = false;
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (!ts_node_is_named(c)) {
+            after_as = strcmp(ts_node_type(c), "as") == 0;
+            continue;
+        }
+        if (after_as) {
+            py_bind_target(b, c, source, depth + 1);
+            after_as = false;
+            continue;
+        }
+        py_bind_as_targets(b, c, source, depth + 1);
+    }
+}
+
+static void py_bind_block(tf_names_t *b, TSNode block, const char *source, int depth);
+
+static bool py_defines_kind(const char *kind) {
+    return strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0 ||
+           strcmp(kind, "decorated_definition") == 0;
+}
+
+/* Statement-level nodes a scope's statements nest in (not expressions). */
+static bool py_statement_level(const char *kind) {
+    return strcmp(kind, "block") == 0 || strstr(kind, "_statement") != NULL ||
+           strstr(kind, "_clause") != NULL;
+}
+
+/* Whether a definition stands among the statements of `node`. */
+static bool py_has_def(TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(c);
+        if (py_defines_kind(ck) || (py_statement_level(ck) && py_has_def(c, depth + 1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Python: the names one statement of a class body binds (it recurses into
+ * compound statements, whose bodies are the same scope). `del` binds nothing
+ * (py_class_body_bindings unbinds at the body's top level), and neither does
+ * `except ... as E`: Python unbinds E when the clause ends, so it is a binding
+ * only for a definition inside the clause. */
+static void py_bind_statement(tf_names_t *b, TSNode s, const char *source, int depth) {
+    if (ts_node_is_null(s) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(s);
+    if (py_defines_kind(kind)) {
+        if (b->module) {
+            TSNode def = strcmp(kind, "decorated_definition") == 0
+                             ? ts_node_child_by_field_name(s, TS_FIELD("definition"))
+                             : s;
+            if (!ts_node_is_null(def)) {
+                tf_names_node(b, ts_node_child_by_field_name(def, TS_FIELD("name")), source);
+            }
+        }
+        return; /* definitions of the class: the step sees them as such */
+    }
+    if (strcmp(kind, "expression_statement") == 0) {
+        uint32_t n = ts_node_named_child_count(s);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode e = ts_node_named_child(s, i);
+            /* `a = b = v`: each assignment's left side, down the chain. An
+             * annotation alone (`x: T`) binds nothing (Python records it in
+             * __annotations__ only). */
+            for (int chain = 0; !ts_node_is_null(e) && chain < TF_BIND_DEPTH; chain++) {
+                const char *ek = ts_node_type(e);
+                if (strcmp(ek, "assignment") != 0 && strcmp(ek, "augmented_assignment") != 0) {
+                    py_bind_walrus(b, e, source, depth + 1);
+                    break;
+                }
+                TSNode right = ts_node_child_by_field_name(e, TS_FIELD("right"));
+                if (ts_node_is_null(right)) {
+                    break;
+                }
+                py_bind_target(b, ts_node_child_by_field_name(e, TS_FIELD("left")), source,
+                               depth + 1);
+                e = right;
+            }
+        }
+        return;
+    }
+    if (strcmp(kind, "import_statement") == 0 || strcmp(kind, "import_from_statement") == 0) {
+        bool from = kind[7] == 'f';
+        uint32_t cc = ts_node_child_count(s);
+        for (uint32_t i = 0; i < cc; i++) {
+            const char *field = ts_node_field_name_for_child(s, i);
+            if (!field || strcmp(field, "name") != 0) {
+                continue;
+            }
+            TSNode name = ts_node_child(s, i);
+            TSNode alias = strcmp(ts_node_type(name), "aliased_import") == 0
+                               ? ts_node_child_by_field_name(name, TS_FIELD("alias"))
+                               : (TSNode){0};
+            if (!ts_node_is_null(alias)) {
+                tf_names_node(b, alias, source);
+                continue;
+            }
+            TSNode dotted = strcmp(ts_node_type(name), "aliased_import") == 0
+                                ? ts_node_child_by_field_name(name, TS_FIELD("name"))
+                                : name;
+            /* `import a.b` binds `a`; `from m import x` binds `x` */
+            TSNode first = !from && ts_node_named_child_count(dotted) > 0
+                               ? ts_node_named_child(dotted, 0)
+                               : dotted;
+            tf_names_node(b, first, source);
+        }
+        return;
+    }
+    if (strcmp(kind, "global_statement") == 0 || strcmp(kind, "nonlocal_statement") == 0) {
+        if (!b->module) {
+            py_bind_target(b, s, source, depth + 1);
+        }
+        return;
+    }
+    if (strcmp(kind, "delete_statement") == 0) {
+        if (b->module) {
+            py_bind_target(b, s, source, depth + 1);
+        }
+        return;
+    }
+    if (strcmp(kind, "type_alias_statement") == 0) {
+        py_bind_target(b, ts_node_child_by_field_name(s, TS_FIELD("left")), source, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "for_statement") == 0) {
+        py_bind_target(b, ts_node_child_by_field_name(s, TS_FIELD("left")), source, depth + 1);
+    }
+    /* A compound statement: walrus names and `as` targets of its headers,
+     * then the statements of every block and clause. */
+    uint32_t n = ts_node_named_child_count(s);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(s, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "block") == 0) {
+            py_bind_block(b, c, source, depth + 1);
+        } else if (strncmp(ck, "except", 6) == 0 && strstr(ck, "_clause") != NULL) {
+            if (b->module || py_has_def(c, depth + 1)) {
+                py_bind_as_targets(b, c, source, depth + 1);
+            }
+            uint32_t m = ts_node_named_child_count(c);
+            for (uint32_t j = 0; j < m; j++) {
+                TSNode part = ts_node_named_child(c, j);
+                if (strcmp(ts_node_type(part), "block") == 0) {
+                    py_bind_block(b, part, source, depth + 2);
+                } else {
+                    py_bind_walrus(b, part, source, depth + 2);
+                }
+            }
+        } else if (strstr(ck, "_clause") != NULL) {
+            py_bind_as_targets(b, c, source, depth + 1);
+            py_bind_statement(b, c, source, depth + 1);
+        } else {
+            py_bind_walrus(b, c, source, depth + 1);
+            py_bind_as_targets(b, c, source, depth + 1);
+        }
+    }
+}
+
+static void py_bind_block(tf_names_t *b, TSNode block, const char *source, int depth) {
+    uint32_t n = ts_node_is_null(block) ? 0 : ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < n; i++) {
+        py_bind_statement(b, ts_node_named_child(block, i), source, depth);
+    }
+}
+
+static TSNode py_def_body(TSNode node) {
+    if (strcmp(ts_node_type(node), "decorated_definition") == 0) {
+        node = ts_node_child_by_field_name(node, TS_FIELD("definition"));
+    }
+    return ts_node_is_null(node) ? node : ts_node_child_by_field_name(node, TS_FIELD("body"));
+}
+
+/* Python: the names a class body binds besides its nested definitions,
+ * '|'-joined, each once, or NULL. The top-level statements are taken in
+ * order: a binding holds from its statement on, and a later top-level `del`
+ * unbinds it -- unless a definition stands between the two, which saw the
+ * name bound when its annotations were evaluated at definition time (a
+ * top-level one: a definition inside a compound statement is no method the
+ * extractor lists). A `del` inside a compound statement may not run: the name
+ * stays bound. */
+static const char *py_class_body_bindings(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = py_def_body(node);
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    CBMHashTable *state = cbm_ht_create(32); /* name -> epoch of its binding, or 1: unbound */
+    if (!state) {
+        return NULL;
+    }
+    tf_names_t order = {.a = a}; /* every name bound once, in first-binding order */
+    uintptr_t epoch = 2;         /* moves on at each definition */
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    for (bool ok = ts_tree_cursor_goto_first_child(&cur); ok;
+         ok = ts_tree_cursor_goto_next_sibling(&cur)) {
+        TSNode s = ts_tree_cursor_current_node(&cur);
+        if (!ts_node_is_named(s)) {
+            continue;
+        }
+        const char *kind = ts_node_type(s);
+        if (py_defines_kind(kind)) {
+            epoch++;
+            continue;
+        }
+        tf_names_t one = {.a = a};
+        bool del = strcmp(kind, "delete_statement") == 0;
+        if (del) {
+            py_bind_target(&one, s, source, 1);
+        } else {
+            py_bind_statement(&one, s, source, 0);
+        }
+        for (const char *p = one.buf; p && *p;) {
+            const char *bar = strchr(p, '|');
+            size_t len = bar ? (size_t)(bar - p) : strlen(p);
+            char *name = cbm_arena_strndup(a, p, len);
+            uintptr_t was = name ? (uintptr_t)cbm_ht_get(state, name) : 0;
+            if (name && del) {
+                if (was == epoch) {
+                    cbm_ht_set(state, name, (void *)(uintptr_t)1);
+                }
+            } else if (name) {
+                if (!was) {
+                    tf_names_add(&order, name, len);
+                }
+                cbm_ht_set(state, name, (void *)epoch);
+            }
+            p = bar ? bar + 1 : p + len;
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    tf_names_t out = {.a = a};
+    for (const char *p = order.buf; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name && (uintptr_t)cbm_ht_get(state, name) > 1) {
+            tf_names_add(&out, name, len);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    cbm_ht_free(state);
+    return out.len ? out.buf : NULL;
+}
+
+/* The names declared `global` among a scope's statements (compound ones
+ * included, nested definitions not: they are scopes of their own). */
+static void py_global_statements(tf_names_t *b, TSNode node, const char *source, int depth) {
+    if (ts_node_is_null(node) || depth > TF_BIND_DEPTH) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "global_statement") == 0) {
+            py_bind_target(b, c, source, depth + 1);
+        } else if (!py_defines_kind(ck) && py_statement_level(ck)) {
+            py_global_statements(b, c, source, depth + 1);
+        }
+    }
+}
+
+/* Python: the names a function's or class's body declares `global` and
+ * binds, '|'-joined, or NULL: the body rebinds them in the module. */
+static const char *py_body_global_names(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = py_def_body(node);
+    tf_names_t declared = {.a = a};
+    py_global_statements(&declared, body, source, 0);
+    if (!declared.len) {
+        return NULL;
+    }
+    tf_names_t bound = {.a = a, .module = true};
+    py_bind_block(&bound, body, source, 0);
+    CBMHashTable *binds = bound.len ? cbm_ht_create(16) : NULL;
+    if (!binds) {
+        return NULL;
+    }
+    for (const char *p = bound.buf; *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name) {
+            cbm_ht_set(binds, name, name);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    tf_names_t out = {.a = a};
+    for (const char *p = declared.buf; *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = cbm_arena_strndup(a, p, len);
+        if (name && cbm_ht_get(binds, name)) {
+            tf_names_add(&out, name, len);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+    cbm_ht_free(binds);
+    return out.len ? out.buf : NULL;
+}
+
 /* Make: a rule names several targets (`up down: deps`), each a goal
  * `make <target>` runs. The rule's definition carries the first target;
  * every further one gets a definition of its own over the same rule span --
@@ -7250,6 +7788,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def_set_type_params(a, &def, py_type_param_names(a, node, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, node, ctx->source));
+    } else if (ctx->language == CBM_LANG_GO) {
+        def_set_type_params(a, &def, go_type_param_names(a, node, ctx->source));
+    }
 
     // Rust: cfg-gated twins (#[cfg(windows)] fn f / #[cfg(not(windows))] fn f)
     // keep the plain QN: they are variants of ONE definition, and the graph
@@ -8542,6 +9086,87 @@ static const char *cs_type_decl_namespace(CBMExtractCtx *ctx, TSNode node) {
     return ts_node_has_error(top) ? NULL : "";
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_go_embedded_text_work;
+uint64_t cbm_extract_test_go_embedded_work(void) {
+    return atomic_load_explicit(&g_go_embedded_text_work, memory_order_relaxed);
+}
+#define GO_EMBEDDED_TEXT_WORK(n) \
+    atomic_fetch_add_explicit(&g_go_embedded_text_work, (uint64_t)(n), memory_order_relaxed)
+#else
+#define GO_EMBEDDED_TEXT_WORK(n) ((void)0)
+#endif
+
+/* The type of an embedded field (an unnamed field declaration) of a struct's
+ * field list, or a null node. */
+static TSNode go_embedded_field_type(TSNode field) {
+    if (strcmp(ts_node_type(field), "field_declaration") != 0 ||
+        !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("name")))) {
+        return (TSNode){0};
+    }
+    return ts_node_child_by_field_name(field, TS_FIELD("type"));
+}
+
+/* Its spelling's span when it can join a '|'-list (non-empty, no '|'). */
+static bool go_embedded_span(TSNode type, const char *source, uint32_t *start, uint32_t *len) {
+    if (ts_node_is_null(type)) {
+        return false;
+    }
+    *start = ts_node_start_byte(type);
+    *len = ts_node_end_byte(type) - *start;
+    GO_EMBEDDED_TEXT_WORK(*len);
+    return *len > 0 && !memchr(source + *start, '|', *len);
+}
+
+/* Go: the types a struct type_spec embeds (its unnamed field declarations),
+ * '|'-joined as written, or NULL. Two passes over the field list with a
+ * cursor (measure, then copy once): linear in the struct's size. */
+static const char *go_struct_embedded_text(CBMArena *a, TSNode spec, const char *source) {
+    TSNode st = ts_node_child_by_field_name(spec, TS_FIELD("type"));
+    if (ts_node_is_null(st) || strcmp(ts_node_type(st), "struct_type") != 0) {
+        return NULL;
+    }
+    TSNode list = cbm_find_child_by_kind(st, "field_declaration_list");
+    if (ts_node_is_null(list)) {
+        return NULL;
+    }
+    size_t total = 0;
+    char *out = NULL;
+    size_t at = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        TSTreeCursor cur = ts_tree_cursor_new(list);
+        for (bool ok = ts_tree_cursor_goto_first_child(&cur); ok;
+             ok = ts_tree_cursor_goto_next_sibling(&cur)) {
+            GO_EMBEDDED_TEXT_WORK(1);
+            uint32_t start = 0;
+            uint32_t len = 0;
+            TSNode field = ts_tree_cursor_current_node(&cur);
+            if (!ts_node_is_named(field) ||
+                !go_embedded_span(go_embedded_field_type(field), source, &start, &len)) {
+                continue;
+            }
+            if (pass == 0) {
+                total += len + 1;
+                continue;
+            }
+            if (at) {
+                out[at++] = '|';
+            }
+            memcpy(out + at, source + start, len);
+            at += len;
+        }
+        ts_tree_cursor_delete(&cur);
+        if (pass == 0) {
+            out = total ? (char *)cbm_arena_alloc(a, total) : NULL;
+            if (!out) {
+                return NULL;
+            }
+        }
+    }
+    out[at] = '\0';
+    return out;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
@@ -8973,6 +9598,23 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def_set_type_params(a, &def, py_type_param_names(a, node, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, node, ctx->source));
+        const char *bound = py_class_body_bindings(a, node, ctx->source);
+        CBMDefTypeFacts *facts = bound ? def_type_facts(a, &def) : NULL;
+        if (facts) {
+            facts->class_bindings = bound;
+        }
+    }
+    if (ctx->language == CBM_LANG_GO) {
+        def_set_type_params(a, &def, go_type_param_names(a, node, ctx->source));
+        const char *embedded = go_struct_embedded_text(a, node, ctx->source);
+        CBMDefTypeFacts *facts = embedded && embedded[0] ? def_type_facts(a, &def) : NULL;
+        if (facts) {
+            facts->go_embedded = embedded;
+        }
+    }
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
@@ -9497,6 +10139,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    if (ctx->language == CBM_LANG_PYTHON) {
+        def_set_type_params(a, &def, py_type_param_names(a, child, ctx->source));
+        def_set_global_names(a, &def, py_body_global_names(a, child, ctx->source));
+    } else if (ctx->language == CBM_LANG_GO) {
+        def_set_type_params(a, &def, go_type_param_names(a, child, ctx->source));
+    }
     const char *client_path = NULL;
     const char *client_method = NULL;
     /* Retrofit services must be interfaces; Pippo and Rapidoid put the path in
@@ -9636,7 +10284,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
  * constructor_declaration named `extension` and nothing flags it: has_error
  * stays 0. A constructor carries its own type's name, so this shape can only be
  * a genuine constructor inside a type literally called `extension` (#2071). */
-static bool csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
+bool cbm_csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
     if (strcmp(ts_node_type(node), "constructor_declaration") != 0) {
         return false;
     }
@@ -9710,7 +10358,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
          * enclosing type, rather than the block itself as a constructor named
          * `extension` with its members buried in the body (#2071). */
         if (ctx->language == CBM_LANG_CSHARP &&
-            csharp_is_extension_block(child, class_node, ctx->source)) {
+            cbm_csharp_is_extension_block(child, class_node, ctx->source)) {
             extract_csharp_extension_members(ctx, child, class_node, class_qn, spec);
             continue;
         }
@@ -11014,6 +11662,53 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     }
 }
 
+/* Go: the type a package-level `var`/`const` spec declares, else the type
+ * its single initializer spells: `T{...}` is T, `&T{...}` is *T, `new(T)` is
+ * *T. NULL for anything else (a call's result, an arithmetic expression):
+ * nothing is inferred. */
+static const char *go_value_type_text(CBMArena *a, TSNode spec, const char *source) {
+    TSNode type = ts_node_child_by_field_name(spec, TS_FIELD("type"));
+    if (!ts_node_is_null(type)) {
+        return cbm_node_text(a, type, source);
+    }
+    TSNode value = ts_node_child_by_field_name(spec, TS_FIELD("value"));
+    if (!ts_node_is_null(value) && strcmp(ts_node_type(value), "expression_list") == 0) {
+        value = ts_node_named_child_count(value) == 1 ? ts_node_named_child(value, 0) : (TSNode){0};
+    }
+    if (ts_node_is_null(value)) {
+        return NULL;
+    }
+    bool pointer = false;
+    if (strcmp(ts_node_type(value), "unary_expression") == 0) {
+        TSNode op = ts_node_child_by_field_name(value, TS_FIELD("operator"));
+        const char *ot = ts_node_is_null(op) ? NULL : cbm_node_text(a, op, source);
+        if (!ot || strcmp(ot, "&") != 0) {
+            return NULL;
+        }
+        value = ts_node_child_by_field_name(value, TS_FIELD("operand"));
+        pointer = true;
+        if (ts_node_is_null(value)) {
+            return NULL;
+        }
+    }
+    const char *vk = ts_node_type(value);
+    const char *text = NULL;
+    if (strcmp(vk, "composite_literal") == 0) {
+        TSNode t = ts_node_child_by_field_name(value, TS_FIELD("type"));
+        text = ts_node_is_null(t) ? NULL : cbm_node_text(a, t, source);
+    } else if (!pointer && strcmp(vk, "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+        TSNode args = ts_node_child_by_field_name(value, TS_FIELD("arguments"));
+        const char *fname = ts_node_is_null(fn) ? NULL : cbm_node_text(a, fn, source);
+        if (fname && strcmp(fname, "new") == 0 && !ts_node_is_null(args) &&
+            ts_node_named_child_count(args) == 1) {
+            text = cbm_node_text(a, ts_node_named_child(args, 0), source);
+            pointer = true;
+        }
+    }
+    return text && pointer ? cbm_arena_sprintf(a, "*%s", text) : text;
+}
+
 static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a,
                                     const char *kind) {
     (void)kind;
@@ -11042,13 +11737,31 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     }
     case CBM_LANG_GO: {
         uint32_t n = ts_node_named_child_count(node);
+        /* In a const block a spec with neither type nor value repeats the
+         * previous spec's (`A Kind = iota; B; C`). */
+        const char *repeated = NULL;
         for (uint32_t i = 0; i < n; i++) {
             TSNode child = ts_node_named_child(node, i);
             const char *ck = ts_node_type(child);
             if (strcmp(ck, "var_spec") == 0 || strcmp(ck, "const_spec") == 0) {
+                bool bare = strcmp(ck, "const_spec") == 0 &&
+                            ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("type"))) &&
+                            ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("value")));
+                const char *vtype = bare ? repeated : go_value_type_text(a, child, ctx->source);
+                repeated = vtype;
                 TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
                 if (!ts_node_is_null(vname)) {
+                    int before = ctx->result->defs.count;
                     push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                    /* The value's type reaches other files (pkg.V.Method()),
+                     * never the graph (CBMDefTypeFacts.value_type). */
+                    CBMDefTypeFacts *facts =
+                        vtype && ctx->result->defs.count == before + 1
+                            ? def_type_facts(a, &ctx->result->defs.items[before])
+                            : NULL;
+                    if (facts) {
+                        facts->value_type = vtype;
+                    }
                 }
             }
         }

@@ -1168,11 +1168,15 @@ TEST(golsp_crossfile_interface_field_chain) {
                          "type Context struct {\n\techo *echo.Echo\n}\n\n"
                          "func (c *Context) process() {\n\tc.echo.Binder.Bind(\"hello\")\n}\n";
 
+    /* The walked file's struct carries its fields as the pipeline folds them
+     * (pxc_fold_struct_fields): every route reads a struct's fields from its
+     * definition. */
     CBMLSPDef defs[] = {
         {.qualified_name = "test.main.Context",
          .short_name = "Context",
          .label = "Type",
-         .def_module_qn = "test.main"},
+         .def_module_qn = "test.main",
+         .field_defs = "echo:*echo.Echo"},
         {.qualified_name = "test.main.Context.process",
          .short_name = "process",
          .label = "Method",

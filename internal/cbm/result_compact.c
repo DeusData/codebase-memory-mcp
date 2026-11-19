@@ -282,6 +282,16 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
     cr_str(c, &d->alias_target);
+    /* The type-facts record: one record, then its strings. */
+    cr_array(c, (void **)&d->type_facts, d->type_facts ? 1 : 0, sizeof(CBMDefTypeFacts));
+    CBMDefTypeFacts *facts = (CBMDefTypeFacts *)d->type_facts;
+    if (facts) {
+        cr_str(c, &facts->type_params);
+        cr_str(c, &facts->value_type);
+        cr_str(c, &facts->go_embedded);
+        cr_str(c, &facts->class_bindings);
+        cr_str(c, &facts->global_names);
+    }
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -461,6 +471,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->constants);
     cr_list(c, &r->global_vars);
     cr_list(c, &r->macros);
+    cr_list(c, &r->included_files);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
     cr_str(c, &r->module_doc);
