@@ -956,6 +956,66 @@ TEST(java_enum_dedup_preserves_calls_issue1234) {
  *   1) the field loop returned on the first match → only the superclass
  *      was emitted, the interfaces were dropped.
  *   2) the emitted name was the full field text including the keyword. */
+/* An interface's (and a class's implements) type list with qualified names:
+ * each is recorded as written, without the keyword, and none is lost next to
+ * a generic one. Before the fix a qualified name in a type_list was skipped:
+ * `interface I2 extends i1.I1` fell to the raw text "extends i1.I1" and
+ * `extends i1.I1, java.lang.Comparable<String>` kept only the generic. */
+static int java_bases_are(const char *src, const char *name, const char *const *want) {
+    CBMFileResult *r = extract(src, CBM_LANG_JAVA, "t", "T.java");
+    if (!r || r->has_error) {
+        return 0;
+    }
+    const CBMDefinition *d = NULL;
+    for (int i = 0; i < r->defs.count && !d; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0) {
+            d = &r->defs.items[i];
+        }
+    }
+    /* As a set: a class's `implements` list is collected twice (the
+     * `interfaces` field and the `super_interfaces` child are one node),
+     * main's behaviour for simple names too. Every wanted name is there and
+     * nothing else is. */
+    int ok = d && d->base_classes;
+    for (int w = 0; ok && want[w]; w++) {
+        bool seen = false;
+        for (int i = 0; d->base_classes[i] && !seen; i++) {
+            seen = strcmp(d->base_classes[i], want[w]) == 0;
+        }
+        ok = seen;
+    }
+    for (int i = 0; ok && d->base_classes[i]; i++) {
+        bool wanted = false;
+        for (int w = 0; want[w] && !wanted; w++) {
+            wanted = strcmp(d->base_classes[i], want[w]) == 0;
+        }
+        ok = wanted;
+    }
+    if (!ok) {
+        printf("\n  %s: bases", name);
+        for (int i = 0; d && d->base_classes && d->base_classes[i]; i++) {
+            printf(" [%s]", d->base_classes[i]);
+        }
+        printf("\n");
+    }
+    cbm_free_result(r);
+    return ok;
+}
+
+TEST(java_qualified_type_list_bases) {
+    static const char *const one[] = {"i1.I1", NULL};
+    static const char *const two[] = {"i1.I1", "java.lang.Comparable", NULL};
+    static const char *const gen[] = {"a.b.Box", "I1", NULL};
+    static const char *const cls[] = {"d1.Top1", "i1.I1", "java.io.Closeable", NULL};
+    ASSERT_TRUE(java_bases_are("interface I2 extends i1.I1 { }", "I2", one));
+    ASSERT_TRUE(java_bases_are("interface I7 extends i1.I1, java.lang.Comparable<String> { }", "I7",
+                               two));
+    ASSERT_TRUE(java_bases_are("interface I8 extends a.b.Box<String>, I1 { }", "I8", gen));
+    ASSERT_TRUE(java_bases_are("class C extends d1.Top1 implements i1.I1, java.io.Closeable { }", "C",
+                               cls));
+    PASS();
+}
+
 TEST(java_class_extends_and_implements) {
     CBMFileResult *r = extract("public class DefaultLinkTool extends DefaultDiagramTool implements "
                                "ILinkTool, Closeable { }",
@@ -16051,6 +16111,7 @@ SUITE(extraction) {
     RUN_TEST(java_interface_no_duplicate_function_issue1234);
     RUN_TEST(java_enum_dedup_preserves_calls_issue1234);
     RUN_TEST(java_class_extends_and_implements);
+    RUN_TEST(java_qualified_type_list_bases);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);

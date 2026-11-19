@@ -4664,13 +4664,17 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
                 }
             }
         } else if (strcmp(ck, "type_list") == 0 || strcmp(ck, "interface_type_list") == 0) {
-            // Java: super_interfaces contains type_list with multiple type_identifiers.
+            // Java: super_interfaces / extends_interfaces contain a type_list of
+            // type names; a qualified one (`a.b.I`) is a scoped_type_identifier.
+            // Without it `interface I2 extends a.I1` fell to the raw-text fallback
+            // ("extends a.I1", keyword included), and `extends a.I1, B<T>` lost a.I1.
             uint32_t tlnc = ts_node_named_child_count(child);
             for (uint32_t ti = 0; ti < tlnc && count < out_cap; ti++) {
                 TSNode tl_child = ts_node_named_child(child, ti);
                 const char *tlk = ts_node_type(tl_child);
                 if (strcmp(tlk, "type_identifier") == 0 || strcmp(tlk, "generic_type") == 0 ||
-                    strcmp(tlk, "qualified_name") == 0) {
+                    strcmp(tlk, "qualified_name") == 0 ||
+                    strcmp(tlk, "scoped_type_identifier") == 0) {
                     char *t = cbm_node_text(a, tl_child, source);
                     if (t) {
                         char *angle = strchr(t, '<');
