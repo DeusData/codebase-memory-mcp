@@ -742,9 +742,10 @@ async function main() {
   const source = resolveDownloadBase();
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
-  // Linux ships a fully-static "-portable" build; the standard linux binary
-  // dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
-  // have no such variant. Keep in sync with install.sh / pypi _cli.py / cli.c.
+  // Linux ships a fully-static "-portable" build; the standard linux binary is
+  // built on Ubuntu 22.04, dynamically links glibc 2.35+ and fails on older
+  // distros. macOS/Windows have no such variant. Keep in sync with install.sh /
+  // pypi _cli.py / cli.c.
   const variant = platform === 'linux' ? '-portable' : '';
   // No UI/standard split since v0.10.0: one archive per platform, graph UI
   // always embedded. The old CBM_VARIANT=ui opt-in pointed at ui-* archives

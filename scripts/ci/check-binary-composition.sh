@@ -34,6 +34,13 @@
 #   reported n/a instead of asserted, because eager binding is a property of
 #   the release link flags, not of the packaging path the fixture exercises.
 #   Only contract tests set it; release derivation never does.
+#   CBM_GLIBC_FLOOR=<x.y> declares the oldest glibc a dynamic Linux artifact
+#   must start on: A6-glibc-floor then asserts that no GLIBC_* symbol version
+#   the binary requires is newer. CBM_GLIBCXX_FLOOR=<x.y.z> (only together
+#   with CBM_GLIBC_FLOOR) does the same for libstdc++'s GLIBCXX_* versions.
+#   The floor is a property of the BUILD venue, so only the venues that build
+#   in the pinned ubuntu:22.04 container declare it (_build.yml build-linux,
+#   pr.yml glibc-floor); everywhere else A6 is reported n/a.
 set -euo pipefail
 
 case "${1:-}" in
@@ -125,6 +132,20 @@ for arg in "$@"; do
 done
 if [ "${#TARGETS[@]}" -eq 0 ]; then
     echo "FAIL: no binaries or directories given (see --help)" >&2
+    exit 2
+fi
+# A malformed floor must stop the run: compared as text it would let any
+# version through, and an assertion that cannot fail is not a gate.
+for floor_var in CBM_GLIBC_FLOOR CBM_GLIBCXX_FLOOR; do
+    floor_value="${!floor_var:-}"
+    if [ -n "$floor_value" ] &&
+        ! printf '%s\n' "$floor_value" | awk '!/^[0-9]+(\.[0-9]+)+$/ { bad = 1 } END { exit bad }'; then
+        echo "FAIL: $floor_var='$floor_value' is not a dotted version such as 2.35 (see --help)" >&2
+        exit 2
+    fi
+done
+if [ -n "${CBM_GLIBCXX_FLOOR:-}" ] && [ -z "${CBM_GLIBC_FLOOR:-}" ]; then
+    echo "FAIL: CBM_GLIBCXX_FLOOR needs CBM_GLIBC_FLOOR (see --help)" >&2
     exit 2
 fi
 
@@ -249,6 +270,76 @@ bind_now_state() {
     else
         echo lazy
     fi
+}
+
+# Succeeds when the ELF has a PT_DYNAMIC, i.e. the loader binds it at startup.
+has_dynamic_section() {
+    case "$ELF_READER_KIND" in
+    readelf)
+        "$ELF_READER" -lW "$1" 2>/dev/null |
+            awk '$1 == "DYNAMIC" { found = 1 } END { exit !found }'
+        ;;
+    objdump)
+        "$ELF_READER" -p "$1" 2>/dev/null |
+            awk '/^Dynamic Section:/ { found = 1 } END { exit !found }'
+        ;;
+    esac
+}
+
+# Every GLIBC_* / GLIBCXX_* version name in the ELF's dynamic version tables,
+# one per line, sorted and unique. The version-needs table (.gnu.version_r) is
+# what the loader checks at startup and survives every strip level. A name can
+# sit inside a larger token ("2h(GLIBC_2.17)" for a hidden version), so it is
+# matched anywhere in the line rather than as a whole field.
+elf_glibc_version_needs() {
+    case "$ELF_READER_KIND" in
+    readelf) "$ELF_READER" -VW "$1" 2>/dev/null ;;
+    objdump) "$ELF_READER" -p "$1" 2>/dev/null ;;
+    esac |
+        awk '{ s = $0
+               while (match(s, /GLIBC(XX)?_[A-Za-z0-9_.]+/)) {
+                   print substr(s, RSTART, RLENGTH)
+                   s = substr(s, RSTART + RLENGTH)
+               } }' |
+        LC_ALL=C sort -u
+}
+
+# Echoes one verdict line for the versions with PREFIX (GLIBC or GLIBCXX) in
+# the name list on stdin, against FLOOR:
+#   none                     no numbered version with that prefix
+#   ok <max> <count>         every one is <= FLOOR
+#   newer <max> <names...>   these are newer than FLOOR
+#   unnumbered <names...>    a non-release name (GLIBC_PRIVATE, ...): no
+#                            numbered floor covers it
+# GLIBC_ABI_DT_RELR (a -z pack-relative-relocs link) counts as 2.36, the glibc
+# release that added it. Numeric field-by-field comparison: as text, 2.4 would
+# sort after 2.35.
+glibc_floor_verdict() { # prefix, floor
+    awk -v prefix="$1" -v floor="$2" '
+        function newer(a, b,    x, y, na, nb, n, i, xi, yi) {
+            na = split(a, x, "."); nb = split(b, y, ".")
+            n = na > nb ? na : nb
+            for (i = 1; i <= n; i++) {
+                xi = (i <= na) ? x[i] + 0 : 0
+                yi = (i <= nb) ? y[i] + 0 : 0
+                if (xi != yi) return xi > yi
+            }
+            return 0
+        }
+        index($0, prefix "_") == 1 {
+            version = substr($0, length(prefix) + 2)
+            if ($0 == "GLIBC_ABI_DT_RELR") version = "2.36"
+            if (version !~ /^[0-9]+(\.[0-9]+)*$/) { unnumbered = unnumbered " " $0; next }
+            count++
+            if (max == "" || newer(version, max)) max = version
+            if (newer(version, floor)) over = over " " $0
+        }
+        END {
+            if (unnumbered != "") print "unnumbered" unnumbered
+            else if (count == 0) print "none"
+            else if (over != "") print "newer " max over
+            else print "ok " max " " count
+        }'
 }
 
 # ── Reporting ───────────────────────────────────────────────────────
@@ -530,6 +621,86 @@ EOF
     else
         printf 'n/a  %-22s %s: UI-capable artifact, HTTP server ships here by design\n' \
             A5-no-ui-http "$token"
+    fi
+
+    # A6 — glibc floor. The standard Linux binaries link glibc and libstdc++
+    # dynamically, so the oldest system they start on is set by the newest
+    # GLIBC_x.y / GLIBCXX_x.y.z symbol version they require: a property of the
+    # build venue's headers and toolchain that no compile, test or smoke on that
+    # venue can see, and that is fatal at startup anywhere older (#2486: built
+    # on the ubuntu-latest runner, the binary required GLIBC_2.38 and
+    # GLIBCXX_3.4.32 and refused to start on Ubuntu 22.04). Measured on the
+    # artifact, like A1-A1d, because a build container is not evidence that the
+    # bytes inherited its floor. The floor is declared by the venue, never
+    # assumed: a binary built on a developer's newer distro legitimately needs
+    # that distro's glibc.
+    if [ -z "${CBM_GLIBC_FLOOR:-}" ]; then
+        printf 'n/a  %-22s %s: no glibc floor declared (CBM_GLIBC_FLOOR unset)\n' \
+            A6-glibc-floor "$token"
+    elif [ "$fmt" != elf ]; then
+        printf 'n/a  %-22s %s: glibc symbol versions are an ELF property\n' \
+            A6-glibc-floor "$token"
+    elif ! has_dynamic_section "$file"; then
+        report PASS A6-glibc-floor "$token" \
+            "no PT_DYNAMIC: nothing binds at startup, so no glibc version is required"
+    else
+        version_needs=$(elf_glibc_version_needs "$file")
+        glibc_verdict=$(printf '%s\n' "$version_needs" |
+            glibc_floor_verdict GLIBC "$CBM_GLIBC_FLOOR")
+        read -r _ verdict_max verdict_rest <<EOF
+$glibc_verdict
+EOF
+        case "$glibc_verdict" in
+        ok\ *)
+            report PASS A6-glibc-floor "$token" \
+                "newest required glibc version is GLIBC_$verdict_max <= floor $CBM_GLIBC_FLOOR ($verdict_rest GLIBC_* version(s))"
+            ;;
+        newer\ *)
+            report FAIL A6-glibc-floor "$token" \
+                "requires $verdict_rest -- newer than floor $CBM_GLIBC_FLOOR, so it will not start on glibc $CBM_GLIBC_FLOOR (build in the pinned ubuntu:22.04 container)"
+            ;;
+        unnumbered\ *)
+            report FAIL A6-glibc-floor "$token" \
+                "requires${glibc_verdict#unnumbered} -- not a numbered glibc release, so floor $CBM_GLIBC_FLOOR cannot be proven"
+            ;;
+        *)
+            # Anti-vacuity: a dynamic binary that links glibc always requires
+            # at least one GLIBC_* version, so none means the table was not
+            # readable, or the binary does not link glibc at all.
+            report FAIL A6-glibc-floor "$token" \
+                "dynamic binary requires no GLIBC_* version ($ELF_READER) -- the version table is unreadable or glibc is not linked; floor $CBM_GLIBC_FLOOR cannot be proven"
+            ;;
+        esac
+        if [ -z "${CBM_GLIBCXX_FLOOR:-}" ]; then
+            printf 'n/a  %-22s %s: no libstdc++ floor declared (CBM_GLIBCXX_FLOOR unset)\n' \
+                A6-glibc-floor "$token"
+        else
+            glibcxx_verdict=$(printf '%s\n' "$version_needs" |
+                glibc_floor_verdict GLIBCXX "$CBM_GLIBCXX_FLOOR")
+            read -r _ verdict_max verdict_rest <<EOF
+$glibcxx_verdict
+EOF
+            case "$glibcxx_verdict" in
+            ok\ *)
+                report PASS A6-glibc-floor "$token" \
+                    "newest required libstdc++ version is GLIBCXX_$verdict_max <= floor $CBM_GLIBCXX_FLOOR ($verdict_rest GLIBCXX_* version(s))"
+                ;;
+            newer\ *)
+                report FAIL A6-glibc-floor "$token" \
+                    "requires $verdict_rest -- newer than libstdc++ floor $CBM_GLIBCXX_FLOOR, so it will not start where libstdc++ provides only GLIBCXX_$CBM_GLIBCXX_FLOOR"
+                ;;
+            unnumbered\ *)
+                report FAIL A6-glibc-floor "$token" \
+                    "requires${glibcxx_verdict#unnumbered} -- not a numbered libstdc++ version, so floor $CBM_GLIBCXX_FLOOR cannot be proven"
+                ;;
+            *)
+                # libstdc++ is not linked (or is linked statically): there is
+                # nothing for an older system's libstdc++ to lack.
+                report PASS A6-glibc-floor "$token" \
+                    "no GLIBCXX_* version required (libstdc++ is not linked dynamically)"
+                ;;
+            esac
+        fi
     fi
 }
 

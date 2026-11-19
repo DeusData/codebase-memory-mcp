@@ -286,7 +286,10 @@ services:
   # ── glibc floor (ubuntu-22.04, glibc 2.35) ─────────────────
   # Mirrors CI's broad-matrix 22.04 legs: the portable (musl-static) binary
   # must pass the canonical smoke on the oldest supported userland, and the
-  # dynamic binary must REFUSE to start (glibc 2.38+ floor is by design).
+  # LOCAL dynamic binary (built in the noble test image) must REFUSE to start,
+  # proving this venue is older than the build image. The release dynamic
+  # binary builds in a pinned ubuntu:22.04 container instead (2.35 floor,
+  # asserted by check-binary-composition.sh A6).
   smoke-glibc-floor:
     build:
       context: ..
@@ -301,9 +304,9 @@ services:
         file build/alpine/codebase-memory-mcp | grep -q "statically linked"
         echo "=== glibc-floor: portable binary smoke on glibc 2.35 ==="
         scripts/smoke-local.sh ./build/alpine/codebase-memory-mcp
-        echo "=== glibc-floor: dynamic binary must refuse (glibc 2.38+ floor) ==="
+        echo "=== glibc-floor: local noble-built dynamic binary must refuse ==="
         if build/linux-arm64/codebase-memory-mcp --version 2>/tmp/dynamic-floor.err; then
-          echo "ERROR: dynamic binary ran on glibc 2.35 — floor contract broken"
+          echo "ERROR: a noble-built dynamic binary ran on this venue — it is not older than the build image"
           exit 1
         fi
         grep -qi 'GLIBC' /tmp/dynamic-floor.err

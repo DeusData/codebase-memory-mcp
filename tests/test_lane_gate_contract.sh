@@ -33,9 +33,14 @@ trap 'rm -rf "$WORK"' EXIT
 failures=0
 
 # ── ci-ok ────────────────────────────────────────────────────────────────
-NEEDS_OK='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"success"},"test":{"result":"success"},"pr-smoke":{"result":"skipped"},"contracts":{"result":"skipped"}}'
-NEEDS_RED='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"failure"},"test":{"result":"skipped"},"pr-smoke":{"result":"skipped"},"contracts":{"result":"skipped"}}'
+NEEDS_OK='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"success"},"test":{"result":"success"},"pr-smoke":{"result":"skipped"},"contracts":{"result":"skipped"},"glibc-floor":{"result":"skipped"}}'
+NEEDS_RED='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"failure"},"test":{"result":"skipped"},"pr-smoke":{"result":"skipped"},"contracts":{"result":"skipped"},"glibc-floor":{"result":"skipped"}}'
+NEEDS_T3='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"success"},"test":{"result":"success"},"pr-smoke":{"result":"success"},"contracts":{"result":"skipped"},"glibc-floor":{"result":"success"}}'
+NEEDS_FLOOR_RED='{"changes":{"result":"success"},"security":{"result":"success"},"lint":{"result":"success"},"test":{"result":"success"},"pr-smoke":{"result":"success"},"contracts":{"result":"skipped"},"glibc-floor":{"result":"failure"}}'
 T1='["lint","lint-mem","security-static","shard-completeness","unix-macos14","unix-x86","windows"]'
+# A product change: the Ubuntu smoke leg and, riding with it, the gating
+# release-container build (glibc-floor).
+T3='["glibc-floor","lint","lint-mem","security-static","shard-completeness","smoke-ubuntu","unix-macos14","unix-x86","windows"]'
 
 job() { # name conclusion [status]
     printf '{"name":"%s","status":"%s","conclusion":%s}\n' "$1" "${3:-completed}" \
@@ -60,9 +65,15 @@ t1_jobs() { # the jobs of a green T1 run; $1 = conclusion of the x86 leg
     job "test / shard-completeness" success
     job "pr-smoke" skipped
     job "contracts" skipped
+    job "glibc-floor" skipped
     job "memwaste" skipped
     job "test-impact-shadow" failure
     job "ci-ok" null in_progress
+}
+t3_jobs() { # a green T3 run's jobs; $1 = glibc-floor's conclusion, or "absent"
+    t1_jobs success | grep -v -e '"name":"pr-smoke"' -e '"name":"glibc-floor"'
+    job "pr-smoke (ubuntu-latest, smoke-ubuntu)" success
+    [ "$1" = absent ] || job "glibc-floor" "$1"
 }
 
 gate() { # description want needs lanes jobs-file|-
@@ -108,6 +119,28 @@ gate "a selection without lint or contracts is red" 1 "$NEEDS_OK" '["security-st
 gate "an unknown lane is red" 1 "$NEEDS_OK" '["lint","security-static","no-such-lane"]' "$WORK/t1-green"
 gate "a malformed selection is red" 1 "$NEEDS_OK" 'lint,unix-x86' "$WORK/t1-green"
 gate "a selection without the job list is red" 1 "$NEEDS_OK" "$T1" "$WORK/does-not-exist"
+
+# glibc-floor GATES (user decision R103, #2887): selected with smoke-ubuntu, it
+# must run and succeed like any lane; unselected (docs, tests) it may skip.
+t3_jobs success >"$WORK/t3-green"
+t3_jobs failure >"$WORK/t3-floor-failed"
+t3_jobs skipped >"$WORK/t3-floor-skipped"
+t3_jobs cancelled >"$WORK/t3-floor-cancelled"
+t3_jobs absent >"$WORK/t3-floor-absent"
+{
+    job "changes" success
+    job "security / security-static" success
+    job "contracts" success
+    job "glibc-floor" skipped
+    job "ci-ok" null in_progress
+} >"$WORK/docs-floor-skipped"
+gate "glibc-floor selected and green" 0 "$NEEDS_T3" "$T3" "$WORK/t3-green"
+gate "a selected glibc-floor that FAILED is red" 1 "$NEEDS_T3" "$T3" "$WORK/t3-floor-failed"
+gate "a selected glibc-floor that was skipped is red" 1 "$NEEDS_T3" "$T3" "$WORK/t3-floor-skipped"
+gate "a selected glibc-floor that was cancelled is red" 1 "$NEEDS_T3" "$T3" "$WORK/t3-floor-cancelled"
+gate "a selected glibc-floor with no job at all is red" 1 "$NEEDS_T3" "$T3" "$WORK/t3-floor-absent"
+gate "an unselected glibc-floor (docs-only) may skip" 0 "$NEEDS_OK" '["contracts","security-static"]' "$WORK/docs-floor-skipped"
+gate "a failed glibc-floor fails the needs-level gate" 1 "$NEEDS_FLOOR_RED" - -
 
 # Matrix jobs carry their lane in the name; the neighbouring single job
 # (test-windows-guards) must never be read as the windows leg.

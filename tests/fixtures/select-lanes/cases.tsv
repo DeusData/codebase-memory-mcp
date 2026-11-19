@@ -10,7 +10,7 @@ npm-readme-runs-the-test-legs	pkg/npm/README.md	T1-tests	false	lint lint-mem sec
 issue-template-is-docs	.github/ISSUE_TEMPLATE/bug.yml	T0a-docs	false	contracts security-static
 local-infra	test-infrastructure/run.sh	T0b-nonproduct	false	contracts lint lint-mem security-static
 lint-config	scripts/memory-core-baseline.txt	T0b-nonproduct	false	contracts lint lint-mem security-static
-graph-ui-adds-guards	graph-ui/src/App.tsx	T0b-nonproduct	false	contracts lint lint-mem security-static smoke-ubuntu windows-guards codeql-js
+graph-ui-adds-guards	graph-ui/src/App.tsx	T0b-nonproduct	false	contracts glibc-floor lint lint-mem security-static smoke-ubuntu windows-guards codeql-js
 memwaste-tools-add-memwaste	scripts/memwaste.sh	T0b-nonproduct	false	contracts lint lint-mem memwaste security-static
 non-gating-script-runs-contracts-leg	scripts/benchmark-index.sh	T0b-nonproduct	false	contracts lint lint-mem security-static shard-completeness unix-x86
 test-impact-tooling	scripts/test-impact/replay-selector.sh	T0b-nonproduct	false	contracts lint lint-mem security-static shard-completeness unix-x86
@@ -19,13 +19,13 @@ test-fixture	tests/fixtures/cpp_include/a.h	T1-tests	false	lint lint-mem securit
 contract-test	tests/test_version_metadata_contract.sh	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
 fuzz-harness	tests/fuzz/fuzz_cypher.c	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
 docs-plus-tests	README.md tests/test_store.c	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
-lsp-language	internal/cbm/lsp/go_lsp.c	T2-extract	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-lsp-core	internal/cbm/lsp/type_registry.c	T2-extract	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-grammar-is-extract-not-full	internal/cbm/vendored/grammars/go/parser.c	T2-extract	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-extraction	internal/cbm/extract_calls.c	T2-extract	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-pipeline	src/pipeline/pass_calls.c	T3-mid	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-mcp-plus-tests	src/mcp/mcp.c tests/test_mcp.c	T3-mid	false	lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
-mid-plus-memwaste-tools	src/store/store.c scripts/memwaste-report.py	T3-mid	false	lint lint-mem memwaste security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp codeql-py
+lsp-language	internal/cbm/lsp/go_lsp.c	T2-extract	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+lsp-core	internal/cbm/lsp/type_registry.c	T2-extract	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+grammar-is-extract-not-full	internal/cbm/vendored/grammars/go/parser.c	T2-extract	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+extraction	internal/cbm/extract_calls.c	T2-extract	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+pipeline	src/pipeline/pass_calls.c	T3-mid	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+mcp-plus-tests	src/mcp/mcp.c tests/test_mcp.c	T3-mid	false	glibc-floor lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp
+mid-plus-memwaste-tools	src/store/store.c scripts/memwaste-report.py	T3-mid	false	glibc-floor lint lint-mem memwaste security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows codeql-cpp codeql-py
 daemon	src/daemon/application.c	T4-platform	false	FULL -msan -diag -memwaste -codeql-js -codeql-py -codeql-actions
 main-c-is-cli	src/main.c	T4-platform	false	FULL -msan -diag -memwaste -codeql-js -codeql-py -codeql-actions
 foundation-non-memory	src/foundation/log.c	T4-platform	false	FULL -msan -diag -memwaste -codeql-js -codeql-py -codeql-actions
@@ -59,7 +59,7 @@ harness-driver-forces-full	scripts/test.sh	T5-core	true	FULL
 harness-scheduler-forces-full	scripts/run-test-wave.py	T5-core	true	FULL
 lower-tier-plus-trigger-is-full	docs/x.md src/pipeline/a.c tests/test_main.c	T3-mid	true	FULL
 empty-list-fails-safe	-	T0a-docs	true	FULL
-graph-ui-python-agent	graph-ui/agents/agent.py	T0b-nonproduct	false	codeql-py contracts lint lint-mem security-static smoke-ubuntu windows-guards
-vendored-js-is-not-scanned	graph-ui/vendor/lib.js	T0b-nonproduct	false	contracts lint lint-mem security-static smoke-ubuntu windows-guards
+graph-ui-python-agent	graph-ui/agents/agent.py	T0b-nonproduct	false	codeql-py contracts glibc-floor lint lint-mem security-static smoke-ubuntu windows-guards
+vendored-js-is-not-scanned	graph-ui/vendor/lib.js	T0b-nonproduct	false	contracts glibc-floor lint lint-mem security-static smoke-ubuntu windows-guards
 vendored-only-c-scans-c	vendored/sqlite3/sqlite3.c	T5-core	true	FULL
 codeql-config-is-full	.github/codeql/codeql-config.yml	T5-core	true	FULL

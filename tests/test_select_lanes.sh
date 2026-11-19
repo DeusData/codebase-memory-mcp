@@ -10,7 +10,9 @@
 #   - determinism: order and duplicates never change a byte of the output;
 #   - one decision per input channel: stdin, a file, --batch and the
 #     github-output form all agree;
-#   - a truncated file list (the pulls/files API stops at 3000) selects FULL.
+#   - a truncated file list (the pulls/files API stops at 3000) selects FULL;
+#   - glibc-floor (the gating release-container build, pr.yml) is selected
+#     exactly when smoke-ubuntu is, in every case.
 # The history replay (every September PR push + the real failures) is
 # scripts/test-impact/replay-selector.sh, a separate step.
 #
@@ -48,7 +50,7 @@ failures = []
 # Every lane of the full PR pipeline, spelled out here rather than read from
 # the selector, so a lane silently dropped from the selector's universe fails.
 FULL = {
-    "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+    "diag", "glibc-floor", "license-gate", "lint", "lint-mem", "lsan-macos",
     "memwaste", "msan", "pkg-wrappers", "security-static",
     "shard-completeness", "smoke-mac", "smoke-ubuntu", "smoke-win",
     "tsan-arm", "tsan-mac", "tsan-x86", "unix-arm64", "unix-macos-intel",
@@ -106,6 +108,12 @@ for name, files, tier, full, lanes in cases:
         failures.append(f"{name}: lanes/reasons are not sorted")
     if full and not any(r.startswith("full:") for r in got["reasons"]):
         failures.append(f"{name}: full=true without a 'full:' reason")
+    # The release-container build gates whenever the production Linux binary
+    # can change -- the same condition that selects the Ubuntu smoke leg.
+    if ("glibc-floor" in got["lanes"]) != ("smoke-ubuntu" in got["lanes"]):
+        failures.append(f"{name}: glibc-floor must be selected exactly when smoke-ubuntu is, "
+                        f"got glibc-floor={'glibc-floor' in got['lanes']} "
+                        f"smoke-ubuntu={'smoke-ubuntu' in got['lanes']}")
 
 # 2. Determinism: shuffled, duplicated, CRLF-terminated input with blank lines
 #    is byte-identical to the canonical run.
