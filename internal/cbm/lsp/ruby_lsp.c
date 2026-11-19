@@ -426,16 +426,87 @@ static unsigned ruby_hash(const char *s) {
     return h;
 }
 
-/* Probe one of the shared table's hash indexes. `by_path` selects the key. */
+static unsigned ruby_hash_root_path(const char *root, const char *path) {
+    unsigned h = 2166136261u;
+    for (const char *s = root; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    h = (h ^ 0x1fu) * 16777619u;
+    for (const char *s = path; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+/* Package root of a file, from its module QN ("proj.activemodel.test.models.
+ * topic"): the QN prefix before the first directory named lib, app, test or
+ * spec ("proj.activemodel"). "" when no such directory exists or it sits
+ * directly under the project, so a single-package repository has one root.
+ * Derived from the QN alone, so a full build and the incremental route (which
+ * has only persisted defs) agree, with no file system access. */
+static const char *ruby_package_root(CBMArena *a, const char *module_qn) {
+    if (!module_qn)
+        return "";
+    const char *p = strchr(module_qn, '.'); /* skip the project segment */
+    while (p) {
+        const char *seg = p + 1;
+        const char *end = strchr(seg, '.');
+        if (!end)
+            break; /* the last segment is the file, not a directory */
+        size_t n = (size_t)(end - seg);
+        bool marker =
+            (n == 3 && strncmp(seg, "lib", 3) == 0) || (n == 3 && strncmp(seg, "app", 3) == 0) ||
+            (n == 4 && strncmp(seg, "test", 4) == 0) || (n == 4 && strncmp(seg, "spec", 4) == 0);
+        if (marker)
+            return p == strchr(module_qn, '.')
+                       ? ""
+                       : cbm_arena_strndup(a, module_qn, (size_t)(p - module_qn));
+        p = end;
+    }
+    return "";
+}
+
+/* Probe the QN index. */
 static const RubyClassInfo *ruby_shared_find(const CBMRubyCrossRegistry *sh, const int *slots,
-                                             const char *key, bool by_path) {
-    if (!sh || !slots || !key)
+                                             const char *qn) {
+    if (!sh || !slots || !qn)
         return NULL;
-    unsigned i = ruby_hash(key) & sh->slot_mask;
+    unsigned i = ruby_hash(qn) & sh->slot_mask;
     while (slots[i]) {
         CBM_LSP_WORK(1);
         const RubyClassInfo *c = &sh->classes[slots[i] - 1];
-        if (strcmp(by_path ? c->path : c->qn, key) == 0)
+        if (strcmp(c->qn, qn) == 0)
+            return c;
+        i = (i + 1) & sh->slot_mask;
+    }
+    return NULL;
+}
+
+/* The group head declared in `root` for `path`, or NULL. */
+static const RubyClassInfo *ruby_shared_find_root_path(const CBMRubyCrossRegistry *sh,
+                                                       const char *root, const char *path) {
+    if (!sh || !sh->by_path)
+        return NULL;
+    unsigned i = ruby_hash_root_path(root, path) & sh->slot_mask;
+    while (sh->by_path[i]) {
+        CBM_LSP_WORK(1);
+        const RubyClassInfo *c = &sh->classes[sh->by_path[i] - 1];
+        if (strcmp(c->root, root) == 0 && strcmp(c->path, path) == 0)
+            return c;
+        i = (i + 1) & sh->slot_mask;
+    }
+    return NULL;
+}
+
+/* The first group head with constant path `path` in any root; further roots
+ * chain through path_next. */
+static const RubyClassInfo *ruby_shared_find_path(const CBMRubyCrossRegistry *sh,
+                                                  const char *path) {
+    if (!sh || !sh->by_pp)
+        return NULL;
+    unsigned i = ruby_hash(path) & sh->slot_mask;
+    while (sh->by_pp[i]) {
+        CBM_LSP_WORK(1);
+        const RubyClassInfo *c = &sh->classes[sh->by_pp[i] - 1];
+        if (strcmp(c->path, path) == 0)
             return c;
         i = (i + 1) & sh->slot_mask;
     }
@@ -451,13 +522,13 @@ static const RubyClassInfo *ruby_class_by_qn(RubyLSPContext *ctx, const char *qn
         if (strcmp(ctx->classes[i].qn, qn) == 0)
             return &ctx->classes[i];
     }
-    return ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_qn : NULL, qn, false);
+    return ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_qn : NULL, qn);
 }
 
 /* The merged record for a class of the project table: the group head holding
  * every reopening's methods and the superclass. NULL when `qn` is not in it. */
 static const RubyClassInfo *ruby_shared_head(const CBMRubyCrossRegistry *sh, const char *qn) {
-    const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, qn, false);
+    const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, qn);
     return c && c->group_head ? &sh->classes[c->group_head - 1] : NULL;
 }
 
@@ -506,9 +577,17 @@ static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) 
         if (strcmp(ctx->classes[i].path, path) == 0)
             return ctx->classes[i].qn;
     }
+    /* The caller's own package root wins. Failing that, a constant declared
+     * in exactly one root resolves there; one declared under several roots,
+     * none of them the caller's, stays unresolved rather than landing on
+     * another package's same-named class. */
+    const CBMRubyCrossRegistry *sh = ctx->shared;
     const RubyClassInfo *c =
-        ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_path : NULL, path, true);
-    return c ? c->qn : NULL;
+        ruby_shared_find_root_path(sh, ctx->caller_root ? ctx->caller_root : "", path);
+    if (c)
+        return c->qn;
+    c = ruby_shared_find_path(sh, path);
+    return c && !c->path_next ? c->qn : NULL;
 }
 
 const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
@@ -669,7 +748,7 @@ static bool ruby_walk_seen(RubyLSPContext *ctx, RubyLookupWalk *w, const char *c
     }
     if (!mark) {
         const CBMRubyCrossRegistry *sh = ctx->shared;
-        const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, class_qn, false);
+        const RubyClassInfo *c = ruby_shared_find(sh, sh ? sh->by_qn : NULL, class_qn);
         if (!c)
             return false;
         RubySharedMark *m = ruby_shared_mark(ctx, (int)(c - sh->classes));
@@ -2021,12 +2100,12 @@ static const char *ruby_def_superclass_ref(CBMArena *arena, const CBMLSPDef *d) 
 }
 
 /* Insert entry `idx` (already stored in sh->classes) into one hash index. */
-static void ruby_shared_insert(CBMRubyCrossRegistry *sh, int *slots, int idx, bool by_path) {
-    const RubyClassInfo *c = &sh->classes[idx];
-    unsigned i = ruby_hash(by_path ? c->path : c->qn) & sh->slot_mask;
-    while (slots[i])
+/* Insert entry `idx` into the QN index. */
+static void ruby_shared_insert_qn(CBMRubyCrossRegistry *sh, int idx) {
+    unsigned i = ruby_hash(sh->classes[idx].qn) & sh->slot_mask;
+    while (sh->by_qn[i])
         i = (i + 1) & sh->slot_mask;
-    slots[i] = idx + 1;
+    sh->by_qn[i] = idx + 1;
 }
 
 typedef struct {
@@ -2107,18 +2186,21 @@ static bool ruby_build_shared_mixins(CBMRubyCrossRegistry *sh, CBMArena *arena, 
         mi->module_ref = tmp[i].ref;
         mi->kind = tmp[i].kind;
         ctx->nesting = body_nesting[tmp[i].cls];
+        ctx->caller_root = sh->classes[tmp[i].cls].root;
         mi->module_qn = ruby_resolve_constant(ctx, tmp[i].ref);
     }
     sh->mixin_count = n;
     return true;
 }
 
-/* Slot of `path` in the by-path index, or -1 when absent. */
-static int ruby_shared_path_slot(const CBMRubyCrossRegistry *sh, const char *path) {
-    unsigned i = ruby_hash(path) & sh->slot_mask;
+/* Slot of (root, path) in the by-path index, or -1 when absent. */
+static int ruby_shared_path_slot(const CBMRubyCrossRegistry *sh, const char *root,
+                                 const char *path) {
+    unsigned i = ruby_hash_root_path(root, path) & sh->slot_mask;
     while (sh->by_path[i]) {
         CBM_LSP_WORK(1);
-        if (strcmp(sh->classes[sh->by_path[i] - 1].path, path) == 0)
+        const RubyClassInfo *c = &sh->classes[sh->by_path[i] - 1];
+        if (strcmp(c->root, root) == 0 && strcmp(c->path, path) == 0)
             return (int)i;
         i = (i + 1) & sh->slot_mask;
     }
@@ -2157,6 +2239,7 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
     sh->slot_mask = slots - 1;
     sh->by_qn = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
     sh->by_path = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
+    sh->by_pp = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
     sh->classes = (RubyClassInfo *)cbm_arena_alloc(arena, (size_t)(max_classes ? max_classes : 1) *
                                                               sizeof(RubyClassInfo));
     const char **decl_nesting = (const char **)cbm_arena_alloc(
@@ -2167,11 +2250,12 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
     const char **body_nesting = (const char **)cbm_arena_alloc(
         arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
-    if (!sh->by_qn || !sh->by_path || !sh->classes || !decl_nesting || !decl_mixins ||
+    if (!sh->by_qn || !sh->by_path || !sh->by_pp || !sh->classes || !decl_nesting || !decl_mixins ||
         !body_nesting)
         return NULL;
     memset(sh->by_qn, 0, slots * sizeof(int));
     memset(sh->by_path, 0, slots * sizeof(int));
+    memset(sh->by_pp, 0, slots * sizeof(int));
 
     /* Ruby constants live in one global namespace, so every project class is
      * a resolution candidate. Pass A: one entry per declaration, and per
@@ -2187,13 +2271,14 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         const char *suffix = ruby_cross_class_suffix(d);
         if (!suffix)
             continue;
-        if (ruby_shared_find(sh, sh->by_qn, d->qualified_name, false))
+        if (ruby_shared_find(sh, sh->by_qn, d->qualified_name))
             continue; /* the same class body seen again — one entry per QN */
         const char *path = ruby_dotted(arena, suffix);
         int n = sh->class_count++;
         RubyClassInfo *ci = &sh->classes[n];
         memset(ci, 0, sizeof(*ci));
         ci->path = path;
+        ci->root = ruby_package_root(arena, d->def_module_qn);
         ci->qn = d->qualified_name;
         ci->is_module = strcmp(d->label, "Module") == 0;
         if (!ci->is_module)
@@ -2204,16 +2289,41 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         decl_nesting[n] = last ? cbm_arena_strndup(arena, suffix, (size_t)(last - suffix)) : "";
         decl_mixins[n] = d->mixin_refs;
         body_nesting[n] = suffix;
-        ruby_shared_insert(sh, sh->by_qn, n, false);
-        int slot = ruby_shared_path_slot(sh, path);
-        if (slot < 0)
-            ruby_shared_insert(sh, sh->by_path, n, true);
-        else if (strcmp(ci->qn, sh->classes[sh->by_path[slot] - 1].qn) < 0)
+        ruby_shared_insert_qn(sh, n);
+        int slot = ruby_shared_path_slot(sh, ci->root, path);
+        if (slot < 0) {
+            unsigned h = ruby_hash_root_path(ci->root, path) & sh->slot_mask;
+            while (sh->by_path[h])
+                h = (h + 1) & sh->slot_mask;
+            sh->by_path[h] = n + 1;
+        } else if (strcmp(ci->qn, sh->classes[sh->by_path[slot] - 1].qn) < 0)
             sh->by_path[slot] = n + 1;
     }
     for (int i = 0; i < sh->class_count; i++) {
         RubyClassInfo *ci = &sh->classes[i];
-        ci->group_head = sh->by_path[ruby_shared_path_slot(sh, ci->path)];
+        ci->group_head = sh->by_path[ruby_shared_path_slot(sh, ci->root, ci->path)];
+    }
+    /* Heads sharing a constant path across package roots, chained from one
+     * by_pp entry, so a lookup can tell "one root" from "several". */
+    for (int i = 0; i < sh->class_count; i++) {
+        if (sh->classes[i].group_head != i + 1)
+            continue;
+        unsigned h = ruby_hash(sh->classes[i].path) & sh->slot_mask;
+        bool placed = false;
+        while (sh->by_pp[h]) {
+            RubyClassInfo *first = &sh->classes[sh->by_pp[h] - 1];
+            if (strcmp(first->path, sh->classes[i].path) == 0) {
+                RubyClassInfo *tail = first;
+                while (tail->path_next)
+                    tail = &sh->classes[tail->path_next - 1];
+                tail->path_next = i + 1;
+                placed = true;
+                break;
+            }
+            h = (h + 1) & sh->slot_mask;
+        }
+        if (!placed)
+            sh->by_pp[h] = i + 1;
     }
 
     /* Pass B: methods, in a fixed QN order so a name defined by two reopenings
@@ -2270,6 +2380,7 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         if (!ci->superclass_ref)
             continue;
         ctx.nesting = decl_nesting[i];
+        ctx.caller_root = ci->root;
         ci->superclass_qn = ruby_resolve_constant(&ctx, ci->superclass_ref);
     }
     /* The merged record's superclass comes from the smallest-QN declaration
@@ -2312,6 +2423,7 @@ void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, i
     RubyLSPContext ctx;
     ruby_lsp_init(&ctx, arena, source, source_len, &shared->reg, module_qn, out);
     ctx.shared = shared;
+    ctx.caller_root = ruby_package_root(arena, module_qn);
     ctx.import_names = import_names;
     ctx.import_qns = import_qns;
     ctx.import_count = import_count;

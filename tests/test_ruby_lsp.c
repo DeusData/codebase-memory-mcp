@@ -1817,10 +1817,12 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     char *snap_classes = (char *)malloc(classes_bytes);
     char *snap_by_qn = (char *)malloc(slots_bytes);
     char *snap_by_path = (char *)malloc(slots_bytes);
-    ASSERT(snap_classes && snap_by_qn && snap_by_path);
+    char *snap_by_pp = (char *)malloc(slots_bytes);
+    ASSERT(snap_classes && snap_by_qn && snap_by_path && snap_by_pp);
     memcpy(snap_classes, sh->classes, classes_bytes);
     memcpy(snap_by_qn, sh->by_qn, slots_bytes);
     memcpy(snap_by_path, sh->by_path, slots_bytes);
+    memcpy(snap_by_pp, sh->by_pp, slots_bytes);
 
     const char *src1 =
         "class One\n  def run\n    c = Child.new\n    c.shared_m\n    c.own_m\n  end\nend\n";
@@ -1851,7 +1853,9 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before &&
                      memcmp(snap_classes, sh->classes, classes_bytes) == 0 &&
                      memcmp(snap_by_qn, sh->by_qn, slots_bytes) == 0 &&
-                     memcmp(snap_by_path, sh->by_path, slots_bytes) == 0;
+                     memcmp(snap_by_path, sh->by_path, slots_bytes) == 0 &&
+                     memcmp(snap_by_pp, sh->by_pp, slots_bytes) == 0;
+    free(snap_by_pp);
     free(snap_classes);
     free(snap_by_qn);
     free(snap_by_path);
@@ -1992,6 +1996,71 @@ static bool rubylsp_order_edges(bool reversed, bool *ctor, bool *label, bool *du
         out_dump(&out);
     cbm_arena_destroy(&arena);
     return true;
+}
+
+TEST(rubylsp_cross_same_named_classes_stay_in_their_package) {
+    /* Two packages of one repository each declare their own Topic. A call
+     * from inside a package reaches that package's Topic, never the other's;
+     * a caller in a third package, where the constant is declared under
+     * several roots and none is its own, resolves nothing; a constant
+     * declared under one root only still resolves from anywhere. */
+    CBMLSPDef defs[7];
+    cross_def(&defs[0], "proj.alpha.test.models.topic.Topic", "Topic", "Class",
+              "proj.alpha.test.models.topic", NULL, NULL);
+    cross_def(&defs[1], "proj.alpha.test.models.topic.Topic.hello", "hello", "Method",
+              "proj.alpha.test.models.topic", "proj.alpha.test.models.topic.Topic", NULL);
+    cross_def(&defs[2], "proj.beta.test.models.topic.Topic", "Topic", "Class",
+              "proj.beta.test.models.topic", NULL, NULL);
+    cross_def(&defs[3], "proj.beta.test.models.topic.Topic.hello", "hello", "Method",
+              "proj.beta.test.models.topic", "proj.beta.test.models.topic.Topic", NULL);
+    cross_def(&defs[4], "proj.beta.lib.only.Only", "Only", "Class", "proj.beta.lib.only", NULL,
+              NULL);
+    cross_def(&defs[5], "proj.beta.lib.only.Only.ping", "ping", "Method", "proj.beta.lib.only",
+              "proj.beta.lib.only.Only", NULL);
+    cross_def(&defs[6], "proj.alpha.lib.x.X", "X", "Class", "proj.alpha.lib.x", NULL, NULL);
+
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, 7);
+    ASSERT(sh != NULL);
+
+    const char *src =
+        "class Caller\n  def run\n    Topic.new.hello\n    Only.new.ping\n  end\nend\n";
+    const char *mods[3] = {"proj.alpha.test.cases.caller", "proj.beta.test.cases.caller",
+                           "proj.gamma.test.cases.caller"};
+    const char *callers[3] = {"proj.alpha.test.cases.caller.Caller.run",
+                              "proj.beta.test.cases.caller.Caller.run",
+                              "proj.gamma.test.cases.caller.Caller.run"};
+    bool alpha_ok = false;
+    bool beta_ok = false;
+    bool gamma_none = false;
+    bool only_all = true;
+    for (int i = 0; i < 3; i++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMResolvedCallArray o;
+        memset(&o, 0, sizeof(o));
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), mods[i], sh, NULL, NULL, 0,
+                                             NULL, &o);
+        bool alpha = out_has(&o, callers[i], "proj.alpha.test.models.topic.Topic.hello");
+        bool beta = out_has(&o, callers[i], "proj.beta.test.models.topic.Topic.hello");
+        if (i == 0)
+            alpha_ok = alpha && !beta;
+        else if (i == 1)
+            beta_ok = beta && !alpha;
+        else
+            gamma_none = !alpha && !beta;
+        only_all = only_all && out_has(&o, callers[i], "proj.beta.lib.only.Only.ping");
+        if (!(only_all && (i != 0 || alpha_ok)))
+            out_dump(&o);
+        cbm_arena_destroy(&a);
+    }
+    cbm_arena_destroy(&build);
+    ASSERT(alpha_ok);
+    ASSERT(beta_ok);
+    ASSERT(gamma_none);
+    ASSERT(only_all);
+    PASS();
 }
 
 TEST(rubylsp_cross_registry_is_def_order_independent) {
@@ -2245,6 +2314,7 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_compact_class_name);
     RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
     RUN_TEST(rubylsp_cross_reopened_class_work_is_bounded);
+    RUN_TEST(rubylsp_cross_same_named_classes_stay_in_their_package);
     RUN_TEST(rubylsp_cross_registry_is_def_order_independent);
     RUN_TEST(rubylsp_extractor_flags_singleton_methods_and_mixins);
     RUN_TEST(rubylsp_cross_singleton_and_instance_do_not_shadow);

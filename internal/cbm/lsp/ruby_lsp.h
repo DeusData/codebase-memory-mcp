@@ -42,6 +42,13 @@ typedef struct {
      * index + 1 (the entry's own index + 1 for the head itself); 0 in a
      * per-file table. */
     int group_head;
+    /* Shared table only: the package root this declaration sits in ("" when
+     * it has none; see ruby_package_root), and, on a head, the next head
+     * (table index + 1) with the same constant path in another root. Two
+     * packages of one repository can each declare their own `Topic`; the
+     * merged record is per (root, path) so they are never pooled. */
+    const char *root;
+    int path_next;
     /* Head entries only: this constant's include/prepend/extend records, a
      * range of the registry's `mixins` array (all reopenings, in declaring-QN
      * then source order). */
@@ -108,6 +115,9 @@ typedef struct {
      * resolution). NULL for per-file extraction. Consulted after this file's
      * own table, so a class declared here always wins. */
     const struct CBMRubyCrossRegistry *shared;
+    /* Package root of the file being resolved ("" = none); picks which
+     * root's classes a shared-table constant lookup prefers. */
+    const char *caller_root;
 
     /* Class/module table (pass 1) — this file's own declarations only. */
     RubyClassInfo *classes;
@@ -217,7 +227,8 @@ typedef struct CBMRubyCrossRegistry {
     /* Open-addressing hash indexes over `classes` (values are index + 1, 0 =
      * empty slot): by QN, and by dotted constant path (group head only). */
     int *by_qn;
-    int *by_path;
+    int *by_path; /* (package root, path) -> group head */
+    int *by_pp;   /* path alone -> first head; the rest chain via path_next */
     unsigned slot_mask;
     RubyMixinInfo *mixins; /* owner_qn = the merged record's QN; grouped by head */
     int mixin_count;
