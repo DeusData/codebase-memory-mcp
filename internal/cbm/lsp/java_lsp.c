@@ -4854,6 +4854,14 @@ static void java_own_supertypes(JavaLSPContext *ctx, CBMTypeRegistry *overlay,
             if (qn && cbm_registry_lookup_type(ctx->registry, qn) &&
                 !java_type_ambiguous(ctx->registry, qn)) {
                 slot->embedded_types[j] = qn;
+            } else {
+                /* No registered type: what the file's scope names outside the
+                 * project (an import's target, a java.lang name) or the
+                 * spelling as the shared registrar keeps it, never main's
+                 * same-package guess `module_qn.Name`, which names no type. */
+                bool outside =
+                    qn && strchr(qn, '.') && !cbm_registry_lookup_type(ctx->registry, qn);
+                slot->embedded_types[j] = outside ? qn : spelled;
             }
         }
     }

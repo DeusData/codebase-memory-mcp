@@ -542,6 +542,26 @@ static const jts_file_t JTS_FILES[] = {
      "        System.out.println(s.deep30() + \" \" + s.field30());\n"
      "    }\n"
      "}\n"},
+    /* 28, 29: a class of the calling file whose supertype is a library type
+     * (org.lib28.Life28 through a single-type import, org.lib29.Base29
+     * through an on-demand import; compiled for javac, never indexed). javac:
+     * Help28 is sv.Help28 in both (neither library type declares a member
+     * type of that name); the call runs sv.Help28.ping28. */
+    {"src/main/java/sv/Svc28.java",
+     "package sv;\n\n"
+     "import org.lib28.Life28;\n\n"
+     "public class Svc28 implements Life28 {\n"
+     "    String imported28() { Help28 h = new Help28(); return h.ping28(); }\n"
+     "    public static void main(String[] a) {\n"
+     "        System.out.println(new Svc28().imported28() + \" \" + new Svc29().onDemand29());\n"
+     "    }\n"
+     "}\n"},
+    {"src/main/java/sv/Svc29.java",
+     "package sv;\n\n"
+     "import org.lib29.*;\n\n"
+     "public class Svc29 extends Base29 {\n"
+     "    String onDemand29() { Help28 h = new Help28(); return h.ping28(); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -897,6 +917,16 @@ static int jts_check_qualified_interface(jts_index_t *ix) {
 static int jts_check_bare_library_supertype(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "deep30", "ping28", "sv.Help28.ping28");
     ok &= jts_expect_engine(ix, "field30", "ping28", "sv.Help28.ping28");
+    return ok;
+}
+
+/* 28, 29: a library supertype of the calling file's class (an import's
+ * target, a spelling of an on-demand import's package) is no project type
+ * the registry misses: the answer stands (rule ii). Main's same-package guess
+ * for it (`<project>.<path>.Life28`) named no type and withheld the answer. */
+static int jts_check_library_supertype(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "imported28", "ping28", "sv.Help28.ping28");
+    ok &= jts_expect_engine(ix, "onDemand29", "ping28", "sv.Help28.ping28");
     return ok;
 }
 
@@ -1523,6 +1553,7 @@ JTS_ROUTES(inherited_project_member, jts_check_inherited_project_member)
 JTS_ROUTES(type_param, jts_check_type_param)
 JTS_ROUTES(qualified_interface, jts_check_qualified_interface)
 JTS_ROUTES(bare_library_supertype, jts_check_bare_library_supertype)
+JTS_ROUTES(library_supertype, jts_check_library_supertype)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1563,6 +1594,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_qualified_interface_parallel);
     RUN_TEST(java_type_scope_bare_library_supertype_sequential);
     RUN_TEST(java_type_scope_bare_library_supertype_parallel);
+    RUN_TEST(java_type_scope_library_supertype_sequential);
+    RUN_TEST(java_type_scope_library_supertype_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
