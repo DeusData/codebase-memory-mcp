@@ -1433,8 +1433,12 @@ func TestVerifyCandidateWaitsForResult(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				done <- verifyCandidateWithCommand("candidate", func(ctx context.Context, path string, args ...string) *exec.Cmd {
-					if _, deadline := ctx.Deadline(); deadline {
-						t.Error("candidate verification must wait for its result, without a deadline")
+					// The bound must exist (a stuck candidate releases the cache
+					// lock) and be generous: at least two minutes, far above the
+					// old 15 s that cut off slow hosts (#2877).
+					if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < 2*time.Minute {
+						t.Errorf("candidate verification deadline = %v (set %v), want a bound of minutes",
+							deadline, ok)
 					}
 					if path != "candidate" || !reflect.DeepEqual(args, []string{"--version"}) {
 						t.Errorf("candidate command = %q %q", path, args)

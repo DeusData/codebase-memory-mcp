@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from test_daemon_stability import read_cleanup_trace
+from test_daemon_stability import SetupFailure, read_cleanup_trace, trace_deadline_failure
 
 
 class WorkerTraceTest(unittest.TestCase):
@@ -60,6 +60,32 @@ class WorkerTraceTest(unittest.TestCase):
             with mock.patch("builtins.open", side_effect=read):
                 with self.assertRaises(PermissionError):
                     read_cleanup_trace(stderr, cache, {})
+
+    def test_worker_log_still_unreadable_at_deadline_is_red(self):
+        for winerror in (5, 32):
+            with self.subTest(winerror=winerror), tempfile.TemporaryDirectory() as cache:
+                Path(cache, "logs").mkdir()
+                worker = str(Path(cache, "logs", ".worker-log-fixture"))
+                stderr = str(Path(cache, "stderr"))
+                Path(stderr).write_bytes(b"cli")
+                Path(worker).write_bytes(b"worker")
+                denied = PermissionError(13, "Permission denied", worker)
+                denied.winerror = winerror
+                real_open = open
+
+                def read(path, *args, **kwargs):
+                    if path == worker:
+                        raise denied
+                    return real_open(path, *args, **kwargs)
+
+                with mock.patch("builtins.open", side_effect=read):
+                    trace = read_cleanup_trace(stderr, cache, {})
+                with mock.patch("builtins.print"):
+                    self.assertIs(trace_deadline_failure(trace, "setup: "), False)
+
+    def test_readable_trace_at_deadline_is_a_setup_failure(self):
+        with self.assertRaises(SetupFailure):
+            trace_deadline_failure(b"cli\nworker", "setup: ")
 
 
 if __name__ == "__main__":

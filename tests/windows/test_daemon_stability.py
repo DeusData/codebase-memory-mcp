@@ -520,6 +520,9 @@ def section_churn_stability(binary, work):
         kill_pid(daemon_pid)
 
 
+UNREADABLE_TRACE = b"worker trace temporarily unreadable"
+
+
 def read_cleanup_trace(err_path, cache, traces):
     # The supervisor removes successful worker logs while this guard polls them.
     paths = [err_path]
@@ -539,8 +542,17 @@ def read_cleanup_trace(err_path, cache, traces):
             # Keep the last trace and retry on the next poll; retain diagnostics.
             if path == err_path or getattr(error, "winerror", None) not in (5, 32):
                 raise
-            unavailable.append(("worker trace temporarily unreadable: " + str(error)).encode())
+            unavailable.append(UNREADABLE_TRACE + (": " + str(error)).encode())
     return b"\n".join(list(traces.values()) + unavailable)
+
+
+def trace_deadline_failure(trace, setup_message):
+    """At a polling deadline: a worker log that is still unreadable is RED (the
+    guard cannot see the work it checks); anything else is a setup failure."""
+    if UNREADABLE_TRACE in trace:
+        print("RED: a worker log was still unreadable at the deadline:\n" + excerpt(trace))
+        return False
+    raise SetupFailure(setup_message + excerpt(trace))
 
 
 def section_local_cleanup_waits_for_startup_gate(binary, work):
@@ -603,7 +615,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
                                        excerpt(trace))
                 time.sleep(0.01)
             if not locked:
-                raise SetupFailure("index never entered local work:\n" + excerpt(trace))
+                return trace_deadline_failure(trace, "index never entered local work:\n")
             while time.monotonic() < deadline:
                 trace = read_cleanup_trace(err_path, cache, traces)
                 if b"Completed index_repository (" in trace:
@@ -614,7 +626,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
                     return False
                 time.sleep(0.01)
             else:
-                raise SetupFailure("CLI did not finish its work:\n" + excerpt(trace))
+                return trace_deadline_failure(trace, "CLI did not finish its work:\n")
             # The outer CLI flushes this completion message after receiving
             # the worker result and closing its daemon session, immediately
             # before local cleanup. pipeline.done is too early: worker result
