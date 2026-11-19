@@ -7902,14 +7902,18 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         return NULL;
     }
 
-    char dbpath[CLI_BUF_1K];
-    snprintf(dbpath, sizeof(dbpath), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+    char dbpath[4096];
+    int dbpath_length = snprintf(dbpath, sizeof(dbpath), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+    if (dbpath_length < 0 || (size_t)dbpath_length >= sizeof(dbpath)) {
+        return NULL;
+    }
 
     /* Ensure directory exists */
     mkdirp(cache_dir, DIR_PERMS);
 
     sqlite3 *db = NULL;
-    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+    if (cbm_runtime_settings_open_db(dbpath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
+        SQLITE_OK) {
         if (db) {
             sqlite3_close(db);
         }

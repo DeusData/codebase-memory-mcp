@@ -55,6 +55,10 @@
 #define CBM_DAEMON_CONTROL_REQUEST_SIZE 65U
 #define CBM_DAEMON_CONTROL_CLIENT_CAP 8U
 #define CBM_DAEMON_STATUS_RESPONSE_SIZE 121U
+#define CBM_DAEMON_STATUS_CACHE_PATH_SIZE 4096U
+/* Separate operation: the frozen STATUS response remains exactly 121 bytes. */
+#define CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE \
+    (CBM_DAEMON_STATUS_RESPONSE_SIZE + CBM_DAEMON_STATUS_CACHE_PATH_SIZE)
 #define CBM_DAEMON_STOP_RESPONSE_SIZE 40U
 #define CBM_DAEMON_RUNTIME_PROJECT_KEY_MAX 4096U
 #define CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX (CBM_DAEMON_MAX_FRAME_SIZE - 16U)
@@ -87,6 +91,9 @@ typedef enum {
      * otherwise begins the normal stopping sequence — including for a
      * PERMANENT generation, which this op and process kill alone may end. */
     CBM_DAEMON_RUNTIME_OP_STOP = 11,
+    /* Authenticated read-only STATUS plus a NUL-terminated canonical cache
+     * path in a fixed 4096-byte suffix. Empty means unavailable. */
+    CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS = 12,
 } cbm_daemon_runtime_operation_t;
 
 typedef enum {
@@ -180,6 +187,8 @@ typedef struct {
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_build_identity_t identity;
+    /* Optional canonical path, copied at startup; never persisted in logs. */
+    const char *cache_directory;
     const char *conflict_log_path;
     size_t conflict_log_cap_bytes;
     /* Hard cap on accepted connection threads, including sockets that have not
@@ -279,6 +288,11 @@ typedef struct {
 } cbm_daemon_runtime_status_t;
 
 typedef struct {
+    cbm_daemon_runtime_status_t status;
+    char cache_directory[CBM_DAEMON_STATUS_CACHE_PATH_SIZE];
+} cbm_daemon_runtime_status_details_t;
+
+typedef struct {
     bool accepted; /* stopping was initiated */
     bool busy;     /* refused: committed clients hold the daemon */
     uint16_t committed_clients;
@@ -292,6 +306,13 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
                                        const cbm_daemon_build_identity_t *identity,
                                        uint32_t timeout_ms,
                                        cbm_daemon_runtime_status_t *status_out);
+
+/* Prefer STATUS_DETAILS, then fall back to legacy STATUS within one timeout.
+ * A successful legacy reply leaves cache_directory empty. */
+bool cbm_daemon_runtime_request_status_details(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                               const cbm_daemon_build_identity_t *identity,
+                                               uint32_t timeout_ms,
+                                               cbm_daemon_runtime_status_details_t *details_out);
 
 /* One-shot authenticated stop request. Refuses while committed clients exist
  * (result_out lists their pids); otherwise begins the stopping sequence, for

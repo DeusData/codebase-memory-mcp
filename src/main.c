@@ -27,6 +27,8 @@
 #include "daemon/application.h"
 #include "daemon/bootstrap.h"
 #include "daemon/frontend.h"
+#include "daemon/runtime.h"
+#include "daemon/service.h"
 #include "daemon/host.h"
 #include "daemon/ipc.h"
 #include "daemon/project_lock.h"
@@ -1844,6 +1846,124 @@ static void main_conflict_remedy_probe(const cbm_daemon_ipc_endpoint_t *endpoint
     }
 }
 
+static bool main_cache_path_matches(const char *path, const char *expected_fingerprint) {
+    if (!path || !path[0] || !expected_fingerprint) {
+        return false;
+    }
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    cbm_sha256_hex(path, strlen(path), fingerprint);
+    return strcmp(fingerprint, expected_fingerprint) == 0;
+}
+
+/* Stream the quoted path: two maximum-length roots must not pass through
+ * the frozen 512-byte rendezvous message or a truncating concatenation. */
+static void main_print_cache_path(const char *path) {
+    enum { ASCII_SPACE = 0x20, ASCII_DELETE = 0x7f };
+    (void)fputc('"', stderr);
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        switch (*p) {
+        case '"':
+        case '\\':
+            (void)fputc('\\', stderr);
+            (void)fputc(*p, stderr);
+            break;
+        case '\n':
+            (void)fputs("\\n", stderr);
+            break;
+        case '\r':
+            (void)fputs("\\r", stderr);
+            break;
+        case '\t':
+            (void)fputs("\\t", stderr);
+            break;
+        case '\b':
+            (void)fputs("\\b", stderr);
+            break;
+        case '\f':
+            (void)fputs("\\f", stderr);
+            break;
+        default:
+            if (*p < ASCII_SPACE || *p == ASCII_DELETE) {
+                (void)fprintf(stderr, "\\u%04x", (unsigned)*p);
+            } else {
+                (void)fputc(*p, stderr);
+            }
+        }
+    }
+    (void)fputc('"', stderr);
+}
+
+/* Client-only diagnostics: cohort records and durable logs retain hashes.
+ * A daemon may have turned over since rejection; prove the returned path
+ * belongs to the rejected cache/build before attributing it to that conflict. */
+static bool main_report_cache_conflict(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       const cbm_daemon_conflict_t *conflict) {
+    if (conflict->status != CBM_DAEMON_HELLO_CACHE_CONFLICT) {
+        return false;
+    }
+    char requested[MAIN_PATH_CAP] = "";
+    const char *cache = cbm_resolve_cache_dir();
+    if (cache) {
+        (void)snprintf(requested, sizeof(requested), "%s", cache);
+    }
+    cbm_daemon_runtime_status_details_t details;
+    bool known = cbm_daemon_runtime_request_status_details(
+        endpoint, identity, MAIN_CONFLICT_STATUS_PROBE_TIMEOUT_MS, &details);
+    bool paths_known =
+        known &&
+        strcmp(details.status.build_fingerprint, conflict->active_build_fingerprint) == 0 &&
+        main_cache_path_matches(details.cache_directory, conflict->active_cache_fingerprint) &&
+        main_cache_path_matches(requested, conflict->requested_cache_fingerprint);
+    if (paths_known) {
+        (void)fputs("codebase-memory-mcp: CBM could not start because the active account daemon "
+                    "uses a different cache directory.\n  requested cache: ",
+                    stderr);
+        main_print_cache_path(requested);
+        (void)fputs("\n  daemon cache: ", stderr);
+        main_print_cache_path(details.cache_directory);
+        (void)fputs("\nClose all CBM sessions and commands, then retry with one consistent "
+                    "CBM_CACHE_DIR.",
+                    stderr);
+    } else {
+        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+        if (!cbm_daemon_conflict_format(conflict, message, sizeof(message))) {
+            return false;
+        }
+        (void)fprintf(stderr, "codebase-memory-mcp: %s Cache paths unavailable or unverified.",
+                      message);
+    }
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE];
+    if (cbm_daemon_conflict_remedy_format(known ? &details.status : NULL, remedy, sizeof(remedy))) {
+        (void)fprintf(stderr, " %s", remedy);
+    }
+    (void)fputc('\n', stderr);
+    return true;
+}
+
+static void main_report_cohort_failure(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       cbm_version_cohort_status_t status,
+                                       const cbm_daemon_conflict_t *conflict, const char *fallback,
+                                       bool probe) {
+    char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+    bool formatted = status == CBM_VERSION_COHORT_CONFLICT &&
+                     cbm_daemon_conflict_format(conflict, message, sizeof(message));
+    char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE] = "";
+    if (status == CBM_VERSION_COHORT_CONFLICT) {
+        (void)cbm_version_cohort_log_conflict(conflict);
+        /* Hooks fail open on a tight budget; they skip both probes. */
+        if (probe) {
+            if (main_report_cache_conflict(endpoint, identity, conflict)) {
+                return;
+            }
+            main_conflict_remedy_probe(endpoint, identity, NULL, remedy, sizeof(remedy));
+        }
+    }
+    (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n", formatted ? message : fallback,
+                  remedy[0] ? " " : "", remedy);
+}
+
 /* Client bootstrap with the upgrade policy: a CONFLICT against a PERMANENT
  * daemon of a strictly OLDER release is resolved by draining that daemon
  * (the same authenticated path install/update use) and retrying once. A
@@ -3009,20 +3129,11 @@ int main(int argc, char **argv) {
                                                    main_deadline_after(MAIN_STARTUP_TIMEOUT_MS),
                                                    &cohort_lease, &cohort_conflict);
         if (cohort_status != CBM_VERSION_COHORT_OK) {
-            char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
-            bool formatted = cohort_status == CBM_VERSION_COHORT_CONFLICT &&
-                             cbm_daemon_conflict_format(&cohort_conflict, message, sizeof(message));
-            char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE] = "";
-            if (cohort_status == CBM_VERSION_COHORT_CONFLICT) {
-                (void)cbm_version_cohort_log_conflict(&cohort_conflict);
-                main_conflict_remedy_probe(local_endpoint, &local_identity, NULL, remedy,
-                                           sizeof(remedy));
-            }
-            (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
-                          formatted ? message
-                                    : "CLI exact-build admission could not be verified; retry "
-                                      "after active CBM operations exit",
-                          remedy[0] ? " " : "", remedy);
+            main_report_cohort_failure(local_endpoint, &local_identity, cohort_status,
+                                       &cohort_conflict,
+                                       "CLI exact-build admission could not be verified; retry "
+                                       "after active CBM operations exit",
+                                       true);
             goto local_cli_cleanup;
         }
         main_local_maintenance_context_init(&maintenance_context);
@@ -3341,21 +3452,9 @@ int main(int argc, char **argv) {
                                          &client_cohort_lease, &client_cohort_conflict)
             : CBM_VERSION_COHORT_IO;
     if (client_cohort_status != CBM_VERSION_COHORT_OK) {
-        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
-        bool formatted =
-            client_cohort_status == CBM_VERSION_COHORT_CONFLICT &&
-            cbm_daemon_conflict_format(&client_cohort_conflict, message, sizeof(message));
-        char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE] = "";
-        if (client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
-            (void)cbm_version_cohort_log_conflict(&client_cohort_conflict);
-            /* Hooks fail open on a tight budget; they skip the extra probe. */
-            if (role != CBM_DAEMON_PROCESS_HOOK_CLIENT) {
-                main_conflict_remedy_probe(endpoint, &identity, NULL, remedy, sizeof(remedy));
-            }
-        }
-        (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
-                      formatted ? message : "client exact-build admission failed",
-                      remedy[0] ? " " : "", remedy);
+        main_report_cohort_failure(endpoint, &identity, client_cohort_status,
+                                   &client_cohort_conflict, "client exact-build admission failed",
+                                   role != CBM_DAEMON_PROCESS_HOOK_CLIENT);
         if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             main_hook_report_conflicted_daemon(hook_dialect);
