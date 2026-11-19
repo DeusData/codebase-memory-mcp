@@ -3458,7 +3458,7 @@ static bool pxc_java_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     CBMJavaProjectPackages packages = {.declared = pxc_package_declared, .ud = f->packages};
     cbm_run_java_lsp_cross_packages(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
                                     w->def_count, locals, qns, n, f->result->cached_tree,
-                                    f->packages ? &packages : NULL, w->out);
+                                    f->packages ? &packages : NULL, f->result, w->out);
     pxc_java_one_answer_per_call(f, w);
     return true;
 }

@@ -1010,6 +1010,68 @@ TEST(java_type_scope_incremental_import_edit) {
     PASS();
 }
 
+/* A one-file edit (`append` added at the end of `rel`) through the
+ * incremental route: the repaired graph's engine edges are a fresh full
+ * index's of the edited tree, and the inherited project member types still
+ * answer (javac: Right24 / Right25). */
+static bool jts_incremental_append(const char *rel, const char *append) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_jtsa_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return false;
+    }
+    char repo[512];
+    char inc_db[512];
+    char full_db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    jts_write_fixture(repo, 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    bool ok = jts_pipeline(repo, inc_db, NULL);
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", repo, rel);
+    char *text = jts_read_file(path);
+    ok = ok && text;
+    if (text) {
+        char edited[8192];
+        snprintf(edited, sizeof(edited), "%s%s", text, append);
+        th_write_file(path, edited);
+    }
+    free(text);
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    ok = ok && jts_pipeline(repo, inc_db, &route) && jts_pipeline(repo, full_db, NULL);
+    printf("\n  %s: incremental route %d\n", rel, (int)route);
+    jts_index_t inc;
+    jts_index_t full;
+    bool opened = jts_open(&inc, inc_db) && jts_open(&full, full_db);
+    char *a = opened ? jts_engine_edges(&inc) : NULL;
+    char *b = opened ? jts_engine_edges(&full) : NULL;
+    bool same = a && b && strcmp(a, b) == 0;
+    if (!same) {
+        printf("\n  incremental:\n%s\n  full:\n%s\n", a ? a : "(none)", b ? b : "(none)");
+    }
+    ok = ok && same && opened && jts_check_inherited_project_member(&inc);
+    free(a);
+    free(b);
+    sqlite3_close(inc.db);
+    sqlite3_close(full.db);
+    th_cleanup(tmp);
+    return ok;
+}
+
+/* The review's edit: a newline appended to the subclass's file. */
+TEST(java_type_scope_incremental_inherited_member) {
+    ASSERT_TRUE(jts_incremental_append("src/main/java/msub/Sub24.java", "\n"));
+    PASS();
+}
+
+/* The supertype's own file is the edited one. */
+TEST(java_type_scope_incremental_supertype_edit) {
+    ASSERT_TRUE(jts_incremental_append("src/main/java/mbase/Base24.java", "\n"));
+    PASS();
+}
+
 /* Every CALLS edge out of user/Main.java, one sorted line each, the project
  * prefix dropped. */
 static char *jts_main_edges(jts_index_t *ix) {
@@ -1455,6 +1517,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
+    RUN_TEST(java_type_scope_incremental_inherited_member);
+    RUN_TEST(java_type_scope_incremental_supertype_edit);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);

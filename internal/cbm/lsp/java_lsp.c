@@ -2277,6 +2277,9 @@ static bool java_receiver_is_external(JavaLSPContext *ctx, const char *recv_qn) 
     if ((!base && !(packages && packages->declared)) || !recv_qn ||
         !islower((unsigned char)recv_qn[0]))
         return false;
+    if (packages && packages->declared) {
+        base = NULL; /* the run's package table judges (a closure's registry is partial) */
+    }
     const char *type = NULL;
     for (const char *p = recv_qn; (p = strchr(p, '.')) != NULL; p++) {
         if (isupper((unsigned char)p[1])) {
@@ -4890,14 +4893,15 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
     cbm_run_java_lsp_cross_packages(arena, source, source_len, module_qn, defs, def_count,
-                                    import_names, import_qns, import_count, cached_tree, NULL, out);
+                                    import_names, import_qns, import_count, cached_tree, NULL, NULL,
+                                    out);
 }
 
 void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int source_len,
                                      const char *module_qn, CBMLSPDef *defs, int def_count,
                                      const char **import_names, const char **import_qns,
                                      int import_count, TSTree *cached_tree,
-                                     const CBMJavaProjectPackages *packages,
+                                     const CBMJavaProjectPackages *packages, CBMFileResult *result,
                                      CBMResolvedCallArray *out) {
     if (!arena || !source)
         return;
@@ -4924,6 +4928,13 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
     g_java_reg_packages = NULL;
     cbm_registry_finalize_into(&reg, &idx_arena);
 
+    /* The calling file's own types and their supertypes in an overlay, as the
+     * shared-registry run registers them (its enclosing classes carry the
+     * graph QNs the walk starts from). */
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, arena);
+    overlay.fallback = &reg;
+
     /* Parse if needed. */
     TSTree *tree = cached_tree;
     bool owns_tree = false;
@@ -4941,14 +4952,23 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
     TSNode root = ts_tree_root_node(tree);
 
     JavaLSPContext ctx;
-    java_lsp_init(&ctx, arena, source, source_len, &reg, NULL, module_qn, out);
+    java_lsp_init(&ctx, arena, source, source_len, result ? &overlay : &reg, NULL, module_qn, out);
     ctx.project_packages = packages;
+    if (result) {
+        overlay.tail_arena = &idx_arena;
+        register_local_func_or_type_from_file(&ctx, &overlay, result);
+        cbm_registry_finalize_into(&overlay, &idx_arena);
+    }
 
     /* The calling file's verified import identities. */
     for (int i = 0; i < import_count; i++) {
         if (!import_names[i] || !import_qns[i])
             continue;
         java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_IDENTITY);
+    }
+    if (result) {
+        java_lsp_scan_imports(&ctx, root);
+        java_own_supertypes(&ctx, &overlay, result);
     }
 
     ctx.cross_run = true;

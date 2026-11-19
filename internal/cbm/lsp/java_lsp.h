@@ -220,7 +220,7 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
                                      const char *module_qn, CBMLSPDef *defs, int def_count,
                                      const char **import_names, const char **import_qns,
                                      int import_count, TSTree *cached_tree,
-                                     const CBMJavaProjectPackages *packages,
+                                     const CBMJavaProjectPackages *packages, CBMFileResult *result,
                                      CBMResolvedCallArray *out);
 
 /* Engine answers of cross runs that rest on a simple type name resolved
