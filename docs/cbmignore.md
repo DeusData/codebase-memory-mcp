@@ -75,8 +75,20 @@ For directories:
   suffix instead: Laravel's compiled Blade view cache
   `storage/framework/views/` (at any depth) is skipped even without
   Laravel's stock `.gitignore` there, while other `views/` folders stay
-  indexed. A `.cbmignore` negation
-  (for example `!target/`) can un-skip these directories, except the
+  indexed. Two names need more than the name: a folder called `env` is
+  skipped only when it is a Python environment (it holds `pyvenv.cfg`,
+  `bin/activate`, `Scripts/activate` or `conda-meta/history`, matched by
+  exact name), and `deploy/` and `deployed/` are walked for their
+  deployment and configuration files only. Kept there: Makefile, CMake,
+  YAML, TOML, JSON, INI, Dockerfile, Properties, XML, JSON5, Jsonnet,
+  Jinja2, Kustomize, Go templates, HCL (Terraform, OpenTofu, Packer), Bicep,
+  Nix, Puppet, Pkl, `.env` files, and Bash, Zsh, Fish and PowerShell
+  scripts. Skipped there: program source of every other language, SQL,
+  Groovy, and package manifests (`package.json`, `go.mod`, `Cargo.toml`,
+  `pyproject.toml`, `pom.xml`, ...). A large generated folder under these
+  names costs what it costs under any other name; exclude one with a
+  `.cbmignore` line such as `deploy/generated/`. A `.cbmignore` negation
+  (for example `!target/` or `!deploy/`) can un-skip these directories, except the
   non-negatable safety core: `.git`, `node_modules`, `.worktrees`, and
   `.claude-worktrees`.
 2. **Repo `.gitignore`** — `<repo>/.gitignore` merged with

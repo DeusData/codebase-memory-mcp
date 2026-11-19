@@ -18,6 +18,7 @@ enum {
     GD_ALLOW_BLOB = 1 << GD_BLOB,
     GD_TABLE_COUNT = 10,
     GD_MAX_COLUMNS = 10,
+    GD_LSP_SURFACE = 5,
     GD_COVERAGE_META = 7,
     GD_STORE_META = 8,
     GD_UNRESOLVED_CANDIDATES = 9,
@@ -78,8 +79,9 @@ static const gd_column_t gd_project_summaries[] = {{"project", GD_T, 0, 1},
                                                    {"created_at", GD_T, 0, 0},
                                                    {"updated_at", GD_T, 0, 0}};
 static const gd_column_t gd_lsp_surface[] = {
-    {"project", GD_T, 0, 1},   {"rel_path", GD_T, 0, 2},         {"surface_sha", GD_T, 0, 0},
-    {"defs_json", GD_T, 0, 0}, {"ref_bloom", GD_B | GD_N, 0, 0}, {"config_ctx", GD_T, 0, 0}};
+    {"project", GD_T, 0, 1},       {"rel_path", GD_T, 0, 2},         {"surface_sha", GD_T, 0, 0},
+    {"defs_json", GD_T, 0, 0},     {"ref_bloom", GD_B | GD_N, 0, 0}, {"config_ctx", GD_T, 0, 0},
+    {"included_files", GD_T, 0, 0}};
 static const gd_column_t gd_index_coverage[] = {{"project", GD_T, 0, 1},
                                                 {"rel_path", GD_T, 0, 2},
                                                 {"kind", GD_T, 0, 3},
@@ -119,7 +121,7 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "PRAGMA main.table_xinfo('project_summaries');",
      "SELECT project,summary,source_hash,created_at,updated_at FROM main.project_summaries "
      "ORDER BY CAST(project AS BLOB) ASC;"},
-    {"lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface),
+    {"lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface) - 1,
      "PRAGMA main.table_xinfo('lsp_surface');",
      "SELECT project,rel_path,surface_sha,defs_json,ref_bloom,config_ctx FROM main.lsp_surface "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(rel_path AS BLOB) ASC;"},
@@ -150,6 +152,14 @@ static const gd_table_t gd_coverage_meta_current = {
     "ignored_files_total,coverage_version,hash_records_complete,unresolved_calls_complete "
     "FROM main.index_coverage_meta ORDER BY CAST(project AS BLOB) ASC;"};
 
+/* The same for lsp_surface: index format 7 records the files each C-family
+ * file's #include lookup read (`included_files`). */
+static const gd_table_t gd_lsp_surface_current = {
+    "lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface),
+    "PRAGMA main.table_xinfo('lsp_surface');",
+    "SELECT project,rel_path,surface_sha,defs_json,ref_bloom,config_ctx,included_files "
+    "FROM main.lsp_surface ORDER BY CAST(project AS BLOB) ASC,CAST(rel_path AS BLOB) ASC;"};
+
 #undef GD_B
 #undef GD_N
 #undef GD_T
@@ -168,11 +178,28 @@ typedef struct {
     bool have_uid;
     bool have_counter;
     bool have_unresolved_completeness;
+    bool have_included_files;
 } gd_context_t;
 
 static const gd_table_t *gd_table(const gd_context_t *g, int index) {
-    return index == GD_COVERAGE_META && g->have_unresolved_completeness ? &gd_coverage_meta_current
-                                                                        : &gd_tables[index];
+    if (index == GD_COVERAGE_META && g->have_unresolved_completeness) {
+        return &gd_coverage_meta_current;
+    }
+    if (index == GD_LSP_SURFACE && g->have_included_files) {
+        return &gd_lsp_surface_current;
+    }
+    return &gd_tables[index];
+}
+
+/* The newest schema a table may have, when it has a legacy one too. */
+static const gd_table_t *gd_current_table(const gd_table_t *table) {
+    if (table == &gd_tables[GD_COVERAGE_META]) {
+        return &gd_coverage_meta_current;
+    }
+    if (table == &gd_tables[GD_LSP_SURFACE]) {
+        return &gd_lsp_surface_current;
+    }
+    return NULL;
 }
 
 typedef struct {
@@ -460,9 +487,8 @@ static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
 
 static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
     bool seen[GD_MAX_COLUMNS] = {false};
-    bool coverage_meta = table == &gd_tables[GD_COVERAGE_META];
-    int allowed_columns =
-        coverage_meta ? gd_coverage_meta_current.column_count : table->column_count;
+    const gd_table_t *current = gd_current_table(table);
+    int allowed_columns = current ? current->column_count : table->column_count;
     if (!gd_prepare(g, table->column_query)) {
         return false;
     }
@@ -498,8 +524,11 @@ static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
             return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
         }
     }
-    if (coverage_meta) {
+    if (table == &gd_tables[GD_COVERAGE_META]) {
         g->have_unresolved_completeness = seen[table->column_count];
+    }
+    if (table == &gd_tables[GD_LSP_SURFACE]) {
+        g->have_included_files = seen[table->column_count];
     }
     return gd_finalize(g);
 }

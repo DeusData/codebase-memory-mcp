@@ -24,6 +24,10 @@ typedef enum {
      * Ordinary call resolution keeps its historical language-specific choice,
      * but a function value cannot name one materialized definition exactly. */
     CBM_FUNC_FLAG_AMBIGUOUS_BINDING = 1 << 10,
+    /* Go only: a package-level value (`var`/`const`), registered so `pkg.V`
+     * and a bare `V` of another file have its declared type: the signature's
+     * single result. Never a call target. */
+    CBM_FUNC_FLAG_VALUE = 1 << 11,
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.
