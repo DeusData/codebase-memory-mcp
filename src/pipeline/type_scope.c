@@ -552,7 +552,19 @@ static const char *type_scope_via_open(cbm_type_scope_file_t *f, const char *dot
     }
     const char *found = NULL;
     for (int i = 0; i < f->open_count; i++) {
-        const char *qn = cbm_arena_sprintf(&f->keys, "%s.%s", f->open[i], dotted);
+        const char *qn = NULL;
+        if (f->open[i][0] == CBM_TYPE_SCOPE_OPEN_PACKAGE) {
+            /* A package: one lookup, however many modules declare it. */
+            bool two = false;
+            qn = f->scope.open_package
+                     ? f->scope.open_package(f->scope.open_package_ud, f->open[i] + 1, dotted, &two)
+                     : NULL;
+            if (two) {
+                return NULL;
+            }
+        } else {
+            qn = cbm_arena_sprintf(&f->keys, "%s.%s", f->open[i], dotted);
+        }
         const char *hit = qn ? type_scope_target(f, qn) : NULL;
         if (hit && found && strcmp(hit, found) != 0) {
             return NULL;

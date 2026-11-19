@@ -648,7 +648,11 @@ static const char *pxc_infer_jvm_namespace(CBMArena *arena, const char *rel_path
  * of the others (ctx->stored_namespaces), so every route sees every package.
  * The module is the one the collector gives the file's defs (def_modules).
  * Two sorted copies: by package (a package's modules) and by module (a
- * module's packages). Built once, in the collector's arena, before any def is
+ * module's packages). With them, the type index: one (package, name, module)
+ * triple per project type in a module of the table (`name` the type's QN
+ * after its module: `T`, `Outer.Inner`), sorted, so the modules of a package
+ * that define a name are one binary search, however many directories declare
+ * the package. Built once, in the collector's arena, before any def is
  * collected; never written afterwards. */
 
 typedef struct {
@@ -656,11 +660,27 @@ typedef struct {
     const char *module;
 } pxc_pkg_pair_t;
 
+typedef struct {
+    const char *package;
+    const char *name;
+    const char *module;
+} pxc_pkg_type_t;
+
+typedef struct {
+    uint32_t hash;
+    int first; /* the run's first index into types */
+    int count; /* its length (the modules); 0 = an empty slot */
+} pxc_type_slot_t;
+
 struct cbm_pxc_packages {
     pxc_pkg_pair_t *by_package; /* sorted by (package, module), distinct */
     const char **modules;       /* by_package's modules, parallel (the lookup's array) */
     pxc_pkg_pair_t *by_module;  /* the same pairs sorted by (module, package) */
     int count;
+    pxc_pkg_type_t *types; /* sorted by (package, name, module), distinct */
+    int type_count;
+    pxc_type_slot_t *slots; /* (package, name) -> its run of `types`, open addressing */
+    unsigned slot_mask;
 };
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
@@ -729,6 +749,200 @@ static const cbm_pxc_packages_t *pxc_packages_seal(CBMArena *arena, pxc_pkg_pair
     return t;
 }
 
+/* The type index (see above). */
+
+static int pxc_type_cmp(const void *a, const void *b) {
+    const pxc_pkg_type_t *x = (const pxc_pkg_type_t *)a;
+    const pxc_pkg_type_t *y = (const pxc_pkg_type_t *)b;
+    PXC_PKG_WORK(1);
+    int c = strcmp(x->package, y->package);
+    c = c ? c : strcmp(x->name, y->name);
+    return c ? c : strcmp(x->module, y->module);
+}
+
+typedef struct {
+    const cbm_pxc_packages_t *t;
+    const cbm_registry_t *reg; /* NULL: every QN given is a type */
+    const char *const *labels; /* the row's type labels */
+    CBMArena *arena;
+    pxc_pkg_type_t *items;
+    int count;
+    int cap;
+} pxc_type_index_build_t;
+
+static bool pxc_type_index_grow(pxc_type_index_build_t *b, int need) {
+    if (b->count + need <= b->cap) {
+        return true;
+    }
+    int cap = b->cap ? b->cap * 2 : CBM_SZ_256;
+    while (cap < b->count + need) {
+        cap *= 2;
+    }
+    pxc_pkg_type_t *items =
+        (pxc_pkg_type_t *)cbm_arena_alloc(b->arena, (size_t)cap * sizeof(*items));
+    if (!items) {
+        return false;
+    }
+    if (b->count) {
+        memcpy(items, b->items, (size_t)b->count * sizeof(*items));
+    }
+    b->items = items;
+    b->cap = cap;
+    return true;
+}
+
+/* One project type: its longest QN prefix that is a table module, and one
+ * triple per package that module declares. */
+static void pxc_type_index_add(pxc_type_index_build_t *b, const char *qn, const char *label) {
+    if (!qn || !label) {
+        return;
+    }
+    bool type = false;
+    for (const char *const *l = b->labels; l && *l && !type; l++) {
+        type = strcmp(*l, label) == 0;
+    }
+    if (!type) {
+        return;
+    }
+    const cbm_pxc_packages_t *t = b->t;
+    for (size_t cut = strlen(qn); cut > 0; cut--) {
+        if (qn[cut] != '.') {
+            continue;
+        }
+        int lo = 0;
+        int hi = t->count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            PXC_PKG_WORK(1);
+            if (pxc_cmp_n(t->by_module[mid].module, qn, cut) < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= t->count || pxc_cmp_n(t->by_module[lo].module, qn, cut) != 0) {
+            continue; /* not a module: a shorter prefix may be */
+        }
+        const char *name = cbm_arena_strdup(b->arena, qn + cut + 1);
+        for (int i = lo; name && i < t->count && pxc_cmp_n(t->by_module[i].module, qn, cut) == 0;
+             i++) {
+            PXC_PKG_WORK(1);
+            if (pxc_type_index_grow(b, 1)) {
+                b->items[b->count++] =
+                    (pxc_pkg_type_t){t->by_module[i].package, name, t->by_module[i].module};
+            }
+        }
+        return;
+    }
+}
+
+static void pxc_type_index_node(const cbm_gbuf_node_t *node, void *ud) {
+    pxc_type_index_build_t *b = (pxc_type_index_build_t *)ud;
+    const char *qn = node ? node->qualified_name : NULL;
+    bool type = false;
+    for (const char *const *l = b->labels; qn && node->label && l && *l && !type; l++) {
+        type = strcmp(*l, node->label) == 0;
+    }
+    /* Then the registry's label, as the step's targets read it (type_scope.c). */
+    pxc_type_index_add(b, qn, type && b->reg ? cbm_registry_label_of(b->reg, qn) : NULL);
+}
+
+/* FNV-1a over `package` (pkg_len bytes), a separator and `name`. */
+static uint32_t pxc_type_hash(const char *package, size_t pkg_len, const char *name) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < pkg_len; i++) {
+        h = (h ^ (unsigned char)package[i]) * 16777619u;
+    }
+    h = (h ^ 0x1fu) * 16777619u;
+    for (const char *p = name; *p; p++) {
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    }
+    return h;
+}
+
+/* Sort and dedupe the built triples into the table, then hash each run of
+ * one (package, name), at most half the slots filled. */
+static void pxc_type_index_seal(cbm_pxc_packages_t *t, pxc_type_index_build_t *b) {
+    if (b->count == 0) {
+        return;
+    }
+    qsort(b->items, (size_t)b->count, sizeof(*b->items), pxc_type_cmp);
+    int kept = 0;
+    int runs = 0;
+    for (int i = 0; i < b->count; i++) {
+        if (kept == 0 || pxc_type_cmp(&b->items[kept - 1], &b->items[i]) != 0) {
+            runs += kept == 0 || strcmp(b->items[kept - 1].package, b->items[i].package) != 0 ||
+                    strcmp(b->items[kept - 1].name, b->items[i].name) != 0;
+            b->items[kept++] = b->items[i];
+        }
+    }
+    unsigned slots = CBM_SZ_16;
+    while (slots < (unsigned)runs * 2) {
+        slots *= 2;
+    }
+    pxc_type_slot_t *table =
+        (pxc_type_slot_t *)cbm_arena_alloc(b->arena, (size_t)slots * sizeof(*table));
+    if (!table) {
+        return; /* no index: no type answers through it */
+    }
+    memset(table, 0, (size_t)slots * sizeof(*table));
+    for (int i = 0; i < kept;) {
+        int end = i + 1;
+        while (end < kept && strcmp(b->items[end].package, b->items[i].package) == 0 &&
+               strcmp(b->items[end].name, b->items[i].name) == 0) {
+            end++;
+        }
+        uint32_t h =
+            pxc_type_hash(b->items[i].package, strlen(b->items[i].package), b->items[i].name);
+        unsigned at = h & (slots - 1);
+        while (table[at].count) {
+            PXC_PKG_WORK(1);
+            at = (at + 1) & (slots - 1);
+        }
+        table[at] = (pxc_type_slot_t){h, i, end - i};
+        i = end;
+    }
+    t->types = b->items;
+    t->type_count = kept;
+    t->slots = table;
+    t->slot_mask = slots - 1;
+}
+
+/* The modules of `package` (pkg_len bytes) that define the type `name`: their
+ * count, *first the index of the first triple. One hash probe sequence. */
+static int pxc_package_type_modules(const cbm_pxc_packages_t *t, const char *package,
+                                    size_t pkg_len, const char *name, int *first) {
+    *first = 0;
+    if (!t || !t->slots || !package || !name) {
+        return 0;
+    }
+    uint32_t h = pxc_type_hash(package, pkg_len, name);
+    for (unsigned at = h & t->slot_mask;; at = (at + 1) & t->slot_mask) {
+        const pxc_type_slot_t *slot = &t->slots[at];
+        PXC_PKG_WORK(1);
+        if (!slot->count) {
+            return 0;
+        }
+        const pxc_pkg_type_t *e = &t->types[slot->first];
+        if (slot->hash == h && pxc_cmp_n(e->package, package, pkg_len) == 0 &&
+            strcmp(e->name, name) == 0) {
+            *first = slot->first;
+            return slot->count;
+        }
+    }
+}
+
+/* The one QN `<module>.<name>` a module of `package` defines (in `scratch`),
+ * else NULL; *two when several do. */
+static const char *pxc_package_type(const cbm_pxc_packages_t *t, CBMArena *scratch,
+                                    const char *package, size_t pkg_len, const char *name,
+                                    bool *two) {
+    int first = 0;
+    int n = pxc_package_type_modules(t, package, pkg_len, name, &first);
+    *two = n > 1;
+    return n == 1 ? cbm_arena_sprintf(scratch, "%s.%s", t->types[first].module, name) : NULL;
+}
+
 /* A namespace as a dotted key ('\', ':' and '/' become '.'; the namespace
  * map's normalisation), in `arena`. */
 static const char *pxc_package_key(CBMArena *arena, const char *ns) {
@@ -763,7 +977,8 @@ static const char *pxc_rel_basename(const char *rel) {
 static const cbm_pxc_packages_t *pxc_packages_build(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
                                                     CBMFileResult **cache,
                                                     const cbm_file_info_t *files, int file_count,
-                                                    const char *project_name) {
+                                                    const char *project_name,
+                                                    const char *const *labels) {
     int stored = ctx->stored_namespaces ? ctx->stored_namespace_count : 0;
     int cap = file_count + stored;
     pxc_pkg_pair_t *pairs =
@@ -799,7 +1014,15 @@ static const cbm_pxc_packages_t *pxc_packages_build(const cbm_pipeline_ctx_t *ct
             i--;
         }
     }
-    return pxc_packages_seal(arena, pairs, n);
+    cbm_pxc_packages_t *t = (cbm_pxc_packages_t *)pxc_packages_seal(arena, pairs, n);
+    if (t && t->count > 0 && ctx->gbuf && ctx->registry && labels) {
+        /* The graph holds a node for every registry symbol on every route
+         * (the incremental ones seed the registry from it). */
+        pxc_type_index_build_t b = {.t = t, .reg = ctx->registry, .labels = labels, .arena = arena};
+        cbm_gbuf_foreach_node(ctx->gbuf, pxc_type_index_node, &b);
+        pxc_type_index_seal(t, &b);
+    }
+    return t;
 }
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
@@ -811,6 +1034,24 @@ const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs(CBMArena *arena, const cha
         pairs[i] = (pxc_pkg_pair_t){packages[i], modules[i]};
     }
     return pxc_packages_seal(arena, pairs, pairs ? count : 0);
+}
+
+const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs_types(CBMArena *arena,
+                                                            const char *const *packages,
+                                                            const char *const *modules, int count,
+                                                            const char *const *types,
+                                                            int type_count) {
+    cbm_pxc_packages_t *t =
+        (cbm_pxc_packages_t *)cbm_pxc_packages_from_pairs(arena, packages, modules, count);
+    static const char *const any[] = {"Class", NULL};
+    pxc_type_index_build_t b = {.t = t, .reg = NULL, .labels = any, .arena = arena};
+    for (int i = 0; t && i < type_count; i++) {
+        pxc_type_index_add(&b, types[i], "Class");
+    }
+    if (t) {
+        pxc_type_index_seal(t, &b);
+    }
+    return t;
 }
 #endif
 
@@ -833,10 +1074,16 @@ int cbm_pxc_package_modules(const cbm_pxc_packages_t *t, const char *package, si
             hi = mid;
         }
     }
-    int end = lo;
-    while (end < t->count && pxc_cmp_n(t->by_package[end].package, package, len) == 0) {
+    int end = t->count; /* first pair whose package is > the key: a second search, so
+                         * counting a package's modules never walks them */
+    for (int l2 = lo; l2 < end;) {
+        int mid = l2 + (end - l2) / 2;
         PXC_PKG_WORK(1);
-        end++;
+        if (pxc_cmp_n(t->by_package[mid].package, package, len) <= 0) {
+            l2 = mid + 1;
+        } else {
+            end = mid;
+        }
     }
     if (out_first && end > lo) {
         *out_first = &t->modules[lo];
@@ -914,26 +1161,31 @@ static void pxc_rows_map_add(pxc_rows_map_t *m, const char *key, const char *val
     m->count++;
 }
 
-/* The one `<module>.<rest>` a module of the package defines, else NULL. */
-static const char *pxc_rows_unique_member(const cbm_pipeline_ctx_t *ctx, CBMArena *scratch,
-                                          const char *const *mods, int mod_count,
-                                          const char *rest) {
-    const char *found = NULL;
-    for (int i = 0; i < mod_count; i++) {
-        const char *qn = cbm_arena_sprintf(scratch, "%s.%s", mods[i], rest);
-        PXC_PKG_WORK(1);
-        if (qn && cbm_registry_exists(ctx->registry, qn)) {
-            if (found) {
-                return NULL; /* two modules define it: no answer, never a pick */
-            }
-            found = qn;
-        }
+/* An open import of a whole package: one value (CBM_TYPE_SCOPE_OPEN_PACKAGE
+ * and the package), answered through the type index (pxc_open_package). */
+static void pxc_rows_map_open_package(pxc_rows_map_t *m, const char *package, size_t len) {
+    const char *val =
+        cbm_arena_sprintf(m->scratch, "%c%.*s", CBM_TYPE_SCOPE_OPEN_PACKAGE, (int)len, package);
+    if (val) {
+        pxc_rows_map_add(m, CBM_TYPE_SCOPE_OPEN_KEY, val);
     }
-    return found;
+}
+
+typedef struct {
+    const cbm_pxc_packages_t *t;
+    CBMArena *scratch;
+} pxc_open_package_ud_t;
+
+/* cbm_type_scope_t.open_package over the type index. */
+static const char *pxc_open_package(const void *ud, const char *package, const char *dotted,
+                                    bool *two) {
+    const pxc_open_package_ud_t *u = (const pxc_open_package_ud_t *)ud;
+    return pxc_package_type(u->t, u->scratch, package, strlen(package), dotted, two);
 }
 
 static void pxc_rows_map_row(const cbm_pipeline_ctx_t *ctx, const cbm_pxc_packages_t *t,
                              pxc_rows_map_t *m, const char *local, const char *path) {
+    (void)ctx;
     bool open = strcmp(local, CBM_TYPE_SCOPE_OPEN_KEY) == 0;
     const char *const *mods = NULL;
     int mod_count = 0;
@@ -953,14 +1205,15 @@ static void pxc_rows_map_row(const cbm_pipeline_ctx_t *ctx, const cbm_pxc_packag
         pkg_len--; /* drop the '.' */
     }
     if (mod_count > 0 && open && path[pkg_len] == '\0') {
-        for (int i = 0; i < mod_count; i++) {
-            pxc_rows_map_add(m, local, mods[i]);
-        }
+        pxc_rows_map_open_package(m, path, pkg_len);
         return;
     }
+    /* The one `<module>.<rest>` a module of the package defines: two modules
+     * defining it are no answer, never a pick. */
+    bool two = false;
     const char *member =
         mod_count > 0 && path[pkg_len] == '.'
-            ? pxc_rows_unique_member(ctx, m->scratch, mods, mod_count, path + pkg_len + 1)
+            ? pxc_package_type(t, m->scratch, path, pkg_len, path + pkg_len + 1, &two)
             : NULL;
     pxc_rows_map_add(m, local, member ? member : path);
 }
@@ -977,13 +1230,15 @@ static int pxc_scope_imports_from_rows(const cbm_pipeline_ctx_t *ctx, const cbm_
         }
     }
     if (own_package && fr->namespace_name && fr->namespace_name[0]) {
+        /* The other modules of the own package, as one open package (the own
+         * module answers before any open import does). */
         const char *key = pxc_package_key(scratch, fr->namespace_name);
         const char *const *mods = NULL;
         int mod_count = key ? cbm_pxc_package_modules(t, key, strlen(key), &mods) : 0;
-        for (int i = 0; i < mod_count; i++) {
-            if (!module_qn || strcmp(mods[i], module_qn) != 0) {
-                pxc_rows_map_add(&m, CBM_TYPE_SCOPE_OPEN_KEY, mods[i]);
-            }
+        bool other =
+            mod_count > 1 || (mod_count == 1 && (!module_qn || strcmp(mods[0], module_qn) != 0));
+        if (other) {
+            pxc_rows_map_open_package(&m, key, strlen(key));
         }
     }
     *out_keys = m.keys;
@@ -1356,11 +1611,19 @@ static cbm_type_scope_file_t *pxc_file_scope_begin(
         imp_count = pxc_scope_imports_from_rows(ctx, packages, fr, module_qn, own_package, scratch,
                                                 &imp_keys, &imp_vals);
     }
+    pxc_open_package_ud_t *open_ud =
+        packages && scratch ? (pxc_open_package_ud_t *)cbm_arena_alloc(scratch, sizeof(*open_ud))
+                            : NULL;
+    if (open_ud) {
+        *open_ud = (pxc_open_package_ud_t){.t = packages, .scratch = scratch};
+    }
     cbm_type_scope_t scope = {.reg = ctx->registry,
                               .module_qn = module_qn,
                               .imp_keys = imp_keys,
                               .imp_vals = imp_vals,
-                              .imp_count = imp_count};
+                              .imp_count = imp_count,
+                              .open_package = open_ud ? pxc_open_package : NULL,
+                              .open_package_ud = open_ud};
     if (row->lexical_scopes) {
         /* The file's own scopes: its definitions and the module's ordered
          * namespace facts. */
@@ -1874,7 +2137,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs_ex(const cbm_pipeline_ctx_t *ctx, CBMArena *
     for (int fi = 0; ctx && ctx->registry && !packages && fi < file_count; fi++) {
         if (cbm_pxc_wants_identities(files[fi].language) &&
             pxc_scope_rows(files[fi].language, NULL)) {
-            packages = pxc_packages_build(ctx, arena, cache, files, file_count, project_name);
+            packages = pxc_packages_build(ctx, arena, cache, files, file_count, project_name,
+                                          cbm_type_scope_lang(files[fi].language)->labels);
         }
     }
     if (out_packages) {

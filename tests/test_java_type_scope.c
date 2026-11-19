@@ -1035,15 +1035,19 @@ static uint64_t jts_rows_work(int imports, int classes, int *identities) {
     cbm_registry_t *reg = cbm_registry_new();
     CBMArena arena;
     cbm_arena_init(&arena);
+    const char **types = calloc((size_t)classes, sizeof(char *));
     for (int c = 0; c < classes; c++) {
         char name[32];
         snprintf(name, sizeof(name), "C%d", c);
         char *qn = cbm_arena_sprintf(&arena, "proj.src.main.java.q.C%d", c);
         cbm_registry_add(reg, name, qn, "Class", false);
+        types[c] = qn;
     }
     const char *pkg[] = {"q"};
     const char *mod[] = {"proj.src.main.java.q"};
-    const cbm_pxc_packages_t *t = cbm_pxc_packages_from_pairs(&arena, pkg, mod, 1);
+    const cbm_pxc_packages_t *t =
+        cbm_pxc_packages_from_pairs_types(&arena, pkg, mod, 1, types, classes);
+    free(types);
     CBMImport *rows = calloc((size_t)imports, sizeof(CBMImport));
     for (int i = 0; i < imports; i++) {
         int c = (int)(((long long)i * 7919) % classes);
@@ -1105,6 +1109,91 @@ TEST(java_type_scope_growth_large_package) {
            (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
     ASSERT_TRUE(ida == 20 && idb == 20 && idc == 20);
     ASSERT_TRUE((double)w16 <= (double)w1 * 1.25);
+    PASS();
+}
+
+/* One package `big` over `m` directories, one class C<i> each (the review's
+ * generator gen3.py): every directory's file of package big imports two
+ * classes of big by name and writes a third of another directory, which its
+ * own package names. Over all m files: the table's and the type index's
+ * build, each file's import map and the third spelling. Returns the counted
+ * work; *identities the identities found (3 per file). */
+static uint64_t jts_spread_work(int m, int *identities) {
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char **pkg = calloc((size_t)m, sizeof(char *));
+    const char **mod = calloc((size_t)m, sizeof(char *));
+    const char **types = calloc((size_t)m, sizeof(char *));
+    for (int i = 0; i < m; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "C%d", i);
+        pkg[i] = "big";
+        mod[i] = cbm_arena_sprintf(&arena, "proj.m%d.src.main.java.big", i);
+        types[i] = cbm_arena_sprintf(&arena, "%s.C%d", mod[i], i);
+        cbm_registry_add(reg, name, types[i], "Class", false);
+    }
+    cbm_pipeline_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    ctx->registry = reg;
+    uint64_t before = cbm_type_scope_test_work() + cbm_pxc_packages_test_work();
+    const cbm_pxc_packages_t *t = cbm_pxc_packages_from_pairs_types(&arena, pkg, mod, m, types, m);
+    *identities = 0;
+    for (int i = 0; i < m; i++) {
+        CBMImport rows[2];
+        memset(rows, 0, sizeof(rows));
+        for (int r = 0; r < 2; r++) {
+            int c = (i + 1 + r) % m;
+            rows[r].local_name = cbm_arena_sprintf(&arena, "C%d", c);
+            rows[r].module_path = cbm_arena_sprintf(&arena, "big.C%d", c);
+        }
+        CBMFileResult fr;
+        memset(&fr, 0, sizeof(fr));
+        fr.imports.items = rows;
+        fr.imports.count = 2;
+        fr.namespace_name = "big";
+        CBMArena scratch;
+        cbm_arena_init(&scratch);
+        cbm_type_scope_file_t *fs =
+            cbm_pxc_file_scope(ctx, CBM_LANG_JAVA, &fr, mod[i], NULL, NULL, 0, t, &scratch);
+        const char *const *locals = NULL;
+        const char *const *qns = NULL;
+        int n = cbm_type_scope_file_imports(fs, &locals, &qns);
+        for (int k = 0; k < n; k++) {
+            *identities += qns[k] && strncmp(qns[k], "proj.m", 6) == 0;
+        }
+        char third[32];
+        snprintf(third, sizeof(third), "C%d", (i + m - 1) % m);
+        *identities += cbm_type_scope_resolve(fs, third, strlen(third)) != NULL;
+        cbm_type_scope_file_end(fs);
+        cbm_arena_destroy(&scratch);
+    }
+    uint64_t work = cbm_type_scope_test_work() + cbm_pxc_packages_test_work() - before;
+    free(ctx);
+    free(pkg);
+    free(mod);
+    free(types);
+    cbm_registry_free(reg);
+    cbm_arena_destroy(&arena);
+    return work;
+}
+
+/* Directories per package at 1x, 4x, 16x (100 / 400 / 1,600): the work over
+ * all files grows with them and a log factor (the sorted index), never with
+ * their square; every file finds its three classes. */
+TEST(java_type_scope_growth_package_spread) {
+    int id1 = 0;
+    int id4 = 0;
+    int id16 = 0;
+    uint64_t w1 = jts_spread_work(100, &id1);
+    uint64_t w4 = jts_spread_work(400, &id4);
+    uint64_t w16 = jts_spread_work(1600, &id16);
+    double logs = log2(1600.0) / log2(100.0);
+    printf("\n  one package over 100/400/1600 directories: work %llu / %llu / %llu, "
+           "identities %d / %d / %d\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16, id1, id4,
+           id16);
+    ASSERT_TRUE(id1 == 300 && id4 == 1200 && id16 == 4800);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * logs * 1.25);
     PASS();
 }
 
@@ -1249,6 +1338,7 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);
     RUN_TEST(java_type_scope_growth_large_package);
+    RUN_TEST(java_type_scope_growth_package_spread);
     RUN_TEST(java_type_scope_growth_supertype_chain);
 #endif
 }

@@ -84,6 +84,13 @@ int cbm_pxc_package_modules(const cbm_pxc_packages_t *t, const char *package, si
  * the build's sorts and of every lookup. */
 const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs(CBMArena *arena, const char *const *packages,
                                                       const char *const *modules, int count);
+/* The same, with the type index read from `types` (graph QNs of project types,
+ * each in one of the modules). */
+const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs_types(CBMArena *arena,
+                                                            const char *const *packages,
+                                                            const char *const *modules, int count,
+                                                            const char *const *types,
+                                                            int type_count);
 uint64_t cbm_pxc_packages_test_work(void);
 #endif
 
