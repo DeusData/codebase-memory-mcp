@@ -1267,6 +1267,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
         }
+    } else if (!ctx->site_scope) {
+        /* No result cache (its allocation failed): no scope of the shared
+         * layer either, so every site keeps main's answer, as for a language
+         * without a row (never a wrong answer; the parallel route, which always
+         * has its cache, answers). Logged so a run that degraded shows it. */
+        cbm_log_warn("site_bind.scope_skipped", "reason", "no_result_cache", "effect",
+                     "main_decides_every_site");
     }
 
     cbm_registry_build_swift_owners(ctx->registry, ctx->gbuf, ctx->repo_path, ctx->excluded_dirs,

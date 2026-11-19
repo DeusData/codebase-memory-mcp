@@ -544,7 +544,119 @@ TEST(site_bind_seam_answers_agree_on_both_routes) {
     PASS();
 }
 
+/* USAGE edges proven by the layer (strategy include_scope) into a node whose
+ * QN ends in `.tgt`. */
+static int sb_proven_to(const char *db, const char *tgt) {
+    sqlite3 *h = NULL;
+    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(h);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(h,
+                           "SELECT count(*) FROM edges e JOIN nodes t ON t.id = e.target_id "
+                           "WHERE e.type = 'USAGE' AND t.qualified_name LIKE '%.' || ?1 "
+                           "AND json_extract(e.properties, '$.strategy') = 'include_scope'",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, tgt, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(h);
+    return n;
+}
+
+/* One tree of the protoc fixtures (review 1, B2), indexed on one route; the
+ * proven USAGE edges into `tgt`. */
+static int sb_protoc_case(const char *const files[][2], int nfiles, const char *tgt) {
+    char *tmp = th_mktempdir("sb_protoc");
+    if (!tmp) {
+        return -1;
+    }
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/repo", tmp);
+    int rc = 0;
+    for (int i = 0; i < nfiles && rc == 0; i++) {
+        rc = th_write_file(TH_PATH(dir, files[i][0]), files[i][1]);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/p.db", tmp);
+    int n = rc == 0 && sb_index(dir, db, 1, NULL) == 0 ? sb_proven_to(db, tgt) : -1;
+    th_cleanup(tmp);
+    return n;
+}
+
+/* One protoc case: the proven edges it should have; a miss is printed, so
+ * every shape is reported. */
+static int sb_protoc_expect(const char *shape, int got, int want) {
+    if (got != want) {
+        printf("\n  protoc case %s: %d proven edge(s), want %d\n", shape, got, want);
+    }
+    return got == want;
+}
+
+/* Proven never where protoc resolves nothing (protoc 3.21.12 on each tree,
+ * review 1 fixtures, messages quoted): the first component decides the scope
+ * with no backtracking; a MISSING token; an import cycle; one file under two
+ * spellings; a path protoc refuses. The compiling partner stays proven. */
+TEST(site_bind_protobuf_never_proven_where_protoc_rejects) {
+    int ok = 1;
+    /* "common.Status" is resolved to "x.common.Status", which is not defined */
+    static const char *const prefix[][2] = {
+        {"common.proto", "syntax = \"proto3\";\npackage common;\nmessage Status { int32 a = 1; }\n"},
+        {"x/y.proto", "syntax = \"proto3\";\npackage x.common;\nimport \"common.proto\";\n"
+                      "message M { common.Status s = 1; }\n"}};
+    ok &= sb_protoc_expect("prefix", sb_protoc_case(prefix, 2, "common.Status"), 0);
+    /* "b.C" is resolved to "a.b.C", which is not defined */
+    static const char *const pk2[][2] = {
+        {"c2.proto", "syntax = \"proto3\";\npackage b;\nmessage C { int32 a = 1; }\n"},
+        {"pk2.proto", "syntax = \"proto3\";\npackage a.b;\nimport \"c2.proto\";\n"
+                      "message M2 { b.C x = 1; }\n"}};
+    ok &= sb_protoc_expect("pk2", sb_protoc_case(pk2, 2, "c2.C"), 0);
+    /* compiles: b.D is .a.b.b.D (the innermost scope holding `b`) */
+    static const char *const pk[][2] = {
+        {"pk.proto", "syntax = \"proto3\";\npackage a.b;\nmessage b { message D {} }\n"
+                     "message M { b.D x = 1; }\n"}};
+    ok &= sb_protoc_expect("pk", sb_protoc_case(pk, 1, "pk.D"), 1); /* node pk.D: the file and its name */
+    /* Expected ";" (a MISSING token after the field), Expected field number */
+    static const char *const missing[][2] = {
+        {"t.proto", "syntax = \"proto3\";\npackage t;\nmessage T { int32 a = 1; }\n"},
+        {"u.proto", "syntax = \"proto3\";\npackage u;\nimport \"t.proto\";\n"
+                    "message M { t.T x = 1 }\n"},
+        {"w.proto", "syntax = \"proto3\";\npackage w;\nimport \"t.proto\";\n"
+                    "message P { int32 y = ; t.T x = 1; }\n"}};
+    ok &= sb_protoc_expect("missing", sb_protoc_case(missing, 3, "t.T"), 0);
+    /* File recursively imports itself */
+    static const char *const cycle[][2] = {
+        {"k1.proto", "syntax = \"proto3\";\npackage k;\nimport public \"k2.proto\";\n"
+                     "message K1 { int32 a = 1; }\n"},
+        {"k2.proto", "syntax = \"proto3\";\npackage k;\nimport public \"k1.proto\";\n"
+                     "message K2 { K1 a = 1; }\n"}};
+    ok &= sb_protoc_expect("cycle", sb_protoc_case(cycle, 2, "k1.K1"), 0);
+    /* "cc.T" is already defined in file "common/c.proto" (two spellings) */
+    static const char *const spell[][2] = {
+        {"proto/common/c.proto", "syntax = \"proto3\";\npackage cc;\nmessage T { int32 a = 1; }\n"},
+        {"x.proto", "syntax = \"proto3\";\nimport public \"common/c.proto\";\n"},
+        {"y.proto", "syntax = \"proto3\";\nimport public \"proto/common/c.proto\";\n"},
+        {"z.proto", "syntax = \"proto3\";\nimport \"x.proto\";\nimport \"y.proto\";\n"
+                    "message Z { cc.T t = 1; }\n"}};
+    ok &= sb_protoc_expect("spell", sb_protoc_case(spell, 4, "c.T"), 0);
+    /* Backslashes, consecutive slashes, ".", or ".." are not allowed in the
+     * virtual path */
+    static const char *const dot[][2] = {
+        {"t.proto", "syntax = \"proto3\";\npackage t;\nmessage T { int32 a = 1; }\n"},
+        {"dot.proto", "syntax = \"proto3\";\npackage dot;\nimport \"./t.proto\";\n"
+                      "message D { t.T x = 1; }\n"}};
+    ok &= sb_protoc_expect("dot", sb_protoc_case(dot, 2, "t.T"), 0);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(site_bind) {
+    RUN_TEST(site_bind_protobuf_never_proven_where_protoc_rejects);
     RUN_TEST(site_bind_language_without_row_answers_nothing);
     RUN_TEST(site_bind_protobuf_reference_binds_what_protoc_resolves);
     RUN_TEST(site_bind_protobuf_incremental_equals_full);

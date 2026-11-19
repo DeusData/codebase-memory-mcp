@@ -12,6 +12,7 @@
 #include "pipeline/site_bind.h"
 
 #include "cbm.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -56,9 +57,13 @@ struct cbm_site_scope {
     _Atomic uint64_t present;
     _Atomic uint64_t unsettled;
     _Atomic uint64_t absent;
-    /* CBM_SITE_BIND_DUMP=<path>: one line per answered site and per settled
-     * possible answer, appended (measurement; like CBM_SEM_PAIR_DUMP) */
+    /* CBM_SITE_BIND_DUMP=<path> (test-seam builds only): one line per
+     * answered site and per settled possible answer, appended (measurement) */
     FILE *dump;
+    /* building only: resolved include path -> the first import spelling
+     * that named it (in spell_arena); freed before the closure is sealed */
+    CBMHashTable *spellings;
+    CBMArena spell_arena;
 };
 
 static const char *sb_verdict_name(cbm_closure_verdict_t v) {
@@ -111,13 +116,45 @@ typedef struct {
 
 /* The package a file's facts name: every INCLUDE event carries it; NULL
  * (unknown) for a file without one. */
-static const char *sb_package(const CBMScopeEvent *ev, int n) {
+/* The file's package: the one its INCLUDE events carry; a file without one
+ * (no import) gives it through its definitions: the full name of the one with
+ * the fewest components is the package followed by its name (a top-level
+ * definition; a nested one has more). NULL: unknown (no import, no
+ * definition). `buf` holds a derived package. */
+static const char *sb_package(const CBMScopeEvent *ev, int n, char *buf, size_t cap) {
+    int best = -1;
+    size_t best_dots = SIZE_MAX;
     for (int i = 0; i < n; i++) {
-        if (ev[i].kind == CBM_SCOPE_INCLUDE) {
-            return ev[i].qual ? ev[i].qual : "";
+        if (ev[i].kind == CBM_SCOPE_INCLUDE && ev[i].qual) {
+            return ev[i].qual; /* a stored row's INCLUDE carries none: read the definitions */
+        }
+        if (ev[i].kind == CBM_SCOPE_DEF && ev[i].qual && ev[i].name) {
+            size_t dots = 0;
+            for (const char *c = ev[i].qual; *c; c++) {
+                dots += *c == '.';
+            }
+            if (dots < best_dots) {
+                best_dots = dots;
+                best = i;
+            }
         }
     }
-    return NULL;
+    if (best < 0) {
+        return NULL;
+    }
+    const char *qual = ev[best].qual;
+    size_t ql = strlen(qual);
+    size_t nl = strlen(ev[best].name);
+    if (ql == nl) {
+        return strcmp(qual, ev[best].name) == 0 ? "" : NULL;
+    }
+    if (ql <= nl + SKIP_ONE || qual[ql - nl - SKIP_ONE] != '.' ||
+        strcmp(qual + ql - nl, ev[best].name) != 0 || ql - nl - SKIP_ONE >= cap) {
+        return NULL;
+    }
+    memcpy(buf, qual, ql - nl - SKIP_ONE);
+    buf[ql - nl - SKIP_ONE] = '\0';
+    return buf;
 }
 
 static void sb_add_events(const cbm_pipeline_ctx_t *ctx, cbm_site_scope_t *sc, const sb_file_t *f) {
@@ -161,6 +198,21 @@ static void sb_add_events(const cbm_pipeline_ctx_t *ctx, cbm_site_scope_t *sc, c
                                          f->rel, f->lang, &imp, path,
                                          sizeof(path)) == CBM_INCLUDE_PATH_FILE) {
                 target = cbm_closure_file(sc->closure, path);
+            }
+            if (target >= 0 && sc->spellings) {
+                const char *first = cbm_ht_get(sc->spellings, path);
+                if (!first) {
+                    const char *k = cbm_arena_strdup(&sc->spell_arena, path);
+                    const char *v = cbm_arena_strdup(&sc->spell_arena, imp.module_path);
+                    if (k && v) {
+                        cbm_ht_set(sc->spellings, k, (void *)v);
+                    }
+                } else if (strcmp(first, imp.module_path) != 0) {
+                    /* one file named by two import spellings: protoc reads two
+                     * virtual files that define the same names ("already
+                     * defined"), so nothing through it is proven */
+                    (void)cbm_closure_add_opaque(sc->closure, target);
+                }
             }
             sc->includes++;
             sc->includes_resolved += target >= 0;
@@ -210,10 +262,14 @@ cbm_site_scope_t *cbm_pipeline_site_scope_build(const cbm_pipeline_ctx_t *ctx,
         memset(loaded, 0, (size_t)nrow * sizeof(*loaded));
         sc->closure = cbm_closure_new();
         ok = sc->closure != NULL;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        /* measurement only, in test-seam builds: the product never reads the
+         * variable nor opens a file (sc->dump stays NULL) */
         char dump_path[SB_PATH_BUF];
         if (ok && cbm_safe_getenv("CBM_SITE_BIND_DUMP", dump_path, sizeof(dump_path), NULL)) {
-            sc->dump = fopen(dump_path, "a");
+            sc->dump = cbm_fopen(dump_path, "a");
         }
+#endif
     } else if (sc) {
         memset(sc, 0, sizeof(*sc));
     }
@@ -255,9 +311,12 @@ cbm_site_scope_t *cbm_pipeline_site_scope_build(const cbm_pipeline_ctx_t *ctx,
     for (int i = 0; ok && i < n; i++) {
         sb_file_t *f = &files[i];
         const char *package = NULL;
+        char pkgbuf[SB_PATH_BUF];
         if (f->readable) {
-            package = f->stored ? sb_package(f->facts.events, f->facts.event_count)
-                                : sb_package(f->result->scope.items, f->result->scope.count);
+            package = f->stored ? sb_package(f->facts.events, f->facts.event_count, pkgbuf,
+                                             sizeof(pkgbuf))
+                                : sb_package(f->result->scope.items, f->result->scope.count, pkgbuf,
+                                             sizeof(pkgbuf));
         }
         f->index = cbm_closure_add_file(sc->closure, f->rel, f->row, package);
         if (f->index < 0) {
@@ -271,10 +330,19 @@ cbm_site_scope_t *cbm_pipeline_site_scope_build(const cbm_pipeline_ctx_t *ctx,
             (void)cbm_closure_add_opaque(sc->closure, f->index);
         }
     }
+    if (ok) {
+        cbm_arena_init(&sc->spell_arena);
+        sc->spellings = cbm_ht_create(CBM_SZ_256);
+    }
     for (int i = 0; ok && i < n; i++) {
         if (files[i].readable) {
             sb_add_events(ctx, sc, &files[i]);
         }
+    }
+    if (sc && sc->spellings) {
+        cbm_ht_free(sc->spellings);
+        sc->spellings = NULL;
+        cbm_arena_destroy(&sc->spell_arena);
     }
     ok = ok && cbm_closure_seal(sc->closure) == 0;
     for (int i = 0; files && i < n; i++) {
@@ -316,9 +384,14 @@ void cbm_pipeline_site_scope_free(cbm_site_scope_t *sc) {
         for (int i = 0; i < 8; i++) {
             snprintf(b[i], sizeof(b[i]), "%llu", (unsigned long long)atomic_load(v[i]));
         }
+        /* drawn and present together: whether a possible answer's edge was drawn
+         * by the layer or already there depends on which worker's buffer holds
+         * main's edge (route-dependent); that it exists does not */
+        snprintf(b[2], sizeof(b[2]), "%llu",
+                 (unsigned long long)(atomic_load(v[2]) + atomic_load(v[5])));
         cbm_log_info("site_bind.run", "proven", b[0], "possible", b[1], "possible_drawn", b[2],
-                     "possible_same", b[3], "possible_disagree", b[4], "possible_present", b[5],
-                     "possible_unsettled", b[6], "proven_absent", b[7]);
+                     "possible_same", b[3], "possible_disagree", b[4], "possible_unsettled", b[6],
+                     "proven_absent", b[7]);
     }
     if (sc->dump) {
         fclose(sc->dump);

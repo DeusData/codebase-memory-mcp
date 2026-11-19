@@ -64,6 +64,10 @@ enum {
     CBM_CLOSURE_WHY_CONDITIONAL = 1u << 4, /* the one definition may not be in effect */
     CBM_CLOSURE_WHY_AMBIGUOUS = 1u << 5,   /* two or more definitions are visible */
     CBM_CLOSURE_WHY_NO_NODE = 1u << 6,     /* the one definition has no graph node */
+    /* the one definition is in a message of the referring file (or the
+     * file's package is unknown): the enclosing message, which the facts do
+     * not give, decides (protoc's scope walk) */
+    CBM_CLOSURE_WHY_SCOPE = 1u << 7,
 };
 
 /* How the answer's definition is visible. */
@@ -93,10 +97,10 @@ typedef struct {
     const char *qn;   /* the definition's qualified name (PROVEN, POSSIBLE), else NULL */
     const char *full; /* ... and its full name, NULL when unknown */
     int file;         /* its file, else -1 */
-    int visible;    /* definitions named N visible from the file (2 means two or more) */
-    bool complete;  /* every source on the way is a repository file the facts read whole */
-    uint32_t why;   /* CBM_CLOSURE_WHY_* */
-    uint8_t via;    /* CBM_CLOSURE_VIA_* of the answer */
+    int visible;      /* definitions named N visible from the file (2 means two or more) */
+    bool complete;    /* every source on the way is a repository file the facts read whole */
+    uint32_t why;     /* CBM_CLOSURE_WHY_* */
+    uint8_t via;      /* CBM_CLOSURE_VIA_* of the answer */
 } cbm_closure_answer_t;
 
 typedef struct cbm_closure cbm_closure_t;

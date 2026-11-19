@@ -457,6 +457,12 @@ void cbm_extract_scope(CBMExtractCtx *ctx) {
         qsort(w.imps, (size_t)w.nimps, sizeof(*w.imps), sc_ref_cmp);
     }
     uint64_t visited = sc_walk_tree(&w, ctx->root);
+    if (ts_node_has_error(ctx->root)) {
+        /* a tree with an error the walk may not meet as an ERROR node (a
+         * MISSING token the parser inserted): the compiler rejects the file,
+         * so nothing in it is proven */
+        sc_emit(&w, CBM_SCOPE_OPAQUE, NULL, NULL, -1, ts_node_end_byte(ctx->root), 0);
+    }
     atomic_fetch_add_explicit(&g_scope_nodes_visited, visited + w.steps, memory_order_relaxed);
     CBMScopeEventArray *ev = &ctx->result->scope;
     if (ev->count > SKIP_ONE) {

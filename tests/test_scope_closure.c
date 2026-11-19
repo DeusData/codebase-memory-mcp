@@ -53,28 +53,54 @@ TEST(scope_closure_one_definition_through_an_include_is_proven) {
     PASS();
 }
 
-/* a plain include is not passed on; a re-exporting one is, through a cycle */
+/* a plain include is not passed on; a re-exporting one is, along a chain;
+ * an import cycle (public or plain) is a file protoc refuses ("File
+ * recursively imports itself"): nothing through it or in it is proven */
 TEST(scope_closure_reexport_chain_and_cycle) {
     cbm_closure_t *s = cbm_closure_new();
     int user = cbm_closure_add_file(s, "user.proto", &ROW, "");
     int mid = cbm_closure_add_file(s, "mid.proto", &ROW, "");
     int deep = cbm_closure_add_file(s, "deep.proto", &ROW, "");
+    int user2 = cbm_closure_add_file(s, "user2.proto", &ROW, "");
     int a = cbm_closure_add_file(s, "a.proto", &ROW, "");
     int b = cbm_closure_add_file(s, "b.proto", &ROW, "");
+    int pub = cbm_closure_add_file(s, "pub.proto", &ROW, "");
+    int x = cbm_closure_add_file(s, "x.proto", &ROW, "");
+    int y = cbm_closure_add_file(s, "y.proto", &ROW, "");
     ASSERT_TRUE(cbm_closure_add_def(s, deep, "D", NULL, "q.D", false));
     ASSERT_TRUE(cbm_closure_add_def(s, b, "B", NULL, "q.B", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, y, "Y", NULL, "q.Y", false));
     ASSERT_TRUE(cbm_closure_add_include(s, user, mid, false));
     ASSERT_TRUE(cbm_closure_add_include(s, mid, deep, false)); /* plain: not passed on */
-    ASSERT_TRUE(cbm_closure_add_include(s, user, a, false));
-    ASSERT_TRUE(cbm_closure_add_include(s, a, b, true)); /* public, and back: one component */
+    ASSERT_TRUE(cbm_closure_add_include(s, user, pub, false));
+    ASSERT_TRUE(cbm_closure_add_include(s, pub, deep, true)); /* public: passed on */
+    ASSERT_TRUE(cbm_closure_add_include(s, user2, a, false));
+    ASSERT_TRUE(cbm_closure_add_include(s, a, b, true)); /* public, and back: a cycle */
     ASSERT_TRUE(cbm_closure_add_include(s, b, a, true));
+    ASSERT_TRUE(cbm_closure_add_include(s, x, y, false)); /* plain, and back: a cycle too */
+    ASSERT_TRUE(cbm_closure_add_include(s, y, x, false));
     ASSERT_EQ(cbm_closure_seal(s), 0);
-    ASSERT_EQ(sc_ask(s, user, "D", NULL, 0).verdict, CBM_CLOSURE_PROVEN_ABSENT);
     ASSERT_EQ(sc_ask(s, mid, "D", NULL, 0).verdict, CBM_CLOSURE_PROVEN);
-    cbm_closure_answer_t through = sc_ask(s, user, "B", NULL, 0);
-    ASSERT_EQ(through.verdict, CBM_CLOSURE_PROVEN);
+    cbm_closure_answer_t chain = sc_ask(s, user, "D", NULL, 0);
+    ASSERT_EQ(chain.verdict, CBM_CLOSURE_PROVEN); /* through pub's re-export, not mid's */
+    ASSERT_STR_EQ(chain.qn, "q.D");
+    cbm_closure_t *s2 = cbm_closure_new(); /* the plain include alone */
+    int u2 = cbm_closure_add_file(s2, "user.proto", &ROW, "");
+    int m2 = cbm_closure_add_file(s2, "mid.proto", &ROW, "");
+    int d2 = cbm_closure_add_file(s2, "deep.proto", &ROW, "");
+    ASSERT_TRUE(cbm_closure_add_def(s2, d2, "D", NULL, "q.D", false));
+    ASSERT_TRUE(cbm_closure_add_include(s2, u2, m2, false));
+    ASSERT_TRUE(cbm_closure_add_include(s2, m2, d2, false));
+    ASSERT_EQ(cbm_closure_seal(s2), 0);
+    ASSERT_EQ(sc_ask(s2, u2, "D", NULL, 0).verdict, CBM_CLOSURE_PROVEN_ABSENT);
+    cbm_closure_free(s2);
+    /* the cycles: possible at most, opaque */
+    cbm_closure_answer_t through = sc_ask(s, user2, "B", NULL, 0);
+    ASSERT_EQ(through.verdict, CBM_CLOSURE_POSSIBLE);
     ASSERT_STR_EQ(through.qn, "q.B");
-    ASSERT_EQ(sc_ask(s, a, "B", NULL, 0).verdict, CBM_CLOSURE_PROVEN);
+    ASSERT_EQ(through.why & CBM_CLOSURE_WHY_OPAQUE, CBM_CLOSURE_WHY_OPAQUE);
+    ASSERT_EQ(sc_ask(s, a, "B", NULL, 0).verdict, CBM_CLOSURE_POSSIBLE);
+    ASSERT_EQ(sc_ask(s, x, "Y", NULL, 0).verdict, CBM_CLOSURE_POSSIBLE);
     cbm_closure_free(s);
     PASS();
 }
@@ -134,14 +160,17 @@ TEST(scope_closure_ambiguous_conditional_and_nodeless) {
     PASS();
 }
 
-/* a reference read against the scopes around the site (protoc's scope walk)
- * picks one of two; a definition elsewhere is no candidate */
+/* protoc's scope walk: the innermost scope around the site in which the FIRST
+ * component names a symbol decides, the rest must be there, no backtracking;
+ * the enclosing message is not known, so a name a message of the file holds
+ * is at most possible (protoc takes a bare nested name only inside it) */
 TEST(scope_closure_qualified_reference) {
     cbm_closure_t *s = cbm_closure_new();
     int user = cbm_closure_add_file(s, "a/b/user.proto", &ROW_QUAL, "a.b");
     int common = cbm_closure_add_file(s, "common.proto", &ROW_QUAL, "common");
     int y = cbm_closure_add_file(s, "y.proto", &ROW_QUAL, "y");
     int near = cbm_closure_add_file(s, "a/n.proto", &ROW_QUAL, "a.n");
+    int xc = cbm_closure_add_file(s, "x/y.proto", &ROW_QUAL, "x.common");
     ASSERT_TRUE(
         cbm_closure_add_def(s, common, "Status", "common.Status", "q.common.Status", false));
     ASSERT_TRUE(cbm_closure_add_def(s, y, "Status", "y.Status", "q.y.Status", false));
@@ -149,9 +178,14 @@ TEST(scope_closure_qualified_reference) {
     ASSERT_TRUE(cbm_closure_add_include(s, user, common, false));
     ASSERT_TRUE(cbm_closure_add_include(s, user, y, false));
     ASSERT_TRUE(cbm_closure_add_include(s, user, near, false));
-    /* nested messages of the user's own package */
+    ASSERT_TRUE(cbm_closure_add_include(s, xc, common, false));
+    /* the user's own messages, top-level and nested */
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Outer", "a.b.Outer", "q.Outer", false));
     ASSERT_TRUE(cbm_closure_add_def(s, user, "Inner", "a.b.Outer.Inner", "q.Outer.Inner", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Mid", "a.b.Outer.Mid", "q.Mid", false));
     ASSERT_TRUE(cbm_closure_add_def(s, user, "Deep", "a.b.Outer.Mid.Deep", "q.Deep", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "One", "a.b.One", "q.One", false));
+    ASSERT_TRUE(cbm_closure_add_def(s, user, "Two", "a.b.Two", "q.Two", false));
     ASSERT_TRUE(cbm_closure_add_def(s, user, "Twin", "a.b.One.Twin", "q.One.Twin", false));
     ASSERT_TRUE(cbm_closure_add_def(s, user, "Twin", "a.b.Two.Twin", "q.Two.Twin", false));
     ASSERT_EQ(cbm_closure_seal(s), 0);
@@ -159,15 +193,29 @@ TEST(scope_closure_qualified_reference) {
     ASSERT_EQ(c.verdict, CBM_CLOSURE_PROVEN);
     ASSERT_STR_EQ(c.qn, "q.common.Status");
     ASSERT_STR_EQ(sc_ask(s, user, "Status", ".y.Status", 0).qn, "q.y.Status");
-    /* bare `Status` inside package a.b reads a.b.Status, a.Status, Status and
-     * the messages inside a.b: neither common.Status nor y.Status */
+    /* bare `Status` inside package a.b reads a.b.Status, a.Status, Status:
+     * neither common.Status nor y.Status */
     ASSERT_EQ(sc_ask(s, user, "Status", NULL, 0).verdict, CBM_CLOSURE_PROVEN_ABSENT);
-    /* `n.Kind` inside package a.b: a.b.n.Kind, then a.n.Kind */
+    /* `n.Kind` inside package a.b: `n` first names the package a.n */
     ASSERT_STR_EQ(sc_ask(s, user, "Kind", "n.Kind", 0).qn, "q.a.n.Kind");
-    /* a message scope inside the package: the one Inner, the one Mid.Deep */
-    ASSERT_STR_EQ(sc_ask(s, user, "Inner", NULL, 0).qn, "q.Outer.Inner");
-    ASSERT_STR_EQ(sc_ask(s, user, "Deep", "Mid.Deep", 0).qn, "q.Deep");
-    ASSERT_STR_EQ(sc_ask(s, user, "Inner", ".a.b.Outer.Inner", 0).qn, "q.Outer.Inner");
+    /* `common.Status` inside package x.common: `common` first names x.common,
+     * so protoc reads x.common.Status, which is not defined: no answer */
+    cbm_closure_answer_t pre = sc_ask(s, xc, "Status", "common.Status", 0);
+    ASSERT_TRUE(pre.verdict != CBM_CLOSURE_PROVEN && pre.verdict != CBM_CLOSURE_POSSIBLE);
+    /* a message of the file holds the name: only inside it does protoc take
+     * it, and the site's message is unknown: possible */
+    cbm_closure_answer_t inner = sc_ask(s, user, "Inner", NULL, 0);
+    ASSERT_EQ(inner.verdict, CBM_CLOSURE_POSSIBLE);
+    ASSERT_STR_EQ(inner.qn, "q.Outer.Inner");
+    ASSERT_EQ(inner.why & CBM_CLOSURE_WHY_SCOPE, CBM_CLOSURE_WHY_SCOPE);
+    cbm_closure_answer_t deep = sc_ask(s, user, "Deep", "Mid.Deep", 0);
+    ASSERT_EQ(deep.verdict, CBM_CLOSURE_POSSIBLE);
+    ASSERT_STR_EQ(deep.qn, "q.Deep");
+    /* from the root, or through a top-level message: proven */
+    cbm_closure_answer_t lead = sc_ask(s, user, "Inner", ".a.b.Outer.Inner", 0);
+    ASSERT_EQ(lead.verdict, CBM_CLOSURE_PROVEN);
+    ASSERT_STR_EQ(sc_ask(s, user, "Inner", "Outer.Inner", 0).qn, "q.Outer.Inner");
+    ASSERT_EQ(sc_ask(s, user, "Inner", "Outer.Inner", 0).verdict, CBM_CLOSURE_PROVEN);
     /* `Twin` from inside One is One.Twin, from inside Two is Two.Twin: the
      * enclosing message is not known here, so no answer */
     cbm_closure_answer_t twin = sc_ask(s, user, "Twin", NULL, 0);
@@ -325,6 +373,85 @@ static uint64_t sc_work(int n, bool chain, bool lookups) {
     return right ? w : 0;
 }
 
+/* Counted lookup work of review 1's three shapes at n (one memo, as one
+ * resolver thread): (0, chain) f_i `import public` f_{i+1}, each defines T_i,
+ * a top file includes f_0 and asks every T_i; (1, fan) a top file includes n
+ * files and asks each one's T_i; (2, hub) n files `package p_i; Status`, a hub
+ * re-exports all, n users each include the hub and ask p_i.Status. */
+static uint64_t sc_shape_work(int n, int shape) {
+    cbm_closure_t *s = cbm_closure_new();
+    if (!s) {
+        return 0;
+    }
+    char rel[32];
+    char name[32];
+    char full[32];
+    char pkg[32];
+    int top = cbm_closure_add_file(s, "top.proto", &ROW_QUAL, "u");
+    int hub = cbm_closure_add_file(s, "hub.proto", &ROW_QUAL, "h");
+    int first = -1;
+    bool ok = true;
+    for (int i = 0; ok && i < n; i++) {
+        snprintf(rel, sizeof(rel), "f%d.proto", i);
+        snprintf(pkg, sizeof(pkg), "p%d", i);
+        int f = cbm_closure_add_file(s, rel, &ROW_QUAL, shape == 2 ? pkg : "u");
+        first = first < 0 ? f : first;
+        if (shape == 2) {
+            snprintf(rel, sizeof(rel), "user%d.proto", i);
+            ok = cbm_closure_add_file(s, rel, &ROW_QUAL, "u") >= 0;
+        }
+    }
+    for (int i = 0; ok && i < n; i++) {
+        int f = first + i * (shape == 2 ? 2 : 1);
+        snprintf(name, sizeof(name), "T%d", i);
+        snprintf(full, sizeof(full), shape == 2 ? "p%d.Status" : "u.T%d", i);
+        ok = cbm_closure_add_def(s, f, shape == 2 ? "Status" : name, full, full, false);
+        if (shape == 0) {
+            ok = ok && (i + 1 >= n || cbm_closure_add_include(s, f, f + 1, true));
+        } else if (shape == 1) {
+            ok = ok && cbm_closure_add_include(s, top, f, false);
+        } else {
+            ok = ok && cbm_closure_add_include(s, hub, f, true) &&
+                 cbm_closure_add_include(s, f + 1, hub, false);
+        }
+    }
+    if (shape == 0) {
+        ok = ok && cbm_closure_add_include(s, top, first, false);
+    }
+    ok = ok && cbm_closure_seal(s) == 0;
+    cbm_closure_memo_t *m = ok ? cbm_closure_memo_new() : NULL;
+    bool right = m != NULL;
+    for (int i = 0; right && i < n; i++) {
+        snprintf(name, sizeof(name), "T%d", i);
+        snprintf(full, sizeof(full), "p%d.Status", i);
+        cbm_closure_answer_t a = shape == 2 ? sc_ask_memo(s, m, first + i * 2 + 1, "Status", full)
+                                            : sc_ask_memo(s, m, top, name, NULL);
+        right = a.verdict == CBM_CLOSURE_PROVEN;
+    }
+    uint64_t w = m ? cbm_closure_memo_work(m) : 0;
+    cbm_closure_memo_free(m);
+    cbm_closure_free(s);
+    return right ? w : 0;
+}
+
+TEST(scope_closure_review_shapes_grow_linearly) {
+    static const char *const names[] = {"chain", "fan", "hub"};
+    for (int shape = 0; shape < 3; shape++) {
+        uint64_t w1 = sc_shape_work(100, shape);
+        uint64_t w4 = sc_shape_work(400, shape);
+        uint64_t w16 = sc_shape_work(1600, shape);
+        printf("\n  %s lookups: %llu / %llu / %llu at 1x / 4x / 16x", names[shape],
+               (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+        ASSERT_GT(w1, 0);
+        ASSERT_GT(w4, 0);
+        ASSERT_GT(w16, 0);
+        ASSERT_TRUE(w4 * 2 <= w1 * 9);
+        ASSERT_TRUE(w16 * 2 <= w4 * 9);
+    }
+    printf("\n");
+    PASS();
+}
+
 TEST(scope_closure_work_grows_linearly) {
     for (int chain = 0; chain < 2; chain++) {
         for (int lookups = 0; lookups < 2; lookups++) { /* the build, then the lookups */
@@ -347,6 +474,7 @@ TEST(scope_closure_work_grows_linearly) {
 }
 
 SUITE(scope_closure) {
+    RUN_TEST(scope_closure_review_shapes_grow_linearly);
     RUN_TEST(scope_closure_one_definition_through_an_include_is_proven);
     RUN_TEST(scope_closure_reexport_chain_and_cycle);
     RUN_TEST(scope_closure_incomplete_is_possible_or_no_answer);
