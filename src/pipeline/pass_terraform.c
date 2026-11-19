@@ -1576,20 +1576,67 @@ static int tf_link_refs(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, i
  * first file of that name in the unit's parent directory or above),
  * dirname(x) and get_terragrunt_dir(); anything else is unknown, and an
  * unknown path is no edge. A target must be a file (a directory) the graph
- * holds. */
+ * holds.
+ *
+ * A Terragrunt stack is a terragrunt.stack.hcl file, evaluated the same way,
+ * where E may also be local.N (a local of the stack file, its value
+ * evaluated in turn):
+ *   unit "N" / stack "N" { source = E, path = P }
+ *                                      IMPORTS {via: terragrunt-stack, kind:
+ *                                      unit | stack, local_name: N, path: P,
+ *                                      line} the Folder E names, from the block
+ *   include "N" { path = E }           IMPORTS {via: terragrunt-stack, kind:
+ *                                      include, local_name: N, line} the file
+ *                                      E names, from the block
+ *   read_terragrunt_config(E)          as for a unit
+ * A source is local when it is a relative path that cannot be a URL (no
+ * ':', so no scheme such as git::, https: or file: and no ssh host such as
+ * git@host:) and, resolved from the stack's directory, names a Folder of the
+ * graph. Terragrunt itself tests that the path exists (or has the file:
+ * scheme); this is the conservative subset the graph can check. An included
+ * file's unit and stack blocks and reads are the stack's:
+ * evaluated in its scope and from its directory, as Terragrunt decodes them,
+ * they IMPORTS from the include block, {file} (a read: {read}) naming the
+ * included file. Other *.stack.hcl files are read only through an include.
+ * Unknown: values.X, local.X.Y, local.X[i], get_repo_root(), try(), and a
+ * unit.N.path reference (it needs the generated layout). Units do not resolve
+ * local.X. */
 
 static const char TG_UNIT[] = "terragrunt.hcl";
+static const char TG_STACK[] = "terragrunt.stack.hcl";
 static const char TG_INCLUDE[] = "include.";
 static const char TG_DEPENDENCY[] = "dependency.";
+static const char TG_UNIT_BLOCK[] = "unit.";
+static const char TG_STACK_BLOCK[] = "stack.";
+
+enum { TG_MAX_LOCAL_DEPTH = 8 }; /* local.a = local.b chains */
+
+/* A local's value, evaluated once on first use: BUSY while evaluating (a
+ * cycle meets it: unknown). */
+enum { TG_LOCAL_NEW, TG_LOCAL_BUSY, TG_LOCAL_KNOWN, TG_LOCAL_UNKNOWN };
+
+/* A local of the stack file: its value expression and, once evaluated, its
+ * value. */
+typedef struct {
+    const char *name;
+    TSNode expr;
+    const char *value;
+    int state;
+} tg_local_t;
 
 typedef struct {
     cbm_pipeline_ctx_t *ctx;
     CBMArena *arena;
     CBMHashTable *files;   /* repository path -> File node */
     CBMHashTable *folders; /* directory -> Folder node */
-    const char *unit;      /* the unit's path */
+    const char *unit;      /* the unit's (the stack file's) path */
     const char *udir;      /* its directory */
     const char *src;       /* the text of the file being read */
+    tg_local_t *locals;    /* the stack file's locals; none for a unit */
+    const char *lsrc;      /* the text they are in */
+    int nlocals;
+    int locals_cap;
+    int depth; /* locals being evaluated, to TG_MAX_LOCAL_DEPTH */
     int edges;
 } tg_t;
 
@@ -1664,8 +1711,44 @@ static bool tg_call(const tg_t *g, TSNode call, char *out, size_t sz) {
     return false;
 }
 
-/* An expression's value: a string template of literals and known calls;
- * false when any part is something else. */
+/* `n` is local.NAME (one attribute: local.x.y and local.x[0] are not): the
+ * value of the stack file's local NAME, evaluated once in the text it is
+ * written in; false when there is no such local, in a cycle, or past
+ * TG_MAX_LOCAL_DEPTH. */
+static bool tg_local(const tg_t *g, TSNode n, char *out, size_t sz) {
+    if (g->nlocals == 0 || ts_node_named_child_count(n) != PAIR_LEN) {
+        return false;
+    }
+    TSNode v = ts_node_named_child(n, 0);
+    TSNode at = ts_node_named_child(n, SKIP_ONE);
+    if (!tf_type(v, "variable_expr") || !tf_text_is(g->src, v, "local") ||
+        !tf_type(at, "get_attr")) {
+        return false;
+    }
+    const char *name = tf_attr_name(g->arena, g->src, at);
+    for (int i = 0; name && i < g->nlocals; i++) {
+        tg_local_t *l = &g->locals[i];
+        if (strcmp(l->name, name) != 0) {
+            continue;
+        }
+        if (l->state == TG_LOCAL_NEW && g->depth < TG_MAX_LOCAL_DEPTH) {
+            l->state = TG_LOCAL_BUSY;
+            tg_t h = *g;
+            h.src = g->lsrc;
+            h.depth = g->depth + SKIP_ONE;
+            char val[CBM_SZ_1K];
+            l->value =
+                tg_eval(&h, l->expr, val, sizeof(val)) ? cbm_arena_strdup(g->arena, val) : NULL;
+            l->state = l->value ? TG_LOCAL_KNOWN : TG_LOCAL_UNKNOWN;
+        }
+        size_t len = 0;
+        return l->state == TG_LOCAL_KNOWN && tf_add(out, sz, &len, l->value, strlen(l->value));
+    }
+    return false;
+}
+
+/* An expression's value: a string template of literals, known calls and
+ * stack locals; false when any part is something else. */
 static bool tg_eval(const tg_t *g, TSNode n, char *out, size_t sz) {
     while (
         (tf_type(n, "expression") || tf_type(n, "literal_value") || tf_type(n, "template_expr")) &&
@@ -1674,6 +1757,9 @@ static bool tg_eval(const tg_t *g, TSNode n, char *out, size_t sz) {
     }
     if (tf_type(n, "function_call")) {
         return tg_call(g, n, out, sz);
+    }
+    if (tf_type(n, "expression")) {
+        return tg_local(g, n, out, sz);
     }
     if (!tf_type(n, "string_lit") && !tf_type(n, "quoted_template")) {
         return false;
@@ -1790,6 +1876,12 @@ static void tg_reads(tg_t *g, TSNode body, const char *site, const char *base, i
     }
 }
 
+/* The label of block `name` when it is `prefix` and the label; else NULL. */
+static const char *tg_label(const char *name, const char *prefix) {
+    size_t n = strlen(prefix);
+    return strncmp(name, prefix, n) == 0 ? name + n : NULL;
+}
+
 /* One block of the unit: an include, a dependency, the terraform block. An
  * include's file (its path into `inc`, its block into `inc_node`) is read
  * afterwards for the calls it holds. */
@@ -1802,18 +1894,20 @@ static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_n
     int line = (int)ts_node_start_point(b).row + SKIP_ONE;
     char path[CBM_SZ_1K];
     char props[CBM_SZ_256];
-    if (strncmp(name, TG_INCLUDE, sizeof(TG_INCLUDE) - SKIP_ONE) == 0) {
+    const char *inc_label = tg_label(name, TG_INCLUDE);
+    const char *dep_label = tg_label(name, TG_DEPENDENCY);
+    if (inc_label) {
         const cbm_gbuf_node_t *tgt =
             tg_file(g, tg_attr(g, bb, "path"), g->udir, path, sizeof(path));
         int64_t src = tgt ? tg_def_node(g, g->unit, name) : 0;
         snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
-                 name + sizeof(TG_INCLUDE) - SKIP_ONE, line);
+                 inc_label, line);
         tg_edge(g, src, tgt, "IMPORTS", props);
         if (src > 0) {
             snprintf(inc, inc_sz, "%s", path);
             *inc_node = src;
         }
-    } else if (strncmp(name, TG_DEPENDENCY, sizeof(TG_DEPENDENCY) - SKIP_ONE) == 0) {
+    } else if (dep_label) {
         char v[CBM_SZ_1K];
         char dir[CBM_SZ_1K];
         TSNode e = tg_attr(g, bb, "config_path");
@@ -1822,8 +1916,7 @@ static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_n
             snprintf(path, sizeof(path), "%s%s%s", dir, dir[0] ? "/" : "", TG_UNIT);
             const cbm_gbuf_node_t *tgt = cbm_ht_get(g->files, path);
             snprintf(props, sizeof(props),
-                     "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
-                     name + sizeof(TG_DEPENDENCY) - SKIP_ONE, line);
+                     "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}", dep_label, line);
             tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "DEPENDS_ON", props);
         }
     } else if (strcmp(name, "terraform") == 0) {
@@ -1842,16 +1935,30 @@ static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_n
 
 enum { TG_MAX_INCLUDES = 32 };
 
-/* One unit: its blocks and reads, then the reads of the files it includes. */
-static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
-    const char *slash = strrchr(rel, '/');
-    g->unit = rel;
-    g->udir = cbm_arena_strndup(g->arena, rel, slash ? (size_t)(slash - rel) : 0);
+/* Repository file `rel`, its text into `*src` (the caller frees it), parsed;
+ * NULL when unreadable. */
+static TSTree *tg_parse(const tg_t *g, TSParser *parser, const char *rel, char **src) {
     char path[CBM_SZ_2K];
     snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, rel);
     size_t len = 0;
-    char *src = g->udir ? tf_read(path, &len) : NULL;
-    TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+    *src = tf_read(path, &len);
+    return *src ? ts_parser_parse_string(parser, NULL, *src, (uint32_t)len) : NULL;
+}
+
+/* Unit or stack file `rel` becomes the file being read; parsed as tg_parse,
+ * NULL also when out of memory. */
+static TSTree *tg_enter(tg_t *g, TSParser *parser, const char *rel, char **src) {
+    const char *slash = strrchr(rel, '/');
+    g->unit = rel;
+    g->udir = cbm_arena_strndup(g->arena, rel, slash ? (size_t)(slash - rel) : 0);
+    *src = NULL;
+    return g->udir ? tg_parse(g, parser, rel, src) : NULL;
+}
+
+/* One unit: its blocks and reads, then the reads of the files it includes. */
+static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
+    char *src = NULL;
+    TSTree *tree = tg_enter(g, parser, rel, &src);
     char inc[TG_MAX_INCLUDES][CBM_SZ_1K];
     int64_t inc_node[TG_MAX_INCLUDES];
     int ni = 0;
@@ -1870,9 +1977,7 @@ static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
     }
     cbm_free(CBM_MEM_CLASS_OTHER, src);
     for (int k = 0; k < ni; k++) {
-        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, inc[k]);
-        src = tf_read(path, &len);
-        tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+        tree = tg_parse(g, parser, inc[k], &src);
         if (tree) {
             g->src = src;
             char base[CBM_SZ_1K];
@@ -1886,12 +1991,158 @@ static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
     g->src = NULL;
 }
 
+/* A stack source that can name a local directory: a path that cannot be a
+ * URL (not empty, no scheme, forcer or ssh host: no ':') and is not
+ * absolute. The caller resolves it against the stack directory and requires
+ * a Folder of the graph there; Terragrunt's own test is that the path
+ * exists, so this is a conservative subset. */
+static bool tg_local_source(const char *v) {
+    return v[0] != '\0' && v[0] != '/' && !strchr(v, ':');
+}
+
+/* A unit or stack block `b` of the stack file -- or, `file` set, of that
+ * file the stack includes, with `from` its include block: a local source
+ * IMPORTS the Folder it names, from `from`, else from the block's own node,
+ * else from the stack file's File. */
+static void tg_stack_block(tg_t *g, TSNode b, int64_t from, const char *file) {
+    TSNode bb;
+    const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
+    if (!name || ts_node_is_null(bb)) {
+        return;
+    }
+    const char *kind = "unit";
+    const char *label = tg_label(name, TG_UNIT_BLOCK);
+    if (!label) {
+        kind = "stack";
+        label = tg_label(name, TG_STACK_BLOCK);
+    }
+    if (!label) {
+        return;
+    }
+    char v[CBM_SZ_1K];
+    char dir[CBM_SZ_1K];
+    TSNode e = tg_attr(g, bb, "source");
+    if (ts_node_is_null(e) || !tg_eval(g, e, v, sizeof(v)) || !tg_local_source(v) ||
+        !tf_repo_path(g->udir, v, dir, sizeof(dir))) {
+        return;
+    }
+    const cbm_gbuf_node_t *tgt = g->folders ? cbm_ht_get(g->folders, dir) : NULL;
+    if (!tgt) {
+        return;
+    }
+    char gen[CBM_SZ_256];
+    char esc[CBM_SZ_512];
+    TSNode pe = tg_attr(g, bb, "path");
+    if (ts_node_is_null(pe) || !tg_eval(g, pe, gen, sizeof(gen))) {
+        gen[0] = '\0';
+    }
+    cbm_json_escape(esc, (int)sizeof(esc), gen);
+    int64_t src = from ? from : tg_def_node(g, g->unit, name);
+    if (!src) {
+        const cbm_gbuf_node_t *f = cbm_ht_get(g->files, g->unit);
+        src = f ? f->id : 0;
+    }
+    char props[CBM_SZ_2K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"terragrunt-stack\",\"kind\":\"%s\",\"local_name\":\"%s\"%s%s%s,"
+             "\"path\":\"%s\",\"line\":%d}",
+             kind, label, file ? ",\"file\":\"" : "", file ? file : "", file ? "\"" : "", esc,
+             (int)ts_node_start_point(b).row + SKIP_ONE);
+    tg_edge(g, src, tgt, "IMPORTS", props);
+}
+
+/* The attributes of the stack file's locals blocks, into the scope. */
+static void tg_stack_locals(tg_t *g, TSNode body) {
+    for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+        TSNode b = ts_node_named_child(body, i);
+        TSNode bb;
+        const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
+        if (!name || strcmp(name, "locals") != 0) {
+            continue;
+        }
+        for (uint32_t j = 0; !ts_node_is_null(bb) && j < ts_node_named_child_count(bb); j++) {
+            TSNode at = ts_node_named_child(bb, j);
+            if (!tf_type(at, "attribute") || ts_node_named_child_count(at) < PAIR_LEN ||
+                !tf_grow((void **)&g->locals, &g->locals_cap, g->nlocals, sizeof(*g->locals))) {
+                continue;
+            }
+            g->locals[g->nlocals++] =
+                (tg_local_t){.name = tf_text(g->arena, g->src, ts_node_named_child(at, 0)),
+                             .expr = ts_node_named_child(at, SKIP_ONE),
+                             .state = TG_LOCAL_NEW};
+        }
+    }
+}
+
+/* include "N" { path = E } of the stack file: IMPORTS the file E names, and
+ * that file's unit and stack blocks and reads, from the include block. They
+ * are the stack's (Terragrunt decodes the file in the stack's context): its
+ * scope, and paths from its directory. */
+static void tg_stack_include(tg_t *g, TSParser *parser, TSNode b, const char *name, TSNode bb) {
+    char path[CBM_SZ_1K];
+    const cbm_gbuf_node_t *tgt = tg_file(g, tg_attr(g, bb, "path"), g->udir, path, sizeof(path));
+    int64_t from = tgt ? tg_def_node(g, g->unit, name) : 0;
+    if (!from) {
+        return;
+    }
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"terragrunt-stack\",\"kind\":\"include\",\"local_name\":\"%s\","
+             "\"line\":%d}",
+             tg_label(name, TG_INCLUDE), (int)ts_node_start_point(b).row + SKIP_ONE);
+    tg_edge(g, from, tgt, "IMPORTS", props);
+    char *src = NULL;
+    TSTree *tree = tg_parse(g, parser, path, &src);
+    if (tree) {
+        const char *outer = g->src;
+        g->src = src;
+        TSNode body = tf_root_body(ts_tree_root_node(tree));
+        for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+            tg_stack_block(g, ts_node_named_child(body, i), from, path);
+        }
+        tg_reads(g, body, path, g->udir, from);
+        g->src = outer;
+        ts_tree_delete(tree);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+}
+
+/* One stack file: its locals (the scope), its unit and stack blocks, its
+ * includes, and its reads. The tree lives until the includes are done: the
+ * scope points into it. */
+static void tg_stack_file(tg_t *g, TSParser *parser, const char *rel) {
+    char *src = NULL;
+    TSTree *tree = tg_enter(g, parser, rel, &src);
+    if (tree) {
+        g->src = src;
+        g->lsrc = src;
+        TSNode body = tf_root_body(ts_tree_root_node(tree));
+        tg_stack_locals(g, body);
+        for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
+            TSNode b = ts_node_named_child(body, i);
+            TSNode bb;
+            const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
+            if (name && !ts_node_is_null(bb) && tg_label(name, TG_INCLUDE)) {
+                tg_stack_include(g, parser, b, name, bb);
+            } else {
+                tg_stack_block(g, b, 0, NULL);
+            }
+        }
+        tg_reads(g, body, rel, g->udir, 0);
+        ts_tree_delete(tree);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    g->nlocals = 0;
+    g->src = NULL;
+    g->lsrc = NULL;
+}
+
 static int tg_cmp_str(const void *x, const void *y) {
     return strcmp(*(const char *const *)x, *(const char *const *)y);
 }
 
-/* Every Terragrunt unit of the repository, when the run holds a .hcl file
- * (a unit, or a file units include or read). */
+/* Every Terragrunt unit and stack of the repository, when the run holds a
+ * .hcl file (a unit, a stack, or a file they include or read). */
 static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          TSParser *parser) {
     bool any = false;
@@ -1907,22 +2158,27 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     CBMArena arena;
     cbm_arena_init_lazy(&arena, CBM_SZ_4K);
     tg_t g = {.ctx = ctx, .arena = &arena, .files = cbm_ht_create(0)};
-    const char **units = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)fn * sizeof(char *));
-    int nu = 0;
-    for (int i = 0; g.files && units && i < fn; i++) {
+    const char **confs = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)fn * sizeof(char *));
+    int nc = 0;
+    for (int i = 0; g.files && confs && i < fn; i++) {
         const char *rel = fnodes[i]->file_path;
         if (rel) {
             cbm_ht_set(g.files, rel, (void *)fnodes[i]);
-            if (strcmp(tf_basename(rel), TG_UNIT) == 0) {
-                units[nu++] = rel;
+            const char *base = tf_basename(rel);
+            if (strcmp(base, TG_UNIT) == 0 || strcmp(base, TG_STACK) == 0) {
+                confs[nc++] = rel;
             }
         }
     }
-    if (nu > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
-        qsort((void *)units, (size_t)nu, sizeof(*units), tg_cmp_str);
+    if (nc > 0 && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HCL))) {
+        qsort((void *)confs, (size_t)nc, sizeof(*confs), tg_cmp_str);
         g.folders = tf_label_index(ctx, "Folder");
-        for (int i = 0; i < nu; i++) {
-            tg_unit(&g, parser, units[i]);
+        for (int i = 0; i < nc; i++) {
+            if (strcmp(tf_basename(confs[i]), TG_UNIT) == 0) {
+                tg_unit(&g, parser, confs[i]);
+            } else {
+                tg_stack_file(&g, parser, confs[i]);
+            }
         }
     }
     if (g.folders) {
@@ -1931,7 +2187,8 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     if (g.files) {
         cbm_ht_free(g.files);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, (void *)units);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)confs);
+    cbm_free(CBM_MEM_CLASS_OTHER, g.locals);
     cbm_arena_destroy(&arena);
     return g.edges;
 }
