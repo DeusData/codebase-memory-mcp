@@ -1,0 +1,28 @@
+{
+ "_about": [
+  "Neo4j backend. Copy to neo4j.local.json and adjust; *.local.json is git-ignored.",
+  "The password is read from the environment variable named by neo4j_password_env",
+  "(default NEO4J_PASSWORD) unless vars.neo4j_password is set. Never commit a password.",
+  "project_twin is the SQLite project the parity evals compare against: index the same",
+  "working copy twice, once with graph_db and once without (see cases/neo4j/N08_parity.json)."
+ ],
+ "backend": "neo4j",
+ "binary": "codebase-memory-mcp-neo4j",
+ "neo4j_password_env": "NEO4J_PASSWORD",
+ "env": {},
+ "vars": {
+  "project": "eval-small-n4",
+  "project_twin": "eval-small",
+  "repo": "D:/cbm-evals/work/eval-small",
+  "project_medium": "eval-medium-n4",
+  "repo_medium": "D:/cbm-evals/work/eval-medium",
+  "index_mode": "full",
+  "graph_db": "http://localhost:7474",
+  "graph_db_arg": "http://localhost:7474",
+  "neo4j_user": "neo4j",
+  "neo4j_database": "neo4j",
+  "neo4j_container": "cbm-neo4j",
+  "compose_file": "docker/graph/compose.yaml",
+  "compare_target": "eval-small-n4-other"
+ }
+}

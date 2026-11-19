@@ -1,0 +1,329 @@
+{
+ "suite": "N-SEC",
+ "title": "Neo4j backend: secrets never leak; projects never bleed into each other",
+ "spec": "specs/10_failure_security.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N07-01",
+   "tier": 1,
+   "title": "index_status output does not contain the password (the harness masks the real value as ***)",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json",
+    "verbose": true,
+    "diagnostics": "full"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "text_not_contains": "***",
+    "deep_not_contains": "***"
+   }
+  },
+  {
+   "id": "N07-02",
+   "tier": 1,
+   "title": "list_projects output does not contain the password",
+   "tool": "list_projects",
+   "args": {
+    "format": "json",
+    "detail": "stats"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "text_not_contains": "***",
+    "deep_not_contains": "***"
+   }
+  },
+  {
+   "id": "N07-03",
+   "tier": 1,
+   "title": "the marker file never holds the password",
+   "shell": "{{python}} -c \"import os,sys; t=open(sys.argv[1]+'.graph.json',encoding='utf-8').read(); pw=os.environ.get('NEO4J_PASSWORD',''); print('marker_has_password', bool(pw) and pw in t)\" \"{{db_path}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "marker_has_password False"
+   }
+  },
+  {
+   "id": "N07-04",
+   "tier": 1,
+   "title": "no log under the cache dir holds the password",
+   "shell": "{{python}} -c \"import glob,os,sys; pw=os.environ.get('NEO4J_PASSWORD',''); hits=0\nfor p in glob.glob(os.path.join(sys.argv[1],'logs','**','*'),recursive=True):\n    if os.path.isfile(p) and pw and pw in open(p,'rb').read().decode('utf-8','replace'): hits+=1\nprint('hits=%d'%hits)\" \"{{cache_dir}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "hits=0"
+   }
+  },
+  {
+   "id": "N07-05",
+   "tier": 1,
+   "title": "no eval result/stderr file holds the password",
+   "shell": "{{python}} -c \"import glob,os,sys; pw=os.environ.get('NEO4J_PASSWORD',''); hits=0\nfor p in glob.glob(os.path.join(sys.argv[1],'results','**','*'),recursive=True):\n    if os.path.isfile(p) and pw and pw in open(p,'rb').read().decode('utf-8','replace'): hits+=1\nprint('hits=%d'%hits)\" \"{{evals_dir}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "hits=0"
+   }
+  },
+  {
+   "id": "N07-06",
+   "tier": 1,
+   "title": "a failed login error does not echo the attempted password",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-badpw2",
+    "graph_db": "{{graph_db}}",
+    "graph_password": "evals-wrong-secret-xyz",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false,
+    "text_not_contains": "evals-wrong-secret-xyz",
+    "deep_not_contains": "evals-wrong-secret-xyz"
+   }
+  },
+  {
+   "id": "N07-06a",
+   "tier": 1,
+   "title": "REGRESSION (fixed 2026-11-18): right after another project's failed login, this project still reads",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "label": "Function",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j"
+   }
+  },
+  {
+   "id": "N07-06b",
+   "tier": 2,
+   "title": "workaround: restart the daemon to drop the poisoned credential",
+   "session": "restart",
+   "daemon_stop": true
+  },
+  {
+   "id": "N07-07",
+   "tier": 1,
+   "title": "SCOPE: no foreign project rows under this project's db key",
+   "cypher": "MATCH (n:CbmNode {db: $project}) WHERE n.project <> $project AND NOT n.project ENDS WITH '::missed' RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N07-08",
+   "tier": 1,
+   "title": "SCOPE: File count via engine on project A",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N07-09",
+   "tier": 1,
+   "title": "SCOPE: File count via engine on project B (same repo) is the same number, read from B's rows only",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}-other",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N07-08",
+      "path": "structured.rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N07-10",
+   "tier": 1,
+   "title": "SCOPE: Neo4j holds 2x that many File rows across both projects (so A's count was not 'all of Neo4j')",
+   "cypher": "MATCH (n:CbmNode {label: 'File'}) WHERE n.db IN [$a, $b] AND n.project IN [$a, $b] RETURN count(n)",
+   "params": {
+    "a": "{{project}}",
+    "b": "{{project}}-other"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N07-08",
+      "path": "structured.rows.0.0",
+      "this_path": "rows.0.0",
+      "factor": 2
+     }
+    ]
+   }
+  },
+  {
+   "id": "N07-11",
+   "tier": 1,
+   "title": "SCOPE: trace_path on A never lists a qualified name of B",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "{{project}}-other."
+   }
+  },
+  {
+   "id": "N07-12",
+   "tier": 1,
+   "title": "SCOPE: search_graph on A never returns a qn of B",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": ".*",
+    "limit": 500,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "{{project}}-other."
+   }
+  },
+  {
+   "id": "N07-13",
+   "tier": 1,
+   "title": "SCOPE: deleting project B leaves A intact",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project}}-other"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N07-14",
+   "tier": 1,
+   "title": "…B's rows are gone from Neo4j",
+   "cypher": "MATCH (n:CbmNode {db: $b}) RETURN count(n)",
+   "params": {
+    "b": "{{project}}-other"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N07-15",
+   "tier": 1,
+   "title": "…B's CbmProject is gone",
+   "cypher": "MATCH (p:CbmProject {name: $b}) RETURN count(p)",
+   "params": {
+    "b": "{{project}}-other"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N07-16",
+   "tier": 1,
+   "title": "…A still answers with the same File count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "same_as": [
+     {
+      "step": "N07-08",
+      "path": "structured.rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N07-17",
+   "tier": 1,
+   "title": "…and the indexes are untouched by a project delete",
+   "cypher": "SHOW INDEXES YIELD name WHERE name STARTS WITH 'cbm_node_' RETURN count(name)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      6
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N07-18",
+   "tier": 2,
+   "title": "re-create B for any suite that runs after this one",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-other",
+    "mode": "fast",
+    "graph_db": "{{graph_db}}",
+    "graph_user": "{{neo4j_user}}",
+    "graph_password": "{{neo4j_password}}",
+    "graph_database": "{{neo4j_database}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  }
+ ]
+}

@@ -1,0 +1,340 @@
+{
+ "suite": "S-FTS",
+ "title": "SQLite BM25 (FTS5) search through search_graph query=",
+ "spec": "specs/05_search_graph.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "S03-01",
+   "tier": 1,
+   "title": "a word that only occurs in a docstring finds its function",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "hyphenate",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "search_mode",
+      "op": "eq",
+      "value": "bm25"
+     }
+    ],
+    "rows": [
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "\\.slugify$"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-02",
+   "tier": 1,
+   "title": "a name word finds every symbol carrying it",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "checkout",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": [
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "\\.OrderService\\.checkout$"
+     },
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "test_checkout$"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-03",
+   "tier": 2,
+   "title": "docstring vocabulary: 'receipt' ranks notify and checkout",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "receipt",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": [
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "\\.notify$"
+     },
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "\\.checkout$"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-04",
+   "tier": 1,
+   "title": "no hits is a clean empty answer",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "zzqqxxnothing",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "total",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-05",
+   "tier": 1,
+   "title": "query + label filter",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "receipt",
+    "label": "Function",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "label",
+     "all_match": "^Function$"
+    }
+   }
+  },
+  {
+   "id": "S03-06",
+   "tier": 1,
+   "title": "query + file_pattern restricts to Java",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "format",
+    "file_pattern": "java/**",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "file",
+     "all_match": "\\.java$",
+     "includes": "java/src/main/java/com/example/billing/Money.java"
+    }
+   }
+  },
+  {
+   "id": "S03-07",
+   "tier": 1,
+   "title": "query and semantic_query together are refused",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "money",
+    "semantic_query": [
+     "money"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "S03-08",
+   "tier": 2,
+   "title": "unicode token search (unicode61 tokenizer)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "ünïcode_fn",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": [
+     {
+      "table": "",
+      "col": "qn",
+      "any_match": "ünïcode_fn$"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-09",
+   "tier": 2,
+   "title": "markdown section titles are searchable",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "billing",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "Billing"
+   }
+  },
+  {
+   "id": "S03-10",
+   "tier": 1,
+   "title": "limit 1 pages the ranked list",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "caller",
+    "limit": 1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 1
+     },
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-11",
+   "tier": 1,
+   "title": "offset continues the ranked list without duplicates",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "caller",
+    "limit": 5,
+    "offset": 5,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "unique": "qn"
+    }
+   }
+  },
+  {
+   "id": "S03-12",
+   "tier": 1,
+   "title": "BM25 total is the same with and without paging",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "caller",
+    "limit": 500,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "S03-10",
+      "path": "structured.total"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S03-13",
+   "tier": 2,
+   "title": "macro-style QN suffix does not pollute ranking (C-only rule; records that the query runs)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "macro",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S03-14",
+   "tier": 1,
+   "title": "BM25 answers within 5 s on the small fixture",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "order total cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 5000
+   }
+  },
+  {
+   "id": "S03-15",
+   "tier": 2,
+   "title": "BM25 is served locally even on a Neo4j project (reply names the local part)",
+   "skip_if": "sqlite",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "hyphenate",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "neo4j"
+     }
+    ]
+   }
+  }
+ ]
+}

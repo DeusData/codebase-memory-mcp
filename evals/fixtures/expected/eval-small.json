@@ -1,0 +1,143 @@
+{
+  "_about": [
+    "Ground truth for fixtures/eval-small, hand-verified against the source.",
+    "tier 1 = must hold on every build (a failure is a defect).",
+    "tier 2 = expected; parser-dependent details are frozen at the pilot run (see README 'Golden').",
+    "Paths are repository-relative with forward slashes."
+  ],
+  "project": "eval-small",
+  "source_files_tier1": [
+    "app/cli.py",
+    "app/models.py",
+    "app/money.py",
+    "app/service.py",
+    "app/util/strings.py",
+    "hub/hub.py",
+    "dup/alpha.py",
+    "dup/beta.py",
+    "unicode/ünïcødé.py",
+    "tests/test_service.py",
+    "java/src/main/java/com/example/billing/Money.java",
+    "java/src/main/java/com/example/billing/Invoice.java",
+    "java/src/main/java/com/example/billing/InvoiceService.java",
+    "java/src/test/java/com/example/billing/InvoiceServiceTest.java"
+  ],
+  "source_files_tier2": [
+    "app/__init__.py",
+    "app/util/__init__.py",
+    "hub/__init__.py",
+    "dup/__init__.py",
+    "unicode/__init__.py",
+    "tests/__init__.py",
+    "README.md",
+    "docs/ARCHITECTURE.md",
+    "Dockerfile",
+    "docker-compose.yml"
+  ],
+  "never_indexed": {
+    "vendor/thirdparty/lib.py": "excluded by .cbmignore (vendor/)",
+    "generated/gen.py": "excluded by .gitignore (generated/)"
+  },
+  "never_present_symbols": ["vendored_fn", "generated_fn", "compute_total"],
+  "symbols_tier1": [
+    {"name": "round_cents", "label": "Function", "file": "app/money.py"},
+    {"name": "format_cents", "label": "Function", "file": "app/money.py"},
+    {"name": "Customer", "label": "Class", "file": "app/models.py"},
+    {"name": "Order", "label": "Class", "file": "app/models.py"},
+    {"name": "display_name", "label": "Method", "file": "app/models.py"},
+    {"name": "add_line", "label": "Method", "file": "app/models.py"},
+    {"name": "total", "label": "Method", "file": "app/models.py"},
+    {"name": "ValidationError", "label": "Class", "file": "app/service.py"},
+    {"name": "validate", "label": "Function", "file": "app/service.py"},
+    {"name": "notify", "label": "Function", "file": "app/service.py"},
+    {"name": "OrderService", "label": "Class", "file": "app/service.py"},
+    {"name": "create", "label": "Method", "file": "app/service.py"},
+    {"name": "checkout", "label": "Method", "file": "app/service.py"},
+    {"name": "slugify", "label": "Function", "file": "app/util/strings.py"},
+    {"name": "unused_helper", "label": "Function", "file": "app/util/strings.py"},
+    {"name": "main", "label": "Function", "file": "app/cli.py"},
+    {"name": "hub", "label": "Function", "file": "hub/hub.py"},
+    {"name": "caller_01", "label": "Function", "file": "hub/hub.py"},
+    {"name": "caller_12", "label": "Function", "file": "hub/hub.py"},
+    {"name": "shared_name", "label": "Function", "file": "dup/alpha.py"},
+    {"name": "shared_name", "label": "Function", "file": "dup/beta.py"},
+    {"name": "ünïcode_fn", "label": "Function", "file": "unicode/ünïcødé.py"},
+    {"name": "test_checkout", "label": "Function", "file": "tests/test_service.py"},
+    {"name": "Money", "label": "Class", "file": "java/src/main/java/com/example/billing/Money.java"},
+    {"name": "roundCents", "label": "Method", "file": "java/src/main/java/com/example/billing/Money.java"},
+    {"name": "format", "label": "Method", "file": "java/src/main/java/com/example/billing/Money.java"},
+    {"name": "Invoice", "label": "Class", "file": "java/src/main/java/com/example/billing/Invoice.java"},
+    {"name": "addLine", "label": "Method", "file": "java/src/main/java/com/example/billing/Invoice.java"},
+    {"name": "total", "label": "Method", "file": "java/src/main/java/com/example/billing/Invoice.java"},
+    {"name": "InvoiceService", "label": "Class", "file": "java/src/main/java/com/example/billing/InvoiceService.java"},
+    {"name": "issue", "label": "Method", "file": "java/src/main/java/com/example/billing/InvoiceService.java"},
+    {"name": "audit", "label": "Method", "file": "java/src/main/java/com/example/billing/InvoiceService.java"},
+    {"name": "InvoiceServiceTest", "label": "Class", "file": "java/src/test/java/com/example/billing/InvoiceServiceTest.java"},
+    {"name": "testIssue", "label": "Method", "file": "java/src/test/java/com/example/billing/InvoiceServiceTest.java"}
+  ],
+  "symbols_tier2": [
+    {"name": "{{LONG_NAME}}", "label": "Function", "file": "unicode/ünïcødé.py", "note": "200-character identifier"},
+    {"name": "__init__", "label": "Method", "file": "app/models.py", "note": "two of them (Customer, Order)"},
+    {"name": "Architecture", "label": "Section", "file": "docs/ARCHITECTURE.md"},
+    {"name": "Orders", "label": "Section", "file": "docs/ARCHITECTURE.md"},
+    {"name": "Billing", "label": "Section", "file": "docs/ARCHITECTURE.md"},
+    {"name": "Dead code", "label": "Section", "file": "docs/ARCHITECTURE.md"},
+    {"name": "ORDER_ENV", "label": "EnvVar", "file": "Dockerfile", "note": "also in docker-compose.yml"},
+    {"name": "Service/orders", "label": "Resource", "file": "docker-compose.yml", "note": "compose service"},
+    {"name": "Service/db", "label": "Resource", "file": "docker-compose.yml", "note": "compose service with image postgres:16"}
+  ],
+  "calls_tier1": [
+    {"from": "format_cents", "to": "round_cents", "file": "app/money.py", "kind": "same-file direct call"},
+    {"from": "checkout", "to": "validate", "file": "app/service.py", "kind": "same-file direct call"},
+    {"from": "checkout", "to": "notify", "file": "app/service.py", "kind": "same-file direct call"},
+    {"from": "main", "to": "slugify", "file": "app/cli.py", "kind": "imported-name call"},
+    {"from": "caller_01", "to": "hub", "file": "hub/hub.py"},
+    {"from": "caller_12", "to": "hub", "file": "hub/hub.py"},
+    {"from": "issue", "to": "audit", "file": "InvoiceService.java", "kind": "same-class private call"},
+    {"from": "format", "to": "roundCents", "file": "Money.java", "kind": "same-class static call"}
+  ],
+  "calls_tier2": [
+    {"from": "notify", "to": "format_cents", "file": "app/service.py", "kind": "imported-name call"},
+    {"from": "total", "to": "round_cents", "file": "app/models.py", "kind": "imported-name call inside a generator"},
+    {"from": "main", "to": "checkout", "kind": "method call on a typed local (Python resolver)"},
+    {"from": "main", "to": "create", "kind": "method call on a typed local (Python resolver)"},
+    {"from": "notify", "to": "display_name", "kind": "attribute chain order.customer.display_name()"},
+    {"from": "test_checkout", "to": "checkout", "kind": "test caller"},
+    {"from": "issue", "to": "format", "file": "InvoiceService.java", "kind": "static call Money.format (Java LSP)"},
+    {"from": "issue", "to": "total", "kind": "invoice.total() (Java LSP)"},
+    {"from": "audit", "to": "total", "kind": "invoice.total() (Java LSP)"},
+    {"from": "total", "to": "roundCents", "file": "Invoice.java", "kind": "static call Money.roundCents (Java LSP)"},
+    {"from": "testIssue", "to": "issue", "kind": "test caller (Java)"}
+  ],
+  "hub": {
+    "name": "hub",
+    "file": "hub/hub.py",
+    "inbound_calls_exact": 12,
+    "callers": ["caller_01", "caller_02", "caller_03", "caller_04", "caller_05", "caller_06",
+                "caller_07", "caller_08", "caller_09", "caller_10", "caller_11", "caller_12"]
+  },
+  "dead_code": {
+    "zero_inbound_calls": ["unused_helper"],
+    "note": "caller_01..12, main, test_checkout, testIssue also have 0 inbound CALLS; they are entry points, not dead code."
+  },
+  "duplicates": {
+    "shared_name": ["dup/alpha.py", "dup/beta.py"]
+  },
+  "tests": {
+    "test_files": ["tests/test_service.py", "java/src/test/java/com/example/billing/InvoiceServiceTest.java"],
+    "excluded_by_default_in_trace_path": ["test_checkout", "testIssue"]
+  },
+  "search_code_truth": {
+    "literal_hub()": {"pattern": "hub()", "files": ["hub/hub.py"], "match_lines_min": 12},
+    "literal_round_cents": {"pattern": "round_cents", "files": ["app/money.py", "app/models.py"]},
+    "regex_caller_digits": {"pattern": "caller_[0-9]+", "regex": true, "files": ["hub/hub.py"], "match_lines": 12},
+    "docs_only_token": {"pattern": "intentionally unreferenced", "files": ["docs/ARCHITECTURE.md"]},
+    "unicode_pattern": {"pattern": "ünïcode_fn", "files": ["unicode/ünïcødé.py"]},
+    "never": {"pattern": "vendored_fn", "files": []}
+  },
+  "bm25_truth": {
+    "docstring_only_words": {"query": "hyphenate", "expect_name": "slugify", "note": "word appears only in slugify's docstring"},
+    "name_word": {"query": "checkout", "expect_names": ["checkout", "test_checkout"]}
+  },
+  "qualified_name_rule": "<project>.<path parts without extension>.<Class>.<member>; e.g. eval-small.app.service.OrderService.checkout"
+}

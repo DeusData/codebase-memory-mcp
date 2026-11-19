@@ -1,0 +1,745 @@
+{
+ "suite": "N-DELTA",
+ "title": "Neo4j delta sync: unchanged, edited, added and removed rows; forced full uploads",
+ "spec": "specs/02_indexing_neo4j.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N03-01",
+   "tier": 1,
+   "title": "baseline: in sync",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "exists"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-02",
+   "tier": 1,
+   "title": "baseline Neo4j node count",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N03-03",
+   "tier": 1,
+   "title": "baseline Neo4j edge count",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (:CbmNode {db: $project, gen: p.gen, project: $project})-[r]->(:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N03-04",
+   "tier": 1,
+   "title": "re-index with nothing changed",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-05",
+   "tier": 1,
+   "title": "…still in sync; last_sync is a no-op delta, skipped, or unchanged (record the text)",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync_error",
+      "op": "missing"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-06",
+   "tier": 1,
+   "title": "…node count unchanged",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N03-02",
+      "path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-07",
+   "tier": 1,
+   "title": "EDIT: change round_cents' docstring (same symbols, same ids)",
+   "fs": "write",
+   "path": "app/money.py",
+   "content": "\"\"\"Money helpers: rounding and formatting of cent amounts.\"\"\"\n\n\ndef round_cents(amount: float) -> int:\n    \"\"\"Round a float dollar amount to whole cents. DELTA-EDIT marker.\"\"\"\n    return int(amount * 100 + 0.5)\n\n\ndef format_cents(cents: int) -> str:\n    \"\"\"Format cents as a dollar string, e.g. 1234 -> '$12.34'.\"\"\"\n    cents = round_cents(cents / 100)\n    return f\"${cents // 100}.{cents % 100:02d}\"\n"
+  },
+  {
+   "id": "N03-08",
+   "tier": 1,
+   "title": "re-index after the edit",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-09",
+   "tier": 1,
+   "title": "…the sync was a delta",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^delta:"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-10",
+   "tier": 2,
+   "title": "a docstring edit is a small delta confined to the edited file: the incremental route re-creates that file's nodes with fresh ids (contentless FTS rows are never reused), so they show as a few adds and removes; nothing else moves (measured +4 -4 nodes on a 137-node graph)",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^delta: nodes \\+[0-9] ~[0-9]{1,2} -[0-9], edges \\+[0-9]{1,2} ~[0-9]{1,2} -[0-9]{1,2} "
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-11",
+   "tier": 1,
+   "title": "…node count unchanged by the in-place update",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N03-02",
+      "path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-12",
+   "tier": 1,
+   "title": "…edge count unchanged",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (:CbmNode {db: $project, gen: p.gen, project: $project})-[r]->(:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N03-03",
+      "path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-13",
+   "tier": 1,
+   "title": "…the new docstring reached Neo4j",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project, name: 'round_cents'}) RETURN n.properties_json",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": "DELTA-EDIT"
+   }
+  },
+  {
+   "id": "N03-14",
+   "tier": 1,
+   "title": "…and is what the tools serve",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.money.round_cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "DELTA-EDIT"
+   }
+  },
+  {
+   "id": "N03-15",
+   "tier": 1,
+   "title": "…hub still has 12 callers (untouched rows were not rewritten or lost)",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (c:CbmNode {db: $project, gen: p.gen, project: $project})-[:CALLS]->(h:CbmNode {db: $project, gen: p.gen, project: $project, name: 'hub'}) RETURN count(c)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      12
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-16",
+   "tier": 1,
+   "title": "ADD: a new file with two functions",
+   "fs": "write",
+   "path": "app/extra.py",
+   "content": "\"\"\"Added by the delta eval.\"\"\"\nfrom app.money import round_cents\n\n\ndef extra_one(x: float) -> int:\n    return round_cents(x)\n\n\ndef extra_two() -> int:\n    return extra_one(1.5)\n"
+  },
+  {
+   "id": "N03-17",
+   "tier": 1,
+   "title": "re-index after the add",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-18",
+   "tier": 1,
+   "title": "…sync succeeded as delta or full (adding a file may renumber ids: record which)",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^(delta|full)"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-19",
+   "tier": 1,
+   "title": "…the new functions are in Neo4j",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) WHERE n.name IN ['extra_one', 'extra_two'] RETURN n.name ORDER BY n.name",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      "extra_one"
+     ],
+     [
+      "extra_two"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-20",
+   "tier": 1,
+   "title": "…the new CALLS edge extra_two -> extra_one is in Neo4j",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (a:CbmNode {db: $project, gen: p.gen, project: $project, name: 'extra_two'})-[:CALLS]->(b:CbmNode {name: 'extra_one'}) RETURN count(*)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-21",
+   "tier": 1,
+   "title": "…and the tools see them",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^extra_(one|two)$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "extra_one",
+      "extra_two"
+     ],
+     "count_eq": 2
+    }
+   }
+  },
+  {
+   "id": "N03-22",
+   "tier": 1,
+   "title": "REMOVE: delete the added file",
+   "fs": "delete",
+   "path": "app/extra.py"
+  },
+  {
+   "id": "N03-23",
+   "tier": 1,
+   "title": "re-index after the delete",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-24",
+   "tier": 1,
+   "title": "…the removed rows are gone from Neo4j",
+   "cypher": "MATCH (n:CbmNode {db: $project}) WHERE n.name IN ['extra_one', 'extra_two'] RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-25",
+   "tier": 1,
+   "title": "…node count is back to the baseline",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N03-02",
+      "path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-26",
+   "tier": 1,
+   "title": "…no orphaned relationships remain under the project",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (a:CbmNode {db: $project})-[r]->(b:CbmNode {db: $project}) WHERE a.gen <> p.gen OR b.gen <> p.gen RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-27",
+   "tier": 1,
+   "title": "restore money.py to the fixture text",
+   "fs": "write",
+   "path": "app/money.py",
+   "content": "\"\"\"Money helpers: rounding and formatting of cent amounts.\"\"\"\n\n\ndef round_cents(amount: float) -> int:\n    \"\"\"Round a float dollar amount to whole cents.\"\"\"\n    return int(amount * 100 + 0.5)\n\n\ndef format_cents(cents: int) -> str:\n    \"\"\"Format cents as a dollar string, e.g. 1234 -> '$12.34'.\"\"\"\n    cents = round_cents(cents / 100)\n    return f\"${cents // 100}.{cents % 100:02d}\"\n"
+  },
+  {
+   "id": "N03-28",
+   "tier": 1,
+   "title": "re-index after the restore",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-29",
+   "tier": 1,
+   "title": "…DELTA-EDIT is gone from Neo4j",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project, name: 'round_cents'}) RETURN n.properties_json CONTAINS 'DELTA-EDIT'",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      false
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-30",
+   "tier": 1,
+   "title": "FORCED FULL: remove the local delta state file",
+   "fs": "delete",
+   "path": "{{db_path}}.neo4j-state.db"
+  },
+  {
+   "id": "N03-30a",
+   "tier": 2,
+   "title": "with the state file gone, also change a source file so a sync is needed",
+   "fs": "append",
+   "path": "app/cli.py",
+   "content": "\n# eval: force a source change so the sync is not skipped as unchanged\n"
+  },
+  {
+   "id": "N03-31",
+   "tier": 1,
+   "title": "re-index without the state file",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-32",
+   "tier": 1,
+   "title": "…the sync was a full upload and says why",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^full"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-33",
+   "tier": 1,
+   "title": "…the full upload rewrote the state file (about 30-40 bytes per row)",
+   "shell": "{{python}} -c \"import os,sys; p=sys.argv[1]+'.neo4j-state.db'; print('state_exists', os.path.exists(p), os.path.getsize(p) if os.path.exists(p) else 0)\" \"{{db_path}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "state_exists True"
+   }
+  },
+  {
+   "id": "N03-34",
+   "tier": 1,
+   "title": "…counts are the baseline again",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N03-02",
+      "path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-35",
+   "tier": 1,
+   "title": "…and the old generation was deleted",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project}) WHERE n.gen <> p.gen RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N03-35a",
+   "tier": 2,
+   "title": "restore app/cli.py",
+   "shell": "git checkout -- app/cli.py",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "N03-35b",
+   "tier": 2,
+   "title": "re-index the restore",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-36",
+   "tier": 2,
+   "title": "DELTA OFF: restart the daemon with CBM_NEO4J_DELTA_MAX_ROWS=0",
+   "session": "restart",
+   "env": {
+    "CBM_NEO4J_DELTA_MAX_ROWS": "0"
+   },
+   "daemon_stop": true
+  },
+  {
+   "id": "N03-37",
+   "tier": 2,
+   "title": "…edit a docstring again",
+   "fs": "write",
+   "path": "app/util/strings.py",
+   "content": "\"\"\"String helpers. DELTA-OFF marker.\"\"\"\n\n\ndef slugify(text: str) -> str:\n    \"\"\"Lower-case and hyphenate a string.\"\"\"\n    return \"-\".join(text.lower().split())\n\n\ndef unused_helper(text: str) -> str:\n    \"\"\"Dead code: nothing in this repository calls this function.\"\"\"\n    return text[::-1]\n"
+  },
+  {
+   "id": "N03-38",
+   "tier": 2,
+   "title": "…re-index",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-39",
+   "tier": 2,
+   "title": "…with the delta off the sync is full",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^full"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-40",
+   "tier": 2,
+   "title": "restore strings.py",
+   "fs": "write",
+   "path": "app/util/strings.py",
+   "content": "\"\"\"String helpers.\"\"\"\n\n\ndef slugify(text: str) -> str:\n    \"\"\"Lower-case and hyphenate a string.\"\"\"\n    return \"-\".join(text.lower().split())\n\n\ndef unused_helper(text: str) -> str:\n    \"\"\"Dead code: nothing in this repository calls this function.\"\"\"\n    return text[::-1]\n"
+  },
+  {
+   "id": "N03-41",
+   "tier": 2,
+   "title": "DELTA ON: restart the daemon without the variable",
+   "session": "restart",
+   "env": {
+    "CBM_NEO4J_DELTA_MAX_ROWS": null
+   },
+   "daemon_stop": true
+  },
+  {
+   "id": "N03-42",
+   "tier": 2,
+   "title": "…re-index the restore as a delta",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N03-43",
+   "tier": 2,
+   "title": "…delta again",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^delta:"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N03-44",
+   "tier": 2,
+   "title": "the working copy is clean again (git sees no change)",
+   "shell": "git status --porcelain",
+   "expect": {
+    "rc": 0,
+    "stdout_regex": "^\\s*$"
+   }
+  }
+ ]
+}

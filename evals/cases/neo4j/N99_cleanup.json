@@ -1,0 +1,118 @@
+{
+ "suite": "N-CLEAN",
+ "title": "Neo4j backend: delete the eval projects and prove Neo4j is clean",
+ "spec": "specs/02_indexing_neo4j.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N99-01",
+   "tier": 2,
+   "title": "delete -other",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project}}-other"
+   },
+   "wait": 300
+  },
+  {
+   "id": "N99-02",
+   "tier": 2,
+   "title": "delete the medium project",
+   "skip_if": "no_var:repo_medium",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project_medium}}"
+   },
+   "wait": 600
+  },
+  {
+   "id": "N99-03",
+   "tier": 1,
+   "title": "delete the main project",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project}}"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N99-04",
+   "tier": 1,
+   "title": "no CbmNode rows remain for the eval projects",
+   "cypher": "MATCH (n:CbmNode) WHERE n.db STARTS WITH $prefix RETURN count(n)",
+   "params": {
+    "prefix": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N99-05",
+   "tier": 1,
+   "title": "no CbmProject rows remain for the eval projects",
+   "cypher": "MATCH (p:CbmProject) WHERE p.name STARTS WITH $prefix RETURN count(p)",
+   "params": {
+    "prefix": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N99-06",
+   "tier": 1,
+   "title": "the indexes outlive the projects (shared schema objects)",
+   "cypher": "SHOW INDEXES YIELD name WHERE name STARTS WITH 'cbm_node_' RETURN count(name)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      6
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N99-07",
+   "tier": 1,
+   "title": "local files are gone: db, marker, delta state",
+   "shell": "{{python}} -c \"import os,sys; b=sys.argv[1]; print('left', [s for s in ('', '.graph.json', '.neo4j-state.db') if os.path.exists(b+s)])\" \"{{db_path}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "left []"
+   }
+  },
+  {
+   "id": "N99-08",
+   "tier": 1,
+   "title": "reads on the deleted project fail cleanly",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false,
+    "error_contains": "not found"
+   }
+  }
+ ]
+}

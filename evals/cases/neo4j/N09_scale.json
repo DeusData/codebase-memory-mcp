@@ -1,0 +1,795 @@
+{
+ "suite": "N-SCALE",
+ "title": "Neo4j at scale (eval-medium: 20,002 Java files, one 5,000-caller hub): no timeouts, correct counts, paging, concurrency",
+ "spec": "specs/11_scale_performance.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N09-00",
+   "note": "Prepare with: python3 evals/fixtures/prepare.py medium --work <work>  (defaults: --medium-files 20000 --hub-callers 5000). EXPECTED.json in the repo root has the exact shape. For an estate-sized run use test-env/scale instead."
+  },
+  {
+   "id": "N09-01",
+   "tier": 1,
+   "title": "index eval-medium into Neo4j (synchronous; record the time)",
+   "skip_if": "no_var:repo_medium",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo_medium}}",
+    "name": "{{project_medium}}",
+    "mode": "fast",
+    "graph_db": "{{graph_db}}",
+    "graph_user": "{{neo4j_user}}",
+    "graph_password": "{{neo4j_password}}",
+    "graph_database": "{{neo4j_database}}",
+    "format": "json"
+   },
+   "wait": 7200,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N09-02",
+   "tier": 1,
+   "title": "serving, in sync, full first sync",
+   "skip_if": "no_var:repo_medium",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project_medium}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000,
+    "json": [
+     {
+      "path": "graph_backend.status",
+      "op": "eq",
+      "value": "serving"
+     },
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^full"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-03",
+   "tier": 1,
+   "title": "all six indexes ONLINE and fully populated after a large sync",
+   "skip_if": "no_var:repo_medium",
+   "cypher": "SHOW INDEXES YIELD name, state, populationPercent WHERE name STARTS WITH 'cbm_' AND (state <> 'ONLINE' OR populationPercent < 100) RETURN name",
+   "expect": {
+    "ok": true,
+    "rows_eq": 0
+   }
+  },
+  {
+   "id": "N09-04",
+   "tier": 1,
+   "title": "Neo4j holds at least 5 rows per class (File, Class, 3 Methods)",
+   "skip_if": "no_var:repo_medium",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n) >= 100000",
+   "params": {
+    "project": "{{project_medium}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N09-05",
+   "tier": 1,
+   "title": "HUB: trace_path inbound on the 5,000-caller method answers in bounded time",
+   "skip_if": "no_var:repo_medium",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project_medium}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000,
+    "served_by": "neo4j"
+   }
+  },
+  {
+   "id": "N09-06",
+   "tier": 2,
+   "title": "HUB: callers_total is exactly 5,000 (Java static call resolution)",
+   "skip_if": "no_var:repo_medium",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project_medium}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 5000
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-07",
+   "tier": 1,
+   "title": "HUB: query_graph caller count in bounded time",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Method {name:'hub'}) RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000
+   }
+  },
+  {
+   "id": "N09-08",
+   "tier": 2,
+   "title": "HUB: …and it is 5,000",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Method {name:'hub'}) RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 5000
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-09",
+   "tier": 1,
+   "title": "HUB: get_code_snippet with neighbors on the hub is bounded",
+   "skip_if": "no_var:repo_medium",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project_medium}}",
+    "qualified_name": "hub",
+    "include_neighbors": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000
+   }
+  },
+  {
+   "id": "N09-10",
+   "tier": 1,
+   "title": "CHAIN: run() of C10001 has exactly one caller (C10000.helper, same package)",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (c)-[:CALLS]->(m:Method {name:'run'}) WHERE m.qualified_name ENDS WITH 'C10001.run' RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-10b",
+   "tier": 2,
+   "title": "RESOLVER: run() of C10000 has one caller across a package boundary (C09999.helper, via import)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (c)-[:CALLS]->(m:Method {name:'run'}) WHERE m.qualified_name ENDS WITH 'C10000.run' RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-10c",
+   "tier": 2,
+   "title": "RESOLVER: run() has 19,999 callers in total (every class but the first)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (c)-[:CALLS]->(m:Method {name:'run'}) RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 19999
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-11",
+   "tier": 2,
+   "title": "DEAD: the 200 uncalled dead* methods via EXISTS (engine label scan; record the time)",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (m:Method) WHERE m.name STARTS WITH 'dead' AND NOT EXISTS { (m)<-[:CALLS]-() } RETURN count(m)",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 200
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-12",
+   "tier": 1,
+   "title": "PAGING: search_graph label Method, first page",
+   "skip_if": "no_var:repo_medium",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "label": "Method",
+    "limit": 500,
+    "format": "json",
+    "max_output_tokens": 1000000
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 500
+     },
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "total",
+      "op": "gte",
+      "value": 60000
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-13",
+   "tier": 1,
+   "title": "PAGING: deep offset page is bounded and has no duplicate qns",
+   "skip_if": "no_var:repo_medium",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "label": "Method",
+    "limit": 500,
+    "offset": 50000,
+    "format": "json",
+    "max_output_tokens": 1000000
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000,
+    "rows": {
+     "table": "",
+     "unique": "qn",
+     "count_eq": 500
+    }
+   }
+  },
+  {
+   "id": "N09-14",
+   "tier": 1,
+   "title": "PAGING: query_graph first cursor page over every Method",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (m:Method) RETURN m.qualified_name ORDER BY m.qualified_name",
+    "max_rows": 5000,
+    "format": "json",
+    "max_output_tokens": 1000000
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 120000,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 5000
+     },
+     {
+      "path": "next_cursor",
+      "op": "exists"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-15",
+   "tier": 1,
+   "title": "PAGING: the next cursor page continues without duplicates",
+   "skip_if": "no_var:repo_medium",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "MATCH (m:Method) RETURN m.qualified_name ORDER BY m.qualified_name",
+    "max_rows": 5000,
+    "format": "json",
+    "max_output_tokens": 1000000
+   },
+   "use_prev": [
+    {
+     "step": "N09-14",
+     "path": "structured.next_cursor",
+     "arg": "cursor"
+    }
+   ],
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 120000,
+    "rows": {
+     "table": "",
+     "unique": "m.qualified_name"
+    }
+   }
+  },
+  {
+   "id": "N09-16",
+   "tier": 1,
+   "title": "PAGING: full walk of search_graph Method pages is complete and disjoint",
+   "skip_if": "no_var:repo_medium",
+   "shell": "{{python}} \"{{evals_dir}}/harness/paging_check.py\" --binary \"{{binary}}\" --project {{project_medium}} --tool search_graph --args \"{\\\"label\\\": \\\"Method\\\"}\" --page 500 --max-pages 200",
+   "wait": 3600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "pages_ok"
+   }
+  },
+  {
+   "id": "N09-17",
+   "tier": 1,
+   "title": "SEARCH: search_code over 5,000 hits is bounded",
+   "skip_if": "no_var:repo_medium",
+   "tool": "search_code",
+   "args": {
+    "project": "{{project_medium}}",
+    "pattern": "Hub.hub(",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 120000
+   }
+  },
+  {
+   "id": "N09-18",
+   "tier": 2,
+   "title": "SEARCH: …and counts exactly 5,000 grep hits",
+   "skip_if": "no_var:repo_medium",
+   "tool": "search_code",
+   "args": {
+    "project": "{{project_medium}}",
+    "pattern": "Hub.hub(",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "total_grep_matches",
+      "op": "eq",
+      "value": 5000
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-19",
+   "tier": 1,
+   "title": "SEARCH: BM25 over docstring tokens finds the marked classes",
+   "skip_if": "no_var:repo_medium",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project_medium}}",
+    "query": "EVALDOCTOKEN3",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000,
+    "rows": {
+     "table": "",
+     "col": "qn",
+     "any_match": "C03000$"
+    }
+   }
+  },
+  {
+   "id": "N09-20",
+   "tier": 1,
+   "title": "SCHEMA: get_graph_schema is bounded on the medium graph",
+   "skip_if": "no_var:repo_medium",
+   "tool": "get_graph_schema",
+   "args": {
+    "project": "{{project_medium}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000
+   }
+  },
+  {
+   "id": "N09-21",
+   "tier": 1,
+   "title": "ARCH: get_architecture default aspects is bounded",
+   "skip_if": "no_var:repo_medium",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project_medium}}",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 300000
+   }
+  },
+  {
+   "id": "N09-30",
+   "tier": 1,
+   "title": "read the medium project's current generation",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN p.gen",
+   "params": {
+    "project": "{{project_medium}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N09-31",
+   "tier": 1,
+   "title": "PROFILE: name lookup seeks cbm_node_name, <= 50 db accesses",
+   "cypher": "PROFILE MATCH (n:CbmNode {db: $db, gen: $gen, name: 'hub'}) RETURN n.id",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}"
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, name)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 50
+   }
+  },
+  {
+   "id": "N09-32",
+   "tier": 1,
+   "title": "PROFILE: qualified-name lookup seeks cbm_node_qn, <= 50",
+   "cypher": "PROFILE MATCH (n:CbmNode {db: $db, gen: $gen, qualified_name: $qn}) RETURN n.id",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}",
+    "qn": "{{project_medium}}.src.main.java.com.scale.hub.Hub.hub"
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, qualified_name)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 50
+   }
+  },
+  {
+   "id": "N09-33",
+   "tier": 1,
+   "title": "PROFILE: batched id read (5 ids) seeks cbm_node_id, <= 60",
+   "cypher": "PROFILE UNWIND $ids AS i MATCH (n:CbmNode {db: $db, gen: $gen, id: i}) RETURN n.id",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}",
+    "ids": [
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, id)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 60
+   }
+  },
+  {
+   "id": "N09-34",
+   "tier": 1,
+   "title": "PROFILE: list_files (20,002 File rows) seeks cbm_node_label, <= 3 accesses per row",
+   "cypher": "PROFILE MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) WHERE n.project = $project WITH n.file_path AS path WHERE path <> '' RETURN DISTINCT path ORDER BY path",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}"
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, label)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 70000
+   }
+  },
+  {
+   "id": "N09-35",
+   "tier": 1,
+   "title": "PROFILE: hinted 20,000-row file page reads about its own rows (<= 4 per row)",
+   "cypher": "PROFILE MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) WHERE n.db = $db AND n.gen = $gen AND n.file_path >= '' AND ($project IS NULL OR n.project = $project) RETURN n.id ORDER BY n.db, n.gen, n.file_path, n.id LIMIT 20000",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}"
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, file_path)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 80000
+   }
+  },
+  {
+   "id": "N09-36",
+   "tier": 1,
+   "title": "PROFILE: hinted label page (Method, 60k rows) costs about the label's size, not the graph's (<= 3 per Method)",
+   "cypher": "PROFILE MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, label) WHERE n.db = $db AND n.gen = $gen AND n.id > 0 AND n.label = 'Method' AND ($project IS NULL OR n.project = $project) RETURN n.id ORDER BY n.id LIMIT 20000",
+   "params": {
+    "db": "{{project_medium}}",
+    "project": "{{project_medium}}"
+   },
+   "use_prev": [
+    {
+     "step": "N09-30",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek",
+    "plan_uses_index": "CbmNode(db, gen, label)",
+    "plan_not_operator": [
+     "NodeIndexScan",
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ],
+    "plan_db_hits_lte": 190000
+   }
+  },
+  {
+   "id": "N09-22",
+   "tier": 1,
+   "title": "DELTA: edit one class and re-index; the sync is a small delta",
+   "skip_if": "no_var:repo_medium",
+   "fs": "append",
+   "path": "src/main/java/com/scale/p000/C00001.java",
+   "content": "// delta eval marker\n",
+   "root": "{{repo_medium}}"
+  },
+  {
+   "id": "N09-23",
+   "tier": 1,
+   "title": "DELTA: re-index (record the time: incremental + delta)",
+   "skip_if": "no_var:repo_medium",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo_medium}}",
+    "name": "{{project_medium}}",
+    "format": "json"
+   },
+   "wait": 7200,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N09-24",
+   "tier": 1,
+   "title": "DELTA: last_sync is a delta touching few rows",
+   "skip_if": "no_var:repo_medium",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project_medium}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^delta: nodes \\+0 ~[0-9]{1,2} -0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N09-25",
+   "tier": 1,
+   "title": "DELTA: restore the file",
+   "skip_if": "no_var:repo_medium",
+   "shell": "git checkout -- src/main/java/com/scale/p000/C00001.java",
+   "cwd": "{{repo_medium}}",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "N09-26",
+   "tier": 1,
+   "title": "CONCURRENCY: 8 sessions x 2 rounds of hub/search/count calls, no errors or hangs",
+   "skip_if": "no_var:repo_medium",
+   "shell": "{{python}} \"{{evals_dir}}/harness/concurrent.py\" --binary \"{{binary}}\" --project {{project_medium}} --calls \"{{evals_dir}}/cases/neo4j/conc_calls.json\" --sessions 8 --rounds 2 --max-ms 120000",
+   "wait": 3600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "concurrency_ok"
+   }
+  },
+  {
+   "id": "N09-27",
+   "tier": 2,
+   "title": "RSS: daemon peak memory after the battery (Linux only; record)",
+   "skip_if": "windows",
+   "shell": "{{python}} -c \"import os\nfor pid in os.listdir('/proc'):\n    if pid.isdigit():\n        try:\n            cmd=open('/proc/%s/cmdline'%pid,'rb').read()\n            if b'--cbm-daemon-internal' in cmd:\n                print(pid, [l.strip() for l in open('/proc/%s/status'%pid) if l.startswith(('VmRSS','VmHWM'))])\n        except Exception: pass\"",
+   "expect": {
+    "rc": 0
+   }
+  }
+ ]
+}

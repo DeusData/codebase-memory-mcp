@@ -1,0 +1,23 @@
+{
+  "suite": "S-CLEAN",
+  "title": "SQLite backend: delete the eval projects",
+  "spec": "specs/01_indexing_sqlite.md",
+  "backends": ["sqlite"],
+  "cases": [
+    {"id": "S99-01", "tier": 2, "title": "delete the fast-mode project",
+     "tool": "delete_project", "args": {"project": "{{project}}-fast"}, "wait": 300, "expect": {"ok": true}},
+    {"id": "S99-02", "tier": 2, "title": "delete the normalized-name project (name as listed by S01-23; adjust if normalization differs)",
+     "tool": "delete_project", "args": {"project": "{{project}}-weird-name"}, "wait": 300},
+    {"id": "S99-03", "tier": 1, "title": "delete the main project",
+     "tool": "delete_project", "args": {"project": "{{project}}"}, "wait": 300, "expect": {"ok": true}},
+    {"id": "S99-04", "tier": 1, "title": "the project is gone from list_projects",
+     "tool": "list_projects", "args": {"format": "json", "limit": 500}, "wait": 120,
+     "expect": {"ok": true, "rows": {"table": "projects", "col": "name", "excludes": ["{{project}}", "{{project}}-fast"]}}},
+    {"id": "S99-05", "tier": 1, "title": "graph reads on the deleted project fail cleanly",
+     "tool": "search_graph", "args": {"project": "{{project}}", "name_pattern": "^hub$", "format": "json"}, "wait": 120,
+     "expect": {"ok": false, "error_contains": "not found"}},
+    {"id": "S99-06", "tier": 1, "title": "the SQLite file is removed",
+     "shell": "{{python}} -c \"import os,sys; print('db_exists', os.path.exists(sys.argv[1]))\" \"{{db_path}}\"",
+     "expect": {"rc": 0, "stdout_contains": "db_exists False"}}
+  ]
+}

@@ -1,0 +1,4 @@
+# Eval run outputs; keep the folder, not the runs
+*
+!.gitignore
+!README.md

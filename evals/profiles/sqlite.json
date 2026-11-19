@@ -1,0 +1,15 @@
+{
+ "_about": "Local SQLite backend. Copy to sqlite.local.json and adjust paths; *.local.json is git-ignored.",
+ "backend": "sqlite",
+ "binary": "codebase-memory-mcp-neo4j",
+ "env": {},
+ "vars": {
+  "project": "eval-small",
+  "repo": "D:/cbm-evals/work/eval-small",
+  "project_medium": "eval-medium",
+  "repo_medium": "D:/cbm-evals/work/eval-medium",
+  "index_mode": "full",
+  "graph_db_arg": "sqlite",
+  "compare_target": "eval-small-fast"
+ }
+}

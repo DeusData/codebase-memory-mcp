@@ -1,0 +1,2 @@
+# Vendored code is never indexed (COV-02 / COV-10 rely on this).
+vendor/

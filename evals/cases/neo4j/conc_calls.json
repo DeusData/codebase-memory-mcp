@@ -1,0 +1,8 @@
+[
+  {"tool": "trace_path", "args": {"project": "{{project}}", "function_name": "hub", "direction": "inbound", "depth": 1, "limit": 100, "format": "json"}},
+  {"tool": "search_graph", "args": {"project": "{{project}}", "label": "Method", "limit": 200, "offset": 1000, "format": "json"}},
+  {"tool": "query_graph", "args": {"project": "{{project}}", "query": "MATCH (c)-[:CALLS]->(h:Method {name:'hub'}) RETURN count(c)", "format": "json"}},
+  {"tool": "get_code_snippet", "args": {"project": "{{project}}", "qualified_name": "hub", "format": "json"}},
+  {"tool": "search_code", "args": {"project": "{{project}}", "pattern": "new C00042", "format": "json"}},
+  {"tool": "get_graph_schema", "args": {"project": "{{project}}", "format": "json"}}
+]

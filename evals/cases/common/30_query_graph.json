@@ -1,0 +1,954 @@
+{
+ "suite": "C-QG",
+ "title": "query_graph engine (Cypher subset): correctness on known truth, clauses, paging, unsupported syntax, missed graph",
+ "spec": "specs/07_query_graph.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "QG-01",
+   "tier": 1,
+   "title": "count all nodes",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 10000,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 60
+     },
+     {
+      "path": "total_relation",
+      "op": "eq",
+      "value": "eq"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-02",
+   "tier": 1,
+   "title": "hub has exactly 12 callers",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Function {name:'hub'}) RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 5000,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-03",
+   "tier": 1,
+   "title": "caller names in order",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Function {name:'hub'}) RETURN c.name ORDER BY c.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "caller_01"
+     },
+     {
+      "path": "rows.11.0",
+      "op": "eq",
+      "value": "caller_12"
+     },
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-04",
+   "tier": 1,
+   "title": "dead-code query: no inbound and no outbound CALLS",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } AND NOT EXISTS { (f)-[:CALLS]->() } RETURN f.name ORDER BY f.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "f.name",
+     "includes": "unused_helper",
+     "excludes": [
+      "hub",
+      "caller_01",
+      "format_cents"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-05",
+   "tier": 1,
+   "title": "checkout calls validate and notify (same-file direct calls)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (m:Method {name:'checkout'})-[:CALLS]->(x) RETURN x.name ORDER BY x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": [
+      "validate",
+      "notify"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-06",
+   "tier": 2,
+   "title": "two hops: checkout -> notify -> format_cents",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (m:Method {name:'checkout'})-[:CALLS*1..2]->(x) RETURN DISTINCT x.name ORDER BY x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": [
+      "validate",
+      "notify",
+      "format_cents"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-07",
+   "tier": 1,
+   "title": "Java: issue calls audit",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (m:Method {name:'issue'})-[:CALLS]->(x) RETURN x.name ORDER BY x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": "audit"
+    }
+   }
+  },
+  {
+   "id": "QG-08",
+   "tier": 1,
+   "title": "Java: format calls roundCents",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (m:Method {name:'format'})-[:CALLS]->(x) RETURN x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": "roundCents"
+    }
+   }
+  },
+  {
+   "id": "QG-09",
+   "tier": 1,
+   "title": "label alternation",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n:Class|Interface) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 8
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-10",
+   "tier": 1,
+   "title": "no File under vendor/ or generated/",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) WHERE f.file_path STARTS WITH 'vendor/' OR f.file_path STARTS WITH 'generated/' RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-11",
+   "tier": 1,
+   "title": "File count in the expected band",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 14
+     },
+     {
+      "path": "rows.0.0",
+      "op": "lte",
+      "value": 30
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-12",
+   "tier": 1,
+   "title": "DEFINES_METHOD from the class to its methods",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c:Class {name:'OrderService'})-[:DEFINES_METHOD]->(m) RETURN m.name ORDER BY m.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "m.name",
+     "includes": [
+      "checkout",
+      "create"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-13",
+   "tier": 2,
+   "title": "DEFINES from the file to its top-level symbols",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File {file_path:'app/service.py'})-[:DEFINES]->(x) RETURN x.name ORDER BY x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": [
+      "OrderService",
+      "validate",
+      "notify"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-14",
+   "tier": 2,
+   "title": "IMPORTS edges exist",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH ()-[r:IMPORTS]->() RETURN count(r)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-15",
+   "tier": 1,
+   "title": "aggregation by label",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.label AS l, count(n) AS c ORDER BY c DESC, l",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "l",
+     "includes": [
+      "Function",
+      "Method",
+      "Class",
+      "File"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-16",
+   "tier": 1,
+   "title": "regex predicate",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function) WHERE f.name =~ 'caller_0[1-9]' RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 9
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-17",
+   "tier": 2,
+   "title": "string predicates and functions",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) WHERE toLower(n.name) STARTS WITH 'invoice' RETURN DISTINCT n.name ORDER BY n.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "n.name",
+     "includes": [
+      "Invoice",
+      "InvoiceService",
+      "InvoiceServiceTest"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-17a",
+   "tier": 1,
+   "title": "STARTS WITH on the raw property",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n:Class) WHERE n.name STARTS WITH 'Invoice' RETURN n.name ORDER BY n.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "n.name",
+     "includes": [
+      "Invoice",
+      "InvoiceService",
+      "InvoiceServiceTest"
+     ]
+    }
+   }
+  },
+  {
+   "id": "QG-18",
+   "tier": 1,
+   "title": "OPTIONAL MATCH with a zero count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'unused_helper'}) OPTIONAL MATCH (f)<-[:CALLS]-(c) RETURN f.name, count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": {
+      "f.name": "unused_helper",
+      "COUNT(c)": "0"
+     }
+    }
+   }
+  },
+  {
+   "id": "QG-19",
+   "tier": 1,
+   "title": "UNION",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'hub'}) RETURN f.name AS n UNION MATCH (c:Class {name:'Order'}) RETURN c.name AS n",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 2
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-20",
+   "tier": 1,
+   "title": "ORDER BY / SKIP / LIMIT",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function) RETURN f.name ORDER BY f.name SKIP 2 LIMIT 3",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 3
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-21",
+   "tier": 1,
+   "title": "WITH + WHERE + collect",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c)-[:CALLS]->(h) WITH h, count(c) AS n WHERE n >= 12 RETURN h.name, n",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": {
+      "h.name": "hub",
+      "n": 12
+     }
+    }
+   }
+  },
+  {
+   "id": "QG-22",
+   "tier": 1,
+   "title": "CASE expression",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'hub'}) RETURN CASE WHEN f.name = 'hub' THEN 'yes' ELSE 'no' END AS r",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "yes"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-23",
+   "tier": 2,
+   "title": "engine-only virtual property in_degree",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function) WHERE f.in_degree >= 12 RETURN f.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "f.name",
+     "includes": "hub"
+    }
+   }
+  },
+  {
+   "id": "QG-24",
+   "tier": 1,
+   "title": "duplicate names resolve to two files",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'shared_name'}) RETURN f.file_path ORDER BY f.file_path",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows",
+      "op": "eq",
+      "value": [
+       [
+        "dup/alpha.py"
+       ],
+       [
+        "dup/beta.py"
+       ]
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-25",
+   "tier": 1,
+   "title": "unicode name and file path round-trip",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'ünïcode_fn'}) RETURN f.file_path",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "unicode/ünïcødé.py"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-26",
+   "tier": 2,
+   "title": "test caller resolved (Python method call on a typed local)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (t:Function {name:'test_checkout'})-[:CALLS]->(x) RETURN DISTINCT x.name ORDER BY x.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "x.name",
+     "includes": "checkout"
+    }
+   }
+  },
+  {
+   "id": "QG-27",
+   "tier": 1,
+   "title": "unsupported: list literal in RETURN fails clearly",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name, [1, 2]",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)unsupported|not supported|parse|syntax"
+   }
+  },
+  {
+   "id": "QG-28",
+   "tier": 1,
+   "title": "unsupported: CREATE is refused by the parser",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "CREATE (n:Probe) RETURN n",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "QG-29",
+   "tier": 1,
+   "title": "unsupported: MERGE / SET / DELETE / CALL",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) SET n.x = 1 RETURN n",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "QG-30",
+   "tier": 1,
+   "title": "unsupported: CALL",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "CALL db.labels() YIELD label RETURN label",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "QG-31",
+   "tier": 1,
+   "title": "syntax error is a clear error",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n RETURN n",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "QG-32",
+   "tier": 1,
+   "title": "the probe was not created by the refused writes",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n:Probe) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-33",
+   "tier": 1,
+   "title": "max_rows 5 pages with a cursor",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name ORDER BY n.name",
+    "max_rows": 5,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 5
+     },
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "next_cursor",
+      "op": "exists"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-34",
+   "tier": 1,
+   "title": "the cursor continues",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name ORDER BY n.name",
+    "max_rows": 5,
+    "format": "json"
+   },
+   "use_prev": [
+    {
+     "step": "QG-33",
+     "path": "structured.next_cursor",
+     "arg": "cursor"
+    }
+   ],
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "gte",
+      "value": 1
+     }
+    ],
+    "same_as": [
+     {
+      "step": "QG-33",
+      "path": "structured.total"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-35",
+   "tier": 1,
+   "title": "cursor pages are complete and disjoint (paging_check.py)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/paging_check.py\" --binary \"{{binary}}\" --project {{project}} --tool query_graph --args \"{\\\"query\\\": \\\"MATCH (n) RETURN n.qualified_name, n.label ORDER BY n.qualified_name, n.label\\\"}\" --page 7",
+   "wait": 600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "pages_ok"
+   }
+  },
+  {
+   "id": "QG-36",
+   "tier": 1,
+   "title": "offset paging (compatibility)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name ORDER BY n.name",
+    "max_rows": 5,
+    "offset": 5,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 5
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-37",
+   "tier": 1,
+   "title": "offset and cursor together are refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name ORDER BY n.name",
+    "max_rows": 5,
+    "offset": 5,
+    "format": "json"
+   },
+   "use_prev": [
+    {
+     "step": "QG-33",
+     "path": "structured.next_cursor",
+     "arg": "cursor"
+    }
+   ],
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "QG-38",
+   "tier": 1,
+   "title": "max_rows 0 uses the legacy maximum and reports the exact total",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN n.name",
+    "max_rows": 0,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "QG-01",
+      "path": "structured.rows.0.0",
+      "this_path": "structured.total"
+     }
+    ]
+   }
+  },
+  {
+   "id": "QG-39",
+   "tier": 1,
+   "title": "graph=missed runs the same Cypher on the coverage-gap tree",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN count(n)",
+    "graph": "missed",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "QG-40",
+   "tier": 1,
+   "title": "tree format renders rows",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Function {name:'hub'}) RETURN c.name ORDER BY c.name"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "text_contains": "caller_01"
+   }
+  },
+  {
+   "id": "QG-41",
+   "tier": 1,
+   "title": "served from Neo4j",
+   "skip_if": "sqlite",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'hub'}) RETURN f.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j"
+   }
+  },
+  {
+   "id": "QG-42",
+   "tier": 2,
+   "title": "a heavy engine query on the small graph still finishes (3-hop var-length from every node)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a)-[:CALLS*1..3]->(b) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000
+   }
+  }
+ ]
+}

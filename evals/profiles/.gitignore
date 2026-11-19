@@ -1,0 +1,2 @@
+# Local copies of the profiles with machine-specific paths and nothing secret
+*.local.json

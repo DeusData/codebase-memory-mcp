@@ -1,0 +1,532 @@
+{
+ "suite": "C-SNIP",
+ "title": "get_code_snippet and get_file_outline",
+ "spec": "specs/08_trace_snippets_architecture.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "CS-01",
+   "tier": 1,
+   "title": "snippet by qualified name returns the function source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.money.round_cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 5000,
+    "deep_contains": "int(amount * 100 + 0.5)"
+   }
+  },
+  {
+   "id": "CS-02",
+   "tier": 1,
+   "title": "snippet by short name",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "round_cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "int(amount * 100 + 0.5)"
+   }
+  },
+  {
+   "id": "CS-03",
+   "tier": 2,
+   "title": "an ambiguous short name answers (first candidate or a candidate list), never an empty crash",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "shared_name",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "dup/"
+   }
+  },
+  {
+   "id": "CS-04",
+   "tier": 1,
+   "title": "unknown symbol is a clear error or a suggestion list",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "no_such_symbol_xyz",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "ok": true,
+      "text_regex": "(?i)not found|suggest|no symbol"
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-05",
+   "tier": 1,
+   "title": "class outline lists its methods",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService",
+    "source_mode": "outline",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": [
+     "create",
+     "checkout"
+    ]
+   }
+  },
+  {
+   "id": "CS-06",
+   "tier": 1,
+   "title": "source_mode full returns the whole class",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService",
+    "source_mode": "full",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": [
+     "def checkout",
+     "def create"
+    ]
+   }
+  },
+  {
+   "id": "CS-07",
+   "tier": 2,
+   "title": "include_neighbors adds the callees of checkout",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService.checkout",
+    "include_neighbors": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "validate"
+   }
+  },
+  {
+   "id": "CS-08",
+   "tier": 2,
+   "title": "max_lines bounds the source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService",
+    "source_mode": "full",
+    "max_lines": 3,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "def checkout"
+   }
+  },
+  {
+   "id": "CS-09",
+   "tier": 2,
+   "title": "start_line continues the source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService",
+    "source_mode": "full",
+    "start_line": 28,
+    "max_lines": 10,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "checkout"
+   }
+  },
+  {
+   "id": "CS-10",
+   "tier": 1,
+   "title": "Java method source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "roundCents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "Math.round"
+   }
+  },
+  {
+   "id": "CS-11",
+   "tier": 1,
+   "title": "unicode function source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "ünïcode_fn",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "return \"ok\""
+   }
+  },
+  {
+   "id": "CS-12",
+   "tier": 2,
+   "title": "200-character identifier source",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{LONG_NAME}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "return None"
+   }
+  },
+  {
+   "id": "CS-13",
+   "tier": 1,
+   "title": "snippet of a symbol from an ignored file does not exist",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "vendored_fn",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "deep_not_contains": "Must never appear"
+   }
+  },
+  {
+   "id": "CS-14",
+   "tier": 1,
+   "title": "member paging on a large container (hub.py has 13 functions; use outline of the module if exposed)",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.service.OrderService",
+    "source_mode": "outline",
+    "member_limit": 1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "CS-20",
+   "tier": 1,
+   "title": "file outline of app/service.py in source order",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "app/service.py",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "ValidationError",
+      "validate",
+      "notify",
+      "OrderService",
+      "create",
+      "checkout"
+     ]
+    },
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "ValidationError"
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-21",
+   "tier": 1,
+   "title": "label filter keeps Functions only",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "app/service.py",
+    "labels": [
+     "Function"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "validate",
+      "notify"
+     ],
+     "excludes": [
+      "OrderService",
+      "checkout"
+     ]
+    }
+   }
+  },
+  {
+   "id": "CS-22",
+   "tier": 1,
+   "title": "hub.py outline has 13 declarations",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "hub/hub.py",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 13
+    }
+   }
+  },
+  {
+   "id": "CS-23",
+   "tier": 1,
+   "title": "outline paging: limit 2 then offset 2",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "hub/hub.py",
+    "limit": 2,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 2
+    },
+    "json": [
+     {
+      "path": "total",
+      "op": "eq",
+      "value": 13
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-24",
+   "tier": 1,
+   "title": "…offset 2",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "hub/hub.py",
+    "limit": 2,
+    "offset": 2,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 2
+    },
+    "json": [
+     {
+      "path": "offset",
+      "op": "eq",
+      "value": 2
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-25",
+   "tier": 1,
+   "title": "unicode file path outline",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "unicode/ünïcødé.py",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "ünïcode_fn",
+     "count_gte": 2
+    }
+   }
+  },
+  {
+   "id": "CS-26",
+   "tier": 1,
+   "title": "Java file outline lists class and methods",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "java/src/main/java/com/example/billing/InvoiceService.java",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "InvoiceService",
+      "issue",
+      "audit"
+     ]
+    }
+   }
+  },
+  {
+   "id": "CS-27",
+   "tier": 1,
+   "title": "unknown file is a clear error",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "app/nope.py",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "ok": true,
+      "json": [
+       {
+        "path": "total",
+        "op": "eq",
+        "value": 0
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-28",
+   "tier": 1,
+   "title": "an ignored file has no outline",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "vendor/thirdparty/lib.py",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "rows": {
+       "table": "",
+       "count_eq": 0
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "CS-29",
+   "tier": 1,
+   "title": "a path outside the repo is refused",
+   "tool": "get_file_outline",
+   "args": {
+    "project": "{{project}}",
+    "file_path": "../evals/README.md",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "CS-30",
+   "tier": 1,
+   "title": "snippet served from Neo4j",
+   "skip_if": "sqlite",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.money.round_cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "neo4j"
+     }
+    ]
+   }
+  }
+ ]
+}

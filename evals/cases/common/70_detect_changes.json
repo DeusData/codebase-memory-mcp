@@ -1,0 +1,390 @@
+{
+ "suite": "C-DC",
+ "title": "detect_changes: git diff to files, seeds, impact; compare_graphs",
+ "spec": "specs/08_trace_snippets_architecture.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "DC-01",
+   "tier": 1,
+   "title": "clean tree: no changed files",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "files",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "changed_total",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "DC-02",
+   "tier": 1,
+   "title": "EDIT: add a function to app/money.py",
+   "fs": "append",
+   "path": "app/money.py",
+   "content": "\n\ndef extra_fn() -> int:\n    return round_cents(1.0)\n"
+  },
+  {
+   "id": "DC-03",
+   "tier": 1,
+   "title": "scope=files lists the changed file",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "files",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "changed_total",
+      "op": "eq",
+      "value": 1
+     }
+    ],
+    "deep_contains": "app/money.py"
+   }
+  },
+  {
+   "id": "DC-04",
+   "tier": 2,
+   "title": "scope=impact (inbound): callers of the changed file's symbols are impacted (format_cents, total)",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "direction": "inbound",
+    "depth": 2,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "impacted_total",
+      "op": "gte",
+      "value": 2
+     }
+    ],
+    "deep_contains": [
+     "app.service.notify",
+     "app.models.Order.total"
+    ]
+   }
+  },
+  {
+   "id": "DC-05",
+   "tier": 1,
+   "title": "impact answer has exact totals and never a silent zero when seeds exist",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "seed_symbols",
+      "op": "gte",
+      "value": 1
+     },
+     {
+      "path": "impacted_total_relation",
+      "op": "in",
+      "value": [
+       "eq",
+       "gte"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "DC-05v",
+   "tier": 2,
+   "title": "via=true names the edge each impacted row was reached through (before re-index, so rows exist)",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "via": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "via"
+   }
+  },
+  {
+   "id": "DC-06",
+   "tier": 2,
+   "title": "re-index so the new function becomes a seed",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-07",
+   "tier": 2,
+   "title": "seeds=list names extra_fn and round_cents' file symbols",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "seeds": "list",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "extra_fn"
+   }
+  },
+  {
+   "id": "DC-08",
+   "tier": 2,
+   "title": "via=true adds via_qn / via_edge",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "via": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-09",
+   "tier": 2,
+   "title": "fixpoint walks to closure",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "fixpoint": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-10",
+   "tier": 2,
+   "title": "direction=both and edge_types",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "direction": "inbound",
+    "edge_types": [
+     "CALLS",
+     "USAGE"
+    ],
+    "depth": 3,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-11",
+   "tier": 2,
+   "title": "scope=tests maps the change to tests",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "tests",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-12",
+   "tier": 2,
+   "title": "seed_filter=product excludes test metadata",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "seeds": "list",
+    "seed_filter": "product",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "test_checkout"
+   }
+  },
+  {
+   "id": "DC-13",
+   "tier": 1,
+   "title": "restore the file",
+   "shell": "git checkout -- app/money.py",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "DC-14",
+   "tier": 1,
+   "title": "re-index the restore",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-15",
+   "tier": 1,
+   "title": "clean again: no changed files, no seeds",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "files",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "changed_total",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "DC-16",
+   "tier": 1,
+   "title": "extra_fn is gone from the graph after the restore",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:Function {name:'extra_fn'}) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "DC-17",
+   "tier": 1,
+   "title": "served from Neo4j",
+   "skip_if": "sqlite",
+   "tool": "detect_changes",
+   "args": {
+    "project": "{{project}}",
+    "scope": "impact",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "any_of": [
+     {
+      "ok": true,
+      "json": [
+       {
+        "path": "graph_backend.kind",
+        "op": "eq",
+        "value": "neo4j"
+       }
+      ]
+     },
+     {
+      "ok": true,
+      "json": [
+       {
+        "path": "seed_symbols",
+        "op": "eq",
+        "value": 0
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "DC-18",
+   "tier": 2,
+   "title": "compare_graphs of a project with itself has no additions or removals",
+   "tool": "compare_graphs",
+   "args": {
+    "base_project": "{{project}}",
+    "target_project": "{{compare_target}}"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "DC-19",
+   "tier": 1,
+   "title": "compare_graphs with an unknown project is a clear error",
+   "tool": "compare_graphs",
+   "args": {
+    "base_project": "{{project}}",
+    "target_project": "no-such-project-xyz"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false
+   }
+  }
+ ]
+}

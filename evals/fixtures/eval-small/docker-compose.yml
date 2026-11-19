@@ -1,0 +1,10 @@
+services:
+  orders:
+    build: .
+    environment:
+      ORDER_ENV: prod
+      DATABASE_URL: postgres://db:5432/orders
+    depends_on:
+      - db
+  db:
+    image: postgres:16

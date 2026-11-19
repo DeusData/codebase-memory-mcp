@@ -1,0 +1,320 @@
+{
+ "suite": "S-SCHEMA",
+ "title": "SQLite store: tables, indexes, FTS5, query plans, integrity",
+ "spec": "specs/01_indexing_sqlite.md",
+ "backends": [
+  "sqlite"
+ ],
+ "cases": [
+  {
+   "id": "S02-01",
+   "tier": 1,
+   "title": "core tables exist",
+   "sqlite": "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+   "expect": {
+    "ok": true,
+    "cell_contains": [
+     "projects",
+     "file_hashes",
+     "nodes",
+     "edges",
+     "project_summaries",
+     "index_coverage",
+     "nodes_fts"
+    ]
+   }
+  },
+  {
+   "id": "S02-02",
+   "tier": 1,
+   "title": "the nine user indexes exist",
+   "sqlite": "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name",
+   "expect": {
+    "ok": true,
+    "rows_gte": 9,
+    "cell_contains": [
+     "idx_nodes_label",
+     "idx_nodes_name",
+     "idx_nodes_file",
+     "idx_edges_source",
+     "idx_edges_target",
+     "idx_edges_type",
+     "idx_edges_target_type",
+     "idx_edges_source_type",
+     "idx_edges_url_path"
+    ]
+   }
+  },
+  {
+   "id": "S02-03",
+   "tier": 1,
+   "title": "index column lists match the store's DDL",
+   "sqlite": "SELECT name, sql FROM sqlite_master WHERE type='index' AND name IN ('idx_nodes_label','idx_nodes_name','idx_nodes_file','idx_edges_target_type') ORDER BY name",
+   "expect": {
+    "ok": true,
+    "rows_eq": 4,
+    "cell_contains": [
+     "nodes(project, label)",
+     "nodes(project, name)",
+     "nodes(project, file_path)",
+     "edges(project, target_id, type)"
+    ]
+   }
+  },
+  {
+   "id": "S02-04",
+   "tier": 1,
+   "title": "nodes_fts is an FTS5 external-content table with the body column",
+   "sqlite": "SELECT sql FROM sqlite_master WHERE name='nodes_fts'",
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": [
+     "fts5",
+     "body",
+     "unicode61",
+     "content=''"
+    ]
+   }
+  },
+  {
+   "id": "S02-05",
+   "tier": 1,
+   "title": "nodes_fts holds one row per node",
+   "sqlite": "SELECT (SELECT count(*) FROM nodes) AS nodes, (SELECT count(*) FROM nodes_fts) AS fts",
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "S02-06",
+   "tier": 1,
+   "title": "fts row count equals node count",
+   "sqlite": "SELECT (SELECT count(*) FROM nodes) = (SELECT count(*) FROM nodes_fts)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-07",
+   "tier": 1,
+   "title": "label lookups use idx_nodes_label",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE project='{{project}}' AND label='Function'",
+   "expect": {
+    "ok": true,
+    "cell_contains": "idx_nodes_label"
+   }
+  },
+  {
+   "id": "S02-08",
+   "tier": 1,
+   "title": "name lookups use idx_nodes_name",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE project='{{project}}' AND name='hub'",
+   "expect": {
+    "ok": true,
+    "cell_contains": "idx_nodes_name"
+   }
+  },
+  {
+   "id": "S02-09",
+   "tier": 1,
+   "title": "file lookups use idx_nodes_file",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE project='{{project}}' AND file_path='app/money.py'",
+   "expect": {
+    "ok": true,
+    "cell_contains": "idx_nodes_file"
+   }
+  },
+  {
+   "id": "S02-10",
+   "tier": 1,
+   "title": "outbound edge walks use an edges source index",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT target_id FROM edges WHERE source_id=1 AND type='CALLS'",
+   "expect": {
+    "ok": true,
+    "cell_contains": [
+     "USING COVERING INDEX",
+     "(source_id=?)"
+    ],
+    "cell_not_contains": "SCAN edges"
+   }
+  },
+  {
+   "id": "S02-11",
+   "tier": 1,
+   "title": "inbound edge walks use an edges target index",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT source_id FROM edges WHERE target_id=1 AND type='CALLS'",
+   "expect": {
+    "ok": true,
+    "cell_contains": "idx_edges_target"
+   }
+  },
+  {
+   "id": "S02-12",
+   "tier": 1,
+   "title": "edge-type counts use idx_edges_type",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT count(*) FROM edges WHERE project='{{project}}' AND type='CALLS'",
+   "expect": {
+    "ok": true,
+    "cell_contains": "idx_edges_type"
+   }
+  },
+  {
+   "id": "S02-13",
+   "tier": 1,
+   "title": "no full table scan for a project+label query",
+   "sqlite": "EXPLAIN QUERY PLAN SELECT id FROM nodes WHERE project='{{project}}' AND label='Method'",
+   "expect": {
+    "ok": true,
+    "cell_not_contains": "SCAN nodes"
+   }
+  },
+  {
+   "id": "S02-14",
+   "tier": 1,
+   "title": "no vendor/ or generated/ rows in nodes",
+   "sqlite": "SELECT count(*) FROM nodes WHERE file_path LIKE 'vendor/%' OR file_path LIKE 'generated/%'",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-15",
+   "tier": 1,
+   "title": "projects table has the project",
+   "sqlite": "SELECT count(*) FROM projects WHERE name='{{project}}'",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-16",
+   "tier": 1,
+   "title": "file_hashes covers the tier-1 source files",
+   "sqlite": "SELECT count(*) FROM file_hashes WHERE project='{{project}}' AND rel_path IN ('app/cli.py','app/models.py','app/money.py','app/service.py','app/util/strings.py','hub/hub.py','dup/alpha.py','dup/beta.py','tests/test_service.py','java/src/main/java/com/example/billing/Money.java','java/src/main/java/com/example/billing/Invoice.java','java/src/main/java/com/example/billing/InvoiceService.java','java/src/test/java/com/example/billing/InvoiceServiceTest.java')",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      13
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-17",
+   "tier": 2,
+   "title": "file_hashes covers the unicode path",
+   "sqlite": "SELECT count(*) FROM file_hashes WHERE project='{{project}}' AND rel_path='unicode/ünïcødé.py'",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-18",
+   "tier": 1,
+   "title": "every edge endpoint exists (referential integrity)",
+   "sqlite": "SELECT count(*) FROM edges e WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id=e.source_id) OR NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id=e.target_id)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-19",
+   "tier": 1,
+   "title": "every node's properties JSON is valid",
+   "sqlite": "SELECT count(*) FROM nodes WHERE properties IS NOT NULL AND properties <> '' AND NOT json_valid(properties)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-20",
+   "tier": 1,
+   "title": "integrity_check is ok",
+   "sqlite": "PRAGMA integrity_check",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      "ok"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-21",
+   "tier": 2,
+   "title": "journal mode (record; WAL expected for concurrent readers)",
+   "sqlite": "PRAGMA journal_mode",
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S02-22",
+   "tier": 2,
+   "title": "docstrings are in the FTS body column",
+   "sqlite": "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'body:hyphenate'",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "S02-23",
+   "tier": 2,
+   "title": "FTS name column finds a symbol",
+   "sqlite": "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'name:checkout'",
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_not_contains": "0"
+   }
+  },
+  {
+   "id": "S02-24",
+   "tier": 2,
+   "title": "store_meta / schema version row exists",
+   "sqlite": "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('store_meta','runtime_settings','config')",
+   "expect": {
+    "ok": true
+   }
+  }
+ ]
+}

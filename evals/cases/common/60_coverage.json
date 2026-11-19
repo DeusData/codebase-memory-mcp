@@ -1,0 +1,1013 @@
+{
+ "suite": "C-COV",
+ "title": "Index creation coverage: files, symbols, edges, ignored paths, freshness, coverage tools, recall script",
+ "spec": "specs/04_index_coverage.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "COV-01",
+   "tier": 1,
+   "title": "every tier-1 source file is a File node",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN f.file_path ORDER BY f.file_path",
+    "max_rows": 1000,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "f.file_path",
+     "includes": [
+      "app/cli.py",
+      "app/models.py",
+      "app/money.py",
+      "app/service.py",
+      "app/util/strings.py",
+      "hub/hub.py",
+      "dup/alpha.py",
+      "dup/beta.py",
+      "unicode/ünïcødé.py",
+      "tests/test_service.py",
+      "java/src/main/java/com/example/billing/Money.java",
+      "java/src/main/java/com/example/billing/Invoice.java",
+      "java/src/main/java/com/example/billing/InvoiceService.java",
+      "java/src/test/java/com/example/billing/InvoiceServiceTest.java"
+     ],
+     "excludes": [
+      "vendor/thirdparty/lib.py",
+      "generated/gen.py"
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-02",
+   "tier": 2,
+   "title": "tier-2 files (docs, infra, empty __init__) are File nodes too",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN f.file_path ORDER BY f.file_path",
+    "max_rows": 1000,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "f.file_path",
+     "includes": [
+      "README.md",
+      "docs/ARCHITECTURE.md",
+      "Dockerfile",
+      "docker-compose.yml",
+      "app/__init__.py"
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-03",
+   "tier": 1,
+   "title": "no symbol from an ignored file and no phantom from the docs",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) WHERE n.name =~ '^(vendored_fn|generated_fn|compute_total)$' RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-04",
+   "tier": 1,
+   "title": "every tier-1 Python symbol exists with its label and file",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) WHERE n.file_path STARTS WITH 'app/' OR n.file_path STARTS WITH 'hub/' OR n.file_path STARTS WITH 'dup/' OR n.file_path STARTS WITH 'tests/' RETURN n.name, n.label, n.file_path ORDER BY n.file_path, n.name",
+    "max_rows": 1000,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": [
+      {
+       "n.name": "round_cents",
+       "n.label": "Function",
+       "n.file_path": "app/money.py"
+      },
+      {
+       "n.name": "format_cents",
+       "n.label": "Function",
+       "n.file_path": "app/money.py"
+      },
+      {
+       "n.name": "Customer",
+       "n.label": "Class",
+       "n.file_path": "app/models.py"
+      },
+      {
+       "n.name": "Order",
+       "n.label": "Class",
+       "n.file_path": "app/models.py"
+      },
+      {
+       "n.name": "display_name",
+       "n.label": "Method",
+       "n.file_path": "app/models.py"
+      },
+      {
+       "n.name": "add_line",
+       "n.label": "Method",
+       "n.file_path": "app/models.py"
+      },
+      {
+       "n.name": "total",
+       "n.label": "Method",
+       "n.file_path": "app/models.py"
+      },
+      {
+       "n.name": "ValidationError",
+       "n.label": "Class",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "validate",
+       "n.label": "Function",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "notify",
+       "n.label": "Function",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "OrderService",
+       "n.label": "Class",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "create",
+       "n.label": "Method",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "checkout",
+       "n.label": "Method",
+       "n.file_path": "app/service.py"
+      },
+      {
+       "n.name": "slugify",
+       "n.label": "Function",
+       "n.file_path": "app/util/strings.py"
+      },
+      {
+       "n.name": "unused_helper",
+       "n.label": "Function",
+       "n.file_path": "app/util/strings.py"
+      },
+      {
+       "n.name": "main",
+       "n.label": "Function",
+       "n.file_path": "app/cli.py"
+      },
+      {
+       "n.name": "hub",
+       "n.label": "Function",
+       "n.file_path": "hub/hub.py"
+      },
+      {
+       "n.name": "caller_01",
+       "n.label": "Function",
+       "n.file_path": "hub/hub.py"
+      },
+      {
+       "n.name": "caller_12",
+       "n.label": "Function",
+       "n.file_path": "hub/hub.py"
+      },
+      {
+       "n.name": "shared_name",
+       "n.label": "Function",
+       "n.file_path": "dup/alpha.py"
+      },
+      {
+       "n.name": "shared_name",
+       "n.label": "Function",
+       "n.file_path": "dup/beta.py"
+      },
+      {
+       "n.name": "test_checkout",
+       "n.label": "Function",
+       "n.file_path": "tests/test_service.py"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-05",
+   "tier": 1,
+   "title": "every tier-1 Java symbol exists with its label and file",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) WHERE n.file_path STARTS WITH 'java/' RETURN n.name, n.label, n.file_path ORDER BY n.file_path, n.name",
+    "max_rows": 1000,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": [
+      {
+       "n.name": "Money",
+       "n.label": "Class",
+       "n.file_path": "java/src/main/java/com/example/billing/Money.java"
+      },
+      {
+       "n.name": "roundCents",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/Money.java"
+      },
+      {
+       "n.name": "format",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/Money.java"
+      },
+      {
+       "n.name": "Invoice",
+       "n.label": "Class",
+       "n.file_path": "java/src/main/java/com/example/billing/Invoice.java"
+      },
+      {
+       "n.name": "addLine",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/Invoice.java"
+      },
+      {
+       "n.name": "total",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/Invoice.java"
+      },
+      {
+       "n.name": "InvoiceService",
+       "n.label": "Class",
+       "n.file_path": "java/src/main/java/com/example/billing/InvoiceService.java"
+      },
+      {
+       "n.name": "issue",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/InvoiceService.java"
+      },
+      {
+       "n.name": "audit",
+       "n.label": "Method",
+       "n.file_path": "java/src/main/java/com/example/billing/InvoiceService.java"
+      },
+      {
+       "n.name": "InvoiceServiceTest",
+       "n.label": "Class",
+       "n.file_path": "java/src/test/java/com/example/billing/InvoiceServiceTest.java"
+      },
+      {
+       "n.name": "testIssue",
+       "n.label": "Method",
+       "n.file_path": "java/src/test/java/com/example/billing/InvoiceServiceTest.java"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-06",
+   "tier": 1,
+   "title": "unicode symbol in the unicode file",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n:Function {file_path:'unicode/ünïcødé.py'}) RETURN n.name ORDER BY n.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "n.name",
+     "includes": "ünïcode_fn",
+     "count_gte": 2
+    }
+   }
+  },
+  {
+   "id": "COV-07",
+   "tier": 2,
+   "title": "the 200-character identifier is kept whole",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n:Function {file_path:'unicode/ünïcødé.py'}) RETURN n.name ORDER BY n.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "n.name",
+     "includes": "{{LONG_NAME}}"
+    }
+   }
+  },
+  {
+   "id": "COV-10",
+   "tier": 1,
+   "title": "CALLS tier-1: format_cents -> round_cents",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'format_cents'})-[:CALLS]->(b {name:'round_cents'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-11",
+   "tier": 1,
+   "title": "CALLS tier-1: checkout -> validate",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'checkout'})-[:CALLS]->(b {name:'validate'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-12",
+   "tier": 1,
+   "title": "CALLS tier-1: checkout -> notify",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'checkout'})-[:CALLS]->(b {name:'notify'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-13",
+   "tier": 1,
+   "title": "CALLS tier-1: main -> slugify (imported name)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'main'})-[:CALLS]->(b {name:'slugify'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-14",
+   "tier": 1,
+   "title": "CALLS tier-1: issue -> audit (Java)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'issue'})-[:CALLS]->(b {name:'audit'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-15",
+   "tier": 1,
+   "title": "CALLS tier-1: format -> roundCents (Java)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a {name:'format'})-[:CALLS]->(b {name:'roundCents'}) RETURN count(*)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-16",
+   "tier": 1,
+   "title": "hub inbound is exactly 12 and the dead helper has 0",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (t) WHERE t.name IN ['hub', 'unused_helper'] OPTIONAL MATCH (c)-[:CALLS]->(t) RETURN t.name, count(c) ORDER BY t.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": [
+      {
+       "t.name": "hub",
+       "COUNT(c)": "12"
+      },
+      {
+       "t.name": "unused_helper",
+       "COUNT(c)": "0"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-17",
+   "tier": 2,
+   "title": "CALLS tier-2 (resolver-dependent): notify -> format_cents, total -> round_cents, main -> checkout, issue -> format, total -> roundCents",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (a)-[:CALLS]->(b) WHERE (a.name = 'notify' AND b.name = 'format_cents') OR (a.name = 'total' AND b.name = 'round_cents') OR (a.name = 'main' AND b.name = 'checkout') OR (a.name = 'issue' AND b.name = 'format') OR (a.name = 'total' AND b.name = 'roundCents') RETURN DISTINCT a.name, b.name ORDER BY a.name, b.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "contains_row": [
+      {
+       "a.name": "notify",
+       "b.name": "format_cents"
+      },
+      {
+       "a.name": "total",
+       "b.name": "round_cents"
+      },
+      {
+       "a.name": "main",
+       "b.name": "checkout"
+      },
+      {
+       "a.name": "issue",
+       "b.name": "format"
+      },
+      {
+       "a.name": "total",
+       "b.name": "roundCents"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-18",
+   "tier": 2,
+   "title": "every non-empty source file defines at least one symbol (DEFINES or DEFINES_METHOD reachable)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) WHERE (f.file_path ENDS WITH '.py' OR f.file_path ENDS WITH '.java') AND NOT f.file_path ENDS WITH '__init__.py' AND NOT EXISTS { (f)-[:DEFINES]->() } RETURN f.file_path ORDER BY f.file_path",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 0
+    }
+   }
+  },
+  {
+   "id": "COV-19",
+   "tier": 2,
+   "title": "markdown sections are indexed",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (s:Section) RETURN s.name ORDER BY s.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "s.name",
+     "includes": [
+      "Orders",
+      "Billing",
+      "Dead code"
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-20",
+   "tier": 2,
+   "title": "infra: compose services and env vars are indexed",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) WHERE n.label IN ['Resource', 'EnvVar', 'Image'] RETURN n.label, n.name ORDER BY n.label, n.name",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "n.name",
+     "includes": [
+      "Service/db",
+      "Service/orders",
+      "ORDER_ENV"
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-30",
+   "tier": 1,
+   "title": "check_index_coverage: indexed paths are reported as covered",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/money.py",
+     "hub/hub.py",
+     "java/src/main/java/com/example/billing/Money.java",
+     "unicode/ünïcødé.py"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "paths",
+     "col": "path",
+     "includes": [
+      "app/money.py",
+      "hub/hub.py",
+      "unicode/ünïcødé.py"
+     ],
+     "count_eq": 4
+    }
+   }
+  },
+  {
+   "id": "COV-31",
+   "tier": 2,
+   "title": "…none of them is flagged (vocabulary frozen at the pilot: stale/missing/gap must not appear)",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/money.py",
+     "hub/hub.py"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "paths.0.status",
+      "op": "eq",
+      "value": "no_recorded_issue"
+     },
+     {
+      "path": "paths.0.freshness",
+      "op": "eq",
+      "value": "metadata_match"
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-32",
+   "tier": 1,
+   "title": "check_index_coverage: an ignored path is reported, with a reason, not as covered",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "vendor/thirdparty/lib.py"
+    ],
+    "format": "json",
+    "diagnostics": "full"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "paths.0.status",
+      "op": "eq",
+      "value": "excluded"
+     },
+     {
+      "path": "paths.0.freshness",
+      "op": "eq",
+      "value": "not_tracked"
+     },
+     {
+      "path": "paths.0.coverage.0.kind",
+      "op": "eq",
+      "value": "not_indexed_dir"
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-33",
+   "tier": 1,
+   "title": "check_index_coverage: a nonexistent path is reported as absent",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/nope.py"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "paths.0.freshness",
+      "op": "eq",
+      "value": "missing"
+     },
+     {
+      "path": "paths.0.recommended_action",
+      "op": "eq",
+      "value": "read_source_and_reindex"
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-34",
+   "tier": 1,
+   "title": "check_index_coverage: scopes",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "scopes": [
+     "app",
+     "java/src/main",
+     "vendor"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "scopes",
+     "col": "scope",
+     "includes": [
+      "app",
+      "java/src/main"
+     ]
+    }
+   }
+  },
+  {
+   "id": "COV-35",
+   "tier": 1,
+   "title": "check_index_coverage: path paging",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/cli.py",
+     "app/models.py",
+     "app/money.py"
+    ],
+    "path_limit": 2,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "paths",
+     "count_eq": 2
+    }
+   }
+  },
+  {
+   "id": "COV-36",
+   "tier": 2,
+   "title": "FRESHNESS: edit a file without re-indexing",
+   "fs": "append",
+   "path": "app/util/strings.py",
+   "content": "\n# freshness eval marker\n"
+  },
+  {
+   "id": "COV-37",
+   "tier": 2,
+   "title": "…coverage reports the path as stale/changed",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/util/strings.py"
+    ],
+    "format": "json",
+    "diagnostics": "full"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "paths.0.freshness",
+      "op": "eq",
+      "value": "metadata_changed"
+     },
+     {
+      "path": "paths.0.recommended_action",
+      "op": "eq",
+      "value": "read_source_and_reindex"
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-38",
+   "tier": 2,
+   "title": "…re-index",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "COV-39",
+   "tier": 2,
+   "title": "…fresh again",
+   "tool": "check_index_coverage",
+   "args": {
+    "project": "{{project}}",
+    "paths": [
+     "app/util/strings.py"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "paths.0.freshness",
+      "op": "eq",
+      "value": "metadata_match"
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-40",
+   "tier": 2,
+   "title": "…restore",
+   "shell": "git checkout -- app/util/strings.py",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "COV-41",
+   "tier": 2,
+   "title": "…re-index the restore",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "COV-42",
+   "tier": 1,
+   "title": "index_status diagnostics=full: coverage rows are reported (parse gaps, limits)",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json",
+    "diagnostics": "full"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "not_indexed.dirs",
+      "op": "contains",
+      "value": "vendor"
+     },
+     {
+      "path": "not_indexed.dirs",
+      "op": "contains",
+      "value": "generated"
+     },
+     {
+      "path": "parse_unusable.count",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-43",
+   "tier": 1,
+   "title": "the missed graph is queryable (0 or more gap files for this clean fixture)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "graph": "missed",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "lte",
+      "value": 2
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-44",
+   "tier": 1,
+   "title": "GROUND TRUTH RECALL (coverage_check.py): 100% tier-1 files, symbols, calls; exact hub and dead-code; report tier-2",
+   "shell": "{{python}} \"{{evals_dir}}/harness/coverage_check.py\" --binary \"{{binary}}\" --project {{project}} --expected \"{{evals_dir}}/fixtures/expected/eval-small.json\" --report \"{{evals_dir}}/results/{{backend}}/coverage_{{project}}.json\"",
+   "wait": 900,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "coverage_ok"
+   }
+  },
+  {
+   "id": "COV-45",
+   "tier": 2,
+   "title": "RESOURCE LIMIT: index_max_files below the fixture size refuses the index and preserves the serving index",
+   "shell": "\"{{binary}}\" config set index_max_files 3",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "COV-46",
+   "tier": 2,
+   "title": "…index is refused with resource_limit_exceeded",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)resource_limit_exceeded|index_max_files"
+   }
+  },
+  {
+   "id": "COV-47",
+   "tier": 2,
+   "title": "…the previous graph still serves",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (c)-[:CALLS]->(h:Function {name:'hub'}) RETURN count(c)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "COV-48",
+   "tier": 2,
+   "title": "…reset the limit",
+   "shell": "\"{{binary}}\" config reset index_max_files",
+   "expect": {
+    "rc": 0
+   }
+  }
+ ]
+}

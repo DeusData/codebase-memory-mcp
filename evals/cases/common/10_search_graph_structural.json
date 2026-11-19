@@ -1,0 +1,877 @@
+{
+ "suite": "C-SG",
+ "title": "search_graph structural filters: name/qn regex, label, file glob, degree, relationship, entry points, unicode, errors",
+ "spec": "specs/05_search_graph.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "SG-01",
+   "tier": 1,
+   "title": "exact name regex finds one symbol with its file",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "format": "json",
+    "label": "Function"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 5000,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "hub",
+     "count_eq": 1
+    }
+   }
+  },
+  {
+   "id": "SG-02",
+   "tier": 1,
+   "title": "…and the row's file is hub/hub.py",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "format": "json",
+    "label": "Function"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "file",
+     "includes": "hub/hub.py"
+    }
+   }
+  },
+  {
+   "id": "SG-03",
+   "tier": 1,
+   "title": "label Function + file glob hub/* gives hub and its 12 callers",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "file_pattern": "hub/*",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "count_eq": 13,
+     "includes": [
+      "hub",
+      "caller_01",
+      "caller_12"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-04",
+   "tier": 1,
+   "title": "label Class lists the Python and Java classes",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Class",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "count_gte": 8,
+     "includes": [
+      "Customer",
+      "Order",
+      "OrderService",
+      "ValidationError",
+      "Money",
+      "Invoice",
+      "InvoiceService",
+      "InvoiceServiceTest"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-05",
+   "tier": 1,
+   "title": "label Method lists Python and Java methods",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Method",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "checkout",
+      "create",
+      "total",
+      "roundCents",
+      "issue",
+      "audit"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-06",
+   "tier": 1,
+   "title": "label rows carry only that label",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Method",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "label",
+     "all_match": "^Method$"
+    }
+   }
+  },
+  {
+   "id": "SG-07",
+   "tier": 1,
+   "title": "character class and alternation in name_pattern",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^caller_0[1-9]$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "count_eq": 9
+    }
+   }
+  },
+  {
+   "id": "SG-07a",
+   "tier": 1,
+   "title": "REGRESSION (fixed 2026-11-18): a [a-z]+ range in name_pattern finds unused_helper (the LIKE pre-filter used \"a-z\" as literal text)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^[a-z]+_helper$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "unused_helper"
+    }
+   }
+  },
+  {
+   "id": "SG-07b",
+   "tier": 1,
+   "title": "REGRESSION (fixed 2026-11-18): \\d in name_pattern matches digits (POSIX ERE has no \\d; cbm_regcomp now rewrites \\d \\w \\s)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^caller_0\\d$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 9
+    }
+   }
+  },
+  {
+   "id": "SG-07c",
+   "tier": 1,
+   "title": "REGRESSION (fixed 2026-11-18): a range in qn_pattern",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "qn_pattern": "hub\\.caller_0[1-9]$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 9
+    }
+   }
+  },
+  {
+   "id": "SG-07d",
+   "tier": 2,
+   "title": "BY DESIGN: brackets in file_pattern are literal path text (pages/[id].tsx must stay findable), so dup/[ab]*.py matches no file; use a name/qn regex for classes",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "file_pattern": "dup/[ab]*.py",
+    "label": "Function",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 0
+    }
+   }
+  },
+  {
+   "id": "SG-07e",
+   "tier": 1,
+   "title": "control: a two-character class without a range ([13]) works",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^caller_0[13]$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 2
+    }
+   }
+  },
+  {
+   "id": "SG-08",
+   "tier": 2,
+   "title": "name matching is case-insensitive",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^orderservice$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "OrderService"
+    }
+   }
+  },
+  {
+   "id": "SG-09",
+   "tier": 1,
+   "title": "qn_pattern restricts to one module",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "qn_pattern": "app\\.service\\.",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "qn",
+     "all_match": "app\\.service",
+     "includes": [
+      "{{project}}.app.service.OrderService.checkout",
+      "{{project}}.app.service.validate"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-10",
+   "tier": 1,
+   "title": "file glob **/*.java with label Method excludes Python",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Method",
+    "file_pattern": "**/*.java",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "roundCents",
+      "issue"
+     ],
+     "excludes": "checkout"
+    }
+   }
+  },
+  {
+   "id": "SG-11",
+   "tier": 1,
+   "title": "file glob with a directory finds duplicate names in two files",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "file_pattern": "dup/*.py",
+    "name_pattern": "^shared_name$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "file",
+     "count_eq": 2,
+     "includes": [
+      "dup/alpha.py",
+      "dup/beta.py"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-12",
+   "tier": 1,
+   "title": "file glob substring semantics: 'service' matches app/service.py (issue 200)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "file_pattern": "*service*",
+    "label": "Function",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "validate",
+      "notify"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-13",
+   "tier": 1,
+   "title": "min_degree 12 keeps the hub",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "min_degree": 12,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "count_eq": 1
+    }
+   }
+  },
+  {
+   "id": "SG-14",
+   "tier": 1,
+   "title": "min_degree 13 drops the hub (exactly 12 CALLS)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "min_degree": 13,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 0
+    }
+   }
+  },
+  {
+   "id": "SG-15",
+   "tier": 1,
+   "title": "the hub row reports in=12 degree",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "in",
+     "includes": 12
+    }
+   }
+  },
+  {
+   "id": "SG-16",
+   "tier": 1,
+   "title": "max_degree 0 with label Function includes the dead helper",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "max_degree": 0,
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "unused_helper",
+     "excludes": [
+      "hub",
+      "caller_01",
+      "format_cents"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-17",
+   "tier": 1,
+   "title": "relationship CALLS keeps only nodes that have a CALLS edge",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "relationship": "CALLS",
+    "name_pattern": "^(hub|unused_helper)$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "hub",
+     "excludes": "unused_helper",
+     "count_eq": 1
+    }
+   }
+  },
+  {
+   "id": "SG-18",
+   "tier": 1,
+   "title": "exclude_entry_points drops a caller with no inbound CALLS",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^(caller_01|hub)$",
+    "exclude_entry_points": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "hub",
+     "excludes": "caller_01"
+    }
+   }
+  },
+  {
+   "id": "SG-19",
+   "tier": 2,
+   "title": "include_connected adds neighbours of the matches",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "include_connected": true,
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": [
+     "caller_01",
+     "caller_10"
+    ]
+   }
+  },
+  {
+   "id": "SG-20",
+   "tier": 1,
+   "title": "unicode identifier and unicode file name",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^ünïcode_fn$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "file",
+     "count_eq": 1,
+     "includes": "unicode/ünïcødé.py"
+    }
+   }
+  },
+  {
+   "id": "SG-21",
+   "tier": 2,
+   "title": "200-character identifier",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^{{LONG_NAME}}$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 1
+    }
+   }
+  },
+  {
+   "id": "SG-22",
+   "tier": 1,
+   "title": "ignored files never produce symbols",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^(vendored_fn|generated_fn)$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 0
+    }
+   }
+  },
+  {
+   "id": "SG-23",
+   "tier": 1,
+   "title": "test symbols are included by search_graph (only traces exclude them)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^(test_checkout|testIssue)$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "name",
+     "count_eq": 2
+    }
+   }
+  },
+  {
+   "id": "SG-24",
+   "tier": 1,
+   "title": "label File lists the indexed files and none of the ignored ones",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "File",
+    "limit": 500,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "col": "file",
+     "count_gte": 14,
+     "includes": [
+      "app/money.py",
+      "app/service.py",
+      "hub/hub.py",
+      "java/src/main/java/com/example/billing/Money.java",
+      "tests/test_service.py"
+     ],
+     "excludes": [
+      "vendor/thirdparty/lib.py",
+      "generated/gen.py"
+     ]
+    }
+   }
+  },
+  {
+   "id": "SG-25",
+   "tier": 1,
+   "title": "invalid regex is a clear error",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "(",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)regex|pattern|invalid|parenthes"
+   }
+  },
+  {
+   "id": "SG-26",
+   "tier": 1,
+   "title": "'.*' equals no pattern at all (same total)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": ".*",
+    "limit": 500,
+    "format": "json",
+    "max_output_tokens": 200000
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "SG-27",
+   "tier": 1,
+   "title": "…no pattern",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "limit": 500,
+    "format": "json",
+    "max_output_tokens": 200000
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "SG-26",
+      "path": "structured.total"
+     }
+    ]
+   }
+  },
+  {
+   "id": "SG-28",
+   "tier": 1,
+   "title": "unknown label is an empty answer, not a crash",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "NoSuchLabel",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "any_of": [
+     {
+      "ok": true,
+      "rows": {
+       "table": "",
+       "count_eq": 0
+      }
+     },
+     {
+      "ok": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "SG-29",
+   "tier": 2,
+   "title": "fields narrows the columns",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "fields": [
+     "name",
+     "file"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "SG-30",
+   "tier": 2,
+   "title": "detail=ids is the lean form",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "detail": "ids",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "SG-31",
+   "tier": 1,
+   "title": "tree format renders the match",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "text_contains": "hub"
+   }
+  },
+  {
+   "id": "SG-32",
+   "tier": 2,
+   "title": "infra: Resource label lists the compose services",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Resource",
+    "limit": 100,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": [
+     "Service/-/db",
+     "Service/-/orders"
+    ]
+   }
+  },
+  {
+   "id": "SG-33",
+   "tier": 2,
+   "title": "infra: kind filter on a kind the fixture does not have is empty",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "kind": "Deployment",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "count_eq": 0
+    }
+   }
+  },
+  {
+   "id": "SG-34",
+   "tier": 1,
+   "title": "served from Neo4j",
+   "skip_if": "sqlite",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "min_degree": 1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "json": [
+     {
+      "path": "graph_backend.remote_queries",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "SG-35",
+   "tier": 1,
+   "title": "served locally",
+   "skip_if": "neo4j",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "min_degree": 1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "sqlite"
+   }
+  }
+ ]
+}

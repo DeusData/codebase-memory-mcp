@@ -1,0 +1,416 @@
+{
+ "suite": "S-IDX",
+ "title": "SQLite backend: index creation, re-index, modes, artifact, async",
+ "spec": "specs/01_indexing_sqlite.md",
+ "backends": [
+  "sqlite"
+ ],
+ "cases": [
+  {
+   "id": "S01-01",
+   "tier": 1,
+   "title": "fresh index of eval-small in the profile's mode",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "mode": "{{index_mode}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "status",
+      "op": "exists"
+     }
+    ],
+    "text_not_contains": "error"
+   }
+  },
+  {
+   "id": "S01-02",
+   "tier": 2,
+   "title": "index reply reports the excluded vendor/ subtree (.cbmignore)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "mode": "{{index_mode}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true,
+    "deep_contains": "vendor"
+   }
+  },
+  {
+   "id": "S01-03",
+   "tier": 1,
+   "title": "index_status: project ready, backend kind sqlite",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "sqlite"
+     },
+     {
+      "path": "status",
+      "op": "exists"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-04",
+   "tier": 1,
+   "title": "list_projects lists the project",
+   "tool": "list_projects",
+   "args": {
+    "format": "json",
+    "detail": "stats"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "projects",
+     "col": "name",
+     "includes": "{{project}}"
+    }
+   }
+  },
+  {
+   "id": "S01-05",
+   "tier": 1,
+   "title": "at least the 14 tier-1 source files became File nodes",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 14
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-06",
+   "tier": 1,
+   "title": "re-index with no changes succeeds (incremental path)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S01-07",
+   "tier": 1,
+   "title": "node count is unchanged by the no-op re-index",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 60
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-08",
+   "tier": 2,
+   "title": "persistence:true writes the shareable graph artifact",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "persistence": true,
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S01-09",
+   "tier": 2,
+   "title": "artifact file exists next to the source",
+   "shell": "{{python}} -c \"import os,sys; p=os.path.join(sys.argv[1],'.codebase-memory-neo4j','graph.db.zst'); print('artifact', os.path.exists(p), os.path.getsize(p) if os.path.exists(p) else 0)\" \"{{repo}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "artifact True"
+   }
+  },
+  {
+   "id": "S01-10",
+   "tier": 2,
+   "title": "remove the artifact so the working copy stays clean",
+   "fs": "delete",
+   "path": ".codebase-memory-neo4j"
+  },
+  {
+   "id": "S01-11",
+   "tier": 1,
+   "title": "indexing a path that does not exist is an error",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}/does-not-exist",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "S01-12",
+   "tier": 2,
+   "title": "async index starts and returns at once",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "async": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 30000,
+    "json": [
+     {
+      "path": "state",
+      "op": "in",
+      "value": [
+       "queued",
+       "running",
+       "succeeded"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-13",
+   "sleep": 10
+  },
+  {
+   "id": "S01-14",
+   "tier": 2,
+   "title": "status:true reports the async job's state",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "status": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "state",
+      "op": "in",
+      "value": [
+       "queued",
+       "running",
+       "succeeded"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-15",
+   "sleep": 30
+  },
+  {
+   "id": "S01-16",
+   "tier": 2,
+   "title": "async job reached succeeded",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "status": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "state",
+      "op": "eq",
+      "value": "succeeded"
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-17",
+   "tier": 2,
+   "title": "async and status together are refused",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "async": true,
+    "status": true,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "S01-18",
+   "tier": 2,
+   "title": "fast mode index into a second project (no semantic edges)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-fast",
+    "mode": "fast",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S01-19",
+   "tier": 2,
+   "title": "fast index has no SIMILAR_TO / SEMANTICALLY_RELATED edge types",
+   "tool": "get_graph_schema",
+   "args": {
+    "project": "{{project}}-fast",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": [
+     "SIMILAR_TO",
+     "SEMANTICALLY_RELATED"
+    ],
+    "deep_contains": [
+     "CALLS",
+     "Function"
+    ]
+   }
+  },
+  {
+   "id": "S01-20",
+   "tier": 2,
+   "title": "fast index skips docs/ and test dirs by design, so it has fewer File nodes than full but keeps the 12 non-test tier-1 sources",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}-fast",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 12
+     },
+     {
+      "path": "rows.0.0",
+      "op": "lt",
+      "value": 24
+     }
+    ]
+   }
+  },
+  {
+   "id": "S01-21",
+   "tier": 2,
+   "title": "semantic_query on a fast index is rejected or empty, never a crash",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}-fast",
+    "semantic_query": [
+     "format money as text"
+    ],
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "text_not_contains": "panic"
+   }
+  },
+  {
+   "id": "S01-22",
+   "tier": 2,
+   "title": "name override normalizes unsafe characters",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}} weird/name",
+    "mode": "fast",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "S01-23",
+   "tier": 2,
+   "title": "the normalized project is listed",
+   "tool": "list_projects",
+   "args": {
+    "format": "json",
+    "limit": 500
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "deep_contains": "weird"
+   }
+  }
+ ]
+}

@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Generated code is git-ignored, so discovery must skip it (COV-10).
+generated/

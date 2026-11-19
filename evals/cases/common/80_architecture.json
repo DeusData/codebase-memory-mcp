@@ -1,0 +1,342 @@
+{
+ "suite": "C-ARCH",
+ "title": "get_architecture aspects, manage_adr, ingest_traces (smoke)",
+ "spec": "specs/08_trace_snippets_architecture.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "AR-01",
+   "tier": 1,
+   "title": "default aspects: languages include Python and Java",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 60000,
+    "text_regex": "(?i)python",
+    "deep_contains": "packages"
+   }
+  },
+  {
+   "id": "AR-02",
+   "tier": 1,
+   "title": "…and Java",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "languages"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "text_regex": "(?i)java"
+   }
+  },
+  {
+   "id": "AR-03",
+   "tier": 2,
+   "title": "aspects=all is bounded",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "all"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "ms_under": 120000
+   }
+  },
+  {
+   "id": "AR-04",
+   "tier": 2,
+   "title": "hotspots name the hub",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "hotspots"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "deep_contains": "hub"
+   }
+  },
+  {
+   "id": "AR-05",
+   "tier": 2,
+   "title": "entry points include main",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "entry_points"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "deep_contains": "main"
+   }
+  },
+  {
+   "id": "AR-06",
+   "tier": 1,
+   "title": "file_tree under a path prefix",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "file_tree"
+    ],
+    "path": "app",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "deep_contains": "service.py",
+    "deep_not_contains": "Money.java"
+   }
+  },
+  {
+   "id": "AR-07",
+   "tier": 2,
+   "title": "structure + dependencies + layers + boundaries",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "structure",
+     "dependencies",
+     "layers",
+     "boundaries"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "AR-08",
+   "tier": 2,
+   "title": "clusters and cycles",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "clusters",
+     "cycles"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "AR-09",
+   "tier": 2,
+   "title": "system_structure alone (may report a pending job first; poll once)",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "system_structure"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "AR-10",
+   "sleep": 5
+  },
+  {
+   "id": "AR-11",
+   "tier": 2,
+   "title": "…system_structure second poll with behavior evidence",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "system_structure"
+    ],
+    "include_behavior_evidence": true,
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "AR-12",
+   "tier": 1,
+   "title": "an invalid aspect is a clear error",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "nope"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "AR-13",
+   "tier": 1,
+   "title": "routes aspect runs on a project with no routes",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "aspects": [
+     "routes"
+    ],
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "AR-14",
+   "tier": 2,
+   "title": "manage_adr: sections of a project without an ADR",
+   "tool": "manage_adr",
+   "args": {
+    "project": "{{project}}",
+    "mode": "sections"
+   },
+   "wait": 120,
+   "expect": {
+    "text_not_contains": "panic"
+   }
+  },
+  {
+   "id": "AR-15",
+   "tier": 2,
+   "title": "manage_adr: get",
+   "tool": "manage_adr",
+   "args": {
+    "project": "{{project}}",
+    "mode": "get"
+   },
+   "wait": 120,
+   "expect": {
+    "text_not_contains": "panic"
+   }
+  },
+  {
+   "id": "AR-16",
+   "tier": 2,
+   "title": "manage_adr: set_sections then get returns the text byte-for-byte",
+   "tool": "manage_adr",
+   "args": {
+    "project": "{{project}}",
+    "mode": "update",
+    "content": "## PURPOSE\nEval ADR purpose line.\n"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "text_contains": "updated"
+   }
+  },
+  {
+   "id": "AR-17",
+   "tier": 2,
+   "title": "…get shows it",
+   "tool": "manage_adr",
+   "args": {
+    "project": "{{project}}",
+    "mode": "get"
+   },
+   "wait": 120,
+   "expect": {
+    "text_contains": "Eval ADR purpose line."
+   }
+  },
+  {
+   "id": "AR-18",
+   "tier": 2,
+   "title": "ingest_traces: a caller/callee pair that resolves (arg names per the tool schema; adjust at pilot)",
+   "tool": "ingest_traces",
+   "args": {
+    "project": "{{project}}",
+    "traces": [
+     {
+      "caller": "{{project}}.hub.hub.caller_01",
+      "callee": "{{project}}.hub.hub.hub"
+     }
+    ]
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "pairs_stored",
+      "op": "eq",
+      "value": 1
+     },
+     {
+      "path": "pairs_unmatched",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "AR-19",
+   "tier": 1,
+   "title": "architecture served from Neo4j+local or neo4j (projection is local; reply says which)",
+   "skip_if": "sqlite",
+   "tool": "get_architecture",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 600,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "neo4j"
+     }
+    ]
+   }
+  }
+ ]
+}

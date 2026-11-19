@@ -1,0 +1,752 @@
+{
+ "suite": "N-SCHEMA-IDX",
+ "title": "Neo4j schema indexes: existence, shape, state, use by the product's queries, resilience, scoping",
+ "spec": "specs/03_neo4j_indexes.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N02-01",
+   "tier": 1,
+   "title": "the six cbm_* range indexes exist on :CbmNode and are ONLINE",
+   "cypher": "SHOW INDEXES YIELD name, state, type, labelsOrTypes, properties, populationPercent WHERE name STARTS WITH 'cbm_node_' RETURN name, state, type, labelsOrTypes, properties, populationPercent ORDER BY name",
+   "expect": {
+    "ok": true,
+    "rows_eq": 6,
+    "cell_contains": [
+     "cbm_node_db",
+     "cbm_node_id",
+     "cbm_node_qn",
+     "cbm_node_name",
+     "cbm_node_file",
+     "cbm_node_label",
+     "ONLINE",
+     "RANGE",
+     "CbmNode"
+    ],
+    "cell_not_contains": [
+     "POPULATING",
+     "FAILED"
+    ]
+   }
+  },
+  {
+   "id": "N02-02",
+   "tier": 1,
+   "title": "each index covers exactly the documented property list",
+   "cypher": "SHOW INDEXES YIELD name, properties WHERE name STARTS WITH 'cbm_node_' RETURN name, properties ORDER BY name",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      "cbm_node_db",
+      [
+       "db"
+      ]
+     ],
+     [
+      "cbm_node_file",
+      [
+       "db",
+       "gen",
+       "file_path"
+      ]
+     ],
+     [
+      "cbm_node_id",
+      [
+       "db",
+       "gen",
+       "id"
+      ]
+     ],
+     [
+      "cbm_node_label",
+      [
+       "db",
+       "gen",
+       "label"
+      ]
+     ],
+     [
+      "cbm_node_name",
+      [
+       "db",
+       "gen",
+       "name"
+      ]
+     ],
+     [
+      "cbm_node_qn",
+      [
+       "db",
+       "gen",
+       "qualified_name"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-03",
+   "tier": 1,
+   "title": "every cbm_* index is fully populated",
+   "cypher": "SHOW INDEXES YIELD name, populationPercent WHERE name STARTS WITH 'cbm_node_' AND populationPercent < 100 RETURN name",
+   "expect": {
+    "ok": true,
+    "rows_eq": 0
+   }
+  },
+  {
+   "id": "N02-04",
+   "tier": 1,
+   "title": "uniqueness constraint cbm_project_name on CbmProject(name)",
+   "cypher": "SHOW CONSTRAINTS YIELD name, type, labelsOrTypes, properties WHERE name = 'cbm_project_name' RETURN name, type, labelsOrTypes, properties",
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": [
+     "UNIQUENESS",
+     "CbmProject",
+     "name"
+    ]
+   }
+  },
+  {
+   "id": "N02-05",
+   "tier": 2,
+   "title": "the constraint is enforced (a duplicate CbmProject is refused; nothing is written)",
+   "cypher": "CREATE (p:CbmProject {name: $project}) RETURN p.name",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": false,
+    "error_contains": "already exists"
+   }
+  },
+  {
+   "id": "N02-06",
+   "tier": 1,
+   "title": "read the project's current generation for the plan checks",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN p.gen",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N02-07",
+   "tier": 2,
+   "title": "PLAN: label lookup seeks cbm_node_label (db, gen, label) [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) WHERE n.project = $project RETURN count(n)",
+   "params": {
+    "db": "{{project}}",
+    "project": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex",
+    "plan_not_operator": "NodeByLabelScan"
+   }
+  },
+  {
+   "id": "N02-08",
+   "tier": 2,
+   "title": "PLAN: qualified-name lookup seeks cbm_node_qn [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode {db: $db, gen: $gen, qualified_name: $qn}) RETURN n.id",
+   "params": {
+    "db": "{{project}}",
+    "qn": "{{project}}.hub.hub.hub"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex"
+   }
+  },
+  {
+   "id": "N02-09",
+   "tier": 2,
+   "title": "PLAN: id lookup (batched node reads) seeks cbm_node_id [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN UNWIND $ids AS i MATCH (n:CbmNode {db: $db, gen: $gen, id: i}) RETURN n.id, n.name",
+   "params": {
+    "db": "{{project}}",
+    "ids": [
+     1,
+     2,
+     3
+    ]
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex"
+   }
+  },
+  {
+   "id": "N02-10",
+   "tier": 2,
+   "title": "PLAN: name lookup seeks cbm_node_name [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode {db: $db, gen: $gen, name: 'hub'}) RETURN n.id",
+   "params": {
+    "db": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex"
+   }
+  },
+  {
+   "id": "N02-11",
+   "tier": 2,
+   "title": "PLAN: the product's hinted full-scan page seeks cbm_node_file by range and never label-scans [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) AND ($project IS NULL OR n.project = $project) RETURN n.id, n.file_path ORDER BY n.db, n.gen, n.file_path, n.id LIMIT $max",
+   "params": {
+    "db": "{{project}}",
+    "after_file": "",
+    "keyed": false,
+    "after_id": 0,
+    "project": "{{project}}",
+    "max": 20000
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex",
+    "plan_not_operator": [
+     "NodeByLabelScan",
+     "AllNodesScan"
+    ]
+   }
+  },
+  {
+   "id": "N02-12",
+   "tier": 2,
+   "title": "PLAN: the hinted full-scan page does not sort the whole remainder (PartialTop/PartialSort, no plain Sort)",
+   "cypher": "EXPLAIN MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) AND ($project IS NULL OR n.project = $project) RETURN n.id, n.file_path ORDER BY n.db, n.gen, n.file_path, n.id LIMIT $max",
+   "params": {
+    "db": "{{project}}",
+    "after_file": "",
+    "keyed": false,
+    "after_id": 0,
+    "project": "{{project}}",
+    "max": 20000
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_not_operator": [
+     "Sort",
+     "Top"
+    ]
+   }
+  },
+  {
+   "id": "N02-13",
+   "tier": 2,
+   "title": "PLAN: the product's hinted label page seeks cbm_node_label [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, label) WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label AND ($project IS NULL OR n.project = $project) RETURN n.id ORDER BY n.id LIMIT $max",
+   "params": {
+    "db": "{{project}}",
+    "after_id": 0,
+    "label": "Function",
+    "project": "{{project}}",
+    "max": 20000
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex",
+    "plan_not_operator": "NodeByLabelScan"
+   }
+  },
+  {
+   "id": "N02-14",
+   "tier": 2,
+   "title": "PLAN: db-only lookup (old-generation delete shape) seeks cbm_node_db [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode {db: $db}) WHERE n.gen <> $gen RETURN count(n)",
+   "params": {
+    "db": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex"
+   }
+  },
+  {
+   "id": "N02-15",
+   "tier": 2,
+   "title": "PLAN: the File-list query (list_files) seeks the label index [tier 2: on a 137-node graph the cost planner may prefer an index scan; the authoritative check is the PROFILE ceiling in N09-30..36]",
+   "cypher": "EXPLAIN MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) WHERE n.project = $project WITH n.file_path AS path WHERE path <> '' RETURN DISTINCT path ORDER BY path",
+   "params": {
+    "db": "{{project}}",
+    "project": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndex"
+   }
+  },
+  {
+   "id": "N02-16",
+   "tier": 2,
+   "title": "PROFILE: label count really runs through the index (records db hits for the scorecard)",
+   "cypher": "PROFILE MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) WHERE n.project = $project RETURN count(n)",
+   "params": {
+    "db": "{{project}}",
+    "project": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "plan_has_operator": "NodeIndexSeek"
+   }
+  },
+  {
+   "id": "N02-17",
+   "tier": 1,
+   "title": "only one generation of the project exists in Neo4j",
+   "cypher": "MATCH (n:CbmNode {db: $db}) WHERE n.gen <> $gen RETURN count(n)",
+   "params": {
+    "db": "{{project}}"
+   },
+   "use_prev": [
+    {
+     "step": "N02-06",
+     "path": "rows.0.0",
+     "arg": "gen"
+    }
+   ],
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-18",
+   "tier": 1,
+   "title": "label is stored both as a property and as a Neo4j label (same count)",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode:Function {db: $project, gen: p.gen, project: $project}) WITH count(n) AS by_label MATCH (p:CbmProject {name: $project}) MATCH (m:CbmNode {db: $project, gen: p.gen, project: $project, label: 'Function'}) RETURN by_label, count(m), by_label = count(m)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": "True"
+   }
+  },
+  {
+   "id": "N02-19",
+   "tier": 1,
+   "title": "sync_format 2: every node carries prop_keys",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen}) WHERE n.prop_keys IS NULL RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-20",
+   "tier": 1,
+   "title": "scalar properties are flattened: a Function row has file_path, start_line, label",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project, name: 'hub', label: 'Function'}) RETURN n.file_path, n.start_line, n.qualified_name, n.properties_json",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": [
+     "hub/hub.py",
+     "{{project}}.hub.hub.hub"
+    ]
+   }
+  },
+  {
+   "id": "N02-21",
+   "tier": 1,
+   "title": "every CALLS relationship keeps type='CALLS' and an id",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (:CbmNode {db: $project, gen: p.gen})-[r:CALLS]->() WHERE r.type <> 'CALLS' OR r.id IS NULL RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-22",
+   "tier": 2,
+   "title": "non-identifier edge types land on CBM_EDGE with the real type kept (record the count)",
+   "cypher": "MATCH (:CbmNode {db: $project})-[r:CBM_EDGE]->() RETURN count(r), collect(DISTINCT r.type)[..5]",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N02-23",
+   "tier": 1,
+   "title": "hub has exactly 12 inbound CALLS in Neo4j",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (c:CbmNode {db: $project, gen: p.gen, project: $project})-[:CALLS]->(h:CbmNode {db: $project, gen: p.gen, project: $project, name: 'hub'}) RETURN count(c)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      12
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-24",
+   "tier": 1,
+   "title": "no cross-project edges: every relationship joins nodes of the same db and gen",
+   "cypher": "MATCH (a:CbmNode {db: $project})-[r]->(b:CbmNode) WHERE b.db <> a.db OR b.gen <> a.gen RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-25",
+   "tier": 1,
+   "title": "the ::missed coverage graph, if any, is under the same db but its own project key",
+   "cypher": "MATCH (n:CbmNode {db: $project}) WHERE n.project <> $project AND NOT n.project ENDS WITH '::missed' RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-26",
+   "tier": 2,
+   "title": "RESILIENCE: drop cbm_node_file by hand (test instance only)",
+   "cypher": "DROP INDEX cbm_node_file IF EXISTS",
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N02-27",
+   "tier": 2,
+   "title": "…the hinted page retries without the hint: a file-filtered search still answers",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "file_pattern": "app/*.py",
+    "label": "Function",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": [
+      "round_cents",
+      "validate"
+     ]
+    }
+   }
+  },
+  {
+   "id": "N02-28",
+   "tier": 2,
+   "title": "…a full node scan (File list) still answers",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (f:File) RETURN count(f)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "gte",
+      "value": 14
+     }
+    ]
+   }
+  },
+  {
+   "id": "N02-29",
+   "tier": 2,
+   "title": "…the next sync recreates the index (CREATE INDEX IF NOT EXISTS on every sync)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N02-30",
+   "tier": 2,
+   "title": "…cbm_node_file is back and ONLINE",
+   "cypher": "SHOW INDEXES YIELD name, state WHERE name = 'cbm_node_file' RETURN name, state",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      "cbm_node_file",
+      "ONLINE"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-30a",
+   "tier": 2,
+   "title": "force a source change",
+   "fs": "append",
+   "path": "app/cli.py",
+   "content": "\n# eval: force a source change so the sync is not skipped as unchanged\n"
+  },
+  {
+   "id": "N02-30b",
+   "tier": 1,
+   "title": "re-index with a real change: the sync runs ensure_schema",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N02-30c",
+   "tier": 1,
+   "title": "cbm_node_file is back and ONLINE after a real sync",
+   "cypher": "SHOW INDEXES YIELD name, state WHERE name = 'cbm_node_file' RETURN name, state",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      "cbm_node_file",
+      "ONLINE"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-30d",
+   "tier": 2,
+   "title": "restore app/cli.py",
+   "shell": "git checkout -- app/cli.py",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "N02-30e",
+   "tier": 2,
+   "title": "re-index the restore",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N02-31",
+   "tier": 1,
+   "title": "repeated syncs never duplicate indexes (still exactly six)",
+   "cypher": "SHOW INDEXES YIELD name WHERE name STARTS WITH 'cbm_node_' RETURN count(name)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      6
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-32",
+   "tier": 1,
+   "title": "…and exactly one cbm_project_name constraint",
+   "cypher": "SHOW CONSTRAINTS YIELD name WHERE name = 'cbm_project_name' RETURN count(name)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N02-33",
+   "tier": 1,
+   "title": "index-backed lookups are fast on the small graph: name equality",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^checkout$",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 3000,
+    "served_by": "neo4j"
+   }
+  },
+  {
+   "id": "N02-34",
+   "tier": 1,
+   "title": "index-backed lookups are fast: qualified name snippet",
+   "tool": "get_code_snippet",
+   "args": {
+    "project": "{{project}}",
+    "qualified_name": "{{project}}.app.money.round_cents",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 3000
+   }
+  },
+  {
+   "id": "N02-35",
+   "tier": 1,
+   "title": "index-backed lookups are fast: label count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (m:Method) RETURN count(m)",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "ms_under": 3000
+   }
+  }
+ ]
+}

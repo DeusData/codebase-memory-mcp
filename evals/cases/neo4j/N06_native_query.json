@@ -1,0 +1,565 @@
+{
+ "suite": "N-NATIVE",
+ "title": "query_graph native:true — bound parameters, read-only guard, scoping, limits",
+ "spec": "specs/07_query_graph.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N06-01",
+   "tier": 1,
+   "title": "engine count for comparison",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N06-02",
+   "tier": 1,
+   "title": "native count scoped by $db/$gen/$project equals the engine count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project}) RETURN count(n) AS c"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N06-01",
+      "path": "structured.rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-03",
+   "tier": 1,
+   "title": "$project and $db are bound to the project name",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "RETURN $project AS p, $db AS d"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "{{project}}"
+     },
+     {
+      "path": "rows.0.1",
+      "op": "eq",
+      "value": "{{project}}"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-04",
+   "tier": 1,
+   "title": "$gen is a positive integer",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "RETURN $gen > 0 AS ok, $gen AS g"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": "true"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-05",
+   "tier": 1,
+   "title": "native hub callers (12) via relationship type",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (c:CbmNode {db: $db, gen: $gen, project: $project})-[:CALLS]->(h:CbmNode {db: $db, gen: $gen, project: $project, name: 'hub'}) RETURN count(c)"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "rows.0.0",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-06",
+   "tier": 2,
+   "title": "native reply names Neo4j as the source",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "RETURN 1"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j"
+   }
+  },
+  {
+   "id": "N06-07",
+   "tier": 1,
+   "title": "WRITE GUARD: CREATE refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "CREATE (m:EvalProbe {k: 1}) RETURN m"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)read.only|refus|not allowed|write"
+   }
+  },
+  {
+   "id": "N06-08",
+   "tier": 1,
+   "title": "WRITE GUARD: MERGE refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MERGE (m:EvalProbe {k: 2}) RETURN m"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-09",
+   "tier": 1,
+   "title": "WRITE GUARD: SET refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: $db}) SET n.evalprobe = 1 RETURN count(n)"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-10",
+   "tier": 1,
+   "title": "WRITE GUARD: DELETE / DETACH DELETE refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: $db, name: 'zz-none'}) DETACH DELETE n"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-11",
+   "tier": 1,
+   "title": "WRITE GUARD: REMOVE refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: $db}) REMOVE n.evalprobe RETURN count(n)"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-12",
+   "tier": 1,
+   "title": "WRITE GUARD: CALL (procedures) refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "CALL db.labels() YIELD label RETURN label"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-13",
+   "tier": 1,
+   "title": "WRITE GUARD: LOAD CSV refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "LOAD CSV FROM 'file:///x.csv' AS row RETURN count(row)"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-14",
+   "tier": 1,
+   "title": "WRITE GUARD: comment/quote smuggling (EXPLAIN … /* ' */ CREATE … // ') refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "EXPLAIN MATCH (n:CbmNode {db: $db}) /* ' */ CREATE (m:EvalProbe) // '"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-15",
+   "tier": 1,
+   "title": "WRITE GUARD: schema changes refused",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "DROP INDEX cbm_node_name"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-16",
+   "tier": 1,
+   "title": "nothing was written by any guarded query",
+   "cypher": "MATCH (m:EvalProbe) RETURN count(m)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N06-17",
+   "tier": 1,
+   "title": "…and no evalprobe property appeared",
+   "cypher": "MATCH (n:CbmNode {db: $project}) WHERE n.evalprobe IS NOT NULL RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      0
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N06-18",
+   "tier": 1,
+   "title": "…and cbm_node_name still exists",
+   "cypher": "SHOW INDEXES YIELD name WHERE name = 'cbm_node_name' RETURN count(name)",
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N06-19",
+   "tier": 1,
+   "title": "ENGINE SCOPE: an engine (non-native) query never sees another project (comment desync attempt)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "format": "json",
+    "query": "MATCH (a) RETURN count(a) --(COUNT { MATCH (m:CbmNode {db: '{{project}}-other'}) })"
+   },
+   "wait": 300,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "ok": true,
+      "same_as": [
+       {
+        "step": "N06-01",
+        "path": "structured.rows.0.0"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-20",
+   "tier": 1,
+   "title": "ENGINE SCOPE: inline db/gen overrides are not a way out",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "format": "json",
+    "query": "MATCH (n {db: '{{project}}-other'}) RETURN count(n)"
+   },
+   "wait": 300,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "json": [
+       {
+        "path": "rows.0.0",
+        "op": "in",
+        "value": [
+         0,
+         "0",
+         null
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-21",
+   "tier": 1,
+   "title": "ENGINE SCOPE: write clauses through the engine are parse errors",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "format": "json",
+    "query": "MATCH (n) /* ' */ DETACH DELETE n /* ' */ RETURN count(n)"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false
+   }
+  },
+  {
+   "id": "N06-22",
+   "tier": 1,
+   "title": "…the graph is intact",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N06-01",
+      "path": "structured.rows.0.0",
+      "this_path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-23",
+   "tier": 2,
+   "title": "RECORD: native Cypher is raw — it can read another project's db when asked to (documented, by design; policy decision for the spec)",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: '{{project}}-other'}) RETURN count(n)"
+   },
+   "wait": 120,
+   "expect": {}
+  },
+  {
+   "id": "N06-24",
+   "tier": 1,
+   "title": "native max_rows pages: 10 of 1000",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "max_rows": 10,
+    "query": "UNWIND range(1, 1000) AS i RETURN i"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 10
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-25",
+   "tier": 1,
+   "title": "native syntax error is a clear Neo4j error",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n RETURN n"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)syntax|invalid|error"
+   }
+  },
+  {
+   "id": "N06-25b",
+   "tier": 2,
+   "skip_if": "no_var:project_twin",
+   "title": "index the SQLite-only twin (the SQLite profile cleans its own project up)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project_twin}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N06-26",
+   "tier": 1,
+   "title": "native on a plain SQLite project is refused",
+   "skip_if": "no_var:project_twin",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project_twin}}",
+    "native": true,
+    "format": "json",
+    "query": "RETURN 1"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)neo4j"
+   }
+  },
+  {
+   "id": "N06-26b",
+   "tier": 2,
+   "skip_if": "no_var:project_twin",
+   "title": "remove the twin again",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project_twin}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N06-27",
+   "tier": 1,
+   "title": "native missing-value rendering is consistent (engine_compat): a null property is '' or null, never a crash",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project, name: 'hub', label: 'Function'}) RETURN n.no_such_property"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "N06-28",
+   "tier": 2,
+   "title": "native query has a server-side time limit (60 s): a runaway cross product is stopped with a clear error, not a hung client",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "native": true,
+    "format": "json",
+    "query": "MATCH (a:CbmNode), (b:CbmNode), (c:CbmNode), (d:CbmNode) WITH a, b, c, d WHERE a.id + b.id + c.id + d.id = -1 RETURN count(*)"
+   },
+   "wait": 200,
+   "expect": {
+    "ms_under": 130000
+   }
+  }
+ ]
+}

@@ -1,0 +1,287 @@
+{
+ "suite": "C-SG-PAGE",
+ "title": "search_graph paging: offset/limit, totals, bounds, output budget, completeness",
+ "spec": "specs/05_search_graph.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "PG-01",
+   "tier": 1,
+   "title": "first page of Functions: 5 rows, has_more, exact total",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 5,
+    "offset": 0,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 5
+     },
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "total",
+      "op": "gte",
+      "value": 20
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-02",
+   "tier": 1,
+   "title": "second page has 5 distinct rows",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 5,
+    "offset": 5,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "",
+     "unique": "qn",
+     "count_eq": 5
+    },
+    "same_as": [
+     {
+      "step": "PG-01",
+      "path": "structured.total"
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-03",
+   "tier": 1,
+   "title": "an offset past the end is an empty page with has_more=false",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 5,
+    "offset": 100000,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 0
+     },
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-04",
+   "tier": 2,
+   "title": "limit 0 is clamped to the minimum (1), never an empty page",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 0,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-05",
+   "tier": 2,
+   "title": "limit above 500 is rejected or clamped, never silently wrong",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 501,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "any_of": [
+     {
+      "ok": false
+     },
+     {
+      "ok": true,
+      "json": [
+       {
+        "path": "returned",
+        "op": "lte",
+        "value": 500
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-06",
+   "tier": 2,
+   "title": "negative offset is clamped to 0 (the first page)",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "offset": -1,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-07",
+   "tier": 1,
+   "title": "walking every Function page is complete and disjoint (paging_check.py)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/paging_check.py\" --binary \"{{binary}}\" --project {{project}} --tool search_graph --args \"{\\\"label\\\": \\\"Function\\\"}\" --page 5",
+   "wait": 600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "pages_ok"
+   }
+  },
+  {
+   "id": "PG-08",
+   "tier": 1,
+   "title": "walking every node (no filter) is complete and disjoint",
+   "shell": "{{python}} \"{{evals_dir}}/harness/paging_check.py\" --binary \"{{binary}}\" --project {{project}} --tool search_graph --args \"{}\" --page 17",
+   "wait": 600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "pages_ok"
+   }
+  },
+  {
+   "id": "PG-09",
+   "tier": 2,
+   "title": "a tiny output budget truncates and says so",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "limit": 500,
+    "max_output_tokens": 128,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "any_of": [
+     {
+      "json": [
+       {
+        "path": "truncated",
+        "op": "eq",
+        "value": true
+       }
+      ]
+     },
+     {
+      "json": [
+       {
+        "path": "returned",
+        "op": "lt",
+        "value": 500
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-10",
+   "tier": 1,
+   "title": "page order is stable: the same page twice is identical",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "label": "Function",
+    "limit": 5,
+    "offset": 5,
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "PG-02",
+      "path": "structured.groups"
+     }
+    ]
+   }
+  },
+  {
+   "id": "PG-11",
+   "tier": 1,
+   "title": "the whole small graph fits in one 500-row page",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "limit": 500,
+    "format": "json",
+    "max_output_tokens": 200000
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "has_more",
+      "op": "eq",
+      "value": false
+     }
+    ],
+    "rows": {
+     "table": "",
+     "unique": "qn",
+     "count_gte": 60
+    }
+   }
+  }
+ ]
+}

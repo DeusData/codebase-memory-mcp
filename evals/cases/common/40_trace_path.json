@@ -1,0 +1,536 @@
+{
+ "suite": "C-TP",
+ "title": "trace_path: callers/callees, depth, test exclusion, edge types, paging, modes, errors",
+ "spec": "specs/08_trace_snippets_architecture.md",
+ "backends": [
+  "sqlite",
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "TP-01",
+   "tier": 1,
+   "title": "inbound depth 1 on hub: exactly 12 callers",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "ms_under": 5000,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     },
+     {
+      "path": "callers_total_relation",
+      "op": "eq",
+      "value": "eq"
+     }
+    ],
+    "rows": {
+     "table": "callers",
+     "col": "name",
+     "unique": "name",
+     "includes": [
+      "caller_01",
+      "caller_12"
+     ],
+     "count_eq": 12
+    }
+   }
+  },
+  {
+   "id": "TP-02",
+   "tier": 1,
+   "title": "every hub caller is at hop 1",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 3,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "callers",
+     "col": "hop",
+     "all_match": "^1$"
+    }
+   }
+  },
+  {
+   "id": "TP-03",
+   "tier": 1,
+   "title": "outbound depth 1 on checkout lists validate and notify",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "outbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": [
+     "validate",
+     "notify"
+    ]
+   }
+  },
+  {
+   "id": "TP-04",
+   "tier": 2,
+   "title": "outbound depth 2 reaches format_cents through notify",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "outbound",
+    "depth": 2,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "format_cents"
+   }
+  },
+  {
+   "id": "TP-05",
+   "tier": 1,
+   "title": "tests are excluded by default (both directions on checkout)",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "both",
+    "depth": 2,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "test_checkout"
+   }
+  },
+  {
+   "id": "TP-06",
+   "tier": 2,
+   "title": "include_tests=true brings the test caller back",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "inbound",
+    "depth": 2,
+    "include_tests": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "test_checkout"
+   }
+  },
+  {
+   "id": "TP-07",
+   "tier": 1,
+   "title": "Java outbound: issue -> audit",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "issue",
+    "direction": "outbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "audit"
+   }
+  },
+  {
+   "id": "TP-08",
+   "tier": 2,
+   "title": "Java inbound with tests: testIssue -> issue",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "issue",
+    "direction": "inbound",
+    "depth": 1,
+    "include_tests": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "testIssue"
+   }
+  },
+  {
+   "id": "TP-09",
+   "tier": 1,
+   "title": "Java outbound: format -> roundCents",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "format",
+    "direction": "outbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "roundCents"
+   }
+  },
+  {
+   "id": "TP-10",
+   "tier": 1,
+   "title": "a qualified name selects the symbol unambiguously",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "{{project}}.app.service.OrderService.checkout",
+    "direction": "outbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "validate"
+   }
+  },
+  {
+   "id": "TP-11",
+   "tier": 2,
+   "title": "an ambiguous short name (total: Python and Java) still answers, naming the candidates",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "total",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "TP-12",
+   "tier": 1,
+   "title": "unknown function is a clear error",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "no_such_function_xyz",
+    "direction": "inbound",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)not found|unknown|no symbol"
+   }
+  },
+  {
+   "id": "TP-13",
+   "tier": 1,
+   "title": "limit 5 pages the callers",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "limit": 5,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ],
+    "rows": {
+     "table": "callers",
+     "count_eq": 5
+    }
+   }
+  },
+  {
+   "id": "TP-14",
+   "tier": 1,
+   "title": "walking every caller page is complete and disjoint (paging_check.py)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/paging_check.py\" --binary \"{{binary}}\" --project {{project}} --tool trace_path --args \"{\\\"function_name\\\": \\\"hub\\\", \\\"direction\\\": \\\"inbound\\\", \\\"depth\\\": 1}\" --page 5",
+   "wait": 600,
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "pages_ok"
+   }
+  },
+  {
+   "id": "TP-15",
+   "tier": 1,
+   "title": "edge_types CALLS keeps the 12 callers; IMPORTS gives none",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "edge_types": [
+     "IMPORTS"
+    ],
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 0
+     }
+    ]
+   }
+  },
+  {
+   "id": "TP-16",
+   "tier": 2,
+   "title": "risk_labels and include_evidence add their columns",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "risk_labels": true,
+    "include_evidence": true,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_contains": "confidence"
+   }
+  },
+  {
+   "id": "TP-17",
+   "tier": 2,
+   "title": "mode data_flow with a parameter filter runs",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "outbound",
+    "mode": "data_flow",
+    "parameter_name": "order",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "TP-18",
+   "tier": 2,
+   "title": "mode cross_service runs (no services in the fixture)",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "checkout",
+    "direction": "both",
+    "mode": "cross_service",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "TP-19",
+   "tier": 2,
+   "title": "mode run from the compose service reaches the Dockerfile program",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "Service/orders",
+    "direction": "outbound",
+    "mode": "run",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callees_total",
+      "op": "gte",
+      "value": 1
+     }
+    ],
+    "deep_contains": "python"
+   }
+  },
+  {
+   "id": "TP-20",
+   "tier": 2,
+   "title": "depth 16 is clamped to the maximum (15) and still answers",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "depth": 16,
+    "format": "json",
+    "direction": "inbound"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "TP-21",
+   "tier": 2,
+   "title": "depth 0 is clamped to 1: the direct callers, never an empty trace",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "depth": 0,
+    "format": "json",
+    "direction": "inbound"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "TP-22",
+   "tier": 1,
+   "title": "alias trace_call_path works",
+   "tool": "trace_call_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ]
+   }
+  },
+  {
+   "id": "TP-23",
+   "tier": 1,
+   "title": "tree format renders",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "text_contains": "caller_01"
+   }
+  },
+  {
+   "id": "TP-24",
+   "tier": 1,
+   "title": "served from Neo4j with remote queries counted",
+   "skip_if": "sqlite",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "json": [
+     {
+      "path": "graph_backend.remote_queries",
+      "op": "gte",
+      "value": 1
+     }
+    ]
+   }
+  },
+  {
+   "id": "TP-25",
+   "tier": 2,
+   "title": "resolver evidence hidden by default (no confidence column)",
+   "tool": "trace_path",
+   "args": {
+    "project": "{{project}}",
+    "function_name": "hub",
+    "direction": "inbound",
+    "depth": 1,
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "deep_not_contains": "confidence"
+   }
+  }
+ ]
+}

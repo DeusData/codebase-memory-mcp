@@ -1,0 +1,523 @@
+{
+ "suite": "N-IDX",
+ "title": "Neo4j backend: index creation and sync into Neo4j",
+ "spec": "specs/02_indexing_neo4j.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N01-01",
+   "tier": 1,
+   "title": "index eval-small with graph_db (first sync is a full upload)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "mode": "{{index_mode}}",
+    "graph_db": "{{graph_db}}",
+    "graph_user": "{{neo4j_user}}",
+    "graph_password": "{{neo4j_password}}",
+    "graph_database": "{{neo4j_database}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true,
+    "text_not_contains": "***"
+   }
+  },
+  {
+   "id": "N01-02",
+   "tier": 1,
+   "title": "index_status: kind neo4j, serving, in sync, full first sync",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "neo4j"
+     },
+     {
+      "path": "graph_backend.status",
+      "op": "eq",
+      "value": "serving"
+     },
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     },
+     {
+      "path": "graph_backend.uri",
+      "op": "eq",
+      "value": "{{graph_db}}"
+     },
+     {
+      "path": "graph_backend.database",
+      "op": "eq",
+      "value": "{{neo4j_database}}"
+     },
+     {
+      "path": "graph_backend.synced_generation",
+      "op": "exists"
+     },
+     {
+      "path": "graph_backend.last_sync",
+      "op": "regex",
+      "value": "^full"
+     },
+     {
+      "path": "graph_backend.last_sync_error",
+      "op": "missing"
+     }
+    ],
+    "text_not_contains": "***"
+   }
+  },
+  {
+   "id": "N01-03",
+   "tier": 1,
+   "title": "synced generation equals the local generation",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N01-02",
+      "path": "structured.graph_backend.synced_generation",
+      "this_path": "structured.graph_backend.local_generation"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-04",
+   "tier": 1,
+   "title": "marker <project>.db.graph.json holds uri/user/database, never the password",
+   "shell": "{{python}} -c \"import json,sys; p=sys.argv[1]+'.graph.json'; d=json.load(open(p,encoding='utf-8')); print('keys', sorted(d)); print('has_password_key', any('pass' in k.lower() for k in d)); print(json.dumps(d))\" \"{{db_path}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": [
+     "uri",
+     "synced_generation",
+     "has_password_key False"
+    ],
+    "stdout_not_contains": "***"
+   }
+  },
+  {
+   "id": "N01-05",
+   "tier": 1,
+   "title": "CbmProject node exists for the project",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN p.name, p.gen, p.generation, p.sync_format",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1,
+    "cell_contains": "{{project}}"
+   }
+  },
+  {
+   "id": "N01-06",
+   "tier": 1,
+   "title": "CbmProject.sync_format is the current layout (2)",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN p.sync_format",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      2
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N01-07",
+   "tier": 1,
+   "title": "CbmProject.generation equals the synced generation reported by index_status",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN toString(p.generation)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N01-02",
+      "path": "structured.graph_backend.synced_generation",
+      "this_path": "rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-08",
+   "tier": 1,
+   "title": "Neo4j node count for the project (current generation, code graph only)",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (n:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(n)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N01-09",
+   "tier": 1,
+   "title": "engine count(n) equals the Neo4j node count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH (n) RETURN count(n)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N01-08",
+      "path": "rows.0.0",
+      "this_path": "structured.rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-10",
+   "tier": 1,
+   "title": "Neo4j edge count for the project",
+   "cypher": "MATCH (p:CbmProject {name: $project}) MATCH (a:CbmNode {db: $project, gen: p.gen, project: $project})-[r]->(b:CbmNode {db: $project, gen: p.gen, project: $project}) RETURN count(r)",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N01-11",
+   "tier": 1,
+   "title": "engine edge count equals the Neo4j edge count",
+   "tool": "query_graph",
+   "args": {
+    "project": "{{project}}",
+    "query": "MATCH ()-[r]->() RETURN count(r)",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true,
+    "same_as": [
+     {
+      "step": "N01-10",
+      "path": "rows.0.0",
+      "this_path": "structured.rows.0.0"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-12",
+   "tier": 1,
+   "title": "CbmProject node/edge counters match the graph",
+   "cypher": "MATCH (p:CbmProject {name: $project}) RETURN p.nodes, p.edges",
+   "params": {
+    "project": "{{project}}"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 1
+   }
+  },
+  {
+   "id": "N01-13",
+   "tier": 1,
+   "title": "graph tools name Neo4j as the source",
+   "tool": "search_graph",
+   "args": {
+    "project": "{{project}}",
+    "name_pattern": "^hub$",
+    "format": "json",
+    "label": "Function"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "served_by": "neo4j",
+    "text_contains": "Neo4j",
+    "rows": {
+     "table": "",
+     "col": "name",
+     "includes": "hub",
+     "count_eq": 1
+    }
+   }
+  },
+  {
+   "id": "N01-14",
+   "tier": 1,
+   "title": "the daemon log records graph.backend lines with served_by=neo4j",
+   "shell": "{{python}} -c \"import glob,os,sys; d=os.path.join(sys.argv[1],'logs'); n=0\nfor p in glob.glob(os.path.join(d,'*.log')):\n    n+=open(p,encoding='utf-8',errors='replace').read().count('served_by=neo4j')\nprint('served_by_lines', n)\" \"{{cache_dir}}\"",
+   "expect": {
+    "rc": 0,
+    "stdout_regex": "served_by_lines [1-9]"
+   }
+  },
+  {
+   "id": "N01-15",
+   "tier": 1,
+   "title": "re-index without any graph flags keeps syncing to the same Neo4j (marker)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N01-16",
+   "tier": 1,
+   "title": "still neo4j-backed and in sync after the flagless re-index",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "neo4j"
+     },
+     {
+      "path": "graph_backend.status",
+      "op": "eq",
+      "value": "serving"
+     },
+     {
+      "path": "graph_backend.in_sync",
+      "op": "eq",
+      "value": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-17",
+   "tier": 1,
+   "title": "second project from the same repo (cross-project scoping evals)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-other",
+    "mode": "fast",
+    "graph_db": "{{graph_db}}",
+    "graph_user": "{{neo4j_user}}",
+    "graph_password": "{{neo4j_password}}",
+    "graph_database": "{{neo4j_database}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N01-18",
+   "tier": 1,
+   "title": "the two projects have disjoint db keys in Neo4j",
+   "cypher": "MATCH (n:CbmNode) WHERE n.db IN [$a, $b] RETURN n.db, count(n) ORDER BY n.db",
+   "params": {
+    "a": "{{project}}",
+    "b": "{{project}}-other"
+   },
+   "expect": {
+    "ok": true,
+    "rows_eq": 2
+   }
+  },
+  {
+   "id": "N01-19",
+   "tier": 1,
+   "title": "bolt:// is refused with a hint to use the HTTP port",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-bolt",
+    "graph_db": "bolt://localhost:7687",
+    "graph_password": "{{neo4j_password}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false,
+    "text_regex": "(?i)http|7474",
+    "text_not_contains": "***"
+   }
+  },
+  {
+   "id": "N01-20",
+   "tier": 1,
+   "title": "unreachable Neo4j fails fast, before indexing",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-dead",
+    "graph_db": "http://127.0.0.1:1",
+    "graph_password": "{{neo4j_password}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": false,
+    "ms_under": 30000,
+    "text_regex": "(?i)neo4j|connect"
+   }
+  },
+  {
+   "id": "N01-21",
+   "tier": 1,
+   "title": "neither failed attempt registered a project",
+   "tool": "list_projects",
+   "args": {
+    "format": "json",
+    "limit": 500
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "rows": {
+     "table": "projects",
+     "col": "name",
+     "excludes": [
+      "{{project}}-bolt",
+      "{{project}}-dead"
+     ]
+    }
+   }
+  },
+  {
+   "id": "N01-22",
+   "tier": 2,
+   "title": "graph_db sqlite returns a project to local reads and leaves Neo4j data in place",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-other",
+    "graph_db": "sqlite",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N01-23",
+   "tier": 2,
+   "title": "…index_status now says sqlite",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}-other",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.kind",
+      "op": "eq",
+      "value": "sqlite"
+     }
+    ]
+   }
+  },
+  {
+   "id": "N01-24",
+   "tier": 2,
+   "title": "…and the Neo4j graph of -other is still there",
+   "cypher": "MATCH (n:CbmNode {db: $b}) RETURN count(n) > 0",
+   "params": {
+    "b": "{{project}}-other"
+   },
+   "expect": {
+    "ok": true,
+    "row_eq": [
+     [
+      true
+     ]
+    ]
+   }
+  },
+  {
+   "id": "N01-25",
+   "tier": 2,
+   "title": "re-attach -other to Neo4j for the later suites",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project}}-other",
+    "graph_db": "{{graph_db}}",
+    "graph_user": "{{neo4j_user}}",
+    "graph_password": "{{neo4j_password}}",
+    "graph_database": "{{neo4j_database}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
+   "id": "N01-26",
+   "tier": 2,
+   "title": "-other serving from Neo4j again",
+   "tool": "index_status",
+   "args": {
+    "project": "{{project}}-other",
+    "format": "json"
+   },
+   "wait": 120,
+   "expect": {
+    "ok": true,
+    "json": [
+     {
+      "path": "graph_backend.status",
+      "op": "eq",
+      "value": "serving"
+     }
+    ]
+   }
+  }
+ ]
+}

@@ -1,0 +1,133 @@
+{
+ "suite": "N-PARITY",
+ "title": "Neo4j vs SQLite parity: identical answers for every common case file",
+ "spec": "specs/09_backend_parity.md",
+ "backends": [
+  "neo4j"
+ ],
+ "cases": [
+  {
+   "id": "N08-00",
+   "note": "Run every evals/cases/common/*.json on BOTH profiles first (same working copy, same index mode). Each step below diffs one pair of result files; results/parity/*.md holds the per-step table."
+  },
+  {
+   "id": "N08-01",
+   "tier": 1,
+   "title": "00 schema and status",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/00_schema_and_status.jsonl\" \"{{evals_dir}}/results/neo4j/00_schema_and_status.jsonl\" --report \"{{evals_dir}}/results/parity/00_schema_and_status.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-02",
+   "tier": 1,
+   "title": "10 search_graph structural (unordered: the Project node is named after the project, which sorts differently)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/10_search_graph_structural.jsonl\" \"{{evals_dir}}/results/neo4j/10_search_graph_structural.jsonl\" --unordered --report \"{{evals_dir}}/results/parity/10_search_graph_structural.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-03",
+   "tier": 2,
+   "title": "11 search_graph bm25 + semantic (ranked rows compared as sets) (tier 2: semantic vectors include the project name, which differs between the twins)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/11_search_graph_bm25_semantic.jsonl\" \"{{evals_dir}}/results/neo4j/11_search_graph_bm25_semantic.jsonl\" --unordered --drop-cols score,rank --report \"{{evals_dir}}/results/parity/11_search_graph_bm25_semantic.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-04",
+   "tier": 1,
+   "title": "12 search_graph paging (unordered: the Project node is named after the project, which sorts differently)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/12_search_graph_paging.jsonl\" \"{{evals_dir}}/results/neo4j/12_search_graph_paging.jsonl\" --unordered --report \"{{evals_dir}}/results/parity/12_search_graph_paging.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-05",
+   "tier": 1,
+   "title": "20 search_code",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/20_search_code.jsonl\" \"{{evals_dir}}/results/neo4j/20_search_code.jsonl\" --report \"{{evals_dir}}/results/parity/20_search_code.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-06",
+   "tier": 1,
+   "title": "30 query_graph",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/30_query_graph.jsonl\" \"{{evals_dir}}/results/neo4j/30_query_graph.jsonl\" --report \"{{evals_dir}}/results/parity/30_query_graph.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-07",
+   "tier": 1,
+   "title": "40 trace_path (unordered: tie order differs between backends, recorded as a finding)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/40_trace_path.jsonl\" \"{{evals_dir}}/results/neo4j/40_trace_path.jsonl\" --unordered --report \"{{evals_dir}}/results/parity/40_trace_path.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-08",
+   "tier": 1,
+   "title": "50 snippets and outlines (unordered: tie order differs between backends, recorded as a finding)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/50_snippets_outline.jsonl\" \"{{evals_dir}}/results/neo4j/50_snippets_outline.jsonl\" --unordered --report \"{{evals_dir}}/results/parity/50_snippets_outline.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-09",
+   "tier": 1,
+   "title": "60 coverage",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/60_coverage.jsonl\" \"{{evals_dir}}/results/neo4j/60_coverage.jsonl\" --report \"{{evals_dir}}/results/parity/60_coverage.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-10",
+   "tier": 1,
+   "title": "70 detect_changes",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/70_detect_changes.jsonl\" \"{{evals_dir}}/results/neo4j/70_detect_changes.jsonl\" --report \"{{evals_dir}}/results/parity/70_detect_changes.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  },
+  {
+   "id": "N08-11",
+   "tier": 2,
+   "title": "80 architecture (bounded jobs may differ in pending/complete state; review the diff)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/80_architecture.jsonl\" \"{{evals_dir}}/results/neo4j/80_architecture.jsonl\" --report \"{{evals_dir}}/results/parity/80_architecture.md\"",
+   "expect": {
+    "rc": 0
+   }
+  },
+  {
+   "id": "N08-12",
+   "tier": 1,
+   "title": "S03 BM25 (local on both backends) (BM25 rank values ignored: corpus statistics include the project name)",
+   "shell": "{{python}} \"{{evals_dir}}/harness/compare_backends.py\" \"{{evals_dir}}/results/sqlite/S03_fts_bm25.jsonl\" \"{{evals_dir}}/results/neo4j/S03_fts_bm25.jsonl\" --unordered --drop-cols rank --report \"{{evals_dir}}/results/parity/S03_fts_bm25.md\"",
+   "expect": {
+    "rc": 0,
+    "stdout_contains": "0 differing step(s)"
+   }
+  }
+ ]
+}
