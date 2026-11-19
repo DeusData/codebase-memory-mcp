@@ -746,6 +746,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->namespace_name =
             src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
     }
+    /* PHP types too, where the extractor recorded it (a file may hold several
+     * namespaces): the member lookup finds a trait by namespace and name. */
+    if (lang == CBM_LANG_PHP && src->decl_namespace && cbm_label_is_type_like(src->label)) {
+        dst->namespace_name = cbm_arena_strdup(arena, src->decl_namespace);
+    }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* The return-type string. The Go registrar splits it on '|' (go_lsp.c
      * split_pipe_types), so a Go result LIST arrives split into its element

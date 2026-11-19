@@ -4924,6 +4924,12 @@ static CBMDefTypeFacts *def_type_facts(CBMArena *a, CBMDefinition *def);
 static void extract_php_member_bases(CBMExtractCtx *ctx, CBMArena *a, TSNode node,
                                      CBMDefinition *def) {
     const char *source = ctx->source;
+    /* The namespace and class aliases in force where the type is written:
+     * its own namespace (a file may hold several; the file-level
+     * namespace_name keeps only the first), and its trait names' meaning. */
+    php_names_t names;
+    php_names_at(ctx, node, &names);
+    def->decl_namespace = cbm_arena_strdup(a, names.ns ? names.ns : "");
     char kinds[MAX_BASES + 2];
     int nk = 0;
     bool truncated = false;
@@ -4988,20 +4994,13 @@ static void extract_php_member_bases(CBMExtractCtx *ctx, CBMArena *a, TSNode nod
     int cap = 0;
     const char **mixins = NULL;
     char *rules = NULL;
-    php_names_t names;
-    bool have_names = false;
     uint32_t bc = ts_node_named_child_count(body);
     for (uint32_t i = 0; i < bc; i++) {
         TSNode use = ts_node_named_child(body, i);
         if (strcmp(ts_node_type(use), "use_declaration") != 0) {
             continue;
         }
-        if (!have_names) {
-            /* A trait is named as the class's file names it: qualified here,
-             * where the namespace and `use` statements are known. */
-            php_names_at(ctx, node, &names);
-            have_names = true;
-        }
+        /* A trait is named as the class's file names it (`names`). */
         uint32_t uc = ts_node_named_child_count(use);
         for (uint32_t j = 0; j < uc; j++) {
             TSNode c = ts_node_named_child(use, j);

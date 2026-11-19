@@ -430,6 +430,28 @@ TEST(phpmw_trait_resolved_where_written) {
     PASS();
 }
 
+/* A file with several namespaces (phpunit's bundled tools): a trait declared
+ * in a later one is known by its own namespace, not the file's first. php:
+ * Zs::spin runs. Partner: the same-named method of another class gets no
+ * edge. */
+TEST(phpmw_trait_in_a_later_namespace) {
+    static const PmwFile f[] = {
+        {"src/Bundle.php", "<?php\nnamespace App;\nuse Lib\\HasZ;\n"
+                           "class Zdecoy { public function spin(): int { return 2; } }\n"
+                           "class UsesZ {\n    use HasZ;\n"
+                           "    public function run(): void { $this->z()->spin(); }\n}\n"
+                           "namespace Lib;\n"
+                           "class Zs { public function spin(): int { return 1; } }\n"
+                           "trait HasZ { public function z(): Zs { return new Zs; } }\n"},
+    };
+    static const PmwExpect want[] = {
+        {"UsesZ.run", "Zs.spin", true, true},
+        {"UsesZ.run", "Zdecoy.spin", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 1, want, 2), 0);
+    PASS();
+}
+
 /* A trait's abstract method beside a vendor trait: the vendor trait may
  * implement it (php: fx/req2, `Zv`, its m runs), so the requirement itself
  * answers, as today's flattened copy did, and the parent's m is not reached
@@ -619,6 +641,15 @@ TEST(phpmw_extractor_qualifies_trait_names) {
     ASSERT_STR_EQ(mf->mixins[4], "\\App\\Models\\Sub\\Deep");
     /* `namespace Other;` starts anew: no alias carries over. */
     ASSERT_STR_EQ(nf->mixins[0], "\\Other\\HasThing");
+    /* Each type's own namespace (the file-level one keeps only the first). */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "M") == 0) {
+            ASSERT_STR_EQ(d->decl_namespace, "App\\Models");
+        } else if (d->name && strcmp(d->name, "N") == 0) {
+            ASSERT_STR_EQ(d->decl_namespace, "Other");
+        }
+    }
     cbm_free_result(r);
     const char *br = "<?php\n"
                      "namespace A { use X\\Y; }\n"
@@ -642,6 +673,7 @@ SUITE(php_member_walk) {
     RUN_TEST(phpmw_extractor_records_kinds_traits_rules);
     RUN_TEST(phpmw_extractor_qualifies_trait_names);
     RUN_TEST(phpmw_trait_resolved_where_written);
+    RUN_TEST(phpmw_trait_in_a_later_namespace);
     RUN_TEST(phpmw_requirement_beside_vendor_trait);
     RUN_TEST(phpmw_possible_answer_in_the_walks_order);
     RUN_TEST(phpmw_possible_answer_only_where_today_answered);

@@ -4881,7 +4881,8 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         if (d->qualified_name && d->name && d->label &&
             (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
              strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Enum") == 0)) {
-            php_fqn_add(&ctx, result->namespace_name, d->name, d->qualified_name);
+            php_fqn_add(&ctx, d->decl_namespace ? d->decl_namespace : result->namespace_name,
+                        d->name, d->qualified_name);
         }
     }
 
