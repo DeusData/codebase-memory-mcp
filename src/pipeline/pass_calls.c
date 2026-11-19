@@ -1545,12 +1545,13 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
         }
         return NULL;
     }
-    CBMFileResult *r =
-        cbm_pipeline_test_force_extract_null(ctx, fi->language)
-            ? NULL
-            : cbm_extract_file_ex_with_tests(
-                  src, slen, fi->language, ctx->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
-                  NULL, NULL, ctx->macro_table, ctx->return_type_table, ctx->test_declarations);
+    CBMIncludeScope include_scope = cbm_pipeline_include_scope(ctx);
+    CBMFileResult *r = cbm_pipeline_test_force_extract_null(ctx, fi->language)
+                           ? NULL
+                           : cbm_extract_file_ex_with_tests(
+                                 src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                 CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
+                                 ctx->return_type_table, ctx->test_declarations, &include_scope);
     free(src);
     (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, r);
     if (r) {
