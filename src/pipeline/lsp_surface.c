@@ -52,7 +52,8 @@
  * 6: defs carry their supertypes' kinds in "sk" and their mixin rules in "mr"
  * (the shared member lookup, PHP); a version-5 surface has neither and must be
  * re-extracted. Both are inputs of the def itself, compared like its other
- * fields. */
+ * fields. In version 6, "ns" of a PHP type is the type's own namespace (a file
+ * may hold several), not the file's first one. */
 enum { SURFACE_CODEC_VERSION = 6 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
