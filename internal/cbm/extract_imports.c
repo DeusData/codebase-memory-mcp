@@ -3060,8 +3060,13 @@ static void parse_spec_imports(CBMExtractCtx *ctx) {
         if (!spec_type_matches(spec->import_node_types, kind)) {
             continue;
         }
+        int first = ctx->result->imports.count;
         if (!try_generic_path_fields(ctx, node)) {
             generic_import_from_text(ctx, node);
+        }
+        /* the statement every row came from (CBMImport.start_byte) */
+        for (int i = first; i < ctx->result->imports.count; i++) {
+            ctx->result->imports.items[i].start_byte = ts_node_start_byte(node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);

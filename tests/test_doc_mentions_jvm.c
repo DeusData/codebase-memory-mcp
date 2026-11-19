@@ -543,7 +543,7 @@ static const char *jt_reason(const char *db, const char *rel, const char *raw) {
     "package a;\n"             /* 1 */                                                                     \
     "\n"                       /* 2 */                                                                     \
     "import b.Helper;\n"       /* 3 */                                                                     \
-    "import a.env.Config;\n"   /* 4 */                                                                     \
+    "import a.tmp.Config;\n"   /* 4 */                                                                     \
     "import java.util.List;\n" /* 5 */                                                                     \
     "import b.Generated;\n"    /* 6 */                                                                     \
     "/**\n"                    /* 7 */                                                                     \
@@ -551,7 +551,7 @@ static const char *jt_reason(const char *db, const char *rel, const char *raw) {
                                                                                               */           \
     " * {@value Helper#MASK} {@link List} {@link String} {@link T} {@link Gadget#spin}\n" /* 9 */          \
     " * {@link NoSuchType} {@link Gadget#nope} {@link GadgetTests} {@link Config}\n"      /* 10 */         \
-    " * {@link a.env.Other} {@link b} {@link Shapes.Point#x} {@link Shapes.Shape#SIDES}\n" /* 11           \
+    " * {@link a.tmp.Other} {@link b} {@link Shapes.Point#x} {@link Shapes.Shape#SIDES}\n" /* 11           \
                                                                                             */             \
     " * {@link Shapes.Marker#value()} {@link Shapes.Sized#size} {@link Shapes.Sized#size()}\n" /* 12 */    \
     " * {@link Gadget#Gadget()} {@link Shapes.Made#Made(int)} {@link Shapes.Made#Made(String)}\n" /* 13 */ \
@@ -581,7 +581,7 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
     /* a real package in a layout discovery still skips by name: a plain
      * src/<pkg>/ tree (the open part of #2661); below src/<set>/<lang>/ the
      * same package is kept since #2724 */
-    jt_write(&r, "src/a/env/Config.java", "package a.env;\npublic class Config {}\n");
+    jt_write(&r, "src/a/tmp/Config.java", "package a.tmp;\npublic class Config {}\n");
     jt_write(&r, "src/test/java/a/GadgetTests.java",
              "package a;\n/** Tests {@link Gadget}. */\npublic class GadgetTests {}\n");
     ASSERT_EQ(dm_index(r.repo, r.db, NULL), 0);
@@ -648,7 +648,7 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
     /* not_indexed: a package of the repository in a layout discovery still
      * skips by name, named by an import and by its qualified name */
     ASSERT_STR_EQ(jt_reason(db, w, "Config"), "not_indexed");
-    ASSERT_STR_EQ(jt_reason(db, w, "a.env.Other"), "not_indexed");
+    ASSERT_STR_EQ(jt_reason(db, w, "a.tmp.Other"), "not_indexed");
     /* graph_gap: a package (no node), a record component, an interface
      * constant and an annotation element (declared, no definition), a
      * constructor the class has without declaring it */
@@ -682,6 +682,36 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
 
 /* An oversized reference is unparseable in both languages: the resolver
  * never resolves the prefix that was kept. */
+/* deploy/ outside a source root keeps its configuration files only, so the
+ * Java declared there is on disk but not in the graph and a reference to it
+ * reads not_indexed, as when the whole directory was skipped. env is skipped
+ * only as a Python virtual environment now: its package binds. */
+TEST(doc_mentions_jvm_deploy_package_not_indexed) {
+    jt_repo_t r;
+    ASSERT(jt_begin(&r, "jdeploy"));
+    jt_write(&r, "src/main/java/a/Widget.java",
+             "package a;\n\nimport a.deploy.Job;\nimport a.env.Settings;\n\n"
+             "/** {@link Job} {@link Settings} */\npublic class Widget {}\n");
+    jt_write(&r, "src/a/deploy/Job.java", "package a.deploy;\npublic class Job {}\n");
+    jt_write(&r, "src/a/deploy/job.yaml", "apiVersion: batch/v1\nkind: Job\n");
+    jt_write(&r, "src/a/env/Settings.java", "package a.env;\npublic class Settings {}\n");
+    ASSERT_EQ(dm_index(r.repo, r.db, NULL), 0);
+    const char *w = "src/main/java/a/Widget.java";
+    /* the guard first: a deploy package reads not_indexed (on main the whole
+     * directory was skipped, so main gave the same answer for another reason) */
+    ASSERT_STR_EQ(jt_reason(r.db, w, "Job"), "not_indexed");
+    int yaml = dm_count(r.db, "SELECT COUNT(*) FROM nodes WHERE label = 'File' AND "
+                              "file_path = 'src/a/deploy/job.yaml'");
+    int job =
+        dm_count(r.db, "SELECT COUNT(*) FROM nodes WHERE file_path = 'src/a/deploy/Job.java'");
+    ASSERT_EQ(yaml, 1); /* the directory is walked */
+    ASSERT_EQ(job, 0);  /* its Java is not indexed */
+    ASSERT_STR_EQ(jt_reason(r.db, w, "Settings"), "");
+    ASSERT_EQ(jt_edge(r.db, "a.Widget", "a.env.Settings"), 1);
+    jt_end(&r);
+    PASS();
+}
+
 TEST(doc_mentions_jvm_oversized_reference) {
     jt_repo_t r;
     ASSERT(jt_begin(&r, "big"));
@@ -1099,7 +1129,7 @@ TEST(doc_mentions_jvm_java_member_levels) {
     " * [name], [Gadget.turn], [Gadget.both], [Color.RED], [NoSuchThing], [Gadget.nope],\n" /* 8       \
                                                                                              */        \
     " * [GadgetTests], [Gadget.create], [Alias], [Alias.spin], [far.Helper.run], [far.sub],\n" /* 9 */ \
-    " * [org.outside.Thing], [far.Missing], [k.env.Config]\n" /* 10 */                                 \
+    " * [org.outside.Thing], [far.Missing], [k.tmp.Config]\n" /* 10 */                                 \
     " * @see Gadget.spin\n"                                   /* 11 */                                 \
     " * @see NoSuchThing\n"                                   /* 12 */                                 \
     " * @throws CustomError never\n"                          /* 13 */                                 \
@@ -1122,7 +1152,7 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     /* a real package in a layout discovery still skips by name: a plain
      * src/<pkg>/ tree (the open part of #2661); below src/<set>/<lang>/ the
      * same package is kept since #2724 */
-    jt_write(&r, "src/k/env/Config.kt", "package k.env\n\nclass Config\n");
+    jt_write(&r, "src/k/tmp/Config.kt", "package k.tmp\n\nclass Config\n");
     jt_write(&r, "src/test/kotlin/k/GadgetTests.kt", "package k\n\nclass GadgetTests\n");
     jt_write(&r, "src/test/kotlin/k/samples/Samples.kt",
              "package k.samples\n\nfun widgetSample() {}\n");
@@ -1175,7 +1205,7 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     /* test_only_target */
     ASSERT_STR_EQ(jt_reason(db, w, "GadgetTests"), "test_only_target");
     /* not_indexed: a package of the repository in a layout discovery still skips by name */
-    ASSERT_STR_EQ(jt_reason(db, w, "k.env.Config"), "not_indexed");
+    ASSERT_STR_EQ(jt_reason(db, w, "k.tmp.Config"), "not_indexed");
     /* unparseable: a path with an empty name in it */
     ASSERT_STR_EQ(jt_reason(db, w, "Gadget..spin"), "unparseable");
     /* a `[name]` that names nothing is Markdown text to KDoc: no row. The
@@ -3636,6 +3666,7 @@ SUITE(doc_mentions_jvm) {
     RUN_TEST(doc_mentions_jvm_scope_parse_errors);
     RUN_TEST(doc_mentions_jvm_resolver_parse_errors);
     RUN_TEST(doc_mentions_jvm_java_families_and_reasons);
+    RUN_TEST(doc_mentions_jvm_deploy_package_not_indexed);
     RUN_TEST(doc_mentions_jvm_oversized_reference);
     RUN_TEST(doc_mentions_jvm_java_type_levels);
     RUN_TEST(doc_mentions_jvm_java_member_levels);

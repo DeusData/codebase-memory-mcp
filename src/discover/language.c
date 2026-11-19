@@ -1088,6 +1088,51 @@ const char *cbm_language_name(CBMLanguage lang) {
     return LANG_NAMES[lang] ? LANG_NAMES[lang] : "Unknown";
 }
 
+/* Build and configuration languages: they have no cross-language call
+ * semantics (registry.c's cross-language guard). */
+bool cbm_language_is_build_config(CBMLanguage lang) {
+    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
+           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
+           lang == CBM_LANG_DOCKERFILE;
+}
+
+/* The languages kept in a deploy/ or deployed/ directory (discover.c
+ * CONFIG_ONLY_DIRS), by the classification above (name, then shebang): the
+ * build and configuration languages, every other configuration and
+ * infrastructure language, and the shell family. General-purpose program
+ * languages (the build copies the rule exists for), SQL and Groovy are not
+ * members; neither are the package manifests (cbm_discover_is_package_manifest),
+ * which discovery drops there by name whatever their language. */
+bool cbm_language_is_deployment_config(CBMLanguage lang) {
+    if (cbm_language_is_build_config(lang)) {
+        return true;
+    }
+    switch (lang) {
+    /* other configuration and infrastructure languages */
+    case CBM_LANG_PROPERTIES: /* .properties */
+    case CBM_LANG_XML:        /* web.xml, server and logging configuration */
+    case CBM_LANG_JSON5:
+    case CBM_LANG_JSONNET: /* .jsonnet, .libsonnet */
+    case CBM_LANG_JINJA2:  /* .j2: Ansible and Salt templates */
+    case CBM_LANG_KUSTOMIZE:
+    case CBM_LANG_GOTEMPLATE: /* Helm template helpers (_helpers.tpl), .gotmpl */
+    case CBM_LANG_HCL:        /* Terraform, OpenTofu, Packer, Nomad, Terragrunt */
+    case CBM_LANG_BICEP:
+    case CBM_LANG_NIX:
+    case CBM_LANG_PUPPET:
+    case CBM_LANG_PKL:
+    case CBM_LANG_DOTENV: /* .env, .env.*, *.env */
+    /* the shell family, by suffix or by shebang */
+    case CBM_LANG_BASH:
+    case CBM_LANG_ZSH:
+    case CBM_LANG_FISH:
+    case CBM_LANG_POWERSHELL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* ── Shebang interpreter detection (extensionless scripts) ────────── */
 
 /* Basename of an interpreter path: the segment after the last '/'.  Shebangs

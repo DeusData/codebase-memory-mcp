@@ -11,6 +11,7 @@ typedef struct {
     cbm_inventory_path_t path;
     size_t parent, next, first_directory, last_directory, first_file, last_file;
     size_t excluded;
+    bool config_only; /* in or below deploy/ or deployed/: configuration languages only */
     cbm_inventory_filter_reason_t reason;
     const cbm_ignore_program_t *program;
 } cif_directory;
