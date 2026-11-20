@@ -4933,6 +4933,110 @@ static int coverage_index_unresolved_candidates(cbm_store_t *s, const char *proj
     return CBM_STORE_OK;
 }
 
+/* Scan the existing bounded coverage records by leaf, including sites that
+ * could not be narrowed to a candidate QN. */
+int cbm_store_unresolved_calls_by_leaf(cbm_store_t *s, const char *project, const char *leaf,
+                                       bool include_tests, int offset, int cap,
+                                       cbm_unresolved_call_t **out, int *count, int *total) {
+    *out = NULL;
+    *count = 0;
+    *total = 0;
+    if (!s || !s->db || !project || !leaf || !leaf[0] || offset < 0 || cap < 0) {
+        return CBM_STORE_ERR;
+    }
+    static const char from_where[] =
+        "FROM index_coverage c, json_each(CASE WHEN json_valid(c.detail) AND "
+        "json_type(c.detail) = 'array' THEN c.detail ELSE '[]' END) j "
+        "WHERE c.project = ?1 AND c.kind = 'unresolved_calls' AND j.type = 'object' "
+        "AND json_extract(j.value, '$.leaf') = ?2 "
+        "AND (?3 OR NOT EXISTS (SELECT 1 FROM nodes caller WHERE caller.project = c.project "
+        "AND caller.qualified_name = json_extract(j.value,'$.caller') "
+        "AND CASE WHEN json_valid(caller.properties) THEN "
+        "json_extract(caller.properties,'$.is_test') IN (1,'true') OR "
+        "json_extract(caller.properties,'$.test_role') IN ('case','suite','helper') END))";
+    char sql[CBM_SZ_1K];
+    sqlite3_stmt *stmt = NULL;
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) %s;", from_where);
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved leaf count prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, leaf);
+    sqlite3_bind_int(stmt, ST_COL_3, include_tests);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        *total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "unresolved leaf count");
+        return CBM_STORE_ERR;
+    }
+    if (cap == 0 || offset >= *total) {
+        return CBM_STORE_OK;
+    }
+    snprintf(sql, sizeof(sql),
+             "SELECT json_extract(j.value,'$.caller'), c.rel_path, "
+             "json_extract(j.value,'$.reason'), json_extract(j.value,'$.line'), "
+             "json_extract(j.value,'$.start_byte'), json_extract(j.value,'$.end_byte') %s "
+             "ORDER BY c.rel_path, j.key LIMIT ?4 OFFSET ?5;",
+             from_where);
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved leaf rows prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, leaf);
+    sqlite3_bind_int(stmt, ST_COL_3, include_tests);
+    sqlite3_bind_int(stmt, ST_COL_4, cap);
+    sqlite3_bind_int(stmt, ST_COL_5, offset);
+    cbm_unresolved_call_t *rows =
+        (cbm_unresolved_call_t *)cbm_calloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int n = 0;
+    while (n < cap && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *caller = (const char *)sqlite3_column_text(stmt, 0);
+        const char *rel = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *reason = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+        rows[n].caller_qn = cbm_mem_strdup(CBM_MEM_CLASS_STORE, caller ? caller : "");
+        rows[n].rel_path = cbm_mem_strdup(CBM_MEM_CLASS_STORE, rel ? rel : "");
+        rows[n].reason = cbm_mem_strdup(CBM_MEM_CLASS_STORE, reason ? reason : "");
+        rows[n].line = sqlite3_column_int(stmt, ST_COL_3);
+        rows[n].start_byte = (uint32_t)sqlite3_column_int64(stmt, ST_COL_4);
+        rows[n].end_byte = (uint32_t)sqlite3_column_int64(stmt, ST_COL_5);
+        n++;
+        if (!rows[n - 1].caller_qn || !rows[n - 1].rel_path || !rows[n - 1].reason) {
+            rc = SQLITE_NOMEM;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        cbm_store_unresolved_calls_free(rows, n);
+        store_set_error_sqlite(s, "unresolved leaf rows");
+        return CBM_STORE_ERR;
+    }
+    *out = rows;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_unresolved_calls_free(cbm_unresolved_call_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, rows[i].caller_qn);
+        cbm_free(CBM_MEM_CLASS_STORE, rows[i].rel_path);
+        cbm_free(CBM_MEM_CLASS_STORE, rows[i].reason);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, rows);
+}
+
 /* The caller owns the coverage transaction and rolls it back on failure. */
 static int coverage_write_metadata(cbm_store_t *s, const char *project,
                                    const cbm_coverage_meta_t *meta) {
@@ -7253,24 +7357,73 @@ static char *make_like_hint(const char *literal) {
     return buf;
 }
 
+static bool search_has_in_degree_filter(const cbm_search_params_t *p) {
+    return p->has_in_degree_filter && (p->min_in_degree >= 0 || p->max_in_degree >= 0);
+}
+
 static void search_apply_degree_filter(char *sql, size_t sql_sz, const cbm_search_params_t *p) {
-    bool has_degree_filter = (p->min_degree >= 0 || p->max_degree >= 0);
-    if (!has_degree_filter) {
+    bool has_combined = (p->min_degree >= 0 || p->max_degree >= 0);
+    bool has_in = search_has_in_degree_filter(p);
+    if (!has_combined && !has_in) {
         return;
     }
     char inner_sql[CBM_SZ_4K];
     snprintf(inner_sql, sizeof(inner_sql), "%s", sql);
-    if (p->min_degree >= 0 && p->max_degree >= 0) {
-        snprintf(sql, sql_sz,
-                 "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d",
-                 inner_sql, p->min_degree, p->max_degree);
-    } else if (p->min_degree >= 0) {
-        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d", inner_sql,
-                 p->min_degree);
-    } else {
-        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d", inner_sql,
-                 p->max_degree);
+    char cond[CBM_SZ_256];
+    int cl = 0;
+    if (has_combined) {
+        if (p->min_degree >= 0 && p->max_degree >= 0) {
+            cl = snprintf(cond, sizeof(cond),
+                          "(in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d", p->min_degree,
+                          p->max_degree);
+        } else if (p->min_degree >= 0) {
+            cl = snprintf(cond, sizeof(cond), "(in_deg + out_deg) >= %d", p->min_degree);
+        } else {
+            cl = snprintf(cond, sizeof(cond), "(in_deg + out_deg) <= %d", p->max_degree);
+        }
     }
+    if (has_in) {
+        if (p->min_in_degree >= 0) {
+            cl += snprintf(cond + cl, sizeof(cond) - (size_t)cl, "%sin_deg_f >= %d",
+                           cl > 0 ? " AND " : "", p->min_in_degree);
+        }
+        if (p->max_in_degree >= 0) {
+            cl += snprintf(cond + cl, sizeof(cond) - (size_t)cl, "%sin_deg_f <= %d",
+                           cl > 0 ? " AND " : "", p->max_in_degree);
+        }
+    }
+    snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE %s", inner_sql, cond);
+}
+
+/* The edge types the inbound-degree filter counts, as a SQL IN list of
+ * validated literals: degree_types when given, else the relationship type,
+ * else the standard five. False when a type name is not [A-Z_]+ — the list is
+ * embedded in SQL, so it must carry no bindable or quotable characters. */
+static bool search_in_degree_type_list(const cbm_search_params_t *p, char *out, size_t out_sz) {
+    const char *default_types[] = {"CALLS",    "USAGE",      "CALL_REFERENCE",
+                                   "INHERITS", "IMPLEMENTS", NULL};
+    const char *single[] = {p->relationship, NULL};
+    const char *const *types = p->degree_types;
+    if (!types) {
+        types = p->relationship && p->relationship[0] ? single : default_types;
+    }
+    size_t len = 0;
+    for (int i = 0; types[i]; i++) {
+        if (!types[i][0]) {
+            return false;
+        }
+        for (const char *c = types[i]; *c; c++) {
+            if (!((*c >= 'A' && *c <= 'Z') || *c == '_')) {
+                return false;
+            }
+        }
+        int w = snprintf(out + len, out_sz - len, "%s'%s'", i > 0 ? "," : "", types[i]);
+        if (w < 0 || (size_t)w >= out_sz - len) {
+            return false;
+        }
+        len += (size_t)w;
+    }
+    return len > 0;
 }
 
 /* Append a WHERE clause fragment, joining with AND if not the first. */
@@ -7441,7 +7594,8 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
 /* Build advanced WHERE clauses: relationship, entry points, exclude labels. */
 static void search_where_advanced(const cbm_search_params_t *params, char *where, int where_sz,
                                   int *wlen, int *nparams, search_bind_t *binds, int *bind_idx) {
-    if (params->relationship) {
+    bool inbound_only = search_has_in_degree_filter(params);
+    if (params->relationship && !inbound_only) {
         char rel_clause[CBM_SZ_256];
         snprintf(rel_clause, sizeof(rel_clause),
                  "EXISTS(SELECT 1 FROM edges e WHERE "
@@ -7451,13 +7605,23 @@ static void search_where_advanced(const cbm_search_params_t *params, char *where
         where_bind_text(binds, bind_idx, params->relationship);
     }
     if (params->exclude_entry_points) {
-        /* Exclude nodes with no inbound CALLS but at least one outbound CALLS.
-         * Dead code (degree=0) is NOT excluded — only true entry points. */
         *wlen = where_append(where, where_sz, *wlen, nparams,
-                             "NOT (NOT EXISTS(SELECT 1 FROM edges e WHERE e.target_id = n.id "
-                             "AND e.type = 'CALLS') "
-                             "AND EXISTS(SELECT 1 FROM edges e2 WHERE e2.source_id = n.id "
-                             "AND e2.type = 'CALLS'))");
+                             "COALESCE(CASE WHEN json_valid(n.properties) THEN "
+                             "json_extract(n.properties,'$.is_entry_point') END,0) "
+                             "NOT IN (1,'true')");
+        if (inbound_only) {
+            /* An override may be reached through the declared method. */
+            *wlen = where_append(where, where_sz, *wlen, nparams,
+                                 "NOT EXISTS(SELECT 1 FROM edges e WHERE e.source_id = n.id "
+                                 "AND e.type = 'OVERRIDE')");
+        } else {
+            /* Keep the historical entry-point heuristic for combined degree search. */
+            *wlen = where_append(where, where_sz, *wlen, nparams,
+                                 "NOT (NOT EXISTS(SELECT 1 FROM edges e WHERE e.target_id = n.id "
+                                 "AND e.type = 'CALLS') "
+                                 "AND EXISTS(SELECT 1 FROM edges e2 WHERE e2.source_id = n.id "
+                                 "AND e2.type = 'CALLS'))");
+        }
     }
     if (params->exclude_labels) {
         char excl_clause[CBM_SZ_512];
@@ -7510,7 +7674,8 @@ static int search_name_ranges(const cbm_search_params_t *p, search_name_ranges_t
     r->count = 0;
     /* Without the project the index cannot seek the name; degree filters wrap
      * the query in a subselect this rewrite leaves alone. */
-    if (!p->project || !p->name_pattern || p->min_degree >= 0 || p->max_degree >= 0) {
+    if (!p->project || !p->name_pattern || p->min_degree >= 0 || p->max_degree >= 0 ||
+        search_has_in_degree_filter(p)) {
         return 0;
     }
     char prefix[ST_NAME_RANGE_PREFIX];
@@ -7641,15 +7806,43 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
                               "'IMPLEMENTS')) AS out_deg ";
-    /* A degree filter evaluates both counts for EVERY candidate row (787k
+    /* A combined degree filter evaluates both counts for EVERY candidate row (787k
      * Functions on the kernel: two B-tree seeks each, 1.9 s per pass). The
      * adjacency layer answers them from RAM; the query is otherwise the same,
      * so filter, order, page and total are unchanged. */
-    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
-    if (has_degree_filter && store_graph_mem(s)) {
+    bool has_in_filter = search_has_in_degree_filter(params);
+    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0) || has_in_filter;
+    if ((params->min_degree >= 0 || params->max_degree >= 0) && store_graph_mem(s)) {
         select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
                       "n.file_path, n.start_line, n.end_line, n.properties, "
                       "cbm_adj_degree(n.id, 1) AS in_deg, cbm_adj_degree(n.id, 0) AS out_deg ";
+    }
+    /* The inbound-only filter counts its own scoped column: the adjacency
+     * mask is the fixed five-type set and cannot answer type-scoped or
+     * test-caller-excluded counts. */
+    char select_buf[CBM_SZ_2K];
+    if (has_in_filter) {
+        char type_list[CBM_SZ_1K];
+        if (!search_in_degree_type_list(params, type_list, sizeof(type_list))) {
+            store_set_error(s, "invalid inbound edge types");
+            return CBM_STORE_ERR;
+        }
+        int sl = snprintf(select_buf, sizeof(select_buf),
+                          "%s, (SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND e.type "
+                          "IN (%s)%s) AS in_deg_f ",
+                          select_cols, type_list,
+                          params->exclude_test_callers
+                              ? " AND NOT EXISTS (SELECT 1 FROM nodes src WHERE src.id = "
+                                "e.source_id AND CASE WHEN json_valid(src.properties) THEN "
+                                "json_extract(src.properties,'$.is_test') IN (1,'true') OR "
+                                "json_extract(src.properties,'$.test_role') IN "
+                                "('case','suite','helper') END)"
+                              : "");
+        if (sl < 0 || (size_t)sl >= sizeof(select_buf)) {
+            store_set_error(s, "inbound-degree query exceeds SQL limit");
+            return CBM_STORE_ERR;
+        }
+        select_cols = select_buf;
     }
 
     char where[CBM_SZ_2K] = "";

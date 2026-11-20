@@ -276,6 +276,236 @@ TEST(store_search_degree_filter) {
     PASS();
 }
 
+/* Inbound-only degree filter: max_in_degree=0 selects symbols with no inbound
+ * edge of the counted types, independent of their outbound degree. degree_types
+ * scopes the count, relationship scopes it by default, exclude_test_callers
+ * ignores edges from is_test nodes. The combined max_degree keeps its in+out
+ * semantics. */
+TEST(store_search_in_degree_filter) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "target",
+         .qualified_name = "test.target",
+         .properties_json = "{\"is_test\":false}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "target2",
+         .qualified_name = "test.target2",
+         .properties_json = "{\"is_test\":false}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "isolated",
+         .qualified_name = "test.isolated",
+         .properties_json = "{\"is_test\":false}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "prod_caller",
+         .qualified_name = "test.prod_caller",
+         .properties_json = "{\"is_test\":false}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "test_caller",
+         .qualified_name = "test.test_caller",
+         .properties_json = "{\"is_test\":true}"},
+    };
+    int64_t ids[5];
+    for (int i = 0; i < 5; i++) {
+        ids[i] = cbm_store_upsert_node(s, &nodes[i]);
+        ASSERT_GT(ids[i], 0);
+    }
+    /* target: CALLS from prod, USAGE from test. target2: CALLS from test only.
+     * isolated: nothing. Both callers also CALL target so they have out-degree. */
+    cbm_edge_t edges[] = {
+        {.project = "test", .source_id = ids[3], .target_id = ids[0], .type = "CALLS"},
+        {.project = "test", .source_id = ids[4], .target_id = ids[0], .type = "USAGE"},
+        {.project = "test", .source_id = ids[4], .target_id = ids[1], .type = "CALLS"},
+    };
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+        ASSERT_GT(cbm_store_insert_edge(s, &edges[i]), 0);
+    }
+
+    const char *calls_only[] = {"CALLS", NULL};
+    const char *calls_usage[] = {"CALLS", "USAGE", NULL};
+    const char *usage_only[] = {"USAGE", NULL};
+    const char *lowercase[] = {"calls", NULL};
+
+    /* target has one inbound CALLS and one inbound USAGE, but out-degree 0:
+     * the combined filter would hide it at max_degree=1 — the inbound filter
+     * answers on inbound alone. */
+    cbm_search_params_t p = {.project = "test",
+                             .label = "Function",
+                             .min_degree = -1,
+                             .max_degree = -1,
+                             .has_in_degree_filter = true,
+                             .min_in_degree = -1,
+                             .max_in_degree = 0,
+                             .degree_types = calls_only};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    /* Zero inbound CALLS: isolated and both callers (their edges are outbound).
+     * target and target2 each have a CALLS caller. */
+    ASSERT_EQ(out.count, 3);
+    ASSERT_GTE(search_result_index_by_name(&out, "isolated"), 0);
+    ASSERT_EQ(search_result_index_by_name(&out, "target2"), -1);
+    ASSERT_EQ(search_result_index_by_name(&out, "target"), -1);
+    cbm_store_search_free(&out);
+
+    /* USAGE scope: target's only USAGE caller is a test node. Without the
+     * exclusion target is called; with it, target joins the caller-less set. */
+    p.degree_types = usage_only;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 4);
+    ASSERT_EQ(search_result_index_by_name(&out, "target"), -1);
+    cbm_store_search_free(&out);
+
+    p.exclude_test_callers = true;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 5);
+    ASSERT_GTE(search_result_index_by_name(&out, "target"), 0);
+    cbm_store_search_free(&out);
+
+    /* CALLS+USAGE with test callers excluded: target still has the prod CALLS
+     * edge, target2's only caller is test code. */
+    p.degree_types = calls_usage;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 4);
+    ASSERT_GTE(search_result_index_by_name(&out, "target2"), 0);
+    ASSERT_EQ(search_result_index_by_name(&out, "target"), -1);
+    cbm_store_search_free(&out);
+    p.exclude_test_callers = false;
+
+    /* An explicit relationship scopes the inbound count without requiring
+     * an incident edge: the fully isolated node is still a candidate. */
+    p.degree_types = NULL;
+    p.relationship = "CALLS";
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 3);
+    ASSERT_GTE(search_result_index_by_name(&out, "isolated"), 0);
+    ASSERT_GTE(search_result_index_by_name(&out, "prod_caller"), 0);
+    ASSERT_EQ(search_result_index_by_name(&out, "target2"), -1);
+    cbm_store_search_free(&out);
+    p.relationship = NULL;
+    /* Omit both type selectors to exercise the default type list. */
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 3);
+    cbm_store_search_free(&out);
+
+    /* Both targets have >= 1 inbound CALLS when tests count. */
+    p.degree_types = calls_only;
+    p.max_in_degree = -1;
+    p.min_in_degree = 1;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_GTE(search_result_index_by_name(&out, "target"), 0);
+    ASSERT_GTE(search_result_index_by_name(&out, "target2"), 0);
+    cbm_store_search_free(&out);
+
+    /* Combined filters compose: max_degree=0 (in+out) AND max_in_degree=0
+     * leaves only the fully isolated node. */
+    p.min_in_degree = -1;
+    p.max_in_degree = 0;
+    p.max_degree = 0;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_GTE(search_result_index_by_name(&out, "isolated"), 0);
+    cbm_store_search_free(&out);
+    p.max_degree = -1;
+
+    /* Invalid type names are refused, not embedded in SQL. */
+    p.degree_types = lowercase;
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_ERR);
+    cbm_store_search_free(&out);
+
+    /* Zero-initialized params keep the NEW filter off (the gate is false);
+     * the legacy combined filter sees 0/0 and selects the isolated node,
+     * exactly as before this change. */
+    cbm_search_params_t zero = {.project = "test", .label = "Function"};
+    ASSERT_EQ(cbm_store_search(s, &zero, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_GTE(search_result_index_by_name(&out, "isolated"), 0);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* exclude_entry_points also honors the indexer's is_entry_point flag: a
+ * framework callback with no edges at all is an entry point, not dead code. */
+TEST(store_search_exclude_entry_points_flag) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t entry = {.project = "test",
+                        .label = "Function",
+                        .name = "pinion_task_kill",
+                        .qualified_name = "test.pinion_task_kill",
+                        .properties_json = "{\"is_entry_point\":true}"};
+    cbm_node_t dead = {.project = "test",
+                       .label = "Function",
+                       .name = "truly_dead",
+                       .qualified_name = "test.truly_dead",
+                       .properties_json = "{\"is_entry_point\":false}"};
+    cbm_node_t plain = {.project = "test",
+                        .label = "Function",
+                        .name = "no_flag",
+                        .qualified_name = "test.no_flag"};
+    cbm_node_t override = {.project = "test",
+                           .label = "Method",
+                           .name = "implementation",
+                           .qualified_name = "test.implementation"};
+    cbm_node_t declaration = {.project = "test",
+                              .label = "Method",
+                              .name = "declaration",
+                              .qualified_name = "test.declaration"};
+    ASSERT_GT(cbm_store_upsert_node(s, &entry), 0);
+    int64_t dead_id = cbm_store_upsert_node(s, &dead);
+    int64_t plain_id = cbm_store_upsert_node(s, &plain);
+    int64_t impl_id = cbm_store_upsert_node(s, &override);
+    int64_t decl_id = cbm_store_upsert_node(s, &declaration);
+    ASSERT_GT(dead_id, 0);
+    ASSERT_GT(plain_id, 0);
+    ASSERT_GT(impl_id, 0);
+    ASSERT_GT(decl_id, 0);
+
+    cbm_search_params_t p = {.project = "test",
+                             .label = "Function",
+                             .min_degree = -1,
+                             .max_degree = -1,
+                             .exclude_entry_points = true};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 2); /* dead code and the unflagged node stay */
+    ASSERT_EQ(search_result_index_by_name(&out, "pinion_task_kill"), -1);
+    ASSERT_GTE(search_result_index_by_name(&out, "truly_dead"), 0);
+    ASSERT_GTE(search_result_index_by_name(&out, "no_flag"), 0);
+    cbm_store_search_free(&out);
+
+    cbm_edge_t call = {
+        .project = "test", .source_id = dead_id, .target_id = plain_id, .type = "CALLS"};
+    cbm_edge_t implements = {
+        .project = "test", .source_id = impl_id, .target_id = decl_id, .type = "OVERRIDE"};
+    ASSERT_GT(cbm_store_insert_edge(s, &call), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &implements), 0);
+
+    p.label = NULL;
+    p.has_in_degree_filter = true;
+    p.min_in_degree = -1;
+    p.max_in_degree = 0;
+    p.relationship = "CALLS";
+    ASSERT_EQ(cbm_store_search(s, &p, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_GTE(search_result_index_by_name(&out, "truly_dead"), 0);
+    ASSERT_GTE(search_result_index_by_name(&out, "declaration"), 0);
+    ASSERT_EQ(search_result_index_by_name(&out, "implementation"), -1);
+    ASSERT_EQ(search_result_index_by_name(&out, "pinion_task_kill"), -1);
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_search_degree_counts_inherits) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -2083,6 +2313,8 @@ SUITE(store_search) {
     RUN_TEST(store_search_file_pattern_substring_issue200);
     RUN_TEST(store_search_pagination);
     RUN_TEST(store_search_degree_filter);
+    RUN_TEST(store_search_in_degree_filter);
+    RUN_TEST(store_search_exclude_entry_points_flag);
     RUN_TEST(store_search_degree_counts_inherits);
     RUN_TEST(store_search_degree_calls_plus_inherits_no_double_count);
     RUN_TEST(store_search_min_degree_includes_inherits_only);

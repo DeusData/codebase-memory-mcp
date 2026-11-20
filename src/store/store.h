@@ -243,7 +243,18 @@ typedef struct {
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;           /* -1 = no filter (default), 0+ = minimum */
     int max_degree;           /* -1 = no filter (default), 0+ = maximum */
-    int limit;                /* 0 = default (10) */
+    /* Inbound-only degree filter, independent of the combined in+out filter
+     * above. has_in_degree_filter gates it so zero-initialized params stay
+     * unfiltered; -1 on a bound leaves that side open. degree_types (NULL-
+     * terminated edge-type list) scopes the counted types — NULL means the
+     * relationship type when set, else the standard five. exclude_test_callers
+     * skips inbound edges whose source node carries is_test. */
+    bool has_in_degree_filter;
+    int min_in_degree;
+    int max_in_degree;
+    const char **degree_types;
+    bool exclude_test_callers;
+    int limit; /* 0 = default (10) */
     int offset;
     bool exclude_entry_points;
     bool include_connected;
@@ -880,6 +891,23 @@ int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *c
                               const char *callee_qn, long long *count_out, char *label_buf,
                               size_t label_cap, char *last_seen_buf, size_t last_seen_cap);
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
+
+/* One unresolved call site recorded at index time (index_coverage detail). */
+typedef struct {
+    char *caller_qn;
+    char *rel_path;
+    char *reason;
+    int line;
+    uint32_t start_byte;
+    uint32_t end_byte;
+} cbm_unresolved_call_t;
+
+/* Recorded call sites whose leaf name equals `leaf`. cap=0 counts only.
+ * Free rows with cbm_store_unresolved_calls_free. */
+int cbm_store_unresolved_calls_by_leaf(cbm_store_t *s, const char *project, const char *leaf,
+                                       bool include_tests, int offset, int cap,
+                                       cbm_unresolved_call_t **out, int *count, int *total);
+void cbm_store_unresolved_calls_free(cbm_unresolved_call_t *rows, int count);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
  * cbm_store_coverage_replace materializes the coverage FAILURE rows as a file-

@@ -391,6 +391,7 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * path) keeps every base at its raw spelling. */
 typedef struct {
     const cbm_registry_t *reg;
+    const cbm_pipeline_ctx_t *pipeline;
     const char **imp_keys;
     const char **imp_vals;
     int imp_count;
@@ -1404,6 +1405,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
          * pipeline context (the surface-probe path passes NULL and keeps the
          * raw spelling). */
         pxc_base_scope_t bs = {.imports = &fr->imports,
+                               .pipeline = ctx,
                                .project_name = project_name,
                                .rel = files[fi].rel_path,
                                .lang = files[fi].language};
@@ -1642,6 +1644,81 @@ bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result) {
     return false;
 }
 
+/* Workspace crate roots for the Rust resolver: a fully-qualified path
+ * (`other_crate::module::Type`) names no `use` local, so the per-file import
+ * map never carried the crate head and the resolver fell through to a
+ * canonical QN no def matches. Inject one row per indexed workspace crate —
+ * both spellings, since Cargo names spell '-' where Rust paths spell '_' —
+ * mapping the crate name to its root module QN (the lib.rs directory). The
+ * resolver's use-splice then builds `<root>.module.Type`, and the type
+ * resolver's re-export hop reaches items the module re-exports. */
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *project;
+    const char **keys;
+    const char **vals;
+    int count;
+    int cap;
+} pxc_rust_crate_rows_t;
+
+static void pxc_rust_crate_root_row(const char *key, void *value, void *userdata) {
+    pxc_rust_crate_rows_t *rows = (pxc_rust_crate_rows_t *)userdata;
+    const char *qn = (const char *)value;
+    if (!key || !key[0] || !qn || rows->count + PAIR_LEN > rows->cap) {
+        return;
+    }
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(rows->gbuf, qn);
+    const char *fp = n ? n->file_path : NULL;
+    size_t fl = fp ? strlen(fp) : 0;
+    /* Only an indexed lib.rs proves a Rust crate root (pkgmap also holds
+     * npm/Go/PHP packages). */
+    if (fl < sizeof("lib.rs") - SKIP_ONE ||
+        strcmp(fp + fl - (sizeof("lib.rs") - SKIP_ONE), "lib.rs") != 0 ||
+        (fl > sizeof("lib.rs") - SKIP_ONE &&
+         fp[fl - (sizeof("lib.rs") - SKIP_ONE) - SKIP_ONE] != '/')) {
+        return;
+    }
+    char *dir = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, fp);
+    if (!dir) {
+        return;
+    }
+    dir[fl - (sizeof("lib.rs") - SKIP_ONE)] = '\0';
+    if (dir[0] && dir[strlen(dir) - SKIP_ONE] == '/') {
+        dir[strlen(dir) - SKIP_ONE] = '\0';
+    }
+    char *root_qn = cbm_pipeline_fqn_folder(rows->project, dir);
+    free(dir);
+    if (!root_qn) {
+        return;
+    }
+    /* Underscore spelling (Rust paths) plus the dashed Cargo spelling. */
+    char *under = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+    if (!under) {
+        free(root_qn);
+        return;
+    }
+    for (char *c = under; *c; c++) {
+        if (*c == '-') {
+            *c = '_';
+        }
+    }
+    rows->keys[rows->count] = under;
+    rows->vals[rows->count] = root_qn;
+    rows->count++;
+    if (strcmp(under, key) != 0) {
+        char *dashed = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+        char *root_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, root_qn);
+        if (dashed && root_copy) {
+            rows->keys[rows->count] = dashed;
+            rows->vals[rows->count] = root_copy;
+            rows->count++;
+        } else {
+            free(dashed);
+            free(root_copy);
+        }
+    }
+}
+
 int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
                                 const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
                                 bool include_type_only, const char ***out_keys,
@@ -1671,10 +1748,14 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         cbm_pipeline_php_vendor_names_build(gbuf, project_name, rel_path, result, &php_bindings);
     bool authoritative_empty = php_bindings.targets != NULL;
     cbm_pipeline_php_vendor_names_free(&php_bindings);
-    if (edge_count == 0 && metadata_count == 0 && !authoritative_empty)
+    CBMHashTable *rust_pkgmap = lang == CBM_LANG_RUST ? cbm_pipeline_get_pkgmap() : NULL;
+    if (edge_count == 0 && metadata_count == 0 && !authoritative_empty && !rust_pkgmap)
         return 0;
 
     size_t capacity = (size_t)edge_count + (size_t)metadata_count;
+    if (rust_pkgmap) {
+        capacity += (size_t)cbm_ht_count(rust_pkgmap) * PAIR_LEN;
+    }
     if (capacity == 0)
         capacity = 1;
     const char **keys = (const char **)calloc(capacity, sizeof(const char *));
@@ -1745,6 +1826,16 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         keys[count] = local;
         vals[count] = value;
         count++;
+    }
+    if (rust_pkgmap) {
+        pxc_rust_crate_rows_t rows = {.gbuf = gbuf,
+                                      .project = project_name,
+                                      .keys = keys,
+                                      .vals = vals,
+                                      .count = count,
+                                      .cap = (int)capacity};
+        cbm_ht_foreach(rust_pkgmap, pxc_rust_crate_root_row, &rows);
+        count = rows.count;
     }
     *out_keys = keys;
     *out_vals = vals;
@@ -2567,6 +2658,8 @@ static const pxc_engine_t pxc_engines[] = {
      .registry_lazy = true,
      .run_with_registry = pxc_rust_run_registry,
      .run_one = pxc_rust_run_defs,
+     .field_source = PXC_FIELDS_DEFS,
+     .field_owner_label = "Struct",
      .unfiltered_defs = true},
 };
 
@@ -2678,7 +2771,17 @@ static int pxc_field_items(CBMArena *arena, const CBMFileResult *fr, const pxc_e
                 !cbm_ht_get(owners, fd->parent_class)) {
                 continue;
             }
-            items[n++] = (pxc_field_item_t){fd->parent_class, fd->name, fd->return_type, 0};
+            const char *type = fd->return_type;
+            if (bs && bs->pipeline && bs->lang == CBM_LANG_RUST && strstr(type, "::") &&
+                strcspn(type, "<&*[() \t\r\n") == strlen(type)) {
+                CBMImport path = {.module_path = type};
+                const cbm_gbuf_node_t *tn = pxc_type_node(cbm_pipeline_resolve_import_node(
+                    bs->pipeline, bs->rel, NULL, CBM_LANG_RUST, &path, NULL, NULL));
+                if (tn && tn->name && strcmp(tn->name, pxc_qn_leaf(type)) == 0) {
+                    type = tn->qualified_name;
+                }
+            }
+            items[n++] = (pxc_field_item_t){fd->parent_class, fd->name, type, 0};
         }
         return n;
     }
