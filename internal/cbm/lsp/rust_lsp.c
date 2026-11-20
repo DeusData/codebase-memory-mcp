@@ -58,7 +58,7 @@ static char *rust_node_text(RustLSPContext *ctx, TSNode node);
 static const char *convert_path_to_qn(CBMArena *arena, const char *path);
 static bool rust_type_derefs_to_first_arg(const char *type_qn);
 static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char *name);
-static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text);
+static void rust_collect_bounds(RustLSPContext *ctx, TSNode owner);
 static void rust_record_type_param_bound(RustLSPContext *ctx, const char *param_name,
                                          const char *trait_qn);
 
@@ -776,6 +776,37 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
     if (cbm_registry_lookup_type(ctx->registry, qn)) {
         return qn;
     }
+    /* Re-export hop: `signal::SignalAuthorization` names an item the module
+     * re-exports from one of its files (`pub use signal_controller::...` in
+     * signal/mod.rs), so the registered QN carries one extra file-module
+     * segment. A UNIQUE type of that short name directly under the path's
+     * module prefix is the re-export; two candidates stay unresolved. Runs
+     * for use-spliced QNs too — a crate-rooted path lands here the same way. */
+    const char *last_dot = strrchr(qn, '.');
+    if (last_dot && last_dot > qn && ctx->registry) {
+        size_t prefix_len = (size_t)(last_dot - qn);
+        CBMTypeShortIter it;
+        cbm_registry_types_by_short_name(ctx->registry, last_dot + 1, &it);
+        const char *hit = NULL;
+        int nhit = 0;
+        for (int i; (i = cbm_type_short_iter_next(&it)) >= 0;) {
+            const char *cqn = it.reg->types[i].qualified_name;
+            if (!cqn || strncmp(cqn, qn, prefix_len) != 0 || cqn[prefix_len] != '.') {
+                continue;
+            }
+            /* Exactly one extra segment: the file module that declares the
+             * item the parent mod.rs re-exports. */
+            const char *file_seg = cqn + prefix_len + 1;
+            const char *seg_dot = strchr(file_seg, '.');
+            if (seg_dot && seg_dot[1] && !strchr(seg_dot + 1, '.')) {
+                hit = cqn;
+                nhit++;
+            }
+        }
+        if (nhit == 1) {
+            return hit;
+        }
+    }
     const char *normalized = convert_path_to_qn(ctx->arena, path);
     if (!normalized || strcmp(qn, normalized) != 0) {
         return qn;
@@ -924,6 +955,21 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
                 const char *tk = ts_node_type(tc);
                 /* Skip lifetime arguments — we ignore lifetimes entirely. */
                 if (strcmp(tk, "lifetime") == 0) {
+                    continue;
+                }
+                if (strcmp(tk, "type_binding") == 0) {
+                    /* Model Iterator<Item = T> like the iterator templates
+                     * returned by chain operations, with T as the first arg. */
+                    TSNode name = ts_node_child_by_field_name(tc, "name", 4);
+                    const char *binding = rust_node_text(ctx, name);
+                    if (head_qn &&
+                        (strcmp(head_qn, "core.iter.Iterator") == 0 ||
+                         strcmp(head_qn, "std.iter.Iterator") == 0) &&
+                        binding && strcmp(binding, "Item") == 0) {
+                        TSNode item = ts_node_child_by_field_name(tc, "type", 4);
+                        const CBMType *elem = rust_parse_type_node(ctx, item);
+                        return cbm_type_template(ctx->arena, "core.iter.Iterator", &elem, 1);
+                    }
                     continue;
                 }
                 targs[targ_count++] = rust_parse_type_node(ctx, tc);
@@ -1730,6 +1776,11 @@ const CBMType *rust_eval_expr_type(RustLSPContext *ctx, TSNode node) {
                     const CBMType *base = recv;
                     while (base && base->kind == CBM_TYPE_REFERENCE) {
                         base = base->data.reference.elem;
+                    }
+                    if (base && base->kind == CBM_TYPE_SLICE &&
+                        (strcmp(mname, "iter") == 0 || strcmp(mname, "iter_mut") == 0)) {
+                        const CBMType *item = cbm_type_reference(ctx->arena, base->data.slice.elem);
+                        return cbm_type_template(ctx->arena, "core.iter.Iterator", &item, 1);
                     }
                     /* Template Vec<T> method handling */
                     if (base && base->kind == CBM_TYPE_TEMPLATE) {
@@ -4689,6 +4740,7 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     /* Bind variables introduced by this statement. */
     rust_process_statement(ctx, node);
 
+    const CBMType *closure_param_type = NULL;
     /* Resolve a call expression. */
     if (strcmp(kind, "call_expression") == 0) {
         rust_resolve_call_expression(ctx, node);
@@ -4731,11 +4783,10 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                                    strstr(tn, "VecDeque") || strstr(tn, "Option") ||
                                    strstr(tn, "Result") || strstr(tn, "HashSet") ||
                                    strstr(tn, "BTreeSet") || strstr(tn, "Slice"))) {
-                            ctx->pending_closure_param_type =
-                                base->data.template_type.template_args[0];
+                            closure_param_type = base->data.template_type.template_args[0];
                         }
                     } else if (base && base->kind == CBM_TYPE_SLICE) {
-                        ctx->pending_closure_param_type = base->data.slice.elem;
+                        closure_param_type = base->data.slice.elem;
                     }
                 }
             }
@@ -5016,7 +5067,21 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
         if (!ts_node_is_null(c)) {
+            /* Walking the receiver (another method call in a chain) can
+             * consume its own hint. Install this call's hint only as we
+             * descend into its closure argument. */
+            const CBMType *saved_hint = ctx->pending_closure_param_type;
+            if (closure_param_type && strcmp(ts_node_type(c), "arguments") == 0) {
+                TSNode first = ts_node_named_child(c, 0);
+                if (!ts_node_is_null(first) &&
+                    strcmp(ts_node_type(first), "closure_expression") == 0) {
+                    ctx->pending_closure_param_type = closure_param_type;
+                }
+            }
             rust_resolve_calls_in_node(ctx, c);
+            if (closure_param_type) {
+                ctx->pending_closure_param_type = saved_hint;
+            }
         }
     }
 
@@ -5047,18 +5112,7 @@ static void rust_process_function(RustLSPContext *ctx, TSNode func_node, const c
      * and where-clause bounds into ctx so dispatch through generic
      * receivers can route via the bound trait. */
     int saved_bound_count = ctx->type_param_bound_count;
-    TSNode tp_list = ts_node_child_by_field_name(func_node, "type_parameters", 15);
-    if (!ts_node_is_null(tp_list)) {
-        char *tp_text = rust_node_text(ctx, tp_list);
-        if (tp_text)
-            rust_collect_bounds_from_text(ctx, tp_text);
-    }
-    TSNode where_clause = ts_node_child_by_field_name(func_node, "where_clause", 12);
-    if (!ts_node_is_null(where_clause)) {
-        char *wt = rust_node_text(ctx, where_clause);
-        if (wt)
-            rust_collect_bounds_from_text(ctx, wt);
-    }
+    rust_collect_bounds(ctx, func_node);
 
     /* Bind self for impl/trait methods. */
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
@@ -5142,115 +5196,45 @@ static const char *rust_lookup_type_param_bound(RustLSPContext *ctx, const char 
     return NULL;
 }
 
-/* Parse the impl/function's <T: Bound + Bound, U: Bound> + where clause
- * text into the per-context bound environment. We don't reason about
- * lifetimes; we record only trait bounds and associated-type bindings.
- *
- * Format we accept (simplified TOML-like grammar):
- *   `<T: Clone + Debug, U: Iterator<Item = V>>`
- *   `where T: Clone, U: Iterator<Item = V>`
- *
- * Multiple bounds are split on `+` (top-level), entries on `,`. */
-static void rust_collect_bounds_from_text(RustLSPContext *ctx, const char *text) {
-    if (!ctx || !text)
-        return;
-    /* Walk text, find segments separated by `,` at top depth. For each
-     * segment, split on `:` to get (param, bound-list); split bounds on `+`
-     * at top depth. Resolve each bound through the path resolver to its QN. */
-    int len = (int)strlen(text);
-    int from = 0;
-    while (from < len) {
-        /* Skip whitespace + leading 'where'/punct. */
-        while (from < len && (text[from] == ' ' || text[from] == '\n' || text[from] == '<' ||
-                              text[from] == ',' || text[from] == '>' || text[from] == 'w')) {
-            if (text[from] == 'w' && from + 5 < len && strncmp(text + from, "where", 5) == 0) {
-                from += 5;
-            } else {
-                from++;
+/* Collect simple type-parameter bounds from the syntax tree. The grammar
+ * exposes where_clause as a named child, without a field on its owner. */
+static void rust_collect_bounds(RustLSPContext *ctx, TSNode owner) {
+    uint32_t children = ts_node_named_child_count(owner);
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode list = ts_node_named_child(owner, i);
+        const char *kind = ts_node_type(list);
+        bool is_where = strcmp(kind, "where_clause") == 0;
+        if (!is_where && strcmp(kind, "type_parameters") != 0) {
+            continue;
+        }
+        uint32_t entries = ts_node_named_child_count(list);
+        for (uint32_t j = 0; j < entries; j++) {
+            TSNode entry = ts_node_named_child(list, j);
+            TSNode param = ts_node_child_by_field_name(entry, is_where ? "left" : "name", 4);
+            TSNode bounds = ts_node_child_by_field_name(entry, "bounds", 6);
+            if (ts_node_is_null(param) || ts_node_is_null(bounds) ||
+                strcmp(ts_node_type(param), "type_identifier") != 0) {
+                continue;
             }
-        }
-        if (from >= len)
-            break;
-
-        /* Param name. */
-        int name_start = from;
-        if (text[from] == '\'') {
-            /* Lifetime — skip. */
-            from++;
-            while (from < len && (isalnum((unsigned char)text[from]) || text[from] == '_'))
-                from++;
-            continue;
-        }
-        while (from < len && (isalnum((unsigned char)text[from]) || text[from] == '_'))
-            from++;
-        int name_end = from;
-        if (name_end == name_start) {
-            from++;
-            continue;
-        }
-        char *pname =
-            cbm_arena_strndup(ctx->arena, text + name_start, (size_t)(name_end - name_start));
-        /* Look for `:`. */
-        while (from < len && (text[from] == ' ' || text[from] == '\t'))
-            from++;
-        if (from >= len || text[from] != ':') {
-            /* No bound; skip to next entry. */
-            while (from < len && text[from] != ',' && text[from] != '>' && text[from] != '\n')
-                from++;
-            continue;
-        }
-        from++; /* consume `:` */
-
-        /* Bound list: split on `+` at depth 0, terminated by `,` / `>` /
-         * end of where clause. */
-        int depth = 0;
-        int bound_start = from;
-        while (from < len) {
-            char c = text[from];
-            if (c == '<' || c == '(' || c == '[')
-                depth++;
-            else if (c == '>' || c == ')' || c == ']') {
-                if (depth == 0)
-                    break;
-                depth--;
-            } else if (depth == 0 && (c == '+' || c == ',' || c == '\n')) {
-                /* End of one bound. */
-                int b_end = from;
-                /* Trim trailing whitespace. */
-                while (b_end > bound_start && (text[b_end - 1] == ' ' || text[b_end - 1] == '\t')) {
-                    b_end--;
-                }
-                /* Trim leading whitespace. */
-                int b_start = bound_start;
-                while (b_start < b_end && (text[b_start] == ' ' || text[b_start] == '\t')) {
-                    b_start++;
-                }
-                if (b_end > b_start) {
-                    char *btext =
-                        cbm_arena_strndup(ctx->arena, text + b_start, (size_t)(b_end - b_start));
-                    /* Strip any `<…>` associated-type suffix for the
-                     * trait QN lookup — we keep the trait name only. */
-                    char *langle = strchr(btext, '<');
-                    if (langle)
-                        *langle = '\0';
-                    const char *qn = rust_resolve_path_expr(ctx, btext);
-                    if (qn) {
-                        rust_record_type_param_bound(ctx, pname, qn);
+            const char *name = rust_node_text(ctx, param);
+            uint32_t count = ts_node_named_child_count(bounds);
+            for (uint32_t k = 0; k < count; k++) {
+                TSNode bound = ts_node_named_child(bounds, k);
+                const char *bound_kind = ts_node_type(bound);
+                if (strcmp(bound_kind, "generic_type") == 0) {
+                    bound = ts_node_child_by_field_name(bound, "type", 4);
+                    if (ts_node_is_null(bound)) {
+                        continue;
                     }
+                    bound_kind = ts_node_type(bound);
                 }
-                if (c == '+') {
-                    from++;
-                    bound_start = from;
-                    continue;
+                if (strcmp(bound_kind, "type_identifier") == 0 ||
+                    strcmp(bound_kind, "scoped_type_identifier") == 0) {
+                    const char *path = rust_node_text(ctx, bound);
+                    rust_record_type_param_bound(ctx, name, resolve_path_to_type_qn(ctx, path));
                 }
-                /* End of entry. */
-                break;
             }
-            from++;
         }
-        /* Advance past entry terminator. */
-        if (from < len && (text[from] == ',' || text[from] == '\n'))
-            from++;
     }
 }
 
@@ -5324,6 +5308,15 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
             ctx->self_trait_qn = rust_resolve_path_expr(ctx, tt);
     }
 
+    /* Chalk-lite: the impl block's own type-parameter bounds scope every
+     * method body — `impl<M: Publication> Controller<M>` dispatches
+     * `self.maps.write_target()` through M's bound exactly as a function's
+     * `<T: Trait>` does. Without this the bound environment only ever held
+     * function-level bounds and generic-impl receivers fell through to
+     * unknown_receiver_type. */
+    int saved_bound_count = ctx->type_param_bound_count;
+    rust_collect_bounds(ctx, impl_node);
+
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
     if (!ts_node_is_null(body)) {
         uint32_t nc = ts_node_child_count(body);
@@ -5338,6 +5331,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
         }
     }
 
+    ctx->type_param_bound_count = saved_bound_count;
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
 }
@@ -6260,6 +6254,39 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
+static void rust_cross_struct_fields(CBMArena *arena, CBMRegisteredType *type, const char *fields,
+                                     const char *module_qn) {
+    if (!fields || !*fields) {
+        return;
+    }
+    size_t capacity = 2;
+    for (const char *p = fields; *p; p++) {
+        capacity += *p == '|';
+    }
+    const char **names = cbm_arena_alloc(arena, capacity * sizeof(*names));
+    const CBMType **types = cbm_arena_alloc(arena, capacity * sizeof(*types));
+    if (!names || !types) {
+        return;
+    }
+    size_t count = 0;
+    for (const char *p = fields; *p;) {
+        size_t length = strcspn(p, "|");
+        const char *colon = memchr(p, ':', length);
+        if (colon && colon > p && colon + 1 < p + length) {
+            names[count] = cbm_arena_strndup(arena, p, (size_t)(colon - p));
+            const char *text =
+                cbm_arena_strndup(arena, colon + 1, (size_t)(p + length - colon - 1));
+            types[count++] = rust_parse_return_type_text(arena, text, module_qn);
+        }
+        p += length;
+        p += *p == '|';
+    }
+    names[count] = NULL;
+    types[count] = NULL;
+    type->field_names = names;
+    type->field_types = types;
+}
+
 static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                                          CBMRustLSPDef *defs, int def_count,
                                          const char *module_qn) {
@@ -6299,6 +6326,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         rt.short_name = cbm_arena_strdup(arena, d->short_name);
         rt.is_interface =
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
+        rust_cross_struct_fields(arena, &rt, d->field_defs,
+                                 d->def_module_qn ? d->def_module_qn : module_qn);
         cbm_registry_add_type(reg, rt);
         cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
     }
@@ -6435,10 +6464,22 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
     rust_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
     ctx.cargo_manifest = manifest;
     ctx.syn_calls = synthetic_calls;
-    rust_collect_uses(&ctx, root);
-    for (int i = 0; i < import_count; i++) {
-        if (import_names[i] && import_qns[i]) {
-            rust_lsp_add_use(&ctx, import_names[i], import_qns[i]);
+    /* An exact indexed binding wins over the raw spelling of its use item.
+     * Keep non-definition rows (including workspace crate roots) behind
+     * source bindings so they cannot shadow a source alias. */
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            rust_collect_uses(&ctx, root);
+        }
+        for (int i = 0; i < import_count; i++) {
+            const char *qn = import_qns[i];
+            if (!import_names[i] || !qn) {
+                continue;
+            }
+            bool exact = cbm_registry_lookup_type(reg, qn) || cbm_registry_lookup_func(reg, qn);
+            if (exact == (pass == 0)) {
+                rust_lsp_add_use(&ctx, import_names[i], qn);
+            }
         }
     }
     rust_lsp_process_file(&ctx, root);

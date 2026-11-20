@@ -1801,8 +1801,10 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: Rust call dispatch and test metadata, and framework entry points,
+ *      change nodes and edges in unchanged files.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

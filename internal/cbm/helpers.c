@@ -445,8 +445,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
                has_suffix(base, "Spec.kt") || has_suffix(base, "Test.scala") ||
                has_suffix(base, "Spec.scala");
     case CBM_LANG_RUST:
-        // Rust tests are typically mod tests inside the file, but test files too
-        return has_suffix(base, "_test.rs") || has_prefix(base, "test_");
+        return has_suffix(base, "_test.rs") || has_suffix(base, "_tests.rs") ||
+               has_prefix(base, "test_");
     case CBM_LANG_RUBY:
         return has_suffix(base, "_test.rb") || has_suffix(base, "_spec.rb") ||
                has_prefix(base, "test_");

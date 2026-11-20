@@ -1427,12 +1427,10 @@ TEST(mcp_metadata_byte_budget) {
 
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Seed discovery and independent pagination have a reviewed budget:
-     * 21 KiB overall (raised from 20 KiB for the infra filters and the
-     * topology/deploy/run trace modes: one usage hint per mode keeps them
-     * findable); only detect_changes may exceed the 3200-byte per-tool
-     * ceiling, with its own 4096-byte bound. */
-    ASSERT_LT((int)strlen(json), 21 * 1024);
+    /* Budget for all current tool schemas, including the inbound filters
+     * and unresolved caller paging. detect_changes has a 4096-byte allowance
+     * within the aggregate ceiling. */
+    ASSERT_LT((int)strlen(json), 23 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
@@ -2933,6 +2931,138 @@ TEST(tool_search_graph_basic) {
                                    "\"arguments\":{\"label\":\"Function\",\"limit\":10}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* search_graph's inbound-degree filter: max_in_degree=0 with degree_types
+ * selects caller-less symbols regardless of outbound degree, and
+ * exclude_test_callers drops edges from is_test nodes. The scoping options
+ * require an in-degree filter and validated type names. */
+TEST(tool_search_graph_in_degree_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "indeg-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/indeg"), CBM_STORE_OK);
+
+    const struct {
+        const char *name;
+        const char *props;
+    } nodes[] = {
+        {"target", "{\"is_test\":false}"},
+        {"target2", "{\"is_test\":false}"},
+        {"isolated", "{\"is_test\":false}"},
+        {"prod_caller", "{\"is_test\":false}"},
+        {"test_caller", "{\"test_role\":\"helper\"}"},
+    };
+    int64_t ids[5];
+    for (int i = 0; i < 5; i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, nodes[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = nodes[i].name,
+                        .qualified_name = qn,
+                        .file_path = "src/lib.rs",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = nodes[i].props};
+        ids[i] = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(ids[i], 0);
+    }
+    cbm_edge_t e1 = {.project = proj, .source_id = ids[3], .target_id = ids[0], .type = "CALLS"};
+    cbm_edge_t e2 = {.project = proj, .source_id = ids[4], .target_id = ids[1], .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &e2), 0);
+
+    /* target has a production caller; target2's only caller is test code. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"indeg-proj\",\"label\":\"Function\",\"max_in_degree\":0,"
+        "\"degree_types\":[\"CALLS\"],\"format\":\"json\",\"limit\":50}");
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "isolated"));
+    ASSERT_NULL(strstr(inner, "target2"));
+    free(inner);
+    free(resp);
+
+    /* Excluding test callers makes target2 caller-less too. */
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"indeg-proj\",\"label\":\"Function\",\"max_in_degree\":0,"
+        "\"degree_types\":[\"CALLS\"],\"exclude_test_callers\":true,"
+        "\"format\":\"json\",\"limit\":50}");
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":4"));
+    ASSERT_NOT_NULL(strstr(inner, "target2"));
+    ASSERT_NULL(strstr(inner, "\"target\""));
+    free(inner);
+    free(resp);
+
+    /* Page a scoped inbound search. The fully isolated result is first. */
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"indeg-proj\",\"label\":\"Function\",\"max_in_degree\":0,"
+        "\"relationship\":\"CALLS\",\"format\":\"json\",\"limit\":1}");
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"has_more\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "isolated"));
+    ASSERT_NULL(strstr(inner, "prod_caller"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"indeg-proj\",\"label\":\"Function\",\"max_in_degree\":0,"
+        "\"relationship\":\"CALLS\",\"format\":\"json\",\"limit\":1,\"offset\":1}");
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "prod_caller"));
+    ASSERT_NULL(strstr(inner, "isolated"));
+    free(inner);
+    free(resp);
+
+    /* Scoping options without an in-degree filter are a parameter error. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"indeg-proj\",\"degree_types\":[\"CALLS\"]}");
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "max_in_degree"));
+    free(inner);
+    free(resp);
+
+    const char *bad_types[] = {"[\"calls\"]", "[3]", "\"CALLS\"", "[\"\"]",
+                               "[\"A\",\"B\",\"C\",\"D\",\"E\",\"F\",\"G\",\"H\",\"I\"]"};
+    for (size_t i = 0; i < sizeof(bad_types) / sizeof(bad_types[0]); i++) {
+        char args[256];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"indeg-proj\",\"max_in_degree\":0,\"degree_types\":%s}",
+                 bad_types[i]);
+        resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+        inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "uppercase"));
+        free(inner);
+        free(resp);
+    }
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"indeg-proj\",\"max_in_degree\":0,\"query\":\"target\"}");
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "require structural search"));
+    free(inner);
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -8642,8 +8772,227 @@ TEST(tool_index_status_freshness_sample_cap_truncates) {
     PASS();
 }
 
-/* #2816: stored recursion must remain visible even when the CALLS graph has
- * no self-edges. Removing metadata emission must fail these assertions. */
+/* A #[cfg(test)] module can mount #[test] functions in a file the path
+ * heuristic misses. The indexed flag controls both visibility and the test
+ * column, with path matching as a fallback for legacy nodes. */
+TEST(tool_trace_path_node_is_test_flag) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "istrace-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/istrace"), CBM_STORE_OK);
+
+    cbm_node_t target = {.project = proj,
+                         .label = "Function",
+                         .name = "removal_breaks_invalidation",
+                         .qualified_name =
+                             "istrace-proj.abi.src.signal_decision.removal_breaks_invalidation",
+                         .file_path = "abi/src/signal_decision.rs",
+                         .start_line = 10,
+                         .end_line = 20,
+                         .properties_json = "{\"is_test\":false}"};
+    int64_t target_id = cbm_store_upsert_node(st, &target);
+    ASSERT_GT(target_id, 0);
+
+    const struct {
+        const char *name;
+        const char *file;
+        const char *props;
+    } callers[] = {
+        {"invalidation_breaks", "abi/src/signal_decision.rs", "{\"is_test\":false}"},
+        /* The heuristic misses "_tests.rs": the flag must hide it. */
+        {"a_removal_that_fails_for_any_reason_but_absence_breaks_invalidation",
+         "abi/src/signal_decision_tests.rs", "{\"is_test\":true,\"decorators\":[\"#[test]\"]}"},
+        {"role_only_helper", "abi/src/signal_decision.rs", "{\"test_role\":\"helper\"}"},
+        {"legacy_helper", "src/helpers.rs", "{}"},
+        {"legacy_test_helper", "tests/helpers.rs", "{}"},
+        /* Flag wins over a test-looking path: product code stays visible. */
+        {"prod_under_testpath", "src/test_utils/helper.rs", "{\"is_test\":false}"},
+    };
+    for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
+        char qn[256];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, callers[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = callers[i].name,
+                        .qualified_name = qn,
+                        .file_path = callers[i].file,
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = callers[i].props};
+        int64_t id = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(id, 0);
+        cbm_edge_t e = {.project = proj, .source_id = id, .target_id = target_id, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+    }
+
+    /* Hidden test callers must not consume the visible page limit. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"istrace-proj\",\"function_name\":\"removal_breaks_invalidation\","
+        "\"direction\":\"inbound\",\"depth\":1,\"limit\":3}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(
+        strstr(inner, "a_removal_that_fails_for_any_reason_but_absence_breaks_invalidation"));
+    ASSERT_NOT_NULL(strstr(inner, "invalidation_breaks"));
+    ASSERT_NOT_NULL(strstr(inner, "legacy_helper"));
+    ASSERT_NOT_NULL(strstr(inner, "prod_under_testpath"));
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 3"));
+    ASSERT_NULL(strstr(inner, "legacy_test_helper"));
+    ASSERT_NULL(strstr(inner, "role_only_helper"));
+    ASSERT_NULL(strstr(inner, "next_cursor"));
+    free(inner);
+    free(response);
+
+    /* include_tests=true: the test column reports the node flag. */
+    response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"istrace-proj\",\"function_name\":\"removal_breaks_invalidation\","
+        "\"direction\":\"inbound\",\"depth\":1,\"include_tests\":true,\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner,
+                           "a_removal_that_fails_for_any_reason_but_absence_breaks_invalidation\","
+                           "1,true"));
+    ASSERT_NOT_NULL(strstr(inner, "invalidation_breaks\",1,false"));
+    ASSERT_NOT_NULL(strstr(inner, "prod_under_testpath\",1,false"));
+    ASSERT_NOT_NULL(strstr(inner, "legacy_test_helper\",1,true"));
+    ASSERT_NOT_NULL(strstr(inner, "role_only_helper\",1,true"));
+    free(inner);
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* "No caller" and "caller unresolved" are different answers: a caller-less
+ * inbound trace reports the unresolved total recorded at index time, and
+ * include_unresolved lists the call sites by method name. */
+TEST(tool_trace_path_unresolved_callers) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "unres-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/unres"), CBM_STORE_OK);
+
+    cbm_node_t target = {.project = proj,
+                         .label = "Method",
+                         .name = "name",
+                         .qualified_name = "unres-proj.abi.src.signal.SignalAllowReason.name",
+                         .file_path = "abi/src/signal.rs",
+                         .start_line = 123,
+                         .end_line = 138,
+                         .properties_json = "{\"is_test\":false}"};
+    int64_t target_id = cbm_store_upsert_node(st, &target);
+    ASSERT_GT(target_id, 0);
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "resolved_caller",
+                         .qualified_name = "unres-proj.abi.src.signal.resolved_caller",
+                         .file_path = "abi/src/signal.rs",
+                         .start_line = 1,
+                         .end_line = 5,
+                         .properties_json = "{\"is_test\":false}"};
+    int64_t caller_id = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_node_t other = {.project = proj,
+                        .label = "Function",
+                        .name = "other",
+                        .qualified_name = "unres-proj.abi.src.signal.other",
+                        .file_path = "abi/src/signal.rs",
+                        .start_line = 10,
+                        .end_line = 15,
+                        .properties_json = "{\"is_test\":false}"};
+    int64_t other_id = cbm_store_upsert_node(st, &other);
+    ASSERT_GT(other_id, 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = caller_id, .target_id = other_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    cbm_node_t test_caller = {.project = proj,
+                              .label = "Function",
+                              .name = "test_summary",
+                              .qualified_name = "unres-proj.host.src.signal_maps.test_summary",
+                              .file_path = "host/src/signal_maps.rs",
+                              .properties_json = "{\"is_test\":true}"};
+    ASSERT_GT(cbm_store_upsert_node(st, &test_caller), 0);
+
+    cbm_coverage_row_t row = {
+        .rel_path = "host/src/signal_maps.rs",
+        .kind = "unresolved_calls",
+        .detail = "[{\"caller\":\"unres-proj.host.src.signal_maps.allow_summary\","
+                  "\"leaf\":\"name\",\"reason\":\"unknown_receiver_type\",\"line\":160,"
+                  "\"start_byte\":5897,\"end_byte\":5910},"
+                  "{\"caller\":\"unres-proj.host.src.signal_maps.render_summary\","
+                  "\"leaf\":\"name\",\"reason\":\"unknown_receiver_type\",\"start_byte\":6010},"
+                  "{\"caller\":\"unres-proj.host.src.signal_maps.test_summary\","
+                  "\"leaf\":\"name\",\"reason\":\"unknown_receiver_type\",\"start_byte\":7042}]"};
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, row.rel_path, "fixture", 0, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_replace(st, proj, &row, 1), CBM_STORE_OK);
+
+    /* Default: zero resolved callers, but the unresolved total surfaces. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"unres-proj\",\"function_name\":\"name\",\"direction\":\"inbound\","
+        "\"depth\":1}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 0"));
+    ASSERT_NOT_NULL(strstr(inner, "unresolved_callers_total: 2"));
+    ASSERT_NOT_NULL(strstr(inner, "include_unresolved=true"));
+    free(inner);
+    free(response);
+
+    /* Opt-in: the call site itself, by method name. */
+    response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"unres-proj\",\"function_name\":\"name\",\"direction\":\"inbound\","
+        "\"depth\":1,\"limit\":1,\"include_unresolved\":true,\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"unresolved_callers_total\":2"));
+    ASSERT_NOT_NULL(strstr(inner, "\"unresolved_callers_next_offset\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "allow_summary"));
+    ASSERT_NOT_NULL(strstr(inner, "unknown_receiver_type"));
+    ASSERT_NOT_NULL(strstr(inner, "\"line\":160"));
+    ASSERT_NULL(strstr(inner, "render_summary"));
+    free(inner);
+    free(response);
+
+    response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"unres-proj\",\"function_name\":\"name\",\"direction\":\"inbound\","
+        "\"depth\":1,\"limit\":1,\"include_unresolved\":true,\"unresolved_offset\":1,"
+        "\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "render_summary"));
+    ASSERT_NOT_NULL(strstr(inner, "\"start_byte\":6010"));
+    ASSERT_NULL(strstr(inner, "test_summary"));
+    ASSERT_NULL(strstr(inner, "unresolved_callers_next_offset"));
+    free(inner);
+    free(response);
+
+    /* A function with a resolved caller carries no unresolved section. */
+    response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"unres-proj\",\"function_name\":\"other\",\"direction\":\"inbound\","
+        "\"depth\":1}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1"));
+    ASSERT_NULL(strstr(inner, "unresolved_callers_total"));
+    free(inner);
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #2816: stored recursion remains visible without a CALLS self-edge. */
 TEST(tool_trace_path_recursion_metadata_issue2816) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -19237,6 +19586,102 @@ TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed) {
     PASS();
 }
 
+/* detect_changes seed_filter=product excludes by the node's is_test flag,
+ * not only file shape: a #[cfg(test)] mod mounted via #[path] puts #[test]
+ * functions in a file no test-path heuristic recognizes. */
+TEST(tool_detect_changes_product_seed_filter_uses_node_flag) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-prodflag-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-prodflag-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char source_path[CBM_SZ_4K];
+    snprintf(source_path, sizeof(source_path), "%s/decision_checks.rs", repo);
+    ASSERT_EQ(th_write_file(source_path, "fn prod_check() {}\nfn mounted_test() {}\n"), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    ASSERT_EQ(th_write_file(source_path, "fn prod_check() { 1 }\nfn mounted_test() { 2 }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-prodflag-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t prod = {.project = project,
+                       .label = "Function",
+                       .name = "prod_check",
+                       .qualified_name = "fixture.prod_check",
+                       .file_path = "decision_checks.rs",
+                       .start_line = 1,
+                       .end_line = 1,
+                       .properties_json = "{\"is_test\":false}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &prod), 0);
+    cbm_node_t testfn = {.project = project,
+                         .label = "Function",
+                         .name = "mounted_test",
+                         .qualified_name = "fixture.mounted_test",
+                         .file_path = "decision_checks.rs",
+                         .start_line = 2,
+                         .end_line = 2,
+                         .properties_json = "{\"is_test\":true,\"decorators\":[\"#[test]\"]}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &testfn), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-prodflag-project\",\"base_branch\":\"HEAD\","
+                            "\"seed_filter\":\"product\",\"seeds\":\"list\",\"format\":\"json\","
+                            "\"max_output_tokens\":10000}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    bool prod_seeded = strstr(inner, "fixture.prod_check") != NULL;
+    bool test_excluded = strstr(inner, "fixture.mounted_test") == NULL;
+    free(inner);
+    free(response);
+
+    /* Without the filter both are seeds. */
+    response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-prodflag-project\",\"base_branch\":\"HEAD\","
+                            "\"seeds\":\"list\",\"format\":\"json\",\"max_output_tokens\":10000}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    bool both_seeded = strstr(inner, "fixture.prod_check") != NULL &&
+                       strstr(inner, "fixture.mounted_test") != NULL;
+    free(inner);
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    ASSERT_TRUE(prod_seeded);
+    ASSERT_TRUE(test_excluded);
+    ASSERT_TRUE(both_seeded);
+    PASS();
+}
+
 TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed) {
     char repo[CBM_SZ_4K];
     snprintf(repo, sizeof(repo), "%s/cbm-detect-untracked-path-XXXXXX", cbm_tmpdir());
@@ -28850,6 +29295,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_file_outline_shows_doc_candidates_of_file_and_folders);
     RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_in_degree_filter);
     RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
@@ -28926,6 +29372,8 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_node_is_test_flag);
+    RUN_TEST(tool_trace_path_unresolved_callers);
     RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
     RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
     RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);
@@ -29101,6 +29549,7 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
     RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
+    RUN_TEST(tool_detect_changes_product_seed_filter_uses_node_flag);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
     RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);

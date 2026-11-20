@@ -966,6 +966,17 @@ mode. `index_status` keeps describing the published graph and its freshness.
 | `manage_adr` | CRUD for Architecture Decision Records (`get` reads, `update` replaces the whole document, `set_sections` rewrites only the named sections and leaves every other byte untouched, `sections` lists headings). Query modes do not wait behind a same-project reindex; writes remain serialized. |
 | `ingest_traces` | Store observed call paths or caller/callee pairs under a run label. Both endpoints must resolve to indexed symbols; unresolved names are reported. |
 
+To find unused-symbol candidates in a file, use structural `search_graph` with `file_pattern`,
+`max_in_degree=0`, `degree_types=["CALLS","USAGE","CALL_REFERENCE"]`,
+`exclude_test_callers=true`, and `exclude_entry_points=true`. Search each relevant label,
+such as `Function`, `Method`, and `Variable` for Rust and Go constants. Continue with `next_offset`
+while `has_more` is true. The search ignores inbound edges from indexed tests and test helpers,
+and skips indexed entry points and overrides. Its `in` and `out` columns show the standard
+graph degrees. Use an inbound `trace_path` to check a candidate for unresolved callers.
+Set `include_unresolved=true` to see recorded sites with the same bare callee name.
+These are possible callers. Pass `unresolved_callers_next_offset` as `unresolved_offset`
+to continue that list.
+
 `manage_adr(mode='set_sections')` writes one or more sections by name and splices them into the stored document, so text outside the named sections (including a preamble, code fences and section ordering) is preserved byte-for-byte. Any `## Heading` works, not just the conventional PURPOSE / STACK / ARCHITECTURE / PATTERNS / TRADEOFFS / PHILOSOPHY set; names match exactly, including case. Writing the same section twice is a no-op, so a retry after a lost response cannot duplicate content.
 
 `manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
@@ -1005,6 +1016,10 @@ visible on continuation pages and when an output budget prevents rows from fitti
 - **WHERE**: `= <> < <= > >=`, `AND/OR/XOR/NOT`, `IN`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `IS [NOT] NULL`, regex `=~`, label test `n:Label`, and `EXISTS { (n)-[:TYPE]->() }` (single-hop existence; great for dead-code, e.g. `WHERE NOT EXISTS { (f)<-[:CALLS]-() }`).
 - **Aggregates**: `count` (+`DISTINCT`), `sum`, `avg`, `min`, `max`, `collect`.
 - **Functions**: `labels`, `type`, `id`, `keys`, `properties`; `toLower/toUpper/toString/toInteger/toFloat/toBoolean`; `size`, `length`, `trim/ltrim/rtrim`, `reverse`; `coalesce`, `substring`, `replace`, `left`, `right`.
+
+A single-hop pattern in `WHERE` can test whether a bound node has an adjacent edge,
+as in `WHERE NOT (()-[:CALLS]->(f))`. After `OPTIONAL MATCH`, `count(c)` counts
+bound values of `c`, so it yields zero for a group with no match.
 
 Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results.
 

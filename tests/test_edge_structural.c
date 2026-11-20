@@ -723,6 +723,19 @@ TEST(es_override_go_implicit) {
     PASS();
 }
 
+/* Rust trait impl methods carry OVERRIDE to the trait declaration: dyn/bound
+ * dispatch resolves calls to the trait method, so an orphan check excludes
+ * dispatched impl methods by this edge instead of reporting them caller-less. */
+TEST(es_override_rust_trait_impl_method) {
+    static const ES_LangFile f[] = {
+        {"trait.rs", "pub trait Greet {\n    fn hello(&self) -> String;\n}\n"},
+        {"impl.rs", "use crate::trait::Greet;\n\npub struct English;\n\n"
+                    "impl Greet for English {\n"
+                    "    fn hello(&self) -> String {\n        String::from(\"hi\")\n    }\n}\n"}};
+    ASSERT_TRUE(es_edge_present(f, 2, "OVERRIDE", 1)); /* English.hello -> Greet.hello */
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * FAMILY 6: DECORATES same-file and cross-file
  *
@@ -985,6 +998,7 @@ SUITE(edge_structural) {
     /* ── FAMILY 5: OVERRIDE (Go implicit interface method) ───── */
     /* Expected GREEN: cbm_pipeline_implements_go() emits OVERRIDE. */
     RUN_TEST(es_override_go_implicit);
+    RUN_TEST(es_override_rust_trait_impl_method);
 
     /* ── FAMILY 6: DECORATES ─────────────────────────────────── */
     /* GREEN: cross-file Python (relative import + registry resolution). */

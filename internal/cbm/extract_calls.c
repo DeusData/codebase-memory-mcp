@@ -5009,6 +5009,15 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     call.is_method = true;
                 }
             }
+            if (ctx->language == CBM_LANG_RUST &&
+                strcmp(ts_node_type(node), "call_expression") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "generic_function") == 0) {
+                    fn = ts_node_child_by_field_name(fn, TS_FIELD("function"));
+                }
+                call.is_method =
+                    !ts_node_is_null(fn) && strcmp(ts_node_type(fn), "field_expression") == 0;
+            }
             // Swift initializer guard (#2379; same direction). Flag `T.init(...)`,
             // as written or as a rewritten super.init. Nearly every type has an
             // `init`, so a short-name match onto one is a guess: with a project
