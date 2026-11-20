@@ -14,6 +14,7 @@
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
 #include "foundation/mem_core.h"
+#include "foundation/str_util.h"
 
 enum {
     CYP_BUF_16 = 16,
@@ -2721,8 +2722,44 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
  * name". Reset at the start of every execution. */
 static _Thread_local bool g_cypher_regex_refused = false;
 
-/* Evaluate a comparison operator between actual and expected strings. */
-static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
+/* The first literal `=~` pattern the platform regex compiler rejected during
+ * the CURRENT execution: an unbalanced group, or syntax POSIX ERE does not have
+ * such as the `(?i)` flag. The comparison still evaluates to false on every
+ * row; cbm_cypher_execute names the pattern in result->warning, because an
+ * empty result (or, under NOT, a full one) would otherwise read as an answer
+ * about the graph (#3022). A flag next to the text: the empty pattern is itself
+ * rejected by some compilers. Reset at the start of every execution. */
+static _Thread_local bool g_cypher_regex_invalid = false;
+static _Thread_local char g_cypher_regex_invalid_pattern[CBM_SZ_128];
+
+/* Set instead when the rejected pattern was read from the row (`a.name =~
+ * b.name`, #2591) rather than written in the query. Graph data is not echoed
+ * into the engine's own warning, and only the rows holding such a value
+ * compared false, so that notice names no pattern and no "every row". Reset at
+ * the start of every execution. */
+static _Thread_local bool g_cypher_regex_invalid_row_value = false;
+
+static void cypher_note_invalid_regex(const char *pattern) {
+    if (g_cypher_regex_invalid) {
+        return;
+    }
+    g_cypher_regex_invalid = true;
+    char *buf = g_cypher_regex_invalid_pattern;
+    const size_t cap = sizeof(g_cypher_regex_invalid_pattern);
+    if (snprintf(buf, cap, "%s", pattern) >= (int)cap) {
+        /* Too long to echo whole: cut on a code point boundary and mark it. */
+        static const char ellipsis[] = "...";
+        buf[cap - sizeof(ellipsis)] = '\0';
+        int len = cbm_utf8_trim_partial(buf);
+        snprintf(buf + len, cap - (size_t)len, "%s", ellipsis);
+    }
+}
+
+/* Evaluate a comparison operator between actual and expected strings.
+ * expected_is_row_value: expected was read from the row, not written in the
+ * query as a literal. */
+static bool eval_comparison_op(const char *op, const char *actual, const char *expected,
+                               bool expected_is_row_value) {
     if (strcmp(op, "=") == 0) {
         return strcmp(actual, expected) == 0;
     }
@@ -2735,6 +2772,10 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
         if (comp_rc != 0) {
             if (comp_rc == CBM_REG_ETOOBIG) {
                 g_cypher_regex_refused = true;
+            } else if (expected_is_row_value) {
+                g_cypher_regex_invalid_row_value = true;
+            } else {
+                cypher_note_invalid_regex(expected);
             }
             return false;
         }
@@ -2820,7 +2861,7 @@ static bool eval_property_comparison(const cbm_condition_t *c, const char *actua
     if (actual[0] == '\0' || expected[0] == '\0') {
         return false;
     }
-    bool result = eval_comparison_op(c->op, actual, expected);
+    bool result = eval_comparison_op(c->op, actual, expected, true);
     return c->negated ? !result : result;
 }
 
@@ -2875,7 +2916,7 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     if (c->rhs_variable) {
         return eval_property_comparison(c, actual, b);
     }
-    result = eval_comparison_op(c->op, actual, c->value);
+    result = eval_comparison_op(c->op, actual, c->value, false);
     return c->negated ? !result : result;
 }
 
@@ -6647,6 +6688,9 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
     g_cypher_regex_refused = false;
+    g_cypher_regex_invalid = false;
+    g_cypher_regex_invalid_pattern[0] = '\0';
+    g_cypher_regex_invalid_row_value = false;
     g_cypher_scan_error[0] = '\0';
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     /* max_rows sizes the initial binding array: non-positive means the
@@ -6736,7 +6780,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     /* Any internal ceiling that prevented exhaustive evaluation: a candidate or
      * traversal budget, or a variable-length range clamped to the engine cap. */
     out->truncated = g_cypher_truncated || g_cypher_trail_truncated != 0;
-    char wbuf[CBM_SZ_512] = "";
+    char wbuf[CBM_SZ_1K] = "";
     if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
         if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {
             snprintf(wbuf, sizeof(wbuf),
@@ -6759,6 +6803,25 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
         size_t used = strlen(wbuf);
         snprintf(wbuf + used, sizeof(wbuf) - used,
                  "%sa =~ or property " CBM_REG_ETOOBIG_REASON " — the comparison matched nothing",
+                 used ? "; " : "");
+    }
+    /* A literal `=~` pattern that did not compile: the rows answer a comparison
+     * that was false everywhere, so name the pattern (#3022). */
+    if (g_cypher_regex_invalid) {
+        size_t used = strlen(wbuf);
+        snprintf(wbuf + used, sizeof(wbuf) - used,
+                 "%s=~ pattern '%s' is not a valid POSIX extended regular expression — the "
+                 "comparison evaluated to false on every row",
+                 used ? "; " : "", g_cypher_regex_invalid_pattern);
+    }
+    /* The same failure for a pattern read from the row: no value is echoed, and
+     * only the rows that held such a value compared false. */
+    if (g_cypher_regex_invalid_row_value) {
+        size_t used = strlen(wbuf);
+        snprintf(wbuf + used, sizeof(wbuf) - used,
+                 "%s=~ pattern read from a property or alias is not a valid POSIX extended "
+                 "regular expression on at least one row — the comparison evaluated to false "
+                 "on those rows",
                  used ? "; " : "");
     }
     if (wbuf[0]) {
