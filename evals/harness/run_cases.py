@@ -133,7 +133,7 @@ class Runner:
         self.a = a
         self.profile = load_profile(a.profile)
         self.backend = self.profile["backend"]
-        self.binary = a.binary or self.profile.get("binary") or "codebase-memory-mcp-neo4j"
+        self.binary = a.binary or self.profile.get("binary") or "codebase-memory-mcp"
         v = dict(self.profile["vars"])
         for kv in a.var or []:
             k, _, val = kv.partition("=")
@@ -144,8 +144,8 @@ class Runner:
         v.setdefault("fixture_dir", os.path.join(EVALS, "fixtures", "eval-small"))
         v.setdefault("LONG_NAME", LONG_NAME)
         v.setdefault("python", sys.executable)
-        v.setdefault("cache_dir", os.environ.get("CBM_NEO4J_CACHE_DIR")
-                     or os.path.join(os.path.expanduser("~"), ".cache", "codebase-memory-mcp-neo4j"))
+        v.setdefault("cache_dir", os.environ.get("CBM_CACHE_DIR")
+                     or os.path.join(os.path.expanduser("~"), ".cache", "codebase-memory-mcp"))
         v.setdefault("db_path", os.path.join(v["cache_dir"], f"{v.get('project', 'eval-small')}.db"))
         self.vars = v
         self.secrets = [v.get("neo4j_password", "")]

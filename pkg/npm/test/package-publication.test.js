@@ -50,7 +50,7 @@ test('Unix extraction lists through the system tar and writes only the root exec
     };
 
     await extractExactTarArchive(
-      archive, destination, UNIX_ARCHIVE_NAMES, 'codebase-memory-mcp-neo4j', runner,
+      archive, destination, UNIX_ARCHIVE_NAMES, 'codebase-memory-mcp', runner,
     );
 
     // The listing runner sees the namespace query only; the executable is
@@ -58,10 +58,10 @@ test('Unix extraction lists through the system tar and writes only the root exec
     // tree, so the companions never touch the disk.
     assert.deepEqual(calls.map((call) => call.args), [['-tzf', archive]]);
     assert.equal(
-      fs.readFileSync(path.join(destination, 'codebase-memory-mcp-neo4j'), 'utf8'),
-      'member:codebase-memory-mcp-neo4j',
+      fs.readFileSync(path.join(destination, 'codebase-memory-mcp'), 'utf8'),
+      'member:codebase-memory-mcp',
     );
-    assert.deepEqual(fs.readdirSync(destination), ['codebase-memory-mcp-neo4j']);
+    assert.deepEqual(fs.readdirSync(destination), ['codebase-memory-mcp']);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

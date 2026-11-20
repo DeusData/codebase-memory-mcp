@@ -169,7 +169,7 @@
    "id": "S01-09",
    "tier": 2,
    "title": "artifact file exists next to the source",
-   "shell": "{{python}} -c \"import os,sys; p=os.path.join(sys.argv[1],'.codebase-memory-neo4j','graph.db.zst'); print('artifact', os.path.exists(p), os.path.getsize(p) if os.path.exists(p) else 0)\" \"{{repo}}\"",
+   "shell": "{{python}} -c \"import os,sys; p=os.path.join(sys.argv[1],'.codebase-memory','graph.db.zst'); print('artifact', os.path.exists(p), os.path.getsize(p) if os.path.exists(p) else 0)\" \"{{repo}}\"",
    "expect": {
     "rc": 0,
     "stdout_contains": "artifact True"
@@ -180,7 +180,7 @@
    "tier": 2,
    "title": "remove the artifact so the working copy stays clean",
    "fs": "delete",
-   "path": ".codebase-memory-neo4j"
+   "path": ".codebase-memory"
   },
   {
    "id": "S01-11",

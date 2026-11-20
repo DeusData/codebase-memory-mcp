@@ -18,7 +18,7 @@
 #endif
 
 static const char *HOME = "/Users/dev";
-static const char *CACHE = "/Users/dev/.cache/codebase-memory-mcp-neo4j";
+static const char *CACHE = "/Users/dev/.cache/codebase-memory-mcp";
 
 TEST(ws_depth_counts_components_below_the_volume) {
     ASSERT_EQ(cbm_workspace_path_depth("/"), 0);

@@ -119,9 +119,7 @@ void tree_sitter_objectscript_udl_external_scanner_deserialize(
     void *payload, const char *buffer, unsigned length) {
   // This one is a bit funky.
   // length includes the sizeof(struct Scanner) and the structs it points to
-  if (length > 0) {
-    memcpy(payload, buffer, length);
-  }
+  memcpy(payload, buffer, length);
 }
 
 void tree_sitter_objectscript_udl_external_scanner_destroy(void *payload) {

@@ -372,8 +372,7 @@ const char *cbm_workspace_verdict_reason(cbm_ws_verdict_t verdict) {
     case CBM_WS_DENY_TOO_SHALLOW:
         return "path is too broad to index as one root; name a project directory below it";
     case CBM_WS_DENY_ABSOLUTE:
-        return "path is a volume root or holds the codebase-memory-neo4j cache; it cannot be "
-               "indexed";
+        return "path is a volume root or holds the codebase-memory cache; it cannot be indexed";
     case CBM_WS_DENY_SENSITIVE:
         return "path is a home, credential, system, or application-install directory";
     default:
@@ -595,7 +594,7 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
              * substituted. */
             snprintf(err, err_sz,
                      "%s is outside the allowed root. To allow it, run: "
-                     "codebase-memory-mcp-neo4j allow-root %s",
+                     "codebase-memory-mcp allow-root %s",
                      canonical_path, canonical_path);
         }
         return false;
@@ -614,7 +613,7 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
     if (err) {
         if (cbm_workspace_verdict_is_overridable(verdict)) {
             snprintf(err, err_sz,
-                     "%s: %s. To index it anyway, run: codebase-memory-mcp-neo4j allow-root "
+                     "%s: %s. To index it anyway, run: codebase-memory-mcp allow-root "
                      "--approve-sensitive %s",
                      canonical_path, cbm_workspace_verdict_reason(verdict), canonical_path);
         } else {

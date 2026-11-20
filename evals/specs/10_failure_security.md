@@ -56,7 +56,7 @@ it; the policy decision is open (spec 07).
   with the daemon stopped, start a session: `index_status` must report an error
   for that project; other projects must still work; `delete_project` must remove
   it. Restore the copy afterwards.
-- **Cache dir not writable**: run with `CBM_NEO4J_CACHE_DIR` pointing at a
+- **Cache dir not writable**: run with `CBM_CACHE_DIR` pointing at a
   read-only directory; `initialize` must still succeed and `index_repository` must
   fail with a clear message.
 

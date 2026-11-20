@@ -8,7 +8,7 @@ Case files: `cases/sqlite/S01_index_create.json`, `cases/sqlite/S02_sqlite_schem
 - `prepare.py small` has produced `{{repo}}` (fresh git repo of eval-small).
 - No project named `{{project}}` exists (`list_projects`), or S99 was run.
 - The binary under test is on PATH or given with `--binary`; its daemon starts on
-  demand. `{{cache_dir}}` is `CBM_NEO4J_CACHE_DIR` or `~/.cache/codebase-memory-mcp-neo4j`.
+  demand. `{{cache_dir}}` is `CBM_CACHE_DIR` or `~/.cache/codebase-memory-mcp`.
 
 ## S-IDX: creating and maintaining the index (S01)
 
@@ -20,7 +20,7 @@ Case files: `cases/sqlite/S01_index_create.json`, `cases/sqlite/S02_sqlite_schem
 | S01-04 | `list_projects detail=stats` | The project is listed with counts | 1 |
 | S01-05 | File nodes | `MATCH (f:File) RETURN count(f) >= 14` (the tier-1 source files) | 1 |
 | S01-06/07 | No-op re-index | Succeeds; node count unchanged (incremental path, nothing rewritten) | 1 |
-| S01-08/09/10 | `persistence:true` | Writes `<repo>/.codebase-memory-neo4j/graph.db.zst`; the eval deletes it afterwards | 2 |
+| S01-08/09/10 | `persistence:true` | Writes `<repo>/.codebase-memory/graph.db.zst`; the eval deletes it afterwards | 2 |
 | S01-11 | Nonexistent path | Error | 1 |
 | S01-12..17 | `async:true` then `status:true` | Returns at once with `state` queued/running; polling reaches `succeeded`; `async`+`status` together is refused | 2 |
 | S01-18..20 | `mode: fast` into `<project>-fast` | Succeeds; schema has no `SIMILAR_TO`/`SEMANTICALLY_RELATED`; same File count as the full index | 2 |

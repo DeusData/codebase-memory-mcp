@@ -7,7 +7,7 @@ and no installed binary are needed:
 |---|---|
 | `neo4j` | Stock Neo4j 5.26 image (container `cbm-neo4j`); its store is the host folder `CBM_NEO4J_DATA_DIR`. Browser: http://localhost:7474 |
 | `cbm` | The indexer: builds a repository's graph into that Neo4j. |
-| `mcp` | The codebase-memory-mcp-neo4j server (stdio) for Claude Code and other MCP clients. |
+| `mcp` | The codebase-memory-mcp server (stdio) for Claude Code and other MCP clients. |
 
 `cbm` and `mcp` are built from this checkout, so they run whatever branch is checked out.
 
@@ -29,7 +29,7 @@ NEO4J_PASSWORD=<long random password>
 ## Set up (once per machine)
 
 ```powershell
-cd D:\ai-skills\codebase-memory-mcp-neo4j-fork
+cd D:\ai-skills\codebase-memory-mcp-fork
 copy docker\graph\.env.example docker\graph\.env    # then edit NEO4J_PASSWORD
 docker compose -f docker/graph/compose.yaml up -d neo4j
 docker compose -f docker/graph/compose.yaml --profile tools build cbm   # ~10-15 min
@@ -40,7 +40,7 @@ Rebuild with the last command after pulling code changes.
 ## Graph a repository
 
 ```powershell
-D:\ai-skills\codebase-memory-mcp-neo4j-fork\docker\graph\cbm-graph.cmd -RepoPath "D:\batch applications"
+D:\ai-skills\codebase-memory-mcp-fork\docker\graph\cbm-graph.cmd -RepoPath "D:\batch applications"
 ```
 
 | Option | Default | Meaning |
@@ -69,7 +69,7 @@ docker compose -f docker/graph/compose.yaml run --rm \
 Register the containerised server once:
 
 ```powershell
-claude mcp add codebase-memory-neo4j --scope user -- docker compose -f D:/ai-skills/codebase-memory-mcp-neo4j-fork/docker/graph/compose.yaml run --rm -T mcp
+claude mcp add codebase-memory --scope user -- docker compose -f D:/ai-skills/codebase-memory-mcp-fork/docker/graph/compose.yaml run --rm -T mcp
 ```
 
 It answers from the graphs the indexer built (they share the `CBM_DATA_DIR`
@@ -125,14 +125,6 @@ docker run --rm -v cbm_cbm-data:/from   -v /srv/cbm/cache:/to alpine cp -a /from
 
 ## How it works
 
-The entrypoint creates private state with a restrictive umask, requests explicit
-machine-readable CLI output, and reads the top-level indexing result independently
-of Neo4j's nested backend status. The runtime image includes the required JSON parser.
-For volumes created by older entrypoints, check that the dedicated `/data/home`
-directory is owned by the container user and has mode `0700`; an insecure existing
-directory is intentionally rejected by runtime settings rather than silently trusted.
-
-- The indexer syncs the repo into the `cbm_cbm-data` volume, skipping paths
 - The indexer syncs the repo into `CBM_DATA_DIR/work/<name>`, skipping paths
   matched by the ignore rules. It writes the merged `.cbmignore` at the copy's
   root and indexes the copy. Your repo is never touched, and repeat runs only
@@ -150,4 +142,4 @@ directory is intentionally rejected by runtime settings rather than silently tru
 - To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp cbm cli delete_project --project <name>`.
 - The graph is published to Neo4j generation by generation, so a re-run never
   leaves a half-written graph. If the upload fails, the run fails.
-- To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp-neo4j cbm cli delete_project --project <name>`.
+- To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp cbm cli delete_project --project <name>`.

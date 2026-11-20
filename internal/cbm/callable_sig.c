@@ -79,15 +79,11 @@ static void sig_raw(sig_ctx_t *c, const char *s, size_t n) {
             c->overflow = true;
             return;
         }
-        if (c->len > 0) {
-            memcpy(grown, c->buf, c->len);
-        }
+        memcpy(grown, c->buf, c->len);
         c->buf = grown;
         c->cap = cap;
     }
-    if (n > 0) {
-        memcpy(c->buf + c->len, s, n);
-    }
+    memcpy(c->buf + c->len, s, n);
     c->len += n;
     c->buf[c->len] = '\0';
 }

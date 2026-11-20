@@ -1,6 +1,6 @@
 # Evals: overview
 
-These evals measure whether `codebase-memory-mcp-neo4j` builds a complete, correct
+These evals measure whether `codebase-memory-mcp` builds a complete, correct
 index of a repository and answers graph, text and semantic searches correctly, on
 **both** storage backends:
 

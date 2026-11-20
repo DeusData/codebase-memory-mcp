@@ -1,6 +1,6 @@
 # evals/ — index and search evals for both backends
 
-Black-box evals of `codebase-memory-mcp-neo4j` through MCP: does indexing cover
+Black-box evals of `codebase-memory-mcp` through MCP: does indexing cover
 what is on disk, are the Neo4j schema indexes created and used, and do the
 search tools answer correctly and identically on the **SQLite** and **Neo4j**
 backends. Written 2026-11-12; first run 2026-11-12, second full run 2026-11-18 (see PILOT_ADJUSTMENTS.md).
@@ -19,7 +19,7 @@ evals/
 
 ## Prerequisites
 
-- A build of the fork on PATH as `codebase-memory-mcp-neo4j`, or pass `--binary`.
+- A build of the fork on PATH as `codebase-memory-mcp`, or pass `--binary`.
   The eval binary and any other CBM process must be the same build (the daemon
   admission barrier refuses mixed versions).
 - Python 3.9+ (standard library only), git.

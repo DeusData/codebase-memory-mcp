@@ -13,7 +13,7 @@ func platformOpenRuntimeSetLockOwner(path string) (*os.File, error) {
 }
 
 func platformCreatePrivateMutationRuntimeDirectory() (string, error) {
-	directory, err := os.MkdirTemp("", "codebase-memory-mcp-neo4j-mutation-*")
+	directory, err := os.MkdirTemp("", "codebase-memory-mcp-mutation-*")
 	if err != nil {
 		return "", err
 	}

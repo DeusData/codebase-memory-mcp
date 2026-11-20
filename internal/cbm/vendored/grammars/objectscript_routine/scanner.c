@@ -115,9 +115,7 @@ unsigned tree_sitter_objectscript_routine_external_scanner_serialize(void *paylo
 
 void tree_sitter_objectscript_routine_external_scanner_deserialize(
     void *payload, const char *buffer, unsigned length) {
-  if (length > 0) {
-    memcpy(payload, buffer, length);
-  }
+  memcpy(payload, buffer, length);
 }
 
 void tree_sitter_objectscript_routine_external_scanner_destroy(void *payload) {

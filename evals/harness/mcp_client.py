@@ -1,6 +1,6 @@
 """Minimal MCP stdio client for the evals.
 
-One `Mcp` object is one MCP session (one `codebase-memory-mcp-neo4j` process
+One `Mcp` object is one MCP session (one `codebase-memory-mcp` process
 speaking JSON-RPC over stdin/stdout). Tools run in the per-account daemon the
 binary starts on demand, so environment variables that the daemon must see
 (for example CBM_NEO4J_DELTA_MAX_ROWS or NEO4J_PASSWORD) have to be set before

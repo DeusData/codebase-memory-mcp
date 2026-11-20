@@ -7,7 +7,7 @@
   "working copy twice, once with graph_db and once without (see cases/neo4j/N08_parity.json)."
  ],
  "backend": "neo4j",
- "binary": "codebase-memory-mcp-neo4j",
+ "binary": "codebase-memory-mcp",
  "neo4j_password_env": "NEO4J_PASSWORD",
  "env": {},
  "vars": {

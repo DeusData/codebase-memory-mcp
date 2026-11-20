@@ -556,7 +556,7 @@ static const tool_def_t TOOLS[] = {
      "\"name\":{\"type\":\"string\",\"description\":"
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write .codebase-memory-neo4j/graph.db.zst.\"},"
+     "\"Write .codebase-memory/graph.db.zst.\"},"
      "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
      "\"Doc-code candidates; default: the doc_candidates setting, else on for full, off for "
      "moderate/fast.\"},"
@@ -1473,7 +1473,7 @@ static const int SUPPORTED_VERSION_COUNT =
  * questions the graph answers; facts, not commands. Claude Code cuts them at
  * 4,096 characters. */
 static const char MCP_SERVER_INSTRUCTIONS[] =
-    "codebase-memory-mcp-neo4j is a code knowledge graph of the indexed repository: functions, "
+    "codebase-memory-mcp is a code knowledge graph of the indexed repository: functions, "
     "classes, methods, routes, calls, imports, inheritance and cross-service links. It answers "
     "structural code questions: where a symbol is defined, who calls a function, what a function "
     "calls, call chains and data flow, which code a change affects, which handler serves a route, "
@@ -1535,7 +1535,7 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     yyjson_mut_obj_add_str(doc, root, "protocolVersion", version);
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp-neo4j");
+    yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
     yyjson_mut_obj_add_str(doc, impl, "version", cbm_cli_get_version());
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
@@ -1724,7 +1724,7 @@ static char *normalize_project_arg(char *project) {
 /* Forward decls — defined below alongside store resolution. */
 static const char *cache_dir(char *buf, size_t bufsz);
 
-/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp-neo4j"),
+/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
  * but indexed project names derive from the full path
  * (E:\project\graph\x -> "E-project-graph-x"), so the exact lookup fails
  * while list_projects clearly shows the project. When no <project>.db exists,
@@ -2921,7 +2921,7 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
     }
 
     char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory-neo4j/adr.md", root_path);
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
     struct stat adr_st;
     return stat(adr_path, &adr_st) == 0;
 }
@@ -5832,13 +5832,14 @@ static bool query_graph_cursor_encode(const query_graph_cursor_context_t *contex
              QUERY_GRAPH_CURSOR_DIGEST_HEX_LEN, context->result_digest);
     char seal[17];
     query_graph_cursor_seal(&cursor, seal);
-    int written = cursor.path
-                      ? snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q2.%s.%016llx.%s.%d.%c.%s",
-                                 cursor.generation, (unsigned long long)cursor.params_hash,
-                                 cursor.result_digest, cursor.offset, cursor.path, seal)
-                      : snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q1.%s.%016llx.%s.%d.%s",
-                                 cursor.generation, (unsigned long long)cursor.params_hash,
-                                 cursor.result_digest, cursor.offset, seal);
+    int written =
+        cursor.path
+            ? snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q2.%s.%016llx.%s.%d.%c.%s",
+                       cursor.generation, (unsigned long long)cursor.params_hash,
+                       cursor.result_digest, cursor.offset, cursor.path, seal)
+            : snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q1.%s.%016llx.%s.%d.%s",
+                       cursor.generation, (unsigned long long)cursor.params_hash,
+                       cursor.result_digest, cursor.offset, seal);
     return written > 0 && written < QUERY_GRAPH_CURSOR_TOKEN_CAP;
 }
 
@@ -6294,8 +6295,8 @@ static void qg_native_memo_add(cbm_mcp_server_t *srv, uint64_t key) {
 static int qg_label_count(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
                           const char *generation, const char *label) {
     char key[CBM_SZ_512];
-    int kn = snprintf(key, sizeof(key), "%s\x1f%s\x1f%s%s", project, generation, label ? "L:" : "*",
-                      label ? label : "");
+    int kn = snprintf(key, sizeof(key), "%s\x1f%s\x1f%s%s", project, generation,
+                      label ? "L:" : "*", label ? label : "");
     if (kn < 0 || (size_t)kn >= sizeof(key)) {
         return -1;
     }
@@ -6515,9 +6516,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         } else if (forced == QG_PATH_ENGINE) {
             predicted = false;
         } else {
-            predicted =
-                can_fall_back && qg_predict_native(srv, store, effective_project, generation, query,
-                                                   memo_key, reason, sizeof(reason));
+            predicted = can_fall_back &&
+                        qg_predict_native(srv, store, effective_project, generation, query,
+                                          memo_key, reason, sizeof(reason));
         }
         rc = -1;
         if (predicted) {
@@ -11600,7 +11601,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
             partials++;
         }
     }
-    (void)fprintf(f, "# codebase-memory-mcp-neo4j index coverage report\n");
+    (void)fprintf(f, "# codebase-memory-mcp index coverage report\n");
     (void)fprintf(f, "# project=%s skipped=%d parse_partial=%d\n", project ? project : "",
                   count - partials, partials);
     (void)fprintf(f, "# columns: phase\treason\tpath\n");
@@ -11706,10 +11707,9 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     bool has_artifact = cbm_artifact_exists(repo_path);
     yyjson_mut_obj_add_bool(doc, root, "artifact_present", has_artifact);
     if (persistence && has_artifact) {
-        yyjson_mut_obj_add_str(
-            doc, root, "artifact_hint",
-            "Persistent artifact written to .codebase-memory-neo4j/graph.db.zst. "
-            "Commit this file to share the index with teammates.");
+        yyjson_mut_obj_add_str(doc, root, "artifact_hint",
+                               "Persistent artifact written to .codebase-memory/graph.db.zst. "
+                               "Commit this file to share the index with teammates.");
     }
 
     return degraded;
@@ -13178,7 +13178,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             (void)snprintf(
                 hint, sizeof(hint),
                 "Index database was published, but the persistence artifact export failed for "
-                "repo_path/.codebase-memory-neo4j (%s). Use a writable checkout, or re-run with "
+                "repo_path/.codebase-memory (%s). Use a writable checkout, or re-run with "
                 "--persistence false if the shared artifact is not needed.",
                 export_error);
             yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
@@ -17681,9 +17681,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
         char msg[CBM_SZ_1K];
         const char *store_err = store ? cbm_store_error(store) : NULL;
-        (void)snprintf(
-            msg, sizeof(msg), "search failed before the complete result set was scanned%s%s",
-            store_err && store_err[0] ? ": " : "", store_err && store_err[0] ? store_err : "");
+        (void)snprintf(msg, sizeof(msg),
+                       "search failed before the complete result set was scanned%s%s",
+                       store_err && store_err[0] ? ": " : "",
+                       store_err && store_err[0] ? store_err : "");
         return cbm_mcp_text_result(msg, true);
     }
 
@@ -18948,10 +18949,10 @@ static bool detect_walk_run(cbm_store_t *store, const char *project,
      * lay them out in the walk's (hop, qualified name) order. */
     int n = 0;
     int64_t *ids = NULL;
+    int id_count = 0;
     cbm_node_t *found = NULL;
     int found_count = 0;
     if (ok && total > 0) {
-        int id_count = 0;
         ids = safe_realloc(NULL, (size_t)total * sizeof(*ids));
         ok = ids != NULL;
         for (int i = 0; ok && i < total; i++) {
@@ -18976,9 +18977,10 @@ static bool detect_walk_run(cbm_store_t *store, const char *project,
             continue;
         }
         cbm_node_t key = {.id = hits[i].id};
-        const cbm_node_t *hit = found_count > 0 ? bsearch(&key, found, (size_t)found_count,
-                                                          sizeof(*found), cbm_store_node_cmp_id)
-                                                : NULL;
+        const cbm_node_t *hit =
+            found_count > 0
+                ? bsearch(&key, found, (size_t)found_count, sizeof(*found), cbm_store_node_cmp_id)
+                : NULL;
         ok = hit != NULL; /* a reached node the store cannot read fails the walk, as before */
         if (ok) {
             int at = (int)(hit - found);
@@ -20612,7 +20614,7 @@ static void adr_add_outline(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const
     free(rows);
 }
 
-/* Read the legacy file-based ADR (<root>/.codebase-memory-neo4j/adr.md), used by
+/* Read the legacy file-based ADR (<root>/.codebase-memory/adr.md), used by
  * older versions. Returns a heap buffer (caller frees) or NULL if missing/
  * empty. Kept only to migrate old ADRs into the store (#256). */
 static char *adr_read_legacy_file(const char *root_path) {
@@ -20620,7 +20622,7 @@ static char *adr_read_legacy_file(const char *root_path) {
         return NULL;
     }
     char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory-neo4j/adr.md", root_path);
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
     FILE *fp = cbm_fopen(adr_path, "r");
     if (!fp) {
         return NULL;
@@ -20947,7 +20949,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* One-time migration: older versions wrote ADRs to a file at
-     * <root>/.codebase-memory-neo4j/adr.md. A read never waits for the project lease:
+     * <root>/.codebase-memory/adr.md. A read never waits for the project lease:
      * it returns the legacy content immediately and attempts migration only if
      * a nonblocking acquire succeeds. */
     cbm_adr_t adr;
@@ -21508,8 +21510,8 @@ char *cbm_mcp_result_add_graph_served(char *result, uint64_t remote_queries, int
                        "project, which holds the same generation as Neo4j (no Neo4j equivalent).",
                        what);
     }
-    return mcp_result_append_backend(result, notice, "serving", served_by, (int64_t)remote_queries,
-                                     local_reads > 0 ? what : NULL, NULL);
+    return mcp_result_append_backend(result, notice, "serving", served_by,
+                                     (int64_t)remote_queries, local_reads > 0 ? what : NULL, NULL);
 }
 
 /* Tools that manage a project rather than read its graph: they keep working
@@ -21530,14 +21532,15 @@ static bool mcp_tool_works_without_graph(const char *tool_name) {
  * (info, so the daemon log answers "did this come from Neo4j?" afterwards).
  * A graph read that Neo4j could not serve is refused: its local-index answer
  * is discarded, never returned in Neo4j's place. */
-static char *mcp_report_graph_backend(cbm_mcp_server_t *srv, const char *tool_name, char *result) {
+static char *mcp_report_graph_backend(cbm_mcp_server_t *srv, const char *tool_name,
+                                      char *result) {
     const char *project = srv->current_project ? srv->current_project : "";
     if (srv->graph_fallback_reason[0]) {
         if (mcp_tool_works_without_graph(tool_name)) {
             return result;
         }
-        cbm_log_warn("graph.backend", "tool", tool_name, "project", project, "served_by", "refused",
-                     "reason", srv->graph_fallback_reason);
+        cbm_log_warn("graph.backend", "tool", tool_name, "project", project, "served_by",
+                     "refused", "reason", srv->graph_fallback_reason);
         free(result);
         return cbm_mcp_graph_unavailable_result(tool_name, srv->graph_fallback_reason);
     }
@@ -21819,7 +21822,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
-                     "run: codebase-memory-mcp-neo4j config set auto_index true");
+                     "run: codebase-memory-mcp config set auto_index true");
         return;
     }
 
