@@ -2065,8 +2065,11 @@ static int ap_render(ap_context *c, const char *project, char **out_json) {
     if (budget.failed)
         rc = CBM_STORE_SCAN_LIMIT;
     else {
-        *out_json =
-            yyjson_mut_write_opts(doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, &allocator, NULL, NULL);
+        /* Escaping turns malformed UTF-8 (a Latin-1 path) into U+FFFD, so the
+         * strict re-read in the MCP envelope accepts it. */
+        *out_json = yyjson_mut_write_opts(
+            doc, YYJSON_WRITE_ALLOW_INVALID_UNICODE | YYJSON_WRITE_ESCAPE_UNICODE, &allocator, NULL,
+            NULL);
         if (!*out_json)
             rc = budget.failed ? CBM_STORE_SCAN_LIMIT : CBM_STORE_ERR;
     }
