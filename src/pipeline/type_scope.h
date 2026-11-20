@@ -47,12 +47,34 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Where the declarations a spelling can name come from, beyond the
+ * definition's own enclosing scopes. */
+typedef enum {
+    /* The file's own module, then what its imports bind (the import map). */
+    CBM_TYPE_SCOPE_MODULE_IMPORTS = 0,
+    /* The definitions visible through the file's include closure (C, C++):
+     * the caller's cbm_type_scope_t.visible answers a name; without it no
+     * name has an identity. */
+    CBM_TYPE_SCOPE_INCLUDE_CLOSURE,
+    /* Lexical nesting (Ruby constants): the namespaces of this file that
+     * enclose the definition, innermost first; a name none of them declares
+     * has no identity. */
+    CBM_TYPE_SCOPE_LEXICAL_NESTING,
+} cbm_type_scope_source_t;
+
+/* The import-map key of an open import (see open_imports). */
+#define CBM_TYPE_SCOPE_OPEN_KEY "*"
+
 /* How one language writes type names, and what its engine consumes. */
 typedef struct {
     CBMLanguage lang;
+    cbm_type_scope_source_t scope_source;
     /* A name inside quotes is a type name (Python forward references); in
      * every other language a quoted run is a literal and is skipped. */
     bool quoted_names;
+    /* `::` joins the parts of a qualified name as `.` does (Rust, C++, Ruby
+     * `a::B`): the spelling stays as written, its QN joins with `.`. */
+    bool colon_paths;
     /* Labels of the definitions an identity may name: the type kinds the
      * engine registers and can look members up on. NULL-terminated. */
     const char *const *labels;
@@ -74,7 +96,28 @@ typedef struct {
      * a module (a class `Thing` in pkg/a/__init__.py beside pkg/a/Thing.py:
      * their members share QNs, so no member answer is that class's). */
     bool lexical_scopes;
-    /* Which CBMLSPDef texts hold raw type spellings for this language. */
+    /* Open (on-demand) imports (Java and Kotlin `.*`, C# `using N;`): each
+     * import-map entry under CBM_TYPE_SCOPE_OPEN_KEY names a package whose
+     * every type is visible. A bare name the own module and the named
+     * imports leave unbound is `<package>.<name>` in each open package: one
+     * target across all of them is its identity, two or more are none.
+     * Without the flag the key is an ordinary local name. */
+    bool open_imports;
+    /* The language's implicit external scope (java.lang, kotlin.*, the C#
+     * global namespace): true when a bare name is declared there. A name the
+     * own module and the named imports leave unbound and this answers true
+     * for has no identity (it is the external type, or ambiguous with an open
+     * import). NULL: no such scope. */
+    bool (*implicit_external)(const char *name, size_t len);
+    /* Member types (Java, C#, Kotlin): a bare name written in a definition
+     * nested in a type names that type's member type of the name first, then
+     * each enclosing type's, innermost first (`Inner` written inside `Outer`
+     * is `Outer.Inner`), before the module and the imports. A member type a
+     * supertype declares is not seen: past an enclosing type with a supertype
+     * the answer is a possible type, not a proven one. */
+    bool nested_types;
+    /* Which CBMLSPDef texts hold raw type spellings for this language. Every
+     * row states each one. */
     bool return_types;
     bool param_types;
     bool field_types;    /* "name:type|name:type" in field_defs */
@@ -106,6 +149,11 @@ typedef struct {
      * labels), so a QN that is a module's gets no identity; NULL = not
      * checked. */
     const struct cbm_gbuf *graph;
+    /* CBM_TYPE_SCOPE_INCLUDE_CLOSURE only: the one definition named `name`
+     * (len bytes) the file sees through its include closure, or NULL (none,
+     * several, or the closure is incomplete). */
+    const char *(*visible)(void *ud, const char *name, size_t len);
+    void *visible_ud;
 } cbm_type_scope_t;
 
 /* Per-file working state: the import map by key, the file's own scopes, and
@@ -127,6 +175,16 @@ const char *cbm_type_scope_resolve(cbm_type_scope_file_t *file, const char *spel
  * leave it NULL when no name the def writes needs an identity. The string is
  * allocated in `arena`. */
 void cbm_type_scope_attach(cbm_type_scope_file_t *file, CBMArena *arena, CBMLSPDef *def);
+
+/* The calling file's own identity table: each local name the file's named
+ * imports bind, with the type identity it resolves to in the file's scope
+ * (one answer of a label the engine registers, as for a declared type), in
+ * import-map order, each local once. An engine resolving a bare name at a
+ * call site reads it instead of an import's unverified target. The arrays
+ * and strings are owned by the file state (valid until file_end). Returns
+ * the count (0: none). */
+int cbm_type_scope_file_imports(cbm_type_scope_file_t *file, const char *const **out_locals,
+                                const char *const **out_qns);
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* Work counter for the growth tests: one per byte of type text scanned, per

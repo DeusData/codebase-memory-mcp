@@ -387,6 +387,11 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->imports.items[i].module_path);
         cr_str(c, &r->imports.items[i].member);
     }
+    cr_array(c, (void **)&r->scope.items, r->scope.count, sizeof(CBMScopeEvent));
+    for (int i = 0; i < r->scope.count && r->scope.items; i++) {
+        cr_str(c, &r->scope.items[i].name);
+        cr_str(c, &r->scope.items[i].qual);
+    }
     cr_array(c, (void **)&r->usages.items, r->usages.count, sizeof(CBMUsage));
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {
         cr_str(c, &r->usages.items[i].ref_name);

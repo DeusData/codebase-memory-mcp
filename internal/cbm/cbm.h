@@ -486,6 +486,11 @@ typedef struct {
      * re-export, bare `require('x').y`), so local_name is the path's last segment,
      * not a binding the file can call through (#1128). Default false. */
     bool local_name_synthesized;
+    /* Byte offset of the import statement in the source, recorded by the
+     * spec-driven import parser (parse_spec_imports); 0 where no parser sets
+     * it. Scope facts (CBMScopeEvent INCLUDE) find their row by it. Fills
+     * padding: the struct does not grow. */
+    uint32_t start_byte;
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     const char *member;      // ES named import: the exported name the local binds (`get` in
@@ -763,6 +768,48 @@ typedef struct {
     int count;
     int cap;
 } CBMImportArray;
+
+/* Scope facts (extract_scope.c): what one file defines and includes, in
+ * source order, for the languages with a scope row. A pure function of the
+ * file's bytes; empty for every other language. The values are those of the
+ * parked include-scope branch; the gaps are its ordered-row kinds (shell,
+ * Make), which keep their numbers when they come. */
+typedef enum {
+    CBM_SCOPE_DEF = 1,     /* result->defs[index] is defined here */
+    CBM_SCOPE_INCLUDE = 2, /* result->imports[index] takes effect after `pos` */
+    CBM_SCOPE_ASSIGN = 3,  /* `name` is defined here by a form the graph has no node for */
+    /* bytes [index, pos) are a qualified type reference written as `name`,
+     * qualifier included ("google.protobuf.Empty", ".a.B"): a usage site of
+     * the reference carries only its last identifier */
+    CBM_SCOPE_QREF = 5,
+    /* a parse the facts cannot trust: what is found past it is not proven */
+    CBM_SCOPE_OPAQUE = 8,
+} CBMScopeEventKind;
+
+enum {
+    CBM_SCOPE_REEXPORT = 1u << 4, /* INCLUDE: its names reach this file's includers */
+    /* inside a parse error: may or may not hold where a later name is used */
+    CBM_SCOPE_CONDITIONAL = 1u << 5,
+};
+
+typedef struct {
+    const char *name; /* defined name, or QREF's text; NULL for INCLUDE and OPAQUE */
+    /* DEF: the full name where the row has packages or nesting (Protobuf:
+     * package, enclosing messages, name: "a.b.Outer.Inner"). INCLUDE: the
+     * importing file's package ("" when none), which its references are
+     * relative to. NULL elsewhere. */
+    const char *qual;
+    uint32_t pos;  /* byte offset after which the event is in effect */
+    int32_t index; /* into defs (DEF) or imports (INCLUDE); QREF: start byte; else -1 */
+    uint8_t kind;  /* CBMScopeEventKind */
+    uint8_t flags; /* CBM_SCOPE_* */
+} CBMScopeEvent;
+
+typedef struct {
+    CBMScopeEvent *items;
+    int count;
+    int cap;
+} CBMScopeEventArray;
 
 typedef struct {
     CBMUsage *items;
@@ -1074,6 +1121,10 @@ typedef struct CBMFileResult {
      * bytes; NULL for languages without a scope scanner. */
     CBMDocLinkArray doc_links;
     const char *doc_scope;
+
+    /* Scope facts: definitions and includes in source order (extract_scope.c);
+     * empty outside the languages with a scope row. */
+    CBMScopeEventArray scope;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -1459,6 +1510,7 @@ uint64_t cbm_extract_test_go_embedded_work(void);
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+void cbm_scope_events_push(CBMScopeEventArray *arr, CBMArena *a, CBMScopeEvent ev);
 /* True unless every import of `imports` that binds `local_name` is
  * annotation-only (cbm_import_binds_runtime_name), so also true when no import
  * names it: the rule for the builders that key IMPORTS edges by local name. */
@@ -1548,6 +1600,14 @@ const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);
+
+/* Scope facts (extract_scope.c): result->scope for a language with a scope
+ * row, after its definitions and imports; nothing for any other language. */
+void cbm_extract_scope(CBMExtractCtx *ctx);
+/* True for a language with a scope row. */
+bool cbm_extract_scope_has_row(CBMLanguage lang);
+/* Nodes visited and index probes of every scope walk so far (growth tests). */
+uint64_t cbm_extract_scope_nodes_visited(void);
 
 // K8s / Kustomize semantic extractor (called when language is CBM_LANG_K8S or CBM_LANG_KUSTOMIZE).
 void cbm_extract_k8s(CBMExtractCtx *ctx);
