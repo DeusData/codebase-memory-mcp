@@ -1801,8 +1801,14 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: a Terragrunt stack (terragrunt.stack.hcl) IMPORTS {via:
+ *      terragrunt-stack} the Folder each unit / stack block's local source
+ *      names and the file each include names, its locals resolving
+ *      local.X; its reads IMPORTS {via: terragrunt} as a unit's
+ *      (pass_terraform.c). An index built before holds none of them, so it
+ *      rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
