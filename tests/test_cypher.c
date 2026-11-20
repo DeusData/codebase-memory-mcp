@@ -1602,6 +1602,119 @@ TEST(cypher_exec_where_regex_oversized_pattern_matches_nothing) {
     PASS();
 }
 
+/* issue #3022: an `=~` pattern the regex compiler rejects must not read as "no
+ * such name". An unbalanced group is invalid in every regex dialect; before the
+ * fix the compile failure became "row does not match" on every row with no
+ * sign of it: rc 0, no rows, no warning, and under NOT every row. The engine
+ * keeps answering, as it does for an oversized pattern, and the result's
+ * warning names the pattern that never ran. */
+TEST(cypher_exec_where_regex_invalid_pattern_is_reported_issue3022) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name =~ \".*Order(\" RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    ASSERT_NOT_NULL(r.warning);
+    ASSERT_NOT_NULL(strstr(r.warning, "=~ pattern '.*Order('"));
+    ASSERT_NOT_NULL(strstr(r.warning, "not a valid POSIX extended regular expression"));
+    cbm_cypher_result_free(&r);
+
+    /* Under NOT the swallowed failure turns into "every row matches": the rows
+     * are whatever the negation makes of a comparison that was never run, so
+     * only the warning is pinned here. */
+    cbm_cypher_result_t rn = {0};
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE NOT f.name =~ \".*Order(\" RETURN f.name",
+                            "test", 0, &rn);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(rn.warning);
+    ASSERT_NOT_NULL(strstr(rn.warning, "=~ pattern '.*Order('"));
+    cbm_cypher_result_free(&rn);
+
+    /* The reporter's case: the Neo4j-style inline flag. POSIX ERE has no
+     * `(?i)` group, so regcomp refuses it and the warning names it. A regex
+     * backend that does accept the flag (the TRE build used on Windows parses
+     * `(?...)`) must then match case-insensitively. No rows and no warning is
+     * the one wrong answer. */
+    cbm_cypher_result_t ri = {0};
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name =~ \"(?i).*order.*\" RETURN f.name",
+                            "test", 0, &ri);
+    ASSERT_EQ(rc, 0);
+    if (ri.warning) {
+        ASSERT_EQ(ri.row_count, 0);
+        ASSERT_NOT_NULL(strstr(ri.warning, "=~ pattern '(?i).*order.*'"));
+    } else {
+        ASSERT_EQ(ri.row_count, 3);
+    }
+    cbm_cypher_result_free(&ri);
+
+    /* The warning echoes at most 127 bytes of the pattern: a longer one is cut
+     * on a code point boundary (here inside a run of two-byte "é") and marked. */
+    char longq[400];
+    char *w = longq;
+    w += snprintf(w, sizeof(longq), "MATCH (f:Function) WHERE f.name =~ \"(");
+    for (int i = 0; i < 100; i++) {
+        w += snprintf(w, (size_t)(longq + sizeof(longq) - w), "\xc3\xa9");
+    }
+    snprintf(w, (size_t)(longq + sizeof(longq) - w), "\" RETURN f.name");
+    cbm_cypher_result_t rl = {0};
+    rc = cbm_cypher_execute(s, longq, "test", 0, &rl);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(rl.warning);
+    ASSERT_NOT_NULL(strstr(rl.warning, "\xc3\xa9...' is not a valid"));
+    ASSERT_NULL(strstr(rl.warning, "\xc3...")); /* no half code point before the mark */
+    cbm_cypher_result_free(&rl);
+
+    /* `a.name =~ b.name` (#2591) reads its pattern from the row. Graph data is
+     * not echoed into the warning, and only the rows whose value does not
+     * compile compare false: Caller calls one function whose name is a pattern
+     * that matches "Caller" and one whose name is an unbalanced group. */
+    cbm_store_t *ps = cbm_store_open_memory();
+    cbm_store_upsert_project(ps, "test", "/tmp/test");
+    cbm_node_t caller = {
+        .project = "test", .label = "Function", .name = "Caller", .qualified_name = "test.caller"};
+    cbm_node_t good = {
+        .project = "test", .label = "Function", .name = "Call.*", .qualified_name = "test.good"};
+    cbm_node_t bad = {.project = "test",
+                      .label = "Function",
+                      .name = "Unbalanced(Name",
+                      .qualified_name = "test.bad"};
+    int64_t id_caller = cbm_store_upsert_node(ps, &caller);
+    int64_t id_good = cbm_store_upsert_node(ps, &good);
+    int64_t id_bad = cbm_store_upsert_node(ps, &bad);
+    cbm_edge_t to_good = {
+        .project = "test", .source_id = id_caller, .target_id = id_good, .type = "CALLS"};
+    cbm_edge_t to_bad = {
+        .project = "test", .source_id = id_caller, .target_id = id_bad, .type = "CALLS"};
+    cbm_store_insert_edge(ps, &to_good);
+    cbm_store_insert_edge(ps, &to_bad);
+    cbm_cypher_result_t rp = {0};
+    rc = cbm_cypher_execute(ps, "MATCH (a)-[:CALLS]->(b) WHERE a.name =~ b.name RETURN b.name",
+                            "test", 0, &rp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(rp.row_count, 1);
+    ASSERT_STR_EQ(rp.rows[0][0], "Call.*");
+    ASSERT_NOT_NULL(rp.warning);
+    ASSERT_NULL(strstr(rp.warning, "Unbalanced"));
+    ASSERT_NULL(strstr(rp.warning, "every row"));
+    ASSERT_NOT_NULL(strstr(rp.warning, "=~ pattern read from a property or alias"));
+    cbm_cypher_result_free(&rp);
+    cbm_store_close(ps);
+
+    /* A pattern that compiles is unaffected, and the previous queries' warning
+     * does not leak into this one. */
+    cbm_cypher_result_t ok = {0};
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE f.name =~ \".*Order.*\"", "test", 0, &ok);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(ok.row_count, 3);
+    ASSERT_NULL(ok.warning);
+    cbm_cypher_result_free(&ok);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_contains) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -6524,6 +6637,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);
     RUN_TEST(cypher_exec_where_regex_oversized_pattern_matches_nothing);
+    RUN_TEST(cypher_exec_where_regex_invalid_pattern_is_reported_issue3022);
     RUN_TEST(cypher_exec_where_contains);
     RUN_TEST(cypher_exec_where_starts_with);
     RUN_TEST(cypher_exec_return_properties);
