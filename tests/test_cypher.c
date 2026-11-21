@@ -6291,6 +6291,70 @@ TEST(cypher_stream_chunks_match_single_pass) {
     PASS();
 }
 
+/* WITH and RETURN must agree on nullable node, edge and property counts,
+ * while COUNT(*) still counts the OPTIONAL MATCH fallback row. */
+TEST(cypher_with_count_optional_nulls) {
+    cbm_store_t *s = setup_cypher_store();
+    const char *queries[] = {
+        "MATCH (f:Function) OPTIONAL MATCH (x)-[r:CALLS]->(f) "
+        "RETURN f.name, count(x), count(r), count(x.name), count(DISTINCT x.name), count(*) "
+        "ORDER BY f.name",
+        "MATCH (f:Function) OPTIONAL MATCH (x)-[r:CALLS]->(f) "
+        "WITH f, count(x) AS c, count(r) AS edges, count(x.name) AS names, "
+        "count(DISTINCT x.name) AS unique_names, count(*) AS rows "
+        "RETURN f.name, c, edges, names, unique_names, rows ORDER BY f.name",
+    };
+    for (size_t qi = 0; qi < sizeof(queries) / sizeof(queries[0]); qi++) {
+        cbm_cypher_result_t r = {0};
+        ASSERT_EQ(cbm_cypher_execute(s, queries[qi], "test", 0, &r), 0);
+        ASSERT_EQ(r.row_count, 4);
+        ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+        for (int row = 0; row < r.row_count; row++) {
+            for (int col = 1; col <= 4; col++) {
+                ASSERT_STR_EQ(r.rows[row][col], row == 0 ? "0" : "1");
+            }
+            ASSERT_STR_EQ(r.rows[row][5], "1");
+        }
+        cbm_cypher_result_free(&r);
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_with_count_zero_callers) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (f:Function) OPTIONAL MATCH (x)-[:CALLS]->(f) "
+                                 "WITH f, count(x) AS c WHERE c = 0 RETURN f.name, c",
+                                 "test", 0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_with_count_global_optional_null) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(
+        cbm_cypher_execute(s,
+                           "MATCH (f:Function) WHERE f.name = 'HandleOrder' "
+                           "OPTIONAL MATCH (x)-[:CALLS]->(f) WITH count(x) AS c, count(*) AS rows "
+                           "RETURN c, rows",
+                           "test", 0, &r),
+        0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "0");
+    ASSERT_STR_EQ(r.rows[0][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* OPTIONAL fallback rows (a start node with no match keeps its row, target
  * unbound) sit between the expanded rows of their neighbours in every chunk
  * layout; the multi-pattern form keeps its single pass. */
@@ -6714,6 +6778,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_grouping_keeps_first_seen_groups);
     /* Streamed execution: chunked start set == single pass */
     RUN_TEST(cypher_stream_chunks_match_single_pass);
+    RUN_TEST(cypher_with_count_optional_nulls);
+    RUN_TEST(cypher_with_count_zero_callers);
+    RUN_TEST(cypher_with_count_global_optional_null);
     RUN_TEST(cypher_stream_optional_across_chunks);
     RUN_TEST(cypher_stream_limit_and_max_rows_across_chunks);
     RUN_TEST(cypher_stream_default_chunk_boundary);
