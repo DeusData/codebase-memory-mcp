@@ -1790,10 +1790,10 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         bool loaded_spill = false;
-        CBMFileResult *result = ctx->result_cache
-                                    ? cbm_pipeline_result_acquire(ctx, ctx->result_cache, i, NULL,
-                                                                  &loaded_spill)
-                                    : NULL;
+        CBMFileResult *result =
+            ctx->result_cache
+                ? cbm_pipeline_result_acquire(ctx, ctx->result_cache, i, NULL, &loaded_spill)
+                : NULL;
         if (!result || !file_has_depends_call(result)) {
             if (loaded_spill && result) {
                 cbm_free_result(result);
