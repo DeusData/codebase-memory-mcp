@@ -2002,8 +2002,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         int all_def_count = 0;
         char **def_modules = NULL;
         CBMModuleDefIndex *module_def_index = NULL;
-        CBMCrossLspRegistries cross_registries = {0};
-        CBMCrossLspRegistries *registries_arg = NULL;
+        /* Every route hands the walks the context; only a closure above the
+         * floor builds shared registries into it. */
+        CBMCrossLspRegistries cross_registries;
+        memset(&cross_registries, 0, sizeof(cross_registries));
+        cross_registries.ctx = ctx;
         CBMArena legacy_cross_arena;
         bool legacy_cross_arena_live = false;
         bool owner_walk_required = atomic_load(&ctx->test_definition_owners_seen) != 0;
@@ -2074,16 +2077,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                  * for languages without a shared registry, so convergence
                  * is unaffected; only the amortization strategy changes. */
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
-                    CBMArena *xa = &closure->arena;
-                    cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.python =
-                        cbm_py_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
-                    cross_registries.java =
-                        cbm_java_build_cross_registry(xa, all_defs, all_def_count);
-                    registries_arg = &cross_registries;
+                    cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
+                                                   &cross_registries);
                 }
             } else {
                 all_def_count = 0;
@@ -2122,7 +2117,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_doclinks_begin(ctx, changed_files, ci, cache);
         rc = cbm_parallel_resolve(
             ctx, changed_files, ci, cache, &shared_ids, worker_count, all_defs, all_def_count,
-            closure ? closure->def_modules : def_modules, module_def_index, registries_arg);
+            closure ? closure->def_modules : def_modules, module_def_index, &cross_registries);
         cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:

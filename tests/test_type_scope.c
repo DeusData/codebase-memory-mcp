@@ -392,6 +392,508 @@ TEST(type_scope_python_unlisted_bindings_get_none) {
     PASS();
 }
 
+/* ── The engine table of the cross-file pass ─────────────────────── */
+
+/* Every language that had a cross-file walk has exactly one engine row, and
+ * no other language has one; the engines that built a shared registry with
+ * the others still do, in the same order, and only they; an engine reads
+ * identities exactly where the step has a description of its language. */
+TEST(type_scope_engine_table_rows) {
+    static const CBMLanguage served[] = {
+        CBM_LANG_GO,         CBM_LANG_C,          CBM_LANG_CPP, CBM_LANG_CUDA, CBM_LANG_PYTHON,
+        CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_TSX, CBM_LANG_PHP,  CBM_LANG_CSHARP,
+        CBM_LANG_JAVA,       CBM_LANG_KOTLIN,     CBM_LANG_RUST};
+    int served_count = 0;
+    for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
+        bool expect = false;
+        for (size_t i = 0; i < sizeof(served) / sizeof(served[0]); i++) {
+            expect = expect || served[i] == (CBMLanguage)lang;
+        }
+        served_count += expect ? 1 : 0;
+        ASSERT_EQ(cbm_pxc_has_cross_lsp((CBMLanguage)lang), expect);
+        ASSERT_EQ(cbm_pxc_engine_of_lang((CBMLanguage)lang) >= 0, expect);
+        ASSERT_EQ(cbm_pxc_wants_identities((CBMLanguage)lang),
+                  cbm_type_scope_lang((CBMLanguage)lang) != NULL);
+    }
+    ASSERT_EQ(served_count, 13);
+    ASSERT(cbm_pxc_wants_identities(CBM_LANG_GO));
+    ASSERT(cbm_pxc_wants_identities(CBM_LANG_PYTHON));
+    /* One row, one registry: C, C++ and CUDA share one, as do JavaScript,
+     * TypeScript and TSX; Java and Kotlin do not. */
+    int c_row = cbm_pxc_engine_of_lang(CBM_LANG_C);
+    int js_row = cbm_pxc_engine_of_lang(CBM_LANG_JAVASCRIPT);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_CPP), c_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_CUDA), c_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_TYPESCRIPT), js_row);
+    ASSERT_EQ(cbm_pxc_engine_of_lang(CBM_LANG_TSX), js_row);
+    ASSERT_NEQ(cbm_pxc_engine_of_lang(CBM_LANG_JAVA), cbm_pxc_engine_of_lang(CBM_LANG_KOTLIN));
+    ASSERT_LTE(cbm_pxc_engine_count(), CBM_PXC_MAX_ENGINES);
+    ASSERT_NULL(cbm_pxc_engine_name(cbm_pxc_engine_count()));
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMCrossLspRegistries regs;
+    memset(&regs, 0, sizeof(regs));
+    char built[128] = "";
+    for (int e = 0; e < cbm_pxc_engine_count(); e++) {
+        if (cbm_pxc_build_engine_registry(e, &arena, NULL, 0, &regs)) {
+            ASSERT_NOT_NULL(regs.by_engine[e]);
+            size_t at = strlen(built);
+            snprintf(built + at, sizeof(built) - at, "%s%s", at ? " " : "", cbm_pxc_engine_name(e));
+        } else {
+            ASSERT_NULL(regs.by_engine[e]);
+        }
+    }
+    ASSERT_STR_EQ(built, "go python c cs ts java");
+    ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_CUDA) == regs.by_engine[c_row]);
+    ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_TSX) == regs.by_engine[js_row]);
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUST)); /* lazy */
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_KOTLIN));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_PHP));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUBY));
+    ASSERT_NULL(cbm_pxc_registry_for_lang(NULL, CBM_LANG_GO));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* ── Row fields for the further engines (hand-made rows) ──────────── */
+
+static const char *const ts_row_labels[] = {"Class", "Interface", NULL};
+
+/* A row of an import-map language whose engine does not qualify its own
+ * module (every identity is stored), with the given extras. */
+static cbm_type_scope_lang_t ts_row(void) {
+    cbm_type_scope_lang_t row = {.lang = CBM_LANG_JAVA,
+                                 .scope_source = CBM_TYPE_SCOPE_MODULE_IMPORTS,
+                                 .labels = ts_row_labels,
+                                 .return_types = true,
+                                 .param_types = true,
+                                 .field_types = true,
+                                 .embedded_types = true};
+    return row;
+}
+
+/* The type_scope of one def (qn, label, return text) under `row` in module
+ * p.app, with the scope's extras (visible) from `extra` when given. */
+static const char *ts_row_attach(ts_unit_t *u, const cbm_type_scope_lang_t *row, const char *def_qn,
+                                 const char *label, const char *ret, const char *const *keys,
+                                 const char *const *vals, int n, const cbm_type_scope_t *extra) {
+    cbm_type_scope_t scope = {
+        .reg = u->reg, .module_qn = "p.app", .imp_keys = keys, .imp_vals = vals, .imp_count = n};
+    if (extra) {
+        scope.visible = extra->visible;
+        scope.visible_ud = extra->visible_ud;
+    }
+    cbm_type_scope_file_t *f = cbm_type_scope_file_begin(row, &scope);
+    if (!f) {
+        return "<no file state>";
+    }
+    CBMLSPDef def = {0};
+    def.qualified_name = def_qn;
+    def.short_name = "f";
+    def.label = label;
+    def.return_types = ret;
+    cbm_type_scope_attach(f, &u->arena, &def);
+    cbm_type_scope_file_end(f);
+    return def.type_scope;
+}
+
+/* open_imports: a name the own module and the named imports leave unbound is
+ * the one type of that name across the open packages, or nothing. */
+TEST(type_scope_open_imports_one_answer_or_none) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "Widget", "p.x.Widget", "Class", false);
+    cbm_registry_add(u.reg, "Widget", "p.y.Widget", "Class", false);
+    cbm_registry_add(u.reg, "Gadget", "p.y.Gadget", "Class", false);
+    cbm_registry_add(u.reg, "Local", "p.x.Local", "Class", false);
+    cbm_registry_add(u.reg, "Thing", "p.app.Thing", "Function", false);
+    cbm_registry_add(u.reg, "Thing", "p.x.Thing", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.open_imports = true;
+    const char *keys[] = {"*", "*", "*"};
+    const char *vals[] = {"p.x", "p.y", "p.x"};
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Gadget", keys, vals, 3, NULL),
+                  "Gadget=p.y.Gadget");
+    /* Two open packages declare Widget: none. */
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "Widget", keys, vals, 3, NULL));
+    /* The own module shadows the open packages: its Local, its Thing (a
+     * function, no type: none). */
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Local", keys, vals, 3, NULL),
+                  "Local=p.app.Local");
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "Thing", keys, vals, 3, NULL));
+    /* A named import shadows them too. */
+    const char *nkeys[] = {"*", "*", "Widget"};
+    const char *nvals[] = {"p.x", "p.y", "p.x.Widget"};
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Widget", nkeys, nvals, 3, NULL),
+                  "Widget=p.x.Widget");
+    /* Without the flag "*" is an ordinary local name: Gadget is unbound. */
+    row.open_imports = false;
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "Gadget", keys, vals, 3, NULL));
+    ts_unit_end(&u);
+    PASS();
+}
+
+static bool ts_implicit_string(const char *name, size_t len) {
+    return len == 6 && memcmp(name, "String", 6) == 0;
+}
+
+/* implicit_external: a name the language's implicit external scope declares
+ * (java.lang.String) is no project type of an open package. */
+TEST(type_scope_implicit_external_scope_gets_none) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "String", "p.y.String", "Class", false);
+    cbm_registry_add(u.reg, "Gadget", "p.y.Gadget", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.open_imports = true;
+    const char *keys[] = {"*"};
+    const char *vals[] = {"p.y"};
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "String", keys, vals, 1, NULL),
+                  "String=p.y.String");
+    row.implicit_external = ts_implicit_string;
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "String", keys, vals, 1, NULL));
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Gadget", keys, vals, 1, NULL),
+                  "Gadget=p.y.Gadget");
+    /* The own module's String still shadows the implicit one. */
+    cbm_registry_add(u.reg, "String", "p.app.String", "Class", false);
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "String", keys, vals, 1, NULL),
+                  "String=p.app.String");
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* nested_types: `Inner` written inside `Outer` is `Outer.Inner`, innermost
+ * enclosing type first, before the module. */
+TEST(type_scope_nested_types_innermost_first) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "Outer", "p.app.Outer", "Class", false);
+    cbm_registry_add(u.reg, "Inner", "p.app.Outer.Inner", "Class", false);
+    cbm_registry_add(u.reg, "Leaf", "p.app.Outer.Inner.Leaf", "Class", false);
+    cbm_registry_add(u.reg, "Deep", "p.app.Outer.Deep", "Class", false);
+    cbm_registry_add(u.reg, "Inner", "p.app.Outer.Deep.Inner", "Class", false);
+    cbm_registry_add(u.reg, "Inner", "p.app.Inner", "Class", false);
+    cbm_registry_add(u.reg, "Gizmo", "p.app.Outer.Gizmo", "Method", false);
+    cbm_registry_add(u.reg, "Gizmo", "p.app.Gizmo", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.nested_types = true;
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.Outer.m", "Method", "Inner", NULL, NULL, 0, NULL),
+                  "Inner=p.app.Outer.Inner");
+    ASSERT_STR_EQ(
+        ts_row_attach(&u, &row, "p.app.Outer.Deep.n", "Method", "Inner", NULL, NULL, 0, NULL),
+        "Inner=p.app.Outer.Deep.Inner");
+    /* A type's own texts are written inside it. */
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.Outer", "Class", "Inner", NULL, NULL, 0, NULL),
+                  "Inner=p.app.Outer.Inner");
+    ASSERT_STR_EQ(
+        ts_row_attach(&u, &row, "p.app.Outer.m", "Method", "Inner.Leaf", NULL, NULL, 0, NULL),
+        "Inner.Leaf=p.app.Outer.Inner.Leaf");
+    /* At module level, the module's. */
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Inner", NULL, NULL, 0, NULL),
+                  "Inner=p.app.Inner");
+    /* The enclosing type declares Gizmo as a method: the module's Gizmo is
+     * hidden, and a method is no type: nothing. */
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.Outer.m", "Method", "Gizmo", NULL, NULL, 0, NULL));
+    /* Without the flag the module answers. */
+    row.nested_types = false;
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.Outer.m", "Method", "Inner", NULL, NULL, 0, NULL),
+                  "Inner=p.app.Inner");
+    ts_unit_end(&u);
+    PASS();
+}
+
+static const char *ts_visible_widget(void *ud, const char *name, size_t len) {
+    (void)ud;
+    return len == 6 && memcmp(name, "Widget", 6) == 0 ? "p.h.Widget" : NULL;
+}
+
+/* scope_source INCLUDE_CLOSURE: the caller's closure answers the head. */
+TEST(type_scope_include_closure_source) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "Widget", "p.h.Widget", "Class", false);
+    cbm_registry_add(u.reg, "Part", "p.h.Widget.Part", "Class", false);
+    cbm_registry_add(u.reg, "Gadget", "p.app.Gadget", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.scope_source = CBM_TYPE_SCOPE_INCLUDE_CLOSURE;
+    cbm_type_scope_t extra = {.visible = ts_visible_widget};
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "Widget *", NULL, NULL, 0, &extra),
+                  "Widget=p.h.Widget");
+    ASSERT_STR_EQ(
+        ts_row_attach(&u, &row, "p.app.f", "Function", "Widget.Part", NULL, NULL, 0, &extra),
+        "Widget.Part=p.h.Widget.Part");
+    /* Only the closure answers: the own module's Gadget is not visible by
+     * module, and without a closure nothing is. */
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "Gadget", NULL, NULL, 0, &extra));
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "Widget", NULL, NULL, 0, NULL));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* scope_source LEXICAL_NESTING with `::` paths (Ruby constants): the
+ * namespaces enclosing the def, innermost first, then the file's top level;
+ * `::X` and a name nothing nests get none. */
+TEST(type_scope_lexical_nesting_source) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "A", "p.app.A", "Class", false);
+    cbm_registry_add(u.reg, "B", "p.app.A.B", "Class", false);
+    cbm_registry_add(u.reg, "X", "p.app.A.X", "Class", false);
+    cbm_registry_add(u.reg, "X", "p.app.X", "Class", false);
+    cbm_registry_add(u.reg, "Y", "p.app.A.B.Y", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.scope_source = CBM_TYPE_SCOPE_LEXICAL_NESTING;
+    row.colon_paths = true;
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.A.B.m", "Method", "X", NULL, NULL, 0, NULL),
+                  "X=p.app.A.X");
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.A.B.m", "Method", "Y", NULL, NULL, 0, NULL),
+                  "Y=p.app.A.B.Y");
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.A.B.m", "Method", "A::X", NULL, NULL, 0, NULL),
+                  "A::X=p.app.A.X");
+    ASSERT_STR_EQ(ts_row_attach(&u, &row, "p.app.f", "Function", "X", NULL, NULL, 0, NULL),
+                  "X=p.app.X");
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.A.B.m", "Method", "::X", NULL, NULL, 0, NULL));
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.A.B.m", "Method", "Z", NULL, NULL, 0, NULL));
+    /* Outside a definition (no nesting) the row answers nothing. */
+    ts_facts_t empty;
+    cbm_type_scope_t scope = {
+        .reg = u.reg, .module_qn = "p.app", .module_facts = ts_facts(&empty, NULL, 0)};
+    cbm_type_scope_file_t *f = cbm_type_scope_file_begin(&row, &scope);
+    ASSERT_NOT_NULL(f);
+    ASSERT_NULL(cbm_type_scope_resolve(f, "X", 1));
+    cbm_type_scope_file_end(f);
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* colon_paths: `ns::T` is one spelling, its QN joined with `.`; without the
+ * flag `ns` and `T` are two names. */
+TEST(type_scope_colon_paths) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "T", "p.app.ns.T", "Class", false);
+    cbm_registry_add(u.reg, "vector", "p.app.std.vector", "Class", false);
+    cbm_type_scope_lang_t row = ts_row();
+    row.colon_paths = true;
+    ASSERT_STR_EQ(
+        ts_row_attach(&u, &row, "p.app.f", "Function", "std::vector<ns::T>", NULL, NULL, 0, NULL),
+        "std::vector=p.app.std.vector|ns::T=p.app.ns.T");
+    row.colon_paths = false;
+    ASSERT_NULL(ts_row_attach(&u, &row, "p.app.f", "Function", "ns::T", NULL, NULL, 0, NULL));
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* The calling file's own table: each local its named imports bind, with the
+ * type identity it resolves to; Go binds packages (none); the open key and
+ * a non-type are left out. */
+TEST(type_scope_calling_file_imports) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    ts_facts_t facts;
+    const char *keys[] = {"Store", "make", "Store", "Other", "Local"};
+    const char *vals[] = {"p.a.Store", "p.c.make", "p.a.Store", "p.z.Other", "p.app.Local"};
+    const char *bound[] = {"Store", "make", "Other", "Local"};
+    cbm_type_scope_t scope = {.reg = u.reg,
+                              .module_qn = "p.app",
+                              .imp_keys = keys,
+                              .imp_vals = vals,
+                              .imp_count = 5,
+                              .module_facts = ts_facts(&facts, bound, 4)};
+    cbm_type_scope_file_t *f =
+        cbm_type_scope_file_begin(cbm_type_scope_lang(CBM_LANG_PYTHON), &scope);
+    ASSERT_NOT_NULL(f);
+    const char *const *locals = NULL;
+    const char *const *qns = NULL;
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 2);
+    ASSERT_STR_EQ(locals[0], "Store");
+    ASSERT_STR_EQ(qns[0], "p.a.Store");
+    ASSERT_STR_EQ(locals[1], "Local");
+    ASSERT_STR_EQ(qns[1], "p.app.Local");
+    /* Built once: the same arrays again. */
+    const char *const *again = NULL;
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &again, NULL), 2);
+    ASSERT(again == locals);
+    cbm_type_scope_file_end(f);
+    /* A module whose bindings cannot be listed (a star import) has none. */
+    facts.items[4] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_IMPORT_STAR};
+    facts.facts.count = 5;
+    f = cbm_type_scope_file_begin(cbm_type_scope_lang(CBM_LANG_PYTHON), &scope);
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 0);
+    cbm_type_scope_file_end(f);
+    const char *gkeys[] = {"a"};
+    const char *gvals[] = {"p.a"};
+    cbm_type_scope_t go = {
+        .reg = u.reg, .module_qn = "p.app", .imp_keys = gkeys, .imp_vals = gvals, .imp_count = 1};
+    f = cbm_type_scope_file_begin(cbm_type_scope_lang(CBM_LANG_GO), &go);
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 0);
+    cbm_type_scope_file_end(f);
+    ASSERT_EQ(cbm_type_scope_file_imports(NULL, &locals, &qns), 0);
+    ASSERT_NULL(locals);
+    /* An open row leaves its open key out. */
+    cbm_type_scope_lang_t row = ts_row();
+    row.open_imports = true;
+    const char *okeys[] = {"*", "Store"};
+    const char *ovals[] = {"p.a", "p.a.Store"};
+    cbm_type_scope_t open = {
+        .reg = u.reg, .module_qn = "p.app", .imp_keys = okeys, .imp_vals = ovals, .imp_count = 2};
+    f = cbm_type_scope_file_begin(&row, &open);
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 1);
+    ASSERT_STR_EQ(locals[0], "Store");
+    cbm_type_scope_file_end(f);
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* A walk reads its calling file's table from the same scope the collector
+ * attaches with: none without a context or for an engine that reads no
+ * identities. */
+TEST(type_scope_calling_file_scope_per_engine) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    ts_facts_t facts;
+    const char *keys[] = {"Store"};
+    const char *vals[] = {"p.a.Store"};
+    CBMFileResult *fr = calloc(1, sizeof(*fr));
+    ASSERT_NOT_NULL(fr);
+    fr->py_namespace = *ts_facts(&facts, keys, 1);
+    cbm_pipeline_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    ASSERT_NOT_NULL(ctx);
+    ctx->registry = u.reg;
+    cbm_type_scope_file_t *f = cbm_pxc_file_scope(ctx, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1);
+    ASSERT_NOT_NULL(f);
+    const char *const *locals = NULL;
+    const char *const *qns = NULL;
+    ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 1);
+    ASSERT_STR_EQ(qns[0], "p.a.Store");
+    cbm_type_scope_file_end(f);
+    ASSERT_NULL(cbm_pxc_file_scope(NULL, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1));
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_CPP, fr, "p.app", keys, vals, 1));
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_JAVA, fr, "p.app", keys, vals, 1));
+    free(ctx);
+    free(fr);
+    ts_unit_end(&u);
+    PASS();
+}
+
+/* Counted work of the step for `defs` methods four types deep, each writing
+ * `names` member-type names (nested_types), or the same names through
+ * `open` open packages (open_imports). */
+static uint64_t ts_row_work(int defs, int names, int open, bool nested) {
+    ts_unit_t u;
+    ts_unit_begin(&u);
+    cbm_registry_add(u.reg, "N0", "p.app.N0", "Class", false);
+    cbm_registry_add(u.reg, "N1", "p.app.N0.N1", "Class", false);
+    cbm_registry_add(u.reg, "N2", "p.app.N0.N1.N2", "Class", false);
+    cbm_registry_add(u.reg, "N3", "p.app.N0.N1.N2.N3", "Class", false);
+    char buf[64];
+    size_t text_cap = (size_t)names * 16 + 1;
+    char *text = calloc(1, text_cap);
+    const char *keys[16];
+    const char *vals[16];
+    char owned[16][16];
+    open = open < 16 ? open : 16;
+    for (int i = 0; i < names; i++) {
+        snprintf(buf, sizeof(buf), nested ? "p.app.N0.M%d" : "p.o0.M%d", i);
+        cbm_registry_add(u.reg, "M", buf, "Class", false);
+        size_t at = strlen(text);
+        snprintf(text + at, text_cap - at, "%sM%d", i ? "|" : "", i);
+    }
+    for (int i = 0; i < open; i++) {
+        snprintf(owned[i], sizeof(owned[i]), "p.o%d", i);
+        keys[i] = "*";
+        vals[i] = owned[i];
+    }
+    cbm_type_scope_lang_t row = ts_row();
+    row.nested_types = nested;
+    row.open_imports = !nested;
+    cbm_type_scope_t scope = {
+        .reg = u.reg, .module_qn = "p.app", .imp_keys = keys, .imp_vals = vals, .imp_count = open};
+    cbm_type_scope_file_t *f = cbm_type_scope_file_begin(&row, &scope);
+    uint64_t before = cbm_type_scope_test_work();
+    for (int d = 0; f && d < defs; d++) {
+        snprintf(buf, sizeof(buf), "p.app.N0.N1.N2.N3.m%d", d);
+        CBMLSPDef def = {.qualified_name = buf, .short_name = "m", .label = "Method"};
+        def.return_types = text;
+        cbm_type_scope_attach(f, &u.arena, &def);
+    }
+    uint64_t work = cbm_type_scope_test_work() - before;
+    cbm_type_scope_file_end(f);
+    free(text);
+    ts_unit_end(&u);
+    return work;
+}
+
+TEST(type_scope_nested_and_open_work_grow_linearly) {
+    struct {
+        const char *what;
+        uint64_t small;
+        uint64_t large;
+    } cases[] = {
+        {"nested, defs", ts_row_work(500, 40, 0, true), ts_row_work(1000, 40, 0, true)},
+        {"nested, names", ts_row_work(50, 400, 0, true), ts_row_work(50, 800, 0, true)},
+        {"open, defs", ts_row_work(500, 40, 8, false), ts_row_work(1000, 40, 8, false)},
+        {"open, names", ts_row_work(50, 400, 8, false), ts_row_work(50, 800, 8, false)},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        double ratio = (double)cases[i].large / (double)(cases[i].small ? cases[i].small : 1);
+        printf("    %s: %llu -> %llu (x%.2f)\n", cases[i].what, (unsigned long long)cases[i].small,
+               (unsigned long long)cases[i].large, ratio);
+        ASSERT_GT(cases[i].small, 0);
+        ASSERT(ratio > 1.7 && ratio < 2.3);
+    }
+    PASS();
+}
+
+/* The fold's rows keep each engine's present case: Go and C fold their
+ * structs' fields in declaration order; CUDA files fold none. */
+static const char *ts_folded_fields(CBMLanguage lang, const char *rel, const char *src,
+                                    const char *owner_label, char *out, size_t cap) {
+    out[0] = '\0';
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), lang, "p", rel, 0, NULL, NULL);
+    if (!r) {
+        return "<no result>";
+    }
+    CBMFileResult *cache[] = {r};
+    char rel_path[32];
+    snprintf(rel_path, sizeof(rel_path), "%s", rel);
+    cbm_file_info_t files[] = {{.rel_path = rel_path, .language = lang}};
+    char *modules[1] = {NULL};
+    int count = 0;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs =
+        cbm_pxc_collect_all_defs(NULL, &arena, cache, files, 1, "p", modules, &count, NULL);
+    for (int i = 0; defs && i < count; i++) {
+        if (defs[i].label && strcmp(defs[i].label, owner_label) == 0) {
+            snprintf(out, cap, "%s", defs[i].field_defs ? defs[i].field_defs : "(none)");
+            break;
+        }
+    }
+    free(defs);
+    free(modules[0]);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    return out;
+}
+
+TEST(type_scope_field_fold_rows) {
+    char got[128];
+    ASSERT_STR_EQ(ts_folded_fields(CBM_LANG_GO, "a.go",
+                                   "package p\ntype T struct {\n\tA int\n\tB *T\n}\n", "Struct",
+                                   got, sizeof(got)),
+                  "A:int|B:*T");
+    const char *c_src = "struct point { int x; double y; };\n";
+    ASSERT_STR_EQ(ts_folded_fields(CBM_LANG_C, "a.c", c_src, "Class", got, sizeof(got)),
+                  "x:int|y:double");
+    ASSERT_STR_EQ(ts_folded_fields(CBM_LANG_CUDA, "a.cu", c_src, "Class", got, sizeof(got)),
+                  "(none)");
+    PASS();
+}
+
 /* ── Growth: counted work at two sizes ─────────────────────────────── */
 
 static bool ts_linear(uint64_t small, uint64_t large) {
@@ -2415,6 +2917,17 @@ SUITE(type_scope) {
     RUN_TEST(type_scope_python_class_body_bindings);
     RUN_TEST(type_scope_python_type_parameters);
     RUN_TEST(type_scope_python_unlisted_bindings_get_none);
+    RUN_TEST(type_scope_engine_table_rows);
+    RUN_TEST(type_scope_open_imports_one_answer_or_none);
+    RUN_TEST(type_scope_implicit_external_scope_gets_none);
+    RUN_TEST(type_scope_nested_types_innermost_first);
+    RUN_TEST(type_scope_include_closure_source);
+    RUN_TEST(type_scope_lexical_nesting_source);
+    RUN_TEST(type_scope_colon_paths);
+    RUN_TEST(type_scope_calling_file_imports);
+    RUN_TEST(type_scope_calling_file_scope_per_engine);
+    RUN_TEST(type_scope_nested_and_open_work_grow_linearly);
+    RUN_TEST(type_scope_field_fold_rows);
     RUN_TEST(type_scope_step_work_grows_linearly);
     RUN_TEST(type_scope_lookup_work_grows_linearly);
     RUN_TEST(type_scope_reach_work_grows_linearly);
