@@ -3678,7 +3678,8 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
 }
 
 TEST(tool_get_code_snippet_pages_markdown_section_body) {
-    char repo[] = "/tmp/cbm-mcp-section-XXXXXX";
+    char repo[512];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-section-XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(repo));
     char path[512];
     snprintf(path, sizeof(path), "%s/PRD.md", repo);
