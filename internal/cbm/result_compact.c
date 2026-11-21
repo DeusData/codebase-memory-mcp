@@ -282,6 +282,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
     cr_str(c, &d->alias_target);
+    cr_str(c, &d->mixin_refs);
     /* The type-facts record: one record, then its strings. */
     cr_array(c, (void **)&d->type_facts, d->type_facts ? 1 : 0, sizeof(CBMDefTypeFacts));
     CBMDefTypeFacts *facts = (CBMDefTypeFacts *)d->type_facts;

@@ -2629,7 +2629,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                             census_len(def->client_route_path) + census_len(def->impl_trait) +
                             census_len(def->http_base_url) + census_list(def->extra_props) +
                             census_len(def->decl_namespace) + census_len(def->variant_key) +
-                            census_len(def->alias_target);
+                            census_len(def->alias_target) + census_len(def->mixin_refs);
             if (def->type_facts) {
                 str_def_misc += sizeof(*def->type_facts) +
                                 census_len(def->type_facts->type_params) +

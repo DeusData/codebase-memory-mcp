@@ -847,6 +847,8 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_or_null(doc, o, "al", d->alias_target);
+        yyjson_mut_obj_add_bool(doc, o, "sg", d->is_singleton);
+        add_str_or_null(doc, o, "mx", d->mixin_refs);
         /* Stored for the routes that resolve against this row without
          * re-extracting it; never hashed (see SURFACE_CODEC_VERSION). */
         if (identities && d->type_scope) {
@@ -1262,6 +1264,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
+        d->is_singleton = yyjson_get_bool(yyjson_obj_get(o, "sg"));
+        d->mixin_refs = arena_str_or_null(arena, yyjson_obj_get(o, "mx"));
         d->type_scope = arena_str_or_null(arena, yyjson_obj_get(o, "ty"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
