@@ -3179,6 +3179,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(def_modules);
     }
     cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
+    /* Issue #2945 fix: run FastAPI Depends() pass on the parallel pipeline path too */
+    ctx->result_cache = cache;
+    cbm_pipeline_pass_fastapi_depends(ctx, files, file_count);
+    ctx->result_cache = NULL;
     cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {

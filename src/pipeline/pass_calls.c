@@ -1789,8 +1789,15 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
             break;
         }
 
-        CBMFileResult *result = ctx->result_cache ? ctx->result_cache[i] : NULL;
+        bool loaded_spill = false;
+        CBMFileResult *result = ctx->result_cache
+                                    ? cbm_pipeline_result_acquire(ctx, ctx->result_cache, i, NULL,
+                                                                  &loaded_spill)
+                                    : NULL;
         if (!result || !file_has_depends_call(result)) {
+            if (loaded_spill && result) {
+                cbm_free_result(result);
+            }
             continue;
         }
 
@@ -1798,6 +1805,9 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         int source_len = 0;
         char *source = read_file(files[i].path, &source_len);
         if (!source) {
+            if (loaded_spill) {
+                cbm_free_result(result);
+            }
             continue;
         }
 
@@ -1830,6 +1840,9 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
+        if (loaded_spill) {
+            cbm_free_result(result);
+        }
     }
 
     cbm_regfree(&depends_re);
