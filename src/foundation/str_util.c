@@ -312,7 +312,8 @@ bool cbm_validate_project_name(const char *name) {
 
 bool cbm_is_internal_cache_db(const char *filename) {
     return filename && (strcmp(filename, CBM_CONFIG_DB_FILENAME) == 0 ||
-                        strcmp(filename, CBM_CROSS_REPO_DB_FILENAME) == 0);
+                        strcmp(filename, CBM_CROSS_REPO_DB_FILENAME) == 0 ||
+                        strcmp(filename, CBM_ACTIVITY_DB_FILENAME) == 0);
 }
 
 bool cbm_is_project_index_db(const char *filename) {

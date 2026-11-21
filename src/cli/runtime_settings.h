@@ -8,6 +8,11 @@
  * subsystems. Saved environment values are immutable for this process; they
  * never enter the inherited process environment. */
 bool cbm_runtime_settings_init(const char *cache_dir);
+/* The same for a cache this process may only read: the directory is never
+ * created and never hardened, only verified owner-only
+ * (cbm_daemon_ipc_private_directory_verify), and a hot _config.db journal is
+ * refused rather than rolled back. */
+bool cbm_runtime_settings_init_read_only(const char *cache_dir);
 bool cbm_runtime_settings_initialized(void);
 
 /* JSON API. Returned strings use CBM_MEM_CLASS_OTHER; the caller releases them
