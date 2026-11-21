@@ -5318,7 +5318,10 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "15 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "tools/list") != NULL);
+    ASSERT(strstr(sk[0].content, "15 MCP Tools") == NULL);
+    ASSERT(strstr(sk[0].content, "WHERE NOT EXISTS { (f)<-[:CALLS]-() }") != NULL);
+    ASSERT(strstr(sk[0].content, "not natural-language sentences") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -12371,7 +12374,7 @@ TEST(cli_codex_skill_migrates_every_released_legacy_payload) {
     cbm_cli_set_client_selection_for_testing("codex");
 
     size_t released_count = cbm_cli_released_skill_content_count();
-    bool migrated_all = released_count == 4U;
+    bool migrated_all = released_count == 5U;
     for (size_t i = 0U; migrated_all && i < released_count; i++) {
         const char *released = cbm_cli_released_skill_content_at(i);
         test_mkdirp(legacy_dir);

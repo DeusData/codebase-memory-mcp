@@ -1349,6 +1349,7 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "INHERITS"));
     ASSERT_NOT_NULL(strstr(json, "IMPLEMENTS"));
     ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
+    ASSERT_NOT_NULL(strstr(json, "Keywords; [] ignored; else omit query."));
     free(json);
     PASS();
 }
