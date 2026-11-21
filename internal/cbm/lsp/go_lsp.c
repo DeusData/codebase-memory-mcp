@@ -33,6 +33,8 @@ static const CBMType *go_lookup_field(GoLSPContext *ctx, const char *type_qn,
                                       const char *field_name, int depth);
 static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, TSNode root,
                                          const char *source, const char *module_qn);
+static const char *go_embedded_spelling(const char **next, size_t *len);
+static const char *go_embedded_field_name(CBMArena *a, const char *s, size_t len);
 
 // --- Initialization ---
 
@@ -125,6 +127,90 @@ static const CBMType *resolve_builtin_type(GoLSPContext *ctx, const char *name) 
 
 // --- go_parse_type_node: AST type node -> CBMType ---
 
+/* ── Type names a function declares itself ────────────────────────────
+ *
+ * A function's type parameters (and its receiver's) and the types it declares
+ * in its body are not the package's types of those names: `func F[T any](x T)`
+ * and `func F() { type T struct{...}; var t T }` in a package with its own T.
+ * The walker types such a name as unknown (it abstains) instead of the
+ * package-level type. Each one is bound in the walker's own lexical scope
+ * under a key no identifier can spell ("#T"), so it holds exactly where Go's
+ * does: a type parameter for the function, a local type from its declaration
+ * to the end of its block or closure. */
+#define GO_SHADOW_KEY_MAX 256
+
+static bool go_shadow_key(const char *name, char *key) {
+    size_t n = name ? strlen(name) : 0;
+    if (n == 0 || n + 2 > GO_SHADOW_KEY_MAX) {
+        return false;
+    }
+    key[0] = '#';
+    memcpy(key + 1, name, n + 1);
+    return true;
+}
+
+static bool go_type_shadowed(const GoLSPContext *ctx, const char *name) {
+    char key[GO_SHADOW_KEY_MAX];
+    return go_shadow_key(name, key) && cbm_scope_contains(ctx->current_scope, key);
+}
+
+static void go_shadow_add(GoLSPContext *ctx, TSNode name_node) {
+    char *name = ts_node_is_null(name_node) ? NULL : lsp_node_text(ctx, name_node);
+    char key[GO_SHADOW_KEY_MAX];
+    if (!name || strcmp(name, "_") == 0 || !go_shadow_key(name, key)) {
+        return;
+    }
+    cbm_scope_bind(ctx->current_scope, cbm_arena_strdup(ctx->arena, key), cbm_type_unknown());
+}
+
+/* `[K comparable, V any]`: every name of every type_parameter_declaration. */
+static void go_shadow_type_params(GoLSPContext *ctx, TSNode list) {
+    uint32_t n = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode decl = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(decl), "type_parameter_declaration") != 0) {
+            continue;
+        }
+        uint32_t cc = ts_node_child_count(decl);
+        for (uint32_t k = 0; k < cc; k++) {
+            const char *field = ts_node_field_name_for_child(decl, k);
+            if (field && strcmp(field, "name") == 0) {
+                go_shadow_add(ctx, ts_node_child(decl, k));
+            }
+        }
+    }
+}
+
+/* A generic receiver `(s *Set[K, V])` declares K and V: the type identifiers
+ * inside the receiver type's type arguments. */
+static void go_shadow_receiver_params(GoLSPContext *ctx, TSNode node, bool in_args, int depth) {
+    if (ts_node_is_null(node) || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (in_args && strcmp(kind, "type_identifier") == 0) {
+        go_shadow_add(ctx, node);
+        return;
+    }
+    bool args = in_args || strcmp(kind, "type_arguments") == 0;
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        go_shadow_receiver_params(ctx, ts_node_named_child(node, i), args, depth + 1);
+    }
+}
+
+/* `type T struct{...}` / `type T = U` inside the function being walked. */
+static void go_shadow_declared_types(GoLSPContext *ctx, TSNode decl) {
+    uint32_t n = ts_node_named_child_count(decl);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode spec = ts_node_named_child(decl, i);
+        const char *sk = ts_node_type(spec);
+        if (strcmp(sk, "type_spec") == 0 || strcmp(sk, "type_alias") == 0) {
+            go_shadow_add(ctx, ts_node_child_by_field_name(spec, "name", 4));
+        }
+    }
+}
+
 const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -136,6 +222,8 @@ const CBMType *go_parse_type_node(GoLSPContext *ctx, TSNode node) {
         char *name = lsp_node_text(ctx, node);
         if (!name)
             return cbm_type_unknown();
+        if (go_type_shadowed(ctx, name))
+            return cbm_type_unknown(); /* the function's own T, not the package's */
         const CBMType *builtin = resolve_builtin_type(ctx, name);
         if (builtin)
             return builtin;
@@ -346,6 +434,74 @@ static void go_unify_type(const CBMType *param_type, const CBMType *arg_type,
 
 // --- go_eval_expr_type: recursive expression type evaluator ---
 
+/* Walk a closure's body in a child scope (inheriting every outer binding)
+ * with its declared parameters bound: `func(reg *httpmock.Registry) {
+ * reg.Register(...) }` types `reg` wherever the literal stands (an
+ * argument, an assignment, a composite literal's field value). */
+static void go_walk_func_literal(GoLSPContext *ctx, TSNode node) {
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    CBMScope *saved = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+    if (!ts_node_is_null(params)) {
+        uint32_t nc = ts_node_child_count(params);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode param = ts_node_child(params, i);
+            if (ts_node_is_null(param) || !ts_node_is_named(param) ||
+                strcmp(ts_node_type(param), "parameter_declaration") != 0) {
+                continue;
+            }
+            TSNode type_node = ts_node_child_by_field_name(param, "type", 4);
+            const CBMType *pt = go_parse_type_node(ctx, type_node);
+            uint32_t pnc = ts_node_child_count(param);
+            for (uint32_t j = 0; j < pnc; j++) {
+                TSNode ch = ts_node_child(param, j);
+                if (!ts_node_is_null(ch) && ts_node_is_named(ch) &&
+                    strcmp(ts_node_type(ch), "identifier") == 0) {
+                    char *pname = lsp_node_text(ctx, ch);
+                    if (pname && strcmp(pname, "_") != 0) {
+                        cbm_scope_bind(ctx->current_scope, pname, pt);
+                    }
+                }
+            }
+        }
+    }
+    resolve_calls_in_node(ctx, body);
+    ctx->current_scope = saved;
+}
+
+/* The type a package-level symbol has as an expression: a value's declared
+ * type (CBM_FUNC_FLAG_VALUE: the signature's single result), a function's
+ * own signature. NULL when unknown. */
+static const CBMType *go_symbol_type(const CBMRegisteredFunc *f) {
+    if (!f || !f->signature) {
+        return NULL;
+    }
+    if ((f->flags & CBM_FUNC_FLAG_VALUE) == 0) {
+        return f->signature;
+    }
+    const CBMType **rets =
+        f->signature->kind == CBM_TYPE_FUNC ? f->signature->data.func.return_types : NULL;
+    return rets && rets[0] ? rets[0] : NULL;
+}
+
+/* A package-level symbol a call can target: a function, never a value. */
+static const CBMRegisteredFunc *go_lookup_callable(const CBMTypeRegistry *reg,
+                                                   const char *package_qn, const char *name) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(reg, package_qn, name);
+    return f && (f->flags & CBM_FUNC_FLAG_VALUE) ? NULL : f;
+}
+
+/* The same rule for a lookup by full QN (the fast resolve path). */
+static const CBMRegisteredFunc *go_lookup_func_callable(const CBMTypeRegistry *reg,
+                                                        const char *qn) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_func(reg, qn);
+    return f && (f->flags & CBM_FUNC_FLAG_VALUE) ? NULL : f;
+}
+
 const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return cbm_type_unknown();
@@ -362,12 +518,15 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
         const CBMType *t = cbm_scope_lookup(ctx->current_scope, name);
         if (cbm_scope_contains(ctx->current_scope, name))
             return t ? t : cbm_type_unknown();
+        // A type the function declares itself (a conversion `T(x)`)
+        if (go_type_shadowed(ctx, name))
+            return cbm_type_unknown();
 
-        // Check if it's a package-level function
-        const CBMRegisteredFunc *f =
-            cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
-        if (f && f->signature)
-            return f->signature;
+        // A package-level function or value (of any file of the package)
+        const CBMType *st =
+            go_symbol_type(cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name));
+        if (st)
+            return st;
 
         // Check if it's a builtin type (for type conversions like string(x), int(x))
         const CBMType *bt = resolve_builtin_type(ctx, name);
@@ -400,11 +559,11 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
             if (pkg_name) {
                 const char *pkg_qn = resolve_import(ctx, pkg_name);
                 if (pkg_qn) {
-                    // Look up pkg.Symbol as a function or type
-                    const CBMRegisteredFunc *f =
-                        cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
-                    if (f && f->signature)
-                        return f->signature;
+                    // Look up pkg.Symbol as a function, a value or a type
+                    const CBMType *st = go_symbol_type(
+                        cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name));
+                    if (st)
+                        return st;
                     // Check if it's a type
                     char *type_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", pkg_qn, field_name);
                     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
@@ -805,42 +964,7 @@ const CBMType *go_eval_expr_type(GoLSPContext *ctx, TSNode node) {
     // --- Func literal (closure) ---
     if (strcmp(kind, "func_literal") == 0) {
         // Process the closure body to resolve calls with captured scope
-        TSNode body = ts_node_child_by_field_name(node, "body", 4);
-        if (!ts_node_is_null(body)) {
-            // Push child scope (inherits all outer bindings via parent chain)
-            CBMScope *saved = ctx->current_scope;
-            ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
-
-            // Bind closure parameters
-            TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
-            if (!ts_node_is_null(params)) {
-                uint32_t nc = ts_node_child_count(params);
-                for (uint32_t i = 0; i < nc; i++) {
-                    TSNode param = ts_node_child(params, i);
-                    if (ts_node_is_null(param) || !ts_node_is_named(param))
-                        continue;
-                    if (strcmp(ts_node_type(param), "parameter_declaration") != 0)
-                        continue;
-                    TSNode type_node = ts_node_child_by_field_name(param, "type", 4);
-                    const CBMType *pt = go_parse_type_node(ctx, type_node);
-                    uint32_t pnc = ts_node_child_count(param);
-                    for (uint32_t j = 0; j < pnc; j++) {
-                        TSNode ch = ts_node_child(param, j);
-                        if (!ts_node_is_null(ch) && ts_node_is_named(ch) &&
-                            strcmp(ts_node_type(ch), "identifier") == 0) {
-                            char *pname = lsp_node_text(ctx, ch);
-                            if (pname && strcmp(pname, "_") != 0)
-                                cbm_scope_bind(ctx->current_scope, pname, pt);
-                        }
-                    }
-                }
-            }
-
-            // Walk closure body to resolve calls
-            resolve_calls_in_node(ctx, body);
-
-            ctx->current_scope = saved;
-        }
+        go_walk_func_literal(ctx, node);
 
         // Build full FUNC type with param/return types from AST
         const CBMType *pt_arr[16];
@@ -935,13 +1059,13 @@ const CBMType *go_eval_builtin_call(GoLSPContext *ctx, const char *name, TSNode 
 
 // --- Import-alias re-qualification ------------------------------------
 //
-// parse_field_defs_into_type qualifies struct field type texts as
-// "<def_module>.<text>". When the author wrote the text through an import
-// alias ("Svc:svc.Svc" in module test.main), that yields a QN
-// ("test.main.svc.Svc") that exists nowhere in the project-wide registry —
-// the real QN is "<import_qn>.Svc" and only the calling file's import map
-// can say so. On an exact-QN miss this rewrites the alias segment through
-// the file's imports; returns NULL when no alias segment is involved.
+// parse_field_defs qualifies a struct field type text the defining file's
+// scope did not resolve (no identity in the def's type_scope) as
+// "<def_module>.<text>". Written through an import alias ("Svc:svc.Svc" in
+// module test.main), that yields a QN ("test.main.svc.Svc") that exists
+// nowhere in the project-wide registry. On an exact-QN miss this rewrites the
+// alias segment through the calling file's imports; returns NULL when no alias
+// segment is involved.
 
 static const char *go_requalify_via_imports(GoLSPContext *ctx, const char *type_qn) {
     if (!ctx || !type_qn || !type_qn[0] || ctx->import_count <= 0)
@@ -972,28 +1096,33 @@ static const char *go_requalify_via_imports(GoLSPContext *ctx, const char *type_
     return NULL;
 }
 
+/* Go's selector rule: `x.f` names the field or method f at the shallowest
+ * depth of x's embedding tree that has one, and more than one at that depth
+ * (two embedded types with a method of that name, a field and a method) is
+ * no selection at all. An alias is its target, at the same depth. The walk is
+ * breadth-first and visits each type once; max_depth is the depth the
+ * depth-first walks it replaces went to. The one member, or none. */
+typedef struct {
+    const CBMRegisteredFunc *method;
+    const CBMType *field;
+    const char *field_owner; /* the type declaring the field */
+    int found;               /* distinct members at the shallowest depth with any */
+} go_member_t;
+
+enum { GO_FIELD_LOOKUP_DEPTH = 5 }; /* the depth go_lookup_field always went to */
+
+static go_member_t go_select_member(GoLSPContext *ctx, const char *type_qn, const char *name,
+                                    int max_depth);
+
+/* A field's type: the type's own field, else the one member the selector
+ * rule picks (go_select_member) when that is a field. */
 static const CBMType *go_lookup_field(GoLSPContext *ctx, const char *type_qn,
                                       const char *field_name, int depth) {
-    if (!type_qn || !field_name || depth > 5)
+    (void)depth;
+    if (!type_qn || !field_name)
         return NULL;
-
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
-    if (!rt && depth == 0) {
-        /* Import-alias re-qualification: field texts from cross-package defs
-         * may embed an alias segment only this file's import map resolves. */
-        const char *alt_qn = go_requalify_via_imports(ctx, type_qn);
-        if (alt_qn)
-            rt = cbm_registry_lookup_type(ctx->registry, alt_qn);
-    }
-    if (!rt)
-        return NULL;
-
-    // Follow alias chain
-    if (rt->alias_of)
-        return go_lookup_field(ctx, rt->alias_of, field_name, depth + 1);
-
-    // Direct field lookup
-    if (rt->field_names) {
+    if (rt && !rt->alias_of && rt->field_names) {
         for (int i = 0; rt->field_names[i]; i++) {
             if (strcmp(rt->field_names[i], field_name) == 0 && rt->field_types &&
                 rt->field_types[i]) {
@@ -1001,74 +1130,138 @@ static const CBMType *go_lookup_field(GoLSPContext *ctx, const char *type_qn,
             }
         }
     }
-
-    // Promoted fields from embedded types
-    if (rt->embedded_types) {
-        for (int i = 0; rt->embedded_types[i]; i++) {
-            const CBMType *f = go_lookup_field(ctx, rt->embedded_types[i], field_name, depth + 1);
-            if (f)
-                return f;
-        }
-    }
-
-    return NULL;
+    go_member_t m = go_select_member(ctx, type_qn, field_name, GO_FIELD_LOOKUP_DEPTH);
+    return m.field && !cbm_type_is_unknown(m.field) ? m.field : NULL;
 }
 
 // --- go_lookup_field_or_method: method sets + embedding ---
 
-static const CBMRegisteredFunc *go_lookup_field_or_method_depth(GoLSPContext *ctx,
-                                                                const char *type_qn,
-                                                                const char *member_name,
-                                                                int depth) {
-    if (!type_qn || !member_name)
-        return NULL;
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
-        return NULL;
+static void go_member_note(go_member_t *m, const CBMRegisteredFunc *method, const CBMType *field,
+                           const char *owner) {
+    if (!method && !field) {
+        return; /* nothing of that name here */
+    }
+    if (method) {
+        if (m->method == method ||
+            (m->method && m->method->qualified_name && method->qualified_name &&
+             strcmp(m->method->qualified_name, method->qualified_name) == 0)) {
+            return;
+        }
+        if (!m->method) {
+            m->method = method;
+        }
+        m->found++;
+        return;
+    }
+    if (m->field_owner && owner && strcmp(m->field_owner, owner) == 0) {
+        return;
+    }
+    if (!m->field) {
+        m->field = field;
+        m->field_owner = owner;
+    }
+    m->found++;
+}
 
-    // Direct method lookup
-    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
-    if (f)
-        return f;
-
-    /* Import-alias re-qualification fallback: NAMED receivers built from
-     * cross-package field type texts can carry a "<module>.svc.Svc" QN;
-     * retry the method set on the import-resolved QN (see
-     * go_requalify_via_imports). */
-    if (depth == 0) {
-        const char *alt_qn = go_requalify_via_imports(ctx, type_qn);
-        if (alt_qn) {
-            f = go_lookup_field_or_method_depth(ctx, alt_qn, member_name, depth + 1);
-            if (f)
-                return f;
+static const CBMType *go_own_field(const CBMRegisteredType *rt, const char *name) {
+    for (int i = 0; rt->field_names && rt->field_names[i]; i++) {
+        if (strcmp(rt->field_names[i], name) == 0) {
+            return rt->field_types && rt->field_types[i] ? rt->field_types[i] : cbm_type_unknown();
         }
     }
+    return NULL;
+}
 
-    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
-    if (rt) {
-        // Follow type alias chain
-        if (rt->alias_of) {
-            f = go_lookup_field_or_method_depth(ctx, rt->alias_of, member_name, depth + 1);
-            if (f)
-                return f;
+/* Append `qn` to a level unless the walk has seen it. */
+static void go_member_push(CBMArena *a, CBMHashTable *seen, const char ***level, int *count,
+                           int *cap, const char *qn) {
+    if (!qn || !seen || cbm_ht_get(seen, qn)) {
+        return;
+    }
+    cbm_ht_set(seen, qn, (void *)qn);
+    if (*count == *cap) {
+        int grown_cap = *cap ? *cap * 2 : 8;
+        const char **grown = (const char **)cbm_arena_alloc(a, (size_t)grown_cap * sizeof(char *));
+        if (!grown) {
+            return;
         }
+        if (*count) {
+            memcpy(grown, *level, (size_t)*count * sizeof(char *));
+        }
+        *level = grown;
+        *cap = grown_cap;
+    }
+    (*level)[(*count)++] = qn;
+}
 
-        // Check embedded types (promoted methods)
-        if (rt->embedded_types) {
-            for (int i = 0; rt->embedded_types[i]; i++) {
-                f = go_lookup_field_or_method_depth(ctx, rt->embedded_types[i], member_name,
-                                                    depth + 1);
-                if (f)
-                    return f;
+static go_member_t go_select_member(GoLSPContext *ctx, const char *type_qn, const char *name,
+                                    int max_depth) {
+    go_member_t m = {0};
+    CBMHashTable *seen = cbm_ht_create(16);
+    if (!type_qn || !name || !seen) {
+        cbm_ht_free(seen);
+        return m;
+    }
+    const char **level = NULL;
+    int count = 0;
+    int cap = 0;
+    go_member_push(ctx->arena, seen, &level, &count, &cap, type_qn);
+    /* Import-alias re-qualification: NAMED receivers built from cross-package
+     * field type texts can carry a "<module>.svc.Svc" QN only this file's
+     * import map resolves (go_requalify_via_imports); it names the same type. */
+    go_member_push(ctx->arena, seen, &level, &count, &cap, go_requalify_via_imports(ctx, type_qn));
+    for (int depth = 0; count > 0 && depth <= max_depth && m.found == 0; depth++) {
+        const char **next = NULL;
+        int next_count = 0;
+        int next_cap = 0;
+        for (int i = 0; i < count; i++) {
+            const char *t = level[i];
+            while (t) {
+                go_member_note(&m, cbm_registry_lookup_method(ctx->registry, t, name), NULL, NULL);
+                const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, t);
+                if (!rt) {
+                    break;
+                }
+                const CBMType *field = go_own_field(rt, name);
+                if (field) {
+                    go_member_note(&m, NULL, field, t);
+                }
+                for (int e = 0; rt->embedded_types && rt->embedded_types[e]; e++) {
+                    go_member_push(ctx->arena, seen, &next, &next_count, &next_cap,
+                                   rt->embedded_types[e]);
+                }
+                /* the alias target is this type, at this depth */
+                const char *target = rt->alias_of;
+                t = target && !cbm_ht_get(seen, target) ? target : NULL;
+                if (t) {
+                    cbm_ht_set(seen, t, (void *)t);
+                }
             }
         }
+        level = next;
+        count = next_count;
     }
-
-    return NULL;
+    cbm_ht_free(seen);
+    if (m.found != 1) {
+        m.method = NULL;
+        m.field = NULL;
+    }
+    return m;
 }
 
 const CBMRegisteredFunc *go_lookup_field_or_method(GoLSPContext *ctx, const char *type_qn,
                                                    const char *member_name) {
-    return go_lookup_field_or_method_depth(ctx, type_qn, member_name, 0);
+    if (!type_qn || !member_name)
+        return NULL;
+    // Direct method lookup (a type has no field of a method's name)
+    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
+    if (f)
+        return f;
+    // Its own field of that name: a field, never a promoted method
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (rt && !rt->alias_of && go_own_field(rt, member_name))
+        return NULL;
+    return go_select_member(ctx, type_qn, member_name, CBM_LSP_MAX_LOOKUP_DEPTH).method;
 }
 
 /* Resolve only source forms that prove one callable identity.  This is
@@ -1093,8 +1286,7 @@ static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node) {
         if (cbm_scope_contains(ctx->current_scope, name)) {
             return cbm_scope_lookup_callable(ctx->current_scope, name);
         }
-        const CBMRegisteredFunc *f =
-            cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
+        const CBMRegisteredFunc *f = go_lookup_callable(ctx->registry, ctx->package_qn, name);
         return f ? f->qualified_name : NULL;
     }
 
@@ -1111,8 +1303,7 @@ static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node) {
             char *local = lsp_node_text(ctx, operand);
             const char *package_qn = local ? resolve_import(ctx, local) : NULL;
             if (package_qn) {
-                const CBMRegisteredFunc *f =
-                    cbm_registry_lookup_symbol(ctx->registry, package_qn, member);
+                const CBMRegisteredFunc *f = go_lookup_callable(ctx->registry, package_qn, member);
                 return f ? f->qualified_name : NULL;
             }
         }
@@ -1529,6 +1720,17 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
         return;
     const char *kind = ts_node_type(node);
 
+    /* A closure the walk reaches is walked with its parameters bound, not
+     * as plain children in the enclosing scope. */
+    if (strcmp(kind, "func_literal") == 0) {
+        go_walk_func_literal(ctx, node);
+        return;
+    }
+    /* A type declared in the function shadows the package's from here on. */
+    if (ctx->in_function && strcmp(kind, "type_declaration") == 0) {
+        go_shadow_declared_types(ctx, node);
+    }
+
     // Process statements to build scope
     go_process_statement(ctx, node);
 
@@ -1559,7 +1761,7 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
                             const char *pkg_qn = resolve_import(ctx, pkg_name);
                             if (pkg_qn && field_name) {
                                 const CBMRegisteredFunc *f =
-                                    cbm_registry_lookup_symbol(ctx->registry, pkg_qn, field_name);
+                                    go_lookup_callable(ctx->registry, pkg_qn, field_name);
                                 if (f) {
                                     emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f,
                                                        node);
@@ -1755,7 +1957,7 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
                     }
                     // Package-local function
                     const CBMRegisteredFunc *f =
-                        cbm_registry_lookup_symbol(ctx->registry, ctx->package_qn, name);
+                        go_lookup_callable(ctx->registry, ctx->package_qn, name);
                     if (f) {
                         emit_resolved_call(ctx, f->qualified_name, "lsp_direct", 0.95f, node);
                     } else {
@@ -2018,6 +2220,17 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
     CBMScope *saved_scope = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
 
+    // The function's type parameters (and its receiver's) shadow the
+    // package's types of those names, in its signature and its body (bound in
+    // the function scope just pushed).
+    bool saved_in_function = ctx->in_function;
+    ctx->in_function = true;
+    go_shadow_type_params(ctx, ts_node_child_by_field_name(func_node, "type_parameters", 15));
+    if (strcmp(ts_node_type(func_node), "method_declaration") == 0) {
+        go_shadow_receiver_params(ctx, ts_node_child_by_field_name(func_node, "receiver", 8), false,
+                                  0);
+    }
+
     // Bind parameters into scope (including variadic)
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
     if (!ts_node_is_null(params)) {
@@ -2129,6 +2342,7 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
 
     // Restore scope
     ctx->current_scope = saved_scope;
+    ctx->in_function = saved_in_function;
 }
 
 // --- Process entire file ---
@@ -2171,18 +2385,23 @@ void go_lsp_process_file(GoLSPContext *ctx, TSNode root) {
 
 // --- Helper: parse Go return type text into CBMType ---
 
-const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const char *module_qn) {
+/* scope_ix: the defining def's resolved type identities (CBMLSPDef.type_scope,
+ * indexed), NULL when it has none. A named type the scope knows is that
+ * identity; any other named type keeps the module qualification. */
+static const CBMType *go_parse_type_text_scoped(CBMArena *a, const char *text,
+                                                const char *module_qn,
+                                                const cbm_type_scope_index_t *scope_ix) {
     if (!text || !text[0])
         return cbm_type_unknown();
 
     // Pointer: *Foo
     if (text[0] == '*') {
-        return cbm_type_pointer(a, cbm_parse_return_type_text(a, text + 1, module_qn));
+        return cbm_type_pointer(a, go_parse_type_text_scoped(a, text + 1, module_qn, scope_ix));
     }
 
     // Slice: []Foo
     if (text[0] == '[' && text[1] == ']') {
-        return cbm_type_slice(a, cbm_parse_return_type_text(a, text + 2, module_qn));
+        return cbm_type_slice(a, go_parse_type_text_scoped(a, text + 2, module_qn, scope_ix));
     }
 
     // Builtin types
@@ -2195,19 +2414,30 @@ const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const c
             return cbm_type_builtin(a, text);
     }
 
+    // Named type the defining file's scope resolved (`pkg.T` through its import).
+    const char *scoped = cbm_type_scope_find(scope_ix, text, strlen(text));
+    if (scoped) {
+        return cbm_type_named(a, scoped);
+    }
+
     // Named type: assume local to module
     return cbm_type_named(a, cbm_arena_sprintf(a, "%s.%s", module_qn, text));
 }
 
+const CBMType *cbm_parse_return_type_text(CBMArena *a, const char *text, const char *module_qn) {
+    return go_parse_type_text_scoped(a, text, module_qn, NULL);
+}
+
 typedef struct {
     const char *module_qn;
+    const cbm_type_scope_index_t *scope_ix; /* the def's resolved type identities, or NULL */
 } CBMGoLSPSignatureParserContext;
 
 static const CBMType *cbm_go_lsp_parse_signature_param_text(CBMArena *arena, const char *text,
                                                             void *parser_ctx) {
     const CBMGoLSPSignatureParserContext *ctx = (const CBMGoLSPSignatureParserContext *)parser_ctx;
     const char *module_qn = ctx && ctx->module_qn ? ctx->module_qn : "";
-    return cbm_parse_return_type_text(arena, text, module_qn);
+    return go_parse_type_text_scoped(arena, text, module_qn, ctx ? ctx->scope_ix : NULL);
 }
 
 // --- Shared Go stdlib registry ---
@@ -2578,12 +2808,20 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                 if (ts_node_is_null(field_list))
                     continue;
 
-                // Scan field_declarations for embeds and named fields
-                const char *embeds[16];
+                // Scan field_declarations for embeds and named fields: all of
+                // them (no count decides what the registry holds). An embedded
+                // type is also a field named by its unqualified type name.
+                uint32_t fl_cap = ts_node_child_count(field_list) * 2 + 1;
+                const char **embeds =
+                    (const char **)cbm_arena_alloc(arena, fl_cap * sizeof(const char *));
                 int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
+                const char **fld_names =
+                    (const char **)cbm_arena_alloc(arena, fl_cap * sizeof(const char *));
+                const CBMType **fld_types =
+                    (const CBMType **)cbm_arena_alloc(arena, fl_cap * sizeof(const CBMType *));
                 int fld_count = 0;
+                if (!embeds || !fld_names || !fld_types)
+                    continue;
 
                 // Create a temporary LSP context for parsing field types
                 GoLSPContext tmp_ctx;
@@ -2607,18 +2845,24 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
                     if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Embedded field: has type but no name
-                        if (embed_count < 15) {
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            if (embed_text && embed_text[0]) {
-                                const char *et = embed_text;
-                                while (*et == '*')
-                                    et++;
-                                embeds[embed_count++] =
-                                    cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                        char *embed_text = cbm_node_text(arena, ftype, source);
+                        if (embed_text && embed_text[0]) {
+                            const char *et = embed_text;
+                            while (*et == '*')
+                                et++;
+                            const char *eqn = cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
+                            embeds[embed_count++] = eqn;
+                            size_t elen = 0;
+                            const char *enext = embed_text;
+                            const char *es = go_embedded_spelling(&enext, &elen);
+                            const char *ename = es ? go_embedded_field_name(arena, es, elen) : NULL;
+                            if (ename && eqn) {
+                                fld_names[fld_count] = ename;
+                                fld_types[fld_count] = cbm_type_named(arena, eqn);
+                                fld_count++;
                             }
                         }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
+                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
                         // Named field: name + type
                         char *fn = cbm_node_text(arena, fname, source);
                         if (fn && fn[0]) {
@@ -2682,8 +2926,10 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 // --- Cross-file LSP: parse source, build registry from defs, run LSP ---
 
-// Helper: split "|"-separated string into array of CBMType*.
-static const CBMType **split_pipe_types(CBMArena *a, const char *text, const char *module_qn) {
+// Helper: split "|"-separated string into array of CBMType*. scope_ix: the
+// defining def's resolved type identities (go_parse_type_text_scoped).
+static const CBMType **split_pipe_types(CBMArena *a, const char *text, const char *module_qn,
+                                        const cbm_type_scope_index_t *scope_ix) {
     if (!text || !text[0])
         return NULL;
 
@@ -2708,7 +2954,7 @@ static const CBMType **split_pipe_types(CBMArena *a, const char *text, const cha
             char save = *p;
             *p = '\0';
             if (start[0]) {
-                arr[idx++] = cbm_parse_return_type_text(a, start, module_qn);
+                arr[idx++] = go_parse_type_text_scoped(a, start, module_qn, scope_ix);
             }
             if (save == '\0')
                 break;
@@ -2717,6 +2963,256 @@ static const CBMType **split_pipe_types(CBMArena *a, const char *text, const cha
     }
     arr[idx] = NULL;
     return idx > 0 ? arr : NULL;
+}
+
+/* The mark of a QN in the value table below (go_value_qn_counts) whose
+ * definitions give different answers; any other value is the QN's first
+ * definition. */
+static char g_go_qn_shared_mark;
+
+static bool go_type_qn_shared(const CBMHashTable *shared, const char *qn) {
+    return shared && qn && cbm_ht_get(shared, qn) == &g_go_qn_shared_mark;
+}
+
+static bool go_same_text(const char *a, const char *b) {
+    return (!a || !a[0]) ? (!b || !b[0]) : (b && strcmp(a, b) == 0);
+}
+
+/* The QN a package-level value registers under: <package>.<name>, or NULL
+ * for a def that is no typed value. */
+static const char *go_value_qn(CBMArena *a, const CBMLSPDef *d, const char *def_mod) {
+    if (!d->label || strcmp(d->label, "Variable") != 0 || !d->short_name || !d->return_types ||
+        !d->return_types[0] || strchr(d->return_types, '|') || !def_mod || !def_mod[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(a, "%s.%s", def_mod, d->short_name);
+}
+
+/* Every Go def QN and every value QN, marked shared when two defs that give
+ * different answers have it. A directory holds both `package foo` and
+ * `package foo_test`, and their package-level names live under one directory
+ * QN: a value whose QN another definition also has (a value of another type
+ * or identity, a function, a type of the other package) is registered for
+ * neither, so no answer depends on file order. Two values of one QN that
+ * spell the same type with the same identities (build variants of one
+ * declaration) give one answer and stay. NULL on allocation failure (then no
+ * value is registered). */
+static CBMHashTable *go_value_qn_counts(CBMArena *a, const CBMLSPDef *defs, int def_count,
+                                        const char *fallback_mod) {
+    CBMHashTable *seen = cbm_ht_create((uint32_t)(def_count / 4 + 64));
+    for (int i = 0; seen && i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || d->lang != CBM_LANG_GO) {
+            continue;
+        }
+        const char *def_mod = d->def_module_qn ? d->def_module_qn : fallback_mod;
+        const char *value_qn = go_value_qn(a, d, def_mod);
+        const char *keys[2] = {d->qualified_name,
+                               value_qn && strcmp(value_qn, d->qualified_name) != 0 ? value_qn
+                                                                                    : NULL};
+        for (int k = 0; k < 2; k++) {
+            if (!keys[k]) {
+                continue;
+            }
+            void *prev = cbm_ht_get(seen, keys[k]);
+            if (!prev) {
+                cbm_ht_set(seen, keys[k], (void *)d); /* the first definition */
+                continue;
+            }
+            const CBMLSPDef *first = (const CBMLSPDef *)prev;
+            bool same_value =
+                prev != &g_go_qn_shared_mark && value_qn &&
+                go_value_qn(a, first, first->def_module_qn ? first->def_module_qn : fallback_mod) &&
+                go_same_text(first->return_types, d->return_types) &&
+                go_same_text(first->type_scope, d->type_scope);
+            if (!same_value) {
+                cbm_ht_set(seen, keys[k], &g_go_qn_shared_mark);
+            }
+        }
+    }
+    return seen;
+}
+
+/* ── Language hook: promotion of embedded-struct members ─────────────
+ *
+ * Go promotes the methods and fields of an embedded type to the struct that
+ * embeds it. A member lookup on the struct falls through to its embedded
+ * types (go_lookup_promoted), which needs their QNs; a struct from another
+ * file brings them as their source spelling ("logging.LogHolder", "*Base").
+ * The QN of a spelling is its identity in the declaring file's scope
+ * (type_scope.h), or for a bare name the declaring package's own type; a
+ * spelling neither gives is dropped. This is the one Go-specific step on top
+ * of the shared layer. */
+/* One embedded spelling of a '|'-joined list, without its `*` and its type
+ * arguments (a generic instance names its type): sets *len, returns its
+ * start, or NULL at the end of the list. *next moves past it. */
+static const char *go_embedded_spelling(const char **next, size_t *len) {
+    const char *p = *next;
+    if (!p || !*p) {
+        return NULL;
+    }
+    const char *bar = strchr(p, '|');
+    size_t n = bar ? (size_t)(bar - p) : strlen(p);
+    *next = bar ? bar + 1 : p + n;
+    while (n > 0 && *p == '*') {
+        p++;
+        n--;
+    }
+    const char *bracket = memchr(p, '[', n);
+    *len = bracket ? (size_t)(bracket - p) : n;
+    return p;
+}
+
+/* The QN of one embedded spelling: its identity in the declaring file's
+ * scope, or for a bare name the declaring package's own type; NULL when
+ * neither gives one. */
+static const char *go_embedded_qn(CBMArena *a, const char *s, size_t len, const char *def_mod,
+                                  const cbm_type_scope_index_t *scope_ix) {
+    const char *qn = len ? cbm_type_scope_find(scope_ix, s, len) : NULL;
+    if (!qn && len && !memchr(s, '.', len) && def_mod && def_mod[0]) {
+        qn = cbm_arena_sprintf(a, "%s.%.*s", def_mod, (int)len, s);
+    }
+    return qn;
+}
+
+/* The field name an embedded spelling declares: Go's unqualified type name
+ * (`pkg.T` -> `T`). NULL when it has none. */
+static const char *go_embedded_field_name(CBMArena *a, const char *s, size_t len) {
+    const char *name = s;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '.') {
+            name = s + i + 1;
+        }
+    }
+    size_t n = len - (size_t)(name - s);
+    return n ? cbm_arena_strndup(a, name, n) : NULL;
+}
+
+static const char **go_embedded_qns(CBMArena *a, const char *embedded, const char *def_mod,
+                                    const cbm_type_scope_index_t *scope_ix) {
+    if (!embedded || !embedded[0]) {
+        return NULL;
+    }
+    int count = 1;
+    for (const char *p = embedded; *p; p++) {
+        count += *p == '|';
+    }
+    const char **out = (const char **)cbm_arena_alloc(a, (size_t)(count + 1) * sizeof(*out));
+    if (!out) {
+        return NULL;
+    }
+    int n = 0;
+    size_t len = 0;
+    for (const char *next = embedded, *s; (s = go_embedded_spelling(&next, &len)) != NULL;) {
+        const char *qn = go_embedded_qn(a, s, len, def_mod, scope_ix);
+        if (qn) {
+            out[n++] = qn;
+        }
+    }
+    out[n] = NULL;
+    return n > 0 ? out : NULL;
+}
+
+/* Append fields to rt (a name rt already declares keeps its entry). One hash
+ * set of the names, so the cost is linear in the fields. */
+static void go_append_fields(CBMArena *a, CBMRegisteredType *rt, const char *const *names,
+                             const CBMType *const *types, int n) {
+    if (n <= 0) {
+        return;
+    }
+    int had = 0;
+    while (rt->field_names && rt->field_names[had]) {
+        had++;
+    }
+    const char **out_names =
+        (const char **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(char *));
+    const CBMType **out_types =
+        (const CBMType **)cbm_arena_alloc(a, (size_t)(had + n + 1) * sizeof(CBMType *));
+    CBMHashTable *present = cbm_ht_create((uint32_t)(had + n + 8));
+    if (!out_names || !out_types || !present) {
+        cbm_ht_free(present);
+        return;
+    }
+    int count = 0;
+    for (int i = 0; i < had; i++) {
+        out_names[count] = rt->field_names[i];
+        out_types[count++] = rt->field_types ? rt->field_types[i] : NULL;
+        cbm_ht_set(present, rt->field_names[i], (void *)1);
+    }
+    for (int i = 0; i < n; i++) {
+        if (!names[i] || cbm_ht_get(present, names[i])) {
+            continue;
+        }
+        cbm_ht_set(present, names[i], (void *)1);
+        out_names[count] = names[i];
+        out_types[count++] = types[i] ? types[i] : cbm_type_unknown();
+    }
+    cbm_ht_free(present);
+    out_names[count] = NULL;
+    out_types[count] = NULL;
+    rt->field_names = out_names;
+    rt->field_types = out_types;
+}
+
+/* Go's selector rule names an embedded field by its unqualified type name, at
+ * the embedding type's depth: `s.Config` is the embedded Config even where an
+ * embedded type has a field Config one level down, and a method of that name
+ * one level down is shadowed by it. Each embedded spelling of `embedded`
+ * becomes a field of rt: typed as the embedded type when `typed` and its QN is
+ * known, else of unknown type (it shadows, and answers nothing). */
+static void go_add_embedded_fields(CBMArena *a, CBMRegisteredType *rt, const char *embedded,
+                                   const char *def_mod, const cbm_type_scope_index_t *scope_ix,
+                                   bool typed) {
+    if (!embedded || !embedded[0] || rt->is_interface) {
+        return;
+    }
+    int count = 1;
+    for (const char *p = embedded; *p; p++) {
+        count += *p == '|';
+    }
+    const char **names = (const char **)cbm_arena_alloc(a, (size_t)count * sizeof(char *));
+    const CBMType **types = (const CBMType **)cbm_arena_alloc(a, (size_t)count * sizeof(CBMType *));
+    if (!names || !types) {
+        return;
+    }
+    int n = 0;
+    size_t len = 0;
+    for (const char *next = embedded, *s; (s = go_embedded_spelling(&next, &len)) != NULL;) {
+        const char *name = go_embedded_field_name(a, s, len);
+        if (!name) {
+            continue;
+        }
+        const char *qn = typed ? go_embedded_qn(a, s, len, def_mod, scope_ix) : NULL;
+        names[n] = name;
+        types[n++] = qn ? cbm_type_named(a, qn) : cbm_type_unknown();
+    }
+    go_append_fields(a, rt, names, types, n);
+}
+
+/* A package-level value (a Go `var`/`const` Variable def whose declaration or
+ * initializer spells its type): registered under <package>.<name> with
+ * CBM_FUNC_FLAG_VALUE and that type as the signature's single result, so
+ * `pkg.V.Method()` and a bare `V.Method()` of another file are typed. A
+ * value is never a call target (go_lookup_callable, go_lookup_func_callable),
+ * and a QN another definition shares registers no value (go_value_qn_counts). */
+static void go_register_value(CBMTypeRegistry *reg, CBMArena *a, const CBMLSPDef *d,
+                              const char *def_mod, const cbm_type_scope_index_t *scope_ix,
+                              const CBMHashTable *value_qns) {
+    const char *qn = go_value_qn(a, d, def_mod);
+    if (!qn || !value_qns || go_type_qn_shared(value_qns, qn)) {
+        return;
+    }
+    const CBMType **ret = split_pipe_types(a, d->return_types, def_mod, scope_ix);
+    if (!ret || !ret[0] || cbm_type_is_unknown(ret[0])) {
+        return;
+    }
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.qualified_name = qn;
+    rf.short_name = d->short_name;
+    rf.signature = cbm_type_func(a, NULL, NULL, ret);
+    rf.flags = CBM_FUNC_FLAG_VALUE;
+    cbm_registry_add_func(reg, rf);
 }
 
 // Helper: split "|"-separated string into array of const char*.
@@ -2780,16 +3276,15 @@ static const char *go_alias_target_qn(CBMArena *arena, const char *target,
 /* Parse "name:type|name:type" into NULL-terminated name/type arrays. False when
  * nothing parsed (or on allocation failure): the type keeps no field info. */
 static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char *def_module_qn,
-                             const char ***names_out, const CBMType ***types_out) {
+                             const cbm_type_scope_index_t *scope_ix, const char ***names_out,
+                             const CBMType ***types_out) {
 
-    // Count fields
+    // Count fields: all of them (no count decides which fields a struct has)
     int count = 1;
     for (const char *p = field_defs; *p; p++) {
         if (*p == '|')
             count++;
     }
-    if (count > 63)
-        count = 63;
 
     const char **names = (const char **)cbm_arena_alloc(arena, (count + 1) * sizeof(const char *));
     const CBMType **types =
@@ -2815,7 +3310,7 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
             if (colon && idx < count) {
                 *colon = '\0';
                 names[idx] = cbm_arena_strdup(arena, start);
-                types[idx] = cbm_parse_return_type_text(arena, colon + 1, def_module_qn);
+                types[idx] = go_parse_type_text_scoped(arena, colon + 1, def_module_qn, scope_ix);
                 idx++;
             }
             if (save == '\0')
@@ -2830,23 +3325,268 @@ static bool parse_field_defs(CBMArena *arena, const char *field_defs, const char
     return idx > 0;
 }
 
-static void parse_field_defs_into_type(CBMArena *arena, CBMTypeRegistry *reg, const char *type_qn,
-                                       const char *field_defs, const char *def_module_qn) {
-    if (!field_defs || !field_defs[0] || !type_qn)
-        return;
-    const char **names = NULL;
-    const CBMType **types = NULL;
-    if (parse_field_defs(arena, field_defs, def_module_qn, &names, &types)) {
-        // Find the registered type and update field info
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name &&
-                strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
-                reg->types[ti].field_names = names;
-                reg->types[ti].field_types = types;
-                break;
+/* Go module QNs are directories, so a package and its external test package
+ * (`foo` and `foo_test`), or build-tagged variants, can declare two types of
+ * one QN. A type lookup answers with one entry of a name, which one depends on
+ * file order, so what is keyed by such a QN is registered only where every
+ * definition of the QN gives the same answer:
+ *   - a field when every definition declares it with the same type text whose
+ *     name means the same type (its identity, or the package's own type);
+ *   - the embedded types when every definition embeds the same types.
+ * Build variants of one struct keep what they share; `foo` and `foo_test`
+ * declaring different structs of one name keep only what agrees. A name any
+ * definition declares as a field (named or embedded) is still a field of the
+ * QN at its depth, of unknown type where they do not agree, so no deeper
+ * member of that name is selected (go_type_qn_shadow). */
+typedef struct {
+    const CBMLSPDef *first;
+    int count;                /* definitions of the QN */
+    const char *first_embeds; /* the first definition's embedded QNs, '|'-joined */
+    bool embeds_differ;
+    bool fields_done;
+    const char *fields;    /* count > 1: the fields every definition agrees on, or NULL */
+    const CBMLSPDef **all; /* count > 1: every definition of the QN */
+    int all_cap;
+    bool shadow_done;
+    const char **shadow_names; /* every field name some definition declares */
+    int shadow_count;
+} go_type_qn_t;
+
+/* What a field type text means in one definition: the part the parser looks
+ * up after `*` and `[]`, resolved through the def's identities, or NULL for
+ * the package's own name (the same in every definition of one directory). */
+static const char *go_field_type_identity(const cbm_type_scope_index_t *ix, const char *text) {
+    while (text && (*text == '*' || (text[0] == '[' && text[1] == ']'))) {
+        text += *text == '*' ? 1 : 2;
+    }
+    return text ? cbm_type_scope_find(ix, text, strlen(text)) : NULL;
+}
+
+static const char *go_join_embeds(CBMArena *a, const CBMLSPDef *d) {
+    const char *mod = d->def_module_qn ? d->def_module_qn : "";
+    const char **qns =
+        go_embedded_qns(a, d->embedded_types, mod, cbm_type_scope_index(a, d->type_scope));
+    size_t total = 1;
+    for (int i = 0; qns && qns[i]; i++) {
+        total += strlen(qns[i]) + 1;
+    }
+    char *out = (char *)cbm_arena_alloc(a, total);
+    if (!out) {
+        return "";
+    }
+    size_t at = 0;
+    for (int i = 0; qns && qns[i]; i++) {
+        if (i) {
+            out[at++] = '|';
+        }
+        size_t n = strlen(qns[i]);
+        memcpy(out + at, qns[i], n);
+        at += n;
+    }
+    out[at] = '\0';
+    return out;
+}
+
+/* Keep the fields of `agreed` ("name:type|...") that `d` declares alike. */
+static const char *go_agreed_fields(CBMArena *a, const char *agreed, const CBMLSPDef *agreed_def,
+                                    const CBMLSPDef *d) {
+    if (!agreed || !agreed[0] || !d->field_defs || !d->field_defs[0]) {
+        return NULL;
+    }
+    const cbm_type_scope_index_t *agreed_ix = cbm_type_scope_index(a, agreed_def->type_scope);
+    const cbm_type_scope_index_t *d_ix = cbm_type_scope_index(a, d->type_scope);
+    CBMHashTable *mine = cbm_ht_create(16);
+    char *copy = cbm_arena_strdup(a, d->field_defs);
+    for (char *p = copy; mine && p && *p;) {
+        char *bar = strchr(p, '|');
+        if (bar) {
+            *bar = '\0';
+        }
+        char *colon = strchr(p, ':');
+        if (colon) {
+            *colon = '\0';
+            cbm_ht_set(mine, p, colon + 1); /* name -> type text */
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+    /* The kept fields are a subset of `agreed`: one buffer of its size. */
+    char *out = (char *)cbm_arena_alloc(a, strlen(agreed) + 1);
+    size_t at = 0;
+    char *keep = cbm_arena_strdup(a, agreed);
+    for (char *p = keep; mine && out && p && *p;) {
+        char *bar = strchr(p, '|');
+        if (bar) {
+            *bar = '\0';
+        }
+        char *colon = strchr(p, ':');
+        const char *theirs =
+            colon ? (const char *)cbm_ht_get(mine, cbm_arena_strndup(a, p, (size_t)(colon - p)))
+                  : NULL;
+        if (theirs && strcmp(theirs, colon + 1) == 0 &&
+            go_same_text(go_field_type_identity(agreed_ix, colon + 1),
+                         go_field_type_identity(d_ix, theirs))) {
+            size_t n = strlen(p);
+            if (at) {
+                out[at++] = '|';
             }
+            memcpy(out + at, p, n);
+            at += n;
+        }
+        p = bar ? bar + 1 : NULL;
+    }
+    cbm_ht_free(mine);
+    if (!out || at == 0) {
+        return NULL;
+    }
+    out[at] = '\0';
+    return out;
+}
+
+/* QN -> go_type_qn_t for every Go type definition (keys borrowed from defs;
+ * free with cbm_ht_free, entries live in `a`), or NULL on allocation failure
+ * (then a QN of two definitions keeps nothing). */
+static CBMHashTable *go_type_qn_table(CBMArena *a, const CBMLSPDef *defs, int def_count) {
+    CBMHashTable *table = cbm_ht_create((uint32_t)(def_count / 4 + 64));
+    for (int i = 0; table && i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->label || d->lang != CBM_LANG_GO ||
+            !cbm_label_is_type_like(d->label)) {
+            continue;
+        }
+        go_type_qn_t *e = (go_type_qn_t *)cbm_ht_get(table, d->qualified_name);
+        if (!e) {
+            e = (go_type_qn_t *)cbm_arena_alloc(a, sizeof(*e));
+            if (!e) {
+                cbm_ht_free(table);
+                return NULL;
+            }
+            memset(e, 0, sizeof(*e));
+            e->first = d;
+            cbm_ht_set(table, d->qualified_name, e);
+        }
+        e->count++;
+        if (e->count == 2) {
+            e->first_embeds = go_join_embeds(a, e->first);
+            e->fields = e->first->field_defs;
+        }
+        if (e->count >= 2) {
+            e->embeds_differ =
+                e->embeds_differ || !go_same_text(e->first_embeds, go_join_embeds(a, d));
+            e->fields = go_agreed_fields(a, e->fields, e->first, d);
+            if (e->count > e->all_cap) {
+                int cap = e->all_cap ? e->all_cap * 2 : 4;
+                const CBMLSPDef **grown =
+                    (const CBMLSPDef **)cbm_arena_alloc(a, (size_t)cap * sizeof(*grown));
+                if (!grown) {
+                    cbm_ht_free(table);
+                    return NULL;
+                }
+                if (e->all_cap) {
+                    memcpy(grown, e->all, (size_t)(e->count - 1) * sizeof(*grown));
+                } else {
+                    grown[0] = e->first;
+                }
+                e->all = grown;
+                e->all_cap = cap;
+            }
+            e->all[e->count - 1] = d;
         }
     }
+    return table;
+}
+
+/* The field names some definition of a QN of several declares (named fields
+ * and embedded types), each once; computed on the first call. */
+static int go_pipe_pieces(const char *s) {
+    int n = s && *s ? 1 : 0;
+    for (; s && *s; s++) {
+        n += *s == '|';
+    }
+    return n;
+}
+
+static void go_shadow_note(go_type_qn_t *e, CBMHashTable *seen, const char *name) {
+    if (name && !cbm_ht_get(seen, name)) {
+        cbm_ht_set(seen, name, (void *)name);
+        e->shadow_names[e->shadow_count++] = name;
+    }
+}
+
+static void go_type_qn_shadow(CBMArena *a, go_type_qn_t *e) {
+    if (e->shadow_done) {
+        return;
+    }
+    e->shadow_done = true;
+    int bound = 0;
+    for (int i = 0; i < e->count; i++) {
+        bound += go_pipe_pieces(e->all[i]->field_defs) + go_pipe_pieces(e->all[i]->embedded_types);
+    }
+    CBMHashTable *seen = bound ? cbm_ht_create((uint32_t)(bound + 8)) : NULL;
+    e->shadow_names =
+        seen ? (const char **)cbm_arena_alloc(a, (size_t)(bound + 1) * sizeof(char *)) : NULL;
+    if (!e->shadow_names) {
+        cbm_ht_free(seen);
+        return;
+    }
+    /* In definition order, then declaration order: a fixed order. */
+    for (int i = 0; i < e->count; i++) {
+        const CBMLSPDef *d = e->all[i];
+        for (const char *p = d->field_defs; p && *p;) {
+            const char *colon = strchr(p, ':');
+            const char *bar = strchr(p, '|');
+            if (colon && (!bar || colon < bar) && colon > p) {
+                go_shadow_note(e, seen, cbm_arena_strndup(a, p, (size_t)(colon - p)));
+            }
+            p = bar ? bar + 1 : NULL;
+        }
+        size_t len = 0;
+        for (const char *next = d->embedded_types, *s;
+             (s = go_embedded_spelling(&next, &len)) != NULL;) {
+            go_shadow_note(e, seen, go_embedded_field_name(a, s, len));
+        }
+    }
+    e->shadow_names[e->shadow_count] = NULL;
+    cbm_ht_free(seen);
+}
+
+/* A type QN of several definitions: every field name some definition
+ * declares that rt does not register with a type becomes a field of unknown
+ * type (it shadows deeper members and answers nothing). */
+static void go_add_shadow_fields(CBMArena *a, CBMRegisteredType *rt, const CBMHashTable *table,
+                                 const CBMLSPDef *d) {
+    go_type_qn_t *e = table ? (go_type_qn_t *)cbm_ht_get(table, d->qualified_name) : NULL;
+    if (!e || e->count < 2 || rt->is_interface) {
+        return;
+    }
+    go_type_qn_shadow(a, e);
+    if (e->shadow_count == 0) {
+        return;
+    }
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(a, (size_t)e->shadow_count * sizeof(CBMType *));
+    if (!types) {
+        return;
+    }
+    for (int i = 0; i < e->shadow_count; i++) {
+        types[i] = cbm_type_unknown();
+    }
+    go_append_fields(a, rt, e->shadow_names, types, e->shadow_count);
+}
+
+/* The fields to register for `d`: its own when it is its QN's only definition,
+ * else those every definition of the QN agrees on (NULL: none). Without a
+ * table (allocation failure) every def keeps its own, as before the table. */
+static const char *go_type_qn_fields(const CBMHashTable *table, const CBMLSPDef *d) {
+    const go_type_qn_t *e =
+        table ? (const go_type_qn_t *)cbm_ht_get(table, d->qualified_name) : NULL;
+    return !e || e->count < 2 ? d->field_defs : e->fields;
+}
+
+/* Whether `d`'s embedded types are the same in every definition of its QN. */
+static bool go_type_qn_embeds(const CBMHashTable *table, const CBMLSPDef *d) {
+    const go_type_qn_t *e =
+        table ? (const go_type_qn_t *)cbm_ht_get(table, d->qualified_name) : NULL;
+    return !e || e->count < 2 || !e->embeds_differ;
 }
 
 // --- Phase 1c: Extract type parameters from generic function declarations ---
@@ -3358,12 +4098,16 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
     // caller's arena which outlives this call, so cbm_arena_strdup is
     // wasted work. On kubernetes (~110k defs × 11k files × 5 strdups
     // ~= 6B mallocs) this alone saves ~90s of resolve wall time.
+    CBMHashTable *type_qns = go_type_qn_table(arena, defs, def_count);
+    CBMHashTable *value_qns = go_value_qn_counts(arena, defs, def_count, module_qn);
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
             continue;
 
         const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        /* The def's declared-type identities, indexed once for its texts. */
+        const cbm_type_scope_index_t *scope_ix = cbm_type_scope_index(arena, d->type_scope);
 
         // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
         // Struct included so Go structs (now labelled "Struct") register as types.
@@ -3373,7 +4117,11 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rt.qualified_name = d->qualified_name; // borrowed
             rt.short_name = d->short_name;         // borrowed
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
+            /* Embedded types other definitions of the QN differ in promote
+             * nothing (go_type_qn_table). */
+            rt.embedded_types = go_type_qn_embeds(type_qns, d)
+                                    ? go_embedded_qns(arena, d->embedded_types, def_mod, scope_ix)
+                                    : NULL;
 
             // Set method_names for interfaces from "|"-separated string
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
@@ -3381,12 +4129,22 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             }
             rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
 
-            cbm_registry_add_type(&reg, rt);
-
-            // Populate struct field types from field_defs
-            if (d->field_defs && d->field_defs[0]) {
-                parse_field_defs_into_type(arena, &reg, rt.qualified_name, d->field_defs, def_mod);
+            // Struct field types from field_defs, on this def's own entry: a
+            // type lookup answers with the last entry of a name, so fields on
+            // an earlier receiver placeholder were never seen. A QN of several
+            // definitions keeps the fields they agree on (go_type_qn_table).
+            const char *fields = go_type_qn_fields(type_qns, d);
+            if (fields && fields[0]) {
+                (void)parse_field_defs(arena, fields, def_mod, scope_ix, &rt.field_names,
+                                       &rt.field_types);
             }
+            /* Embedded types are fields too (Go's selector rule), and a QN of
+             * several definitions shadows every field name one declares. */
+            go_add_embedded_fields(arena, &rt, d->embedded_types, def_mod, scope_ix,
+                                   go_type_qn_embeds(type_qns, d));
+            go_add_shadow_fields(arena, &rt, type_qns, d);
+
+            cbm_registry_add_type(&reg, rt);
         }
 
         // Function/Method
@@ -3397,8 +4155,8 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rf.short_name = d->short_name;         // borrowed
 
             // Build FUNC type from return_types text
-            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod, scope_ix);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod, scope_ix};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
@@ -3420,23 +4178,15 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
             cbm_registry_add_func(&reg, rf);
         }
+        go_register_value(&reg, arena, d, def_mod, scope_ix, value_qns);
     }
+    cbm_ht_free(type_qns); /* NULL-safe */
+    cbm_ht_free(value_qns);
 
-    // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
+    // 3. Phase 1b: the walked file's type aliases. Its structs' fields and
+    // embedded types come from their definitions, as on the shared registry:
+    // every field and every embedded type, the same answer on every route.
     {
-        /* One context parses every struct's field types, so its import rows are
-         * chained once (resolve_import), not once per struct. */
-        GoLSPContext tmp_ctx;
-        memset(&tmp_ctx, 0, sizeof(tmp_ctx));
-        tmp_ctx.arena = arena;
-        tmp_ctx.source = source;
-        tmp_ctx.source_len = source_len;
-        tmp_ctx.registry = &reg;
-        tmp_ctx.package_qn = module_qn;
-        tmp_ctx.import_local_names = import_names;
-        tmp_ctx.import_package_qns = import_qns;
-        tmp_ctx.import_count = import_count;
-
         // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
         uint32_t rkn = 0;
         TSNode *rkids = cbm_lsp_collect_children(arena, root, &rkn);
@@ -3483,96 +4233,6 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                         }
                     }
                     continue;
-                }
-
-                if (strcmp(spec_kind2, "type_spec") != 0)
-                    continue;
-
-                TSNode name_node = ts_node_child_by_field_name(spec, "name", 4);
-                TSNode type_node = ts_node_child_by_field_name(spec, "type", 4);
-                if (ts_node_is_null(name_node) || ts_node_is_null(type_node))
-                    continue;
-                if (strcmp(ts_node_type(type_node), "struct_type") != 0)
-                    continue;
-
-                char *type_name = cbm_node_text(arena, name_node, source);
-                if (!type_name || !type_name[0])
-                    continue;
-                const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
-
-                TSNode field_list = ts_node_child_by_field_name(type_node, "body", 4);
-                if (ts_node_is_null(field_list)) {
-                    if (ts_node_named_child_count(type_node) > 0)
-                        field_list = ts_node_named_child(type_node, 0);
-                }
-                if (ts_node_is_null(field_list))
-                    continue;
-
-                const char *embeds[16];
-                int embed_count = 0;
-                const char *fld_names[64];
-                const CBMType *fld_types[64];
-                int fld_count = 0;
-
-                uint32_t fl_nc = ts_node_child_count(field_list);
-                for (uint32_t k = 0; k < fl_nc; k++) {
-                    TSNode field = ts_node_child(field_list, k);
-                    if (ts_node_is_null(field) || !ts_node_is_named(field))
-                        continue;
-                    if (strcmp(ts_node_type(field), "field_declaration") != 0)
-                        continue;
-                    TSNode fname = ts_node_child_by_field_name(field, "name", 4);
-                    TSNode ftype = ts_node_child_by_field_name(field, "type", 4);
-                    if (ts_node_is_null(fname) && !ts_node_is_null(ftype)) {
-                        if (embed_count < 15) {
-                            char *embed_text = cbm_node_text(arena, ftype, source);
-                            if (embed_text && embed_text[0]) {
-                                const char *et = embed_text;
-                                while (*et == '*')
-                                    et++;
-                                embeds[embed_count++] =
-                                    cbm_arena_sprintf(arena, "%s.%s", module_qn, et);
-                            }
-                        }
-                    } else if (!ts_node_is_null(fname) && !ts_node_is_null(ftype) &&
-                               fld_count < 63) {
-                        char *fn = cbm_node_text(arena, fname, source);
-                        if (fn && fn[0]) {
-                            fld_names[fld_count] = fn;
-                            fld_types[fld_count] = go_parse_type_node(&tmp_ctx, ftype);
-                            fld_count++;
-                        }
-                    }
-                }
-
-                for (int ti = 0; ti < reg.type_count; ti++) {
-                    if (!reg.types[ti].qualified_name ||
-                        strcmp(reg.types[ti].qualified_name, type_qn) != 0)
-                        continue;
-
-                    if (embed_count > 0) {
-                        const char **arr = (const char **)cbm_arena_alloc(
-                            arena, (embed_count + 1) * sizeof(const char *));
-                        for (int ei = 0; ei < embed_count; ei++)
-                            arr[ei] = embeds[ei];
-                        arr[embed_count] = NULL;
-                        reg.types[ti].embedded_types = arr;
-                    }
-                    if (fld_count > 0) {
-                        const char **names = (const char **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const char *));
-                        const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                            arena, (fld_count + 1) * sizeof(const CBMType *));
-                        for (int fi = 0; fi < fld_count; fi++) {
-                            names[fi] = fld_names[fi];
-                            types[fi] = fld_types[fi];
-                        }
-                        names[fld_count] = NULL;
-                        types[fld_count] = NULL;
-                        reg.types[ti].field_names = names;
-                        reg.types[ti].field_types = types;
-                    }
-                    break;
                 }
             }
         }
@@ -3638,11 +4298,13 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
      * not finalized until the end, so its own lookup scans every type, and the
      * receiver check below plus the field-definition lookup made the build
      * O(types x (methods + structs)) -- 4.4 s single-threaded on the Go corpus,
-     * the scaling lane's parse_field_defs_into_type x2.9 (waste sanitizer,
-     * 2026-09-17). First-match semantics are kept exactly: a receiver's
-     * placeholder type added before its struct still receives the fields.
-     * NULL on allocation failure: the linear paths below run as before. */
+     * the scaling lane's field-definition lookup x2.9 (waste sanitizer,
+     * 2026-09-17). A receiver's placeholder type added before its struct
+     * receives the struct's fields as well as the struct's own entry.
+     * NULL on allocation failure: the receiver check scans the registry. */
     CBMHashTable *first_type = cbm_ht_create((uint32_t)(def_count / 4 + 1024));
+    CBMHashTable *type_qns = go_type_qn_table(arena, defs, def_count);
+    CBMHashTable *value_qns = go_value_qn_counts(arena, defs, def_count, "");
     int noted_types = 0;
 #define GO_NOTE_NEW_TYPES()                                                        \
     do {                                                                           \
@@ -3666,6 +4328,8 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
          * (set by cbm_pxc_collect_all_defs). There is no caller module to
          * fall back to — this registry is project-wide, not per-file. */
         const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
+        /* The def's declared-type identities, indexed once for its texts. */
+        const cbm_type_scope_index_t *scope_ix = cbm_type_scope_index(arena, d->type_scope);
 
         // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
         // Struct included so Go structs (now labelled "Struct") register as types.
@@ -3675,26 +4339,36 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             rt.qualified_name = d->qualified_name; /* borrowed */
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
+            /* Embedded types other definitions of the QN differ in promote
+             * nothing (go_type_qn_table). */
+            rt.embedded_types = go_type_qn_embeds(type_qns, d)
+                                    ? go_embedded_qns(arena, d->embedded_types, def_mod, scope_ix)
+                                    : NULL;
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
             }
             rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
+            /* Fields on this def's own entry, which a lookup after finalize
+             * answers with (the last entry of a name). The first entry -- a
+             * receiver placeholder when a method came earlier -- keeps them
+             * too, for the first-registered readers. A QN of several
+             * definitions keeps the fields they agree on (go_type_qn_table). */
+            const char *fields = go_type_qn_fields(type_qns, d);
+            if (fields && fields[0]) {
+                (void)parse_field_defs(arena, fields, def_mod, scope_ix, &rt.field_names,
+                                       &rt.field_types);
+            }
+            /* Embedded types are fields too (Go's selector rule), and a QN of
+             * several definitions shadows every field name one declares. */
+            go_add_embedded_fields(arena, &rt, d->embedded_types, def_mod, scope_ix,
+                                   go_type_qn_embeds(type_qns, d));
+            go_add_shadow_fields(arena, &rt, type_qns, d);
             cbm_registry_add_type(reg, rt);
             GO_NOTE_NEW_TYPES();
-            if (d->field_defs && d->field_defs[0]) {
-                if (first_type) {
-                    const char **names = NULL;
-                    const CBMType **types = NULL;
-                    uintptr_t at = (uintptr_t)cbm_ht_get(first_type, rt.qualified_name);
-                    if (parse_field_defs(arena, d->field_defs, def_mod, &names, &types) && at) {
-                        reg->types[at - 1].field_names = names;
-                        reg->types[at - 1].field_types = types;
-                    }
-                } else {
-                    parse_field_defs_into_type(arena, reg, rt.qualified_name, d->field_defs,
-                                               def_mod);
-                }
+            uintptr_t at = first_type ? (uintptr_t)cbm_ht_get(first_type, rt.qualified_name) : 0;
+            if (rt.field_names && at && (int)at - 1 != reg->type_count - 1) {
+                reg->types[at - 1].field_names = rt.field_names;
+                reg->types[at - 1].field_types = rt.field_types;
             }
         }
 
@@ -3703,8 +4377,8 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
-            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod};
+            const CBMType **ret_types = split_pipe_types(arena, d->return_types, def_mod, scope_ix);
+            CBMGoLSPSignatureParserContext param_parser_ctx = {def_mod, scope_ix};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 cbm_go_lsp_parse_signature_param_text, &param_parser_ctx);
@@ -3725,9 +4399,12 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             }
             cbm_registry_add_func(reg, rf);
         }
+        go_register_value(reg, arena, d, def_mod, scope_ix, value_qns);
     }
 #undef GO_NOTE_NEW_TYPES
     cbm_ht_free(first_type);
+    cbm_ht_free(type_qns); /* NULL-safe */
+    cbm_ht_free(value_qns);
 
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
@@ -3828,7 +4505,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
          * but the global registry has. (method_not_found with NAMED
          * receiver, or any other case where callee_qn looks like a
          * full QN). Direct lookup. */
-        const CBMRegisteredFunc *f = cbm_registry_lookup_func(reg, uc->callee_qn);
+        const CBMRegisteredFunc *f = go_lookup_func_callable(reg, uc->callee_qn);
 
         /* Case 2: callee_qn is "local_pkg_alias.suffix" — the alias
          * needs translating through the file's import map to get the
@@ -3848,7 +4525,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
                             char fq[1024];
                             int n = snprintf(fq, sizeof(fq), "%s.%s", import_qns[j], suffix);
                             if (n > 0 && n < (int)sizeof(fq)) {
-                                f = cbm_registry_lookup_func(reg, fq);
+                                f = go_lookup_func_callable(reg, fq);
                             }
                             break;
                         }
@@ -3862,7 +4539,7 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
          * an exact package-local lookup rather than a project-wide short-name
          * guess. */
         if (!f && !strchr(uc->callee_qn, '.') && result->module_qn) {
-            f = cbm_registry_lookup_symbol(reg, result->module_qn, uc->callee_qn);
+            f = go_lookup_callable(reg, result->module_qn, uc->callee_qn);
         }
 
         if (!f)
