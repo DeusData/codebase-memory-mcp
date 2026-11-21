@@ -579,14 +579,10 @@ static const tool_def_t TOOLS[] = {
      "\"kind\":{\"type\":\"string\",\"description\":\"Resource kind, e.g. Deployment.\"},"
      "\"namespace\":{\"type\":\"string\",\"description\":\"Resource namespace.\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
-     "\"max_degree\":{\"type\":\"integer\",\"description\":\"Maximum incoming + outgoing degree. "
-     "Zero selects isolated symbols, not all uncalled functions.\"},"
-     "\"exclude_entry_points\":{\"type\":\"boolean\"},"
+     "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
-     "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Keywords, not "
-     "natural-language sentences. Each element is one token; scores use the minimum cosine "
-     "across tokens. Unknown tokens use sparse-random vectors and can suppress useful matches. "
-     "Not with query (BM25 text search).\"},"
+     "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Keywords; [] ignored; "
+     "else omit query.\"},"
      "\"semantic_limit\":{\"type\":\"integer\",\"default\":50,\"minimum\":0,"
      "\"maximum\":500},"
      "\"semantic_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,"
@@ -4799,7 +4795,7 @@ static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *st
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
     yyjson_val *sq_val = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
-    if (out_present && sq_val) {
+    if (out_present && sq_val && (!yyjson_is_arr(sq_val) || yyjson_arr_size(sq_val) > 0)) {
         *out_present = true;
     }
     sq_run_status_t status = SQ_RUN_OK;
@@ -4829,10 +4825,11 @@ static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *st
     return status;
 }
 
-static bool search_graph_arg_present(const char *args, const char *name) {
+static bool search_graph_semantic_query_present(const char *args) {
     yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    bool present = root && yyjson_is_obj(root) && yyjson_obj_get(root, name) != NULL;
+    yyjson_val *sq_val = root ? yyjson_obj_get(root, "semantic_query") : NULL;
+    bool present = sq_val && (!yyjson_is_arr(sq_val) || yyjson_arr_size(sq_val) > 0);
     if (doc) {
         yyjson_doc_free(doc);
     }
@@ -5624,13 +5621,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * and return early. If FTS5 is unavailable or the query is empty after
      * tokenization, fall through to the regex path. */
     char *query = cbm_mcp_get_string_arg(args, "query");
-    if (query && search_graph_arg_present(args, "semantic_query")) {
+    if (query && search_graph_semantic_query_present(args)) {
         free(query);
         free(project);
         return cbm_mcp_text_result(
-            "query and semantic_query are mutually exclusive — use query for BM25 full-text "
-            "ranking or semantic_query for vector ranking, then issue a separate request for "
-            "the other mode.",
+            "query and semantic_query are mutually exclusive. For BM25 search, remove the "
+            "semantic_query key (an empty array is also accepted). For vector search, remove the "
+            "query key entirely. To run both modes, send two separate requests; do not retry "
+            "unchanged arguments.",
             true);
     }
     if (query && query[0]) {

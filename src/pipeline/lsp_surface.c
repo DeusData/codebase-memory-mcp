@@ -32,15 +32,24 @@
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
-#include "pipeline/doc_links.h" /* cbm_doclinks_storable_scope */
+#include "pipeline/doc_links.h"  /* cbm_doclinks_storable_scope */
+#include "pipeline/type_scope.h" /* the type labels identities may name */
 #include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
 /* 3: Go defs carry their parsed result list `|`-joined in "ret" (F-G8 D1);
  * a version-2 surface holds the raw result text and must be re-extracted.
  * 4: Go identity aliases carry their target in "al" (#2033); a version-3
- * surface has no alias targets and must be re-extracted. */
-enum { SURFACE_CODEC_VERSION = 4 };
+ * surface has no alias targets and must be re-extracted.
+ * 5: defs carry their declared types' identities in "ty" (type_scope.h); a
+ * version-4 surface has none, and a dependent re-resolved against it would
+ * lose the calls a full index makes through them. The surface hash and the
+ * Python namespace comparison leave "ty" out: they judge the identities'
+ * inputs (the def's type texts, the file's imports in "dl" / "py"), which
+ * the planner's probe computes exactly as a full index does; the outputs
+ * also depend on other files' type definitions, which the planner gates
+ * itself (closure_identity_decline, pipeline_incremental.c). */
+enum { SURFACE_CODEC_VERSION = 5 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -328,6 +337,72 @@ int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json
     return status;
 }
 
+/* Two objects equal member by member, in order, leaving out the members named
+ * `skip` (NULL skips none). */
+static bool surface_obj_equal_except(yyjson_val *a, yyjson_val *b, const char *skip) {
+    if (!yyjson_is_obj(a) || !yyjson_is_obj(b)) {
+        return yyjson_equals(a, b);
+    }
+    yyjson_obj_iter ia = yyjson_obj_iter_with(a);
+    yyjson_obj_iter ib = yyjson_obj_iter_with(b);
+    for (;;) {
+        yyjson_val *ka = yyjson_obj_iter_next(&ia);
+        while (ka && skip && yyjson_equals_str(ka, skip)) {
+            ka = yyjson_obj_iter_next(&ia);
+        }
+        yyjson_val *kb = yyjson_obj_iter_next(&ib);
+        while (kb && skip && yyjson_equals_str(kb, skip)) {
+            kb = yyjson_obj_iter_next(&ib);
+        }
+        if (!ka || !kb) {
+            return !ka && !kb;
+        }
+        if (!yyjson_equals(ka, kb) ||
+            !yyjson_equals(yyjson_obj_iter_get_val(ka), yyjson_obj_iter_get_val(kb))) {
+            return false;
+        }
+    }
+}
+
+/* Two surface rows equal but for their declared-type identities ("ty" in
+ * each "lsp" def), which the comparisons leave out (SURFACE_CODEC_VERSION). */
+static bool surface_rows_equal_without_identities(yyjson_val *a, yyjson_val *b) {
+    if (!yyjson_is_obj(a) || !yyjson_is_obj(b)) {
+        return yyjson_equals(a, b);
+    }
+    yyjson_obj_iter ia = yyjson_obj_iter_with(a);
+    yyjson_obj_iter ib = yyjson_obj_iter_with(b);
+    for (;;) {
+        yyjson_val *ka = yyjson_obj_iter_next(&ia);
+        yyjson_val *kb = yyjson_obj_iter_next(&ib);
+        if (!ka || !kb) {
+            return !ka && !kb;
+        }
+        if (!yyjson_equals(ka, kb)) {
+            return false;
+        }
+        yyjson_val *va = yyjson_obj_iter_get_val(ka);
+        yyjson_val *vb = yyjson_obj_iter_get_val(kb);
+        if (!yyjson_equals_str(ka, "lsp") || !yyjson_is_arr(va) || !yyjson_is_arr(vb)) {
+            if (!yyjson_equals(va, vb)) {
+                return false;
+            }
+            continue;
+        }
+        if (yyjson_arr_size(va) != yyjson_arr_size(vb)) {
+            return false;
+        }
+        yyjson_arr_iter da = yyjson_arr_iter_with(va);
+        yyjson_arr_iter db = yyjson_arr_iter_with(vb);
+        for (yyjson_val *x = yyjson_arr_iter_next(&da), *y = yyjson_arr_iter_next(&db); x && y;
+             x = yyjson_arr_iter_next(&da), y = yyjson_arr_iter_next(&db)) {
+            if (!surface_obj_equal_except(x, y, "ty")) {
+                return false;
+            }
+        }
+    }
+}
+
 int cbm_lsp_surface_python_change(const char *old_json, const char *new_json) {
     if (!old_json) {
         return -1;
@@ -349,9 +424,12 @@ int cbm_lsp_surface_python_change(const char *old_json, const char *new_json) {
                 : 0;
     int result = -1;
     if (old_state >= 0 && new_state >= 0) {
-        result = (old_state == 0 && new_state == 0)                                         ? 0
-                 : (old_state != new_state || !new_json || strcmp(old_json, new_json) != 0) ? 1
-                                                                                            : 0;
+        result = (old_state == 0 && new_state == 0) ? 0
+                 : (old_state != new_state || !new_doc ||
+                    !surface_rows_equal_without_identities(yyjson_doc_get_root(old_doc),
+                                                           yyjson_doc_get_root(new_doc)))
+                     ? 1
+                     : 0;
     }
     cbm_arena_destroy(&scratch);
     yyjson_doc_free(old_doc);
@@ -359,12 +437,381 @@ int cbm_lsp_surface_python_change(const char *old_json, const char *new_json) {
     return result;
 }
 
+/* ── Declared-type identities across a repair ─────────────────────── */
+
+static bool surface_type_label(int lang, const char *label) {
+    const cbm_type_scope_lang_t *row =
+        lang >= 0 && lang < (int)CBM_LANG_COUNT ? cbm_type_scope_lang((CBMLanguage)lang) : NULL;
+    for (const char *const *l = row && label ? row->labels : NULL; l && *l; l++) {
+        if (strcmp(*l, label) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Hash one row's type definitions: QN -> its def object (both borrowed from
+ * the returned doc, which the caller frees). A row that does not parse
+ * returns NULL; the planner has validated every row it passes. */
+static yyjson_doc *surface_row_types(const char *json, CBMHashTable *types, uint64_t *work) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    yyjson_val *lsp = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "lsp") : NULL;
+    if (!yyjson_is_arr(lsp)) {
+        return doc;
+    }
+    yyjson_arr_iter it = yyjson_arr_iter_with(lsp);
+    for (yyjson_val *d = yyjson_arr_iter_next(&it); d; d = yyjson_arr_iter_next(&it)) {
+        if (work) {
+            (*work)++;
+        }
+        const char *qn = yyjson_get_str(yyjson_obj_get(d, "qn"));
+        if (qn &&
+            surface_type_label(yyjson_get_int(yyjson_obj_get(d, "lg")),
+                               yyjson_get_str(yyjson_obj_get(d, "lb"))) &&
+            !cbm_ht_get(types, qn)) {
+            cbm_ht_set(types, qn, d);
+        }
+    }
+    return doc;
+}
+
+typedef struct {
+    const CBMHashTable *other; /* the row's types on the other side */
+    CBMHashTable *gone;        /* QNs whose type definition changed or left (owned keys) */
+    bool appeared;
+} surface_type_cmp_t;
+
+static void surface_type_appeared(const char *qn, void *val, void *ud) {
+    (void)val;
+    surface_type_cmp_t *c = (surface_type_cmp_t *)ud;
+    if (!cbm_ht_get(c->other, qn)) {
+        c->appeared = true;
+    }
+}
+
+static void surface_type_changed(const char *qn, void *val, void *ud) {
+    surface_type_cmp_t *c = (surface_type_cmp_t *)ud;
+    yyjson_val *now = (yyjson_val *)cbm_ht_get(c->other, qn);
+    if ((now && surface_obj_equal_except((yyjson_val *)val, now, "ty")) ||
+        cbm_ht_get(c->gone, qn)) {
+        return;
+    }
+    char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, strlen(qn) + 1);
+    if (key) {
+        memcpy(key, qn, strlen(qn) + 1);
+        cbm_ht_set(c->gone, key, key);
+    }
+}
+
+static void surface_free_key(const char *key, void *val, void *ud) {
+    (void)val;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+/* True when one of the identities stored in `ty` ("spelling=QN|...") names a
+ * QN of `gone`. */
+static bool surface_names_gone(const char *ty, const CBMHashTable *gone, char **buf, size_t *cap,
+                               uint64_t *work) {
+    for (const char *p = ty; p && *p;) {
+        const char *eq = strchr(p, '=');
+        if (!eq) {
+            return false;
+        }
+        const char *bar = strchr(eq, '|');
+        size_t len = bar ? (size_t)(bar - eq - 1) : strlen(eq + 1);
+        if (work) {
+            *work += (uint64_t)(len + (size_t)(eq - p) + 1);
+        }
+        if (len + 1 > *cap) {
+            size_t grown_cap = (len + 1) * 2;
+            char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *buf, grown_cap);
+            if (!grown) {
+                return true; /* cannot tell: decline */
+            }
+            *buf = grown;
+            *cap = grown_cap;
+        }
+        memcpy(*buf, eq + 1, len);
+        (*buf)[len] = '\0';
+        if (cbm_ht_get(gone, *buf)) {
+            return true;
+        }
+        p = bar ? bar + 1 : eq + 1 + len;
+    }
+    return false;
+}
+
+const char *cbm_lsp_surface_identity_decline(const char *const *old_rows,
+                                             const char *const *new_rows, int changed_count,
+                                             const cbm_lsp_surface_row_t *stored, int stored_count,
+                                             uint64_t *work) {
+    const char *decline = NULL;
+    CBMHashTable *gone = cbm_ht_create(CBM_SZ_64);
+    if (!gone) {
+        return "alloc";
+    }
+    for (int i = 0; i < changed_count && !decline; i++) {
+        CBMHashTable *before = cbm_ht_create(CBM_SZ_64);
+        CBMHashTable *after = cbm_ht_create(CBM_SZ_64);
+        yyjson_doc *old_doc = before ? surface_row_types(old_rows[i], before, work) : NULL;
+        yyjson_doc *new_doc =
+            after && new_rows[i] ? surface_row_types(new_rows[i], after, work) : NULL;
+        if (!before || !after) {
+            decline = "alloc";
+        } else if (!old_doc || (new_rows[i] && !new_doc)) {
+            decline = "surface_row_unreadable";
+        } else {
+            surface_type_cmp_t appear = {.other = before};
+            cbm_ht_foreach(after, surface_type_appeared, &appear);
+            surface_type_cmp_t change = {.other = after, .gone = gone};
+            cbm_ht_foreach(before, surface_type_changed, &change);
+            if (appear.appeared) {
+                decline = "declared_types_changed";
+            }
+        }
+        yyjson_doc_free(old_doc);
+        yyjson_doc_free(new_doc);
+        cbm_ht_free(before);
+        cbm_ht_free(after);
+    }
+    /* A changed or departed type matters only when an identity names it:
+     * read the stored identities (only rows that hold one are parsed). */
+    char *buf = NULL;
+    size_t cap = 0;
+    for (int r = 0; r < stored_count && !decline && cbm_ht_count(gone) > 0; r++) {
+        const char *json = stored[r].defs_json;
+        if (work && json) {
+            *work += (uint64_t)strlen(json);
+        }
+        if (!json || !strstr(json, "\"ty\":")) {
+            continue;
+        }
+        yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+        yyjson_val *lsp = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "lsp") : NULL;
+        if (!doc) {
+            decline = "surface_row_unreadable";
+        }
+        yyjson_arr_iter it = yyjson_arr_iter_with(lsp);
+        for (yyjson_val *d = lsp ? yyjson_arr_iter_next(&it) : NULL; d && !decline;
+             d = yyjson_arr_iter_next(&it)) {
+            const char *ty = yyjson_get_str(yyjson_obj_get(d, "ty"));
+            if (ty && surface_names_gone(ty, gone, &buf, &cap, work)) {
+                decline = "identity_target_changed";
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, buf);
+    cbm_ht_foreach(gone, surface_free_key, NULL);
+    cbm_ht_free(gone);
+    return decline;
+}
+
+/* ── Scope facts: the "is" key ──────────────────────────────────────────
+ *
+ * A file's scope facts (cbm.h, CBMScopeEvent), stored as
+ *   "is": {"v": SURFACE_SCOPE_V, "ev": [[kind, flags, rank, ...], ...], "im": [module path, ...]}
+ * where rank orders the stored events by position (equal positions share a
+ * rank): an edit that moves bytes but keeps the facts keeps the stored bytes,
+ * and so the surface hash. Per kind: DEF [.., name, qualified name, qual],
+ * INCLUDE [.., index into "im"], ASSIGN [.., name], OPAQUE [..]. QREF events
+ * are not stored: a reference is read where its own file is re-extracted.
+ * Written only for a language with a scope row, so every other file's bytes
+ * stay as they were. A row of such a language written by an older binary has
+ * no "is": a reader must take its facts as unknown, never as empty. */
+enum { SURFACE_SCOPE_V = 1 };
+
+static bool surface_scope_stored(const CBMFileResult *r, const CBMScopeEvent *e) {
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        return e->index >= 0 && e->index < r->imports.count &&
+               r->imports.items[e->index].module_path;
+    case CBM_SCOPE_DEF:
+        return e->index >= 0 && e->index < r->defs.count && e->name &&
+               r->defs.items[e->index].qualified_name;
+    case CBM_SCOPE_ASSIGN:
+        return e->name != NULL;
+    case CBM_SCOPE_OPAQUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool surface_arr_add_str_or_null(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *s) {
+    return s ? yyjson_mut_arr_add_strcpy(doc, arr, s) : yyjson_mut_arr_add_null(doc, arr);
+}
+
+/* One stored event into `ev` (its module path into `im`). */
+static bool surface_scope_event(yyjson_mut_doc *doc, yyjson_mut_val *ev, yyjson_mut_val *im,
+                                int *nim, const CBMFileResult *r, const CBMScopeEvent *e,
+                                int rank) {
+    yyjson_mut_val *a = yyjson_mut_arr(doc);
+    bool ok = a && yyjson_mut_arr_add_int(doc, a, e->kind) &&
+              yyjson_mut_arr_add_int(doc, a, e->flags) && yyjson_mut_arr_add_int(doc, a, rank);
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, im, r->imports.items[e->index].module_path) &&
+             yyjson_mut_arr_add_int(doc, a, (*nim)++);
+        break;
+    case CBM_SCOPE_DEF:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, a, e->name) &&
+             yyjson_mut_arr_add_strcpy(doc, a, r->defs.items[e->index].qualified_name) &&
+             surface_arr_add_str_or_null(doc, a, e->qual);
+        break;
+    case CBM_SCOPE_ASSIGN:
+        ok = ok && yyjson_mut_arr_add_strcpy(doc, a, e->name);
+        break;
+    default:
+        break;
+    }
+    return ok && yyjson_mut_arr_add_val(ev, a);
+}
+
+static bool surface_add_scope(yyjson_mut_doc *doc, yyjson_mut_val *root, const CBMFileResult *r,
+                              CBMLanguage language) {
+    if (!cbm_extract_scope_has_row(language)) {
+        return true; /* no row: nothing to write */
+    }
+    yyjson_mut_val *is = yyjson_mut_obj(doc);
+    yyjson_mut_val *ev = yyjson_mut_arr(doc);
+    yyjson_mut_val *im = yyjson_mut_arr(doc);
+    if (!is || !ev || !im) {
+        return false;
+    }
+    int rank = -1;
+    int64_t last = -1;
+    int nim = 0;
+    for (int i = 0; r && i < r->scope.count; i++) {
+        const CBMScopeEvent *e = &r->scope.items[i];
+        if (!surface_scope_stored(r, e)) {
+            continue;
+        }
+        if ((int64_t)e->pos != last) {
+            rank++;
+            last = e->pos;
+        }
+        if (!surface_scope_event(doc, ev, im, &nim, r, e, rank)) {
+            return false;
+        }
+    }
+    return yyjson_mut_obj_add_int(doc, is, "v", SURFACE_SCOPE_V) &&
+           yyjson_mut_obj_add_val(doc, is, "ev", ev) && yyjson_mut_obj_add_val(doc, is, "im", im) &&
+           yyjson_mut_obj_add_val(doc, root, "is", is);
+}
+
+static const char *surface_json_strdup(CBMArena *a, yyjson_val *v) {
+    const char *s = v ? yyjson_get_str(v) : NULL;
+    return s ? cbm_arena_strdup(a, s) : NULL;
+}
+
+/* One stored event into e (its definition into defs[*ndefs] for a DEF);
+ * false: malformed. */
+static bool surface_scope_event_parse(CBMArena *a, yyjson_val *item, size_t nim, CBMScopeEvent *e,
+                                      CBMDefinition *defs, int *ndefs) {
+    if (!yyjson_is_arr(item) || yyjson_arr_size(item) < 3) {
+        return false;
+    }
+    yyjson_val *kind = yyjson_arr_get(item, 0);
+    yyjson_val *flags = yyjson_arr_get(item, 1);
+    yyjson_val *rank = yyjson_arr_get(item, 2);
+    if (!yyjson_is_int(kind) || !yyjson_is_int(flags) || !yyjson_is_int(rank) ||
+        yyjson_get_int(rank) < 0) {
+        return false;
+    }
+    memset(e, 0, sizeof(*e));
+    e->kind = (uint8_t)yyjson_get_int(kind);
+    e->flags = (uint8_t)yyjson_get_int(flags);
+    e->pos = (uint32_t)yyjson_get_int(rank);
+    e->index = -1;
+    yyjson_val *x = yyjson_arr_get(item, 3);
+    switch (e->kind) {
+    case CBM_SCOPE_INCLUDE:
+        e->index = (int32_t)yyjson_get_int(x);
+        return yyjson_is_int(x) && e->index >= 0 && (size_t)e->index < nim;
+    case CBM_SCOPE_DEF: {
+        CBMDefinition *d = &defs[*ndefs];
+        memset(d, 0, sizeof(*d));
+        e->name = surface_json_strdup(a, x);
+        e->qual = surface_json_strdup(a, yyjson_arr_get(item, 5));
+        d->name = e->name;
+        d->qualified_name = surface_json_strdup(a, yyjson_arr_get(item, 4));
+        e->index = (*ndefs)++;
+        return e->name && d->qualified_name;
+    }
+    case CBM_SCOPE_ASSIGN:
+        e->name = surface_json_strdup(a, x);
+        return e->name != NULL;
+    case CBM_SCOPE_OPAQUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int cbm_lsp_surface_scope_from_json(CBMArena *arena, const char *json, cbm_lsp_scope_facts_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!arena || !json) {
+        return CBM_NOT_FOUND;
+    }
+    yyjson_doc *jd = yyjson_read(json, strlen(json), 0);
+    yyjson_val *root = jd ? yyjson_doc_get_root(jd) : NULL;
+    yyjson_val *is = root ? yyjson_obj_get(root, "is") : NULL;
+    if (!is) {
+        yyjson_doc_free(jd);
+        return jd ? 0 : CBM_NOT_FOUND;
+    }
+    yyjson_val *ver = yyjson_obj_get(is, "v");
+    yyjson_val *ev = yyjson_obj_get(is, "ev");
+    yyjson_val *im = yyjson_obj_get(is, "im");
+    bool ok = yyjson_is_int(ver) && yyjson_get_int(ver) == SURFACE_SCOPE_V && yyjson_is_arr(ev) &&
+              yyjson_is_arr(im);
+    size_t nev = ok ? yyjson_arr_size(ev) : 0;
+    size_t nim = ok ? yyjson_arr_size(im) : 0;
+    CBMScopeEvent *events = nev ? cbm_arena_alloc(arena, nev * sizeof(*events)) : NULL;
+    CBMDefinition *defs = nev ? cbm_arena_alloc(arena, nev * sizeof(*defs)) : NULL;
+    const char **modules = nim ? cbm_arena_alloc(arena, nim * sizeof(*modules)) : NULL;
+    ok = ok && (!nev || (events && defs)) && (!nim || modules);
+    size_t idx;
+    size_t max;
+    yyjson_val *item;
+    if (ok) {
+        yyjson_arr_foreach(im, idx, max, item) {
+            modules[idx] = surface_json_strdup(arena, item);
+            ok = ok && modules[idx];
+        }
+    }
+    int ndefs = 0;
+    if (ok) {
+        yyjson_arr_foreach(ev, idx, max, item) {
+            ok = ok && surface_scope_event_parse(arena, item, nim, &events[idx], defs, &ndefs);
+        }
+    }
+    yyjson_doc_free(jd);
+    if (!ok) {
+        return CBM_NOT_FOUND;
+    }
+    *out = (cbm_lsp_scope_facts_t){.events = events,
+                                   .event_count = (int)nev,
+                                   .defs = defs,
+                                   .def_count = ndefs,
+                                   .modules = modules,
+                                   .module_count = (int)nim};
+    return SKIP_ONE;
+}
+
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
- * symbols from its raw extraction defs. Returns a malloc'd JSON string and its
- * length. */
+ * symbols from its raw extraction defs. Returns the JSON string (malloc'd, or
+ * from `alc` when given) and its length. With identities, each def's
+ * declared-type identities ("ty") are written as well: the stored row carries
+ * them, the hashed bytes do not. */
 static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage language,
                                   const char *rel_path, const CBMLSPDef *defs, int def_count,
-                                  size_t *out_len) {
+                                  bool identities, const yyjson_alc *alc, size_t *out_len) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -400,6 +847,11 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         add_str_or_null(doc, o, "al", d->alias_target);
+        /* Stored for the routes that resolve against this row without
+         * re-extracting it; never hashed (see SURFACE_CODEC_VERSION). */
+        if (identities && d->type_scope) {
+            yyjson_mut_obj_add_str(doc, o, "ty", d->type_scope);
+        }
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -496,9 +948,13 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_doc_free(doc);
         return NULL;
     }
+    if (!surface_add_scope(doc, root, result, language)) {
+        yyjson_mut_doc_free(doc);
+        return NULL; /* missing facts would diverge silently: fail the row */
+    }
     /* Names, types and strings come from source text, which need not be UTF-8:
      * one such byte must not cost the repository every surface row. */
-    char *json = cbm_json_write_text(doc, NULL, out_len);
+    char *json = cbm_json_write_text(doc, alc, out_len);
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -519,6 +975,42 @@ typedef struct {
     _Atomic bool failed;
 } surface_job_t;
 
+/* Row strings are released with cbm_store_free_lsp_surfaces (free), so they
+ * come from the C heap: one place allocates them. */
+static char *surface_row_alloc(size_t n) {
+    return malloc(n);
+}
+
+static char *surface_row_strdup(const char *s) {
+    size_t n = strlen(s);
+    char *copy = surface_row_alloc(n + 1);
+    if (copy) {
+        memcpy(copy, s, n + 1);
+    }
+    return copy;
+}
+
+/* CBMFileResult.included_files, one file per line ("" when none). */
+static char *surface_row_included_files(const CBMFileResult *fr) {
+    size_t len = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        len += strlen(*f) + 1;
+    }
+    char *out = surface_row_alloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (const char *const *f = fr->included_files; f && *f; f++) {
+        size_t n = strlen(*f);
+        memcpy(out + at, *f, n);
+        at += n;
+        out[at++] = '\n';
+    }
+    out[at] = '\0';
+    return out;
+}
+
 static void surface_row_build(int i, void *arg) {
     surface_job_t *job = (surface_job_t *)arg;
     if (atomic_load_explicit(&job->failed, memory_order_relaxed)) {
@@ -535,25 +1027,46 @@ static void surface_row_build(int i, void *arg) {
     }
     int start = job->def_starts ? job->def_starts[i] : 0;
     int end = job->def_starts ? job->def_starts[i + 1] : 0;
+    const CBMLSPDef *slice = job->all_defs ? job->all_defs + start : NULL;
+    bool identities = false;
+    for (int d = 0; slice && d < end - start && !identities; d++) {
+        identities = slice[d].type_scope != NULL;
+    }
     size_t json_len = 0;
+    /* The hash covers the row without identities; a row that has some is
+     * written a second time with them, for storage (the hashed text is then
+     * a memory-core buffer, released here). */
     char *json =
-        surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path,
-                             job->all_defs ? job->all_defs + start : NULL, end - start, &json_len);
+        surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path, slice, end - start,
+                             false, identities ? cbm_json_writer_allocator() : NULL, &json_len);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    if (json) {
+        cbm_sha256_hex(json, json_len, sha);
+    }
+    if (json && identities) {
+        size_t stored_len = 0;
+        char *stored = surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path,
+                                            slice, end - start, true, NULL, &stored_len);
+        cbm_free(CBM_MEM_CLASS_OTHER, json);
+        json = stored;
+    }
+    char *included = surface_row_included_files(fr);
     cbm_pipeline_result_release(fr, loaded);
-    if (!json) {
+    if (!json || !included) {
+        free(json);
+        free(included);
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
         return;
     }
-    char sha[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(json, json_len, sha);
     cbm_lsp_surface_row_t *r = &job->rows[i];
     r->defs_json = json; /* set first: it marks the row present for the compaction */
-    r->project = strdup(job->project);
-    r->rel_path = strdup(job->files[i].rel_path);
-    r->surface_sha = strdup(sha);
+    r->project = surface_row_strdup(job->project);
+    r->rel_path = surface_row_strdup(job->files[i].rel_path);
+    r->surface_sha = surface_row_strdup(sha);
     r->ref_bloom = NULL;
     r->ref_bloom_len = 0;
-    r->config_ctx = strdup("");
+    r->config_ctx = surface_row_strdup("");
+    r->included_files = included;
     if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
     }
@@ -749,6 +1262,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
+        d->type_scope = arena_str_or_null(arena, yyjson_obj_get(o, "ty"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */
