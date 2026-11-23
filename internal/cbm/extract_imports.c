@@ -3291,14 +3291,17 @@ static bool cfml_template_tag(CBMExtractCtx *ctx, TSNode node) {
 /* Like extract_cfml_function_tag, find the value through the attribute name.
  * Keep the entire value so interpolated templates reach the path rule too. */
 static void cfml_record_template(CBMExtractCtx *ctx, TSNode tag) {
-    TSNode attrs = cbm_find_child_by_kind(tag, "cf_tag_attributes");
-    if (ts_node_is_null(attrs)) {
-        attrs = tag;
-    }
-    uint32_t count = ts_node_named_child_count(attrs);
+    uint32_t count = ts_node_named_child_count(tag);
     for (uint32_t i = 0; i < count; i++) {
-        TSNode attr = ts_node_named_child(attrs, i);
-        if (strcmp(ts_node_type(attr), "cf_attribute") != 0) {
+        TSNode attr = ts_node_named_child(tag, i);
+        const char *kind = ts_node_type(attr);
+        /* A generic start tag wraps each attribute separately. */
+        if (strcmp(kind, "cf_tag_attributes") == 0) {
+            attr = cbm_find_child_by_kind(attr, "cf_attribute");
+        } else if (strcmp(kind, "cf_attribute") != 0) {
+            continue;
+        }
+        if (ts_node_is_null(attr)) {
             continue;
         }
         TSNode name = cbm_find_child_by_kind(attr, "cf_attribute_name");
