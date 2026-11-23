@@ -1,6 +1,6 @@
 /*
  * test_include_path.c -- the path rule (src/pipeline/include_path.h): which
- * indexed file a Protobuf or Make import names.
+ * indexed file a CFML, Protobuf or Make import names.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
@@ -361,6 +361,54 @@ TEST(include_path_edges_name_only_indexed_files) {
     PASS();
 }
 
+TEST(include_path_cfml_template_edges) {
+    static const struct {
+        const char *path;
+        const char *text;
+    } files[] = {
+        {"app/index.cfm", "<cfinclude template='local.cfm'>\n"
+                          "<cfif true>\n"
+                          "    <CFMODULE TEMPLATE='/views/panel.cfm' />\n"
+                          "<cfelse>\n"
+                          "    <cfinclude template='../shared/branch.cfm' />\n"
+                          "</cfif>\n"
+         "<cfinclude template='/views/footer.html' />\n"
+                          "<cfinclude template='#var#.cfm' />\n"
+                          "<cfinclude template='missing.cfm' />\n"
+                          "<cfinclude template='elsewhere.cfm' />\n"
+                          "<cfinclude template='/duplicate.cfm' />\n"},
+        {"app/Widget.cfc", "<cfcomponent><cfinclude template='local.cfm'></cfcomponent>\n"},
+        {"app/local.cfm", "<p>Local</p>\n"},
+        {"site/views/panel.cfm", "<p>Panel</p>\n"},
+        {"site/views/footer.html", "<p>Footer</p>\n"},
+        {"shared/branch.cfm", "<p>Branch</p>\n"},
+        {"app/#var#.cfm", "<p>Dynamic bait</p>\n"},
+        {"other/elsewhere.cfm", "<p>Relative path bait</p>\n"},
+        {"app/duplicate.cfm", "<p>First candidate</p>\n"},
+        {"other/duplicate.cfm", "<p>Second candidate</p>\n"},
+    };
+    char *tmp = th_mktempdir("cbm_cfml_edges");
+    ASSERT_NOT_NULL(tmp);
+    char dir[512], db[512];
+    snprintf(dir, sizeof(dir), "%s/repo", tmp);
+    snprintf(db, sizeof(db), "%s/ip.db", tmp);
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        ASSERT_EQ(th_write_file(TH_PATH(dir, files[i].path), files[i].text), 0);
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "app.local"), 1);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "site.views.panel"), 1);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "site.views.footer"), 1);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "shared.branch"), 1);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "%"), 4);
+    ASSERT_EQ(ip_imports(db, "app.Widget.cfc.__file__", "app.local"), 1);
+    th_cleanup(tmp);
+    PASS();
+}
+
 SUITE(include_path) {
     RUN_TEST(include_path_names_no_file_decides_no_target);
     RUN_TEST(include_path_proto_tail_guess_and_ambiguity);
@@ -369,4 +417,5 @@ SUITE(include_path) {
     RUN_TEST(include_path_inventory_digest_follows_indexed_names);
     RUN_TEST(include_path_universe_grows_linearly);
     RUN_TEST(include_path_edges_name_only_indexed_files);
+    RUN_TEST(include_path_cfml_template_edges);
 }

@@ -2528,6 +2528,11 @@ static bool is_export_of_declaration(TSNode node) {
 // ordinary invocation. Static node-kind membership is therefore not enough to
 // make the whole subtree an import scope.
 static bool is_actual_import_boundary(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    /* CFML's listed kinds are tag candidates. Their attributes can hold
+     * ordinary expressions, and a template include introduces no binding. */
+    if (ctx->language == CBM_LANG_CFML) {
+        return false;
+    }
     bool direct_import = spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types);
     bool from_import = spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types);
     if (!direct_import && !from_import) {

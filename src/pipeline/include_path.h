@@ -77,8 +77,8 @@ typedef enum {
     CBM_INCLUDE_PATH_NOT_A_PATH = 0, /* no row, or not a path the row reads: main decides */
     CBM_INCLUDE_PATH_FILE,           /* names one indexed file (path in the buffer) */
     CBM_INCLUDE_PATH_NONE,           /* a path whose file the rule cannot tell (several, unknown) */
-    /* proven: no indexed file is that path or ends with it (letter case
-     * ignored) */
+    /* No indexed file can be selected: the path is absent, or the CFML
+     * mapping rule has no unique match. */
     CBM_INCLUDE_PATH_NO_FILE,
     /* a file picked by an assumption the index cannot check (path in the
      * buffer): the include root or the directory make runs in. Not FILE: main

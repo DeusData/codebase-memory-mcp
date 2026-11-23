@@ -4062,6 +4062,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return NULL;
     }
 
+    /* A tag-dialect .cfc looks like CFScript by filename. The import kind
+     * identifies template paths before the header and symbol strategies. */
+    if (imp->kind == CBM_IMPORT_KIND_TEMPLATE) {
+        const cbm_gbuf_node_t *target = NULL;
+        cbm_include_path_decides(ctx, source_rel, CBM_LANG_CFML, imp, &target);
+        return target;
+    }
+
     /* The importing file's language gates the strategies below. */
     const char *src_base = source_rel ? source_rel : "";
     for (const char *pb = src_base; *pb; pb++) {

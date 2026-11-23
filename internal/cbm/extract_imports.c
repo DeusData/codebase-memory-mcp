@@ -3258,6 +3258,95 @@ static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock 
     ts_parser_delete(parser);
 }
 
+/* The void-tag production hides its name. Read the token after <cf; generic
+ * opening tags expose the same token as a cf_tag_name. */
+static bool cfml_template_tag(CBMExtractCtx *ctx, TSNode node) {
+    TSNode name = cbm_find_child_by_kind(node, "cf_tag_name");
+    if (!ts_node_is_null(name)) {
+        const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+        return ascii_trimmed_equals(text, "include") || ascii_trimmed_equals(text, "module");
+    }
+    if (strcmp(ts_node_type(node), "cf_selfclose_tag") != 0) {
+        return false;
+    }
+    TSNode prefix = ts_node_child(node, 0);
+    if (ts_node_is_null(prefix) || ts_node_is_missing(prefix) ||
+        strcmp(ts_node_type(prefix), "<cf") != 0) {
+        return false;
+    }
+    uint32_t start = ts_node_end_byte(prefix);
+    uint32_t end = start;
+    uint32_t limit = ts_node_end_byte(node);
+    while (end < limit && !isspace((unsigned char)ctx->source[end]) && ctx->source[end] != '/' &&
+           ctx->source[end] != '>') {
+        end++;
+    }
+    if (end - start != sizeof("include") - 1 && end - start != sizeof("module") - 1) {
+        return false;
+    }
+    const char *text = cbm_arena_strndup(ctx->arena, ctx->source + start, end - start);
+    return ascii_trimmed_equals(text, "include") || ascii_trimmed_equals(text, "module");
+}
+
+/* Like extract_cfml_function_tag, find the value through the attribute name.
+ * Keep the entire value so interpolated templates reach the path rule too. */
+static void cfml_record_template(CBMExtractCtx *ctx, TSNode tag) {
+    TSNode attrs = cbm_find_child_by_kind(tag, "cf_tag_attributes");
+    if (ts_node_is_null(attrs)) {
+        attrs = tag;
+    }
+    uint32_t count = ts_node_named_child_count(attrs);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode attr = ts_node_named_child(attrs, i);
+        if (strcmp(ts_node_type(attr), "cf_attribute") != 0) {
+            continue;
+        }
+        TSNode name = cbm_find_child_by_kind(attr, "cf_attribute_name");
+        if (ts_node_is_null(name) ||
+            !ascii_trimmed_equals(cbm_node_text(ctx->arena, name, ctx->source), "template")) {
+            continue;
+        }
+        TSNode value = cbm_find_child_by_kind(attr, "quoted_cf_attribute_value");
+        if (ts_node_is_null(value)) {
+            value = cbm_find_child_by_kind(attr, "cf_attribute_value");
+        }
+        if (!ts_node_is_null(value)) {
+            const char *path =
+                strip_quotes(ctx->arena, cbm_node_text(ctx->arena, value, ctx->source));
+            if (path && path[0]) {
+                CBMImport imp = {.module_path = path,
+                                 .start_byte = ts_node_start_byte(tag),
+                                 .kind = CBM_IMPORT_KIND_TEMPLATE};
+                cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+            }
+        }
+        return;
+    }
+}
+
+/* Includes in conditional and custom-tag bodies are imports too, so walk
+ * the whole tree rather than the root children used by parse_spec_imports. */
+static void parse_cfml_imports(CBMExtractCtx *ctx) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (spec_type_matches(spec->import_node_types, ts_node_type(node)) &&
+            cfml_template_tag(ctx, node)) {
+            cfml_record_template(ctx, node);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return;
+            }
+        }
+    }
+}
+
 static void parse_embedded_imports(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec || !spec->embedded_imports) {
@@ -4892,10 +4981,13 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_SVELTE:
     case CBM_LANG_VUE:
     case CBM_LANG_ASTRO:
+        parse_embedded_imports(ctx);
+        break;
     /* Tag-dialect CFML: <cfscript> bodies are opaque cf_script_content to the
      * cfml grammar; the embedded spec re-parses them as CFSCRIPT (#1412). */
     case CBM_LANG_CFML:
         parse_embedded_imports(ctx);
+        parse_cfml_imports(ctx);
         break;
     default:
         // Grammar-only languages with no dedicated parser: consume the

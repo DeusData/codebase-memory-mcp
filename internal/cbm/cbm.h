@@ -471,6 +471,7 @@ typedef enum {
     CBM_IMPORT_KIND_DEFAULT = 0, // module / class / namespace (language default)
     CBM_IMPORT_KIND_FUNCTION,    // PHP `use function A\b`
     CBM_IMPORT_KIND_CONST,       // PHP `use const A\B`
+    CBM_IMPORT_KIND_TEMPLATE,    // CFML tag with a template attribute
 } CBMImportKind;
 
 typedef struct {
@@ -490,7 +491,7 @@ typedef struct {
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
-    CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
+    CBMImportKind kind;      // syntax-specific import kind, when needed for resolution
 } CBMImport;
 
 /* True when an import binds its local name at runtime. A Python import under
