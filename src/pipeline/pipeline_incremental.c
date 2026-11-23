@@ -15,6 +15,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
 #include <stdio.h>
 #include <time.h>
+#include "pipeline/include_path.h"
 #include "pipeline/lsp_surface.h"
 #include "foundation/mem_core.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -568,6 +569,23 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
     if (rc == 0) {
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
+    }
+    /* The path rule's universe (include_path.h), only where a file of a path
+     * row is discovered: a changed set of the indexed names a row's import
+     * can name (one added, removed or renamed) changes which file an import
+     * names in files that did not change, so it routes to a full index. A key
+     * of the discovered list: nothing is walked. */
+    bool path_row_file = false;
+    for (int i = 0; i < file_count && !path_row_file; i++) {
+        path_row_file = cbm_include_path_row(files[i].language) != NULL;
+    }
+    if (rc == 0 && path_row_file) {
+        char listing_digest[CBM_SHA256_HEX_LEN + 1];
+        rc = cbm_include_path_inventory_digest(files, file_count, listing_digest);
+        if (rc == 0) {
+            rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_INCLUDE_LISTING,
+                                              listing_digest, 0, 0);
+        }
     }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
@@ -3701,6 +3719,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_gbuf_t *gbuf = NULL;
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_include_universe_t *include_universe = NULL;
     CBMHashTable *indexed_files = NULL;
     CBMHashTable *stale_surface_set = NULL;
     closure_resolve_t cr = {0};
@@ -3929,7 +3948,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         cbm_log_error("delta.err", "phase", "stored_namespaces");
         goto out;
     }
+    include_universe = cbm_include_universe_new(files, file_count);
     cbm_pipeline_ctx_t ctx = {
+        .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
         .indexed_files = indexed_files,
@@ -4275,6 +4296,7 @@ out:
         cbm_registry_free(registry);
     }
     cbm_path_alias_collection_free(path_aliases);
+    cbm_include_universe_free(include_universe);
     cbm_ht_free(indexed_files); /* keys borrowed from files */
     if (gbuf) {
         cbm_gbuf_free(gbuf);
@@ -4689,9 +4711,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_path_alias_collection_t *path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
+    cbm_include_universe_t *include_universe = cbm_include_universe_new(files, file_count);
     CBMHashTable *indexed_files = cbm_pipeline_indexed_files_new(files, file_count);
 
     cbm_pipeline_ctx_t ctx = {
+        .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
         .indexed_files = indexed_files,
@@ -4782,6 +4806,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free(changed_files);
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
+        cbm_include_universe_free(include_universe);
         cbm_ht_free(indexed_files); /* keys borrowed from files */
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
@@ -4882,6 +4907,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free(changed_files);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
+    cbm_include_universe_free(include_universe);
     cbm_ht_free(indexed_files); /* keys borrowed from files */
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
