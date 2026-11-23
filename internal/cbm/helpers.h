@@ -48,9 +48,14 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 // Returns a null node if none found.
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
-// Get the QN of an enclosing function, or module_qn if none.
+// Get the QN of an enclosing function, or module_qn if none. test_macro_names:
+// a GoogleTest macro head is named as the def walk names it
+// (cbm_cpp_test_macro_name; cbm_cpp_test_macro_names_on gives the value).
+// pp_test_spans: the preprocessed view's map to the raw tests
+// (cbm_test_span_owner_qn), NULL in a raw view.
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path, const char *module_qn);
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);

@@ -17130,10 +17130,10 @@ TEST(clsp_issue1527_depth_failure_reports_all_entry_points) {
         } else {
             CBMLSPStatus status =
                 mode == 0 ? cbm_run_c_lsp_cross_status(&arena, src, (int)strlen(src), "test", true,
-                                                       defs, 2, NULL, NULL, 0, NULL, &out)
+                                                       defs, 2, NULL, NULL, 0, NULL, &out, true)
                           : cbm_run_c_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
                                                                      "test", true, &overlay, NULL,
-                                                                     NULL, 0, NULL, &out);
+                                                                     NULL, 0, NULL, &out, true);
             correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
         }
         correct = correct && out.count == 0;

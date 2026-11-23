@@ -5769,9 +5769,19 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
             }
         }
     }
+    if (!func_qn && ctx->pp_test_spans) {
+        /* The preprocessed view: a raw GoogleTest definition's body is that
+         * test, whatever its expanded head reads (cbm_test_span_owner_qn). */
+        func_qn = cbm_test_span_owner_qn(ctx->pp_test_spans, func_node);
+    }
     if (!func_qn) {
+        /* GoogleTest `TEST(Suite, Case)`: the definition is TEST_Suite_Case
+         * (#1266), named by the same helper as the def walk and the call
+         * scope; the pipeline joins this caller with theirs by exact QN. */
+        const char *test_name = cbm_cpp_test_macro_name(ctx->arena, ctx->test_macro_names,
+                                                        func_name, func_node, ctx->source);
         // Build enclosing function QN
-        func_qn = c_build_qn(ctx, func_name);
+        func_qn = c_build_qn(ctx, test_name ? test_name : func_name);
         // For a method defined INLINE inside its class body, func_name is a bare
         // identifier ("compute") and enclosing_class_qn was inherited from
         // c_process_class (saved_class_qn == enclosing_class_qn). The textual
@@ -6827,16 +6837,30 @@ static void c_add_type_indexed(CBMTypeRegistry *reg, CTypeFirstIndex *ix, CBMAre
     }
 }
 
+static bool c_lsp_file_run(CBMArena *arena, CBMFileResult *result, const char *source,
+                           int source_len, TSNode root, bool cpp_mode,
+                           CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
+                           const CBMTestSpanMap *pp_test_spans);
+
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin) {
-    (void)cbm_run_c_lsp_with_test_owners(arena, result, source, source_len, root,
-                                       cpp_mode, source_origin, NULL);
+                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
+                   const CBMTestSpanMap *pp_test_spans) {
+    (void)c_lsp_file_run(arena, result, source, source_len, root, cpp_mode, source_origin, NULL,
+                         pp_test_spans);
 }
 
-bool cbm_run_c_lsp_with_test_owners(
-    CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-    TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners) {
+bool cbm_run_c_lsp_with_test_owners(CBMArena *arena, CBMFileResult *result, const char *source,
+                                    int source_len, TSNode root, bool cpp_mode,
+                                    CBMSourceOrigin source_origin,
+                                    const CBMFileResult *test_owners) {
+    return c_lsp_file_run(arena, result, source, source_len, root, cpp_mode, source_origin,
+                          test_owners, NULL);
+}
+
+static bool c_lsp_file_run(CBMArena *arena, CBMFileResult *result, const char *source,
+                           int source_len, TSNode root, bool cpp_mode,
+                           CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
+                           const CBMTestSpanMap *pp_test_spans) {
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
         !cbm_test_definition_owners_match(test_owners, source, source_len, cpp_mode,
@@ -7024,6 +7048,8 @@ bool cbm_run_c_lsp_with_test_owners(
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, &result->resolved_calls);
     ctx.source_origin = source_origin;
     ctx.test_definition_owners = test_owners;
+    ctx.test_macro_names = cpp_mode && result->cpp_test_macro_names;
+    ctx.pp_test_spans = pp_test_spans;
     c_memo_test_stage(&ctx,
                       source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED ? "preprocessed" : "raw");
 
@@ -7225,7 +7251,7 @@ static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, i
                                           const char **include_ns_qns, int include_count,
                                           TSTree *cached_tree, CBMResolvedCallArray *out,
                                           CBMSourceOrigin source_origin,
-                                          const CBMFileResult *test_owners,
+                                          const CBMFileResult *test_owners, bool test_macro_names,
                                           CBMLSPStatus *status) {
     *status = CBM_LSP_COMPLETE;
     /* The retained or re-read source is the file on disk; read it the way the
@@ -7263,6 +7289,7 @@ static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, i
     c_lsp_init(&ctx, arena, source, source_len, reg, module_qn, cpp_mode, out);
     ctx.source_origin = source_origin;
     ctx.test_definition_owners = test_owners;
+    ctx.test_macro_names = cpp_mode && test_macro_names;
     ctx.registry_shared = true; /* Tier-2 shared registry: read-only, see flag doc */
     for (int i = 0; i < include_count; i++) {
         c_lsp_add_include(&ctx, include_paths[i], include_ns_qns[i]);
@@ -7277,6 +7304,8 @@ static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, i
     return c_test_owners_complete(&ctx);
 }
 
+/* Without a file result the extraction default holds: no configuration, so a
+ * C++ file's GoogleTest heads are named (cbm_cpp_test_macro_names_on). */
 bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                        const char *module_qn, bool cpp_mode, CBMTypeRegistry *reg,
                                        const char **include_paths, const char **include_ns_qns,
@@ -7284,17 +7313,17 @@ bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int 
                                        CBMResolvedCallArray *out) {
     return cbm_run_c_lsp_cross_with_registry_status(
                arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
-               include_count, cached_tree, out) == CBM_LSP_COMPLETE;
+               include_count, cached_tree, out, cpp_mode) == CBM_LSP_COMPLETE;
 }
 
 CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
     CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
     CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
-    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out) {
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out, bool test_macro_names) {
     CBMLSPStatus status;
-    (void)c_lsp_cross_with_registry_run(arena, source, source_len, module_qn, cpp_mode, reg,
-                                        include_paths, include_ns_qns, include_count, cached_tree,
-                                        out, CBM_SOURCE_ORIGIN_RAW, NULL, &status);
+    (void)c_lsp_cross_with_registry_run(
+        arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
+        include_count, cached_tree, out, CBM_SOURCE_ORIGIN_RAW, NULL, test_macro_names, &status);
     return status;
 }
 
@@ -7305,12 +7334,11 @@ bool cbm_run_c_lsp_cross_with_registry_with_test_owners(
     CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
     CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
     int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
-    CBMSourceOrigin source_origin, const CBMFileResult *test_owners) {
+    CBMSourceOrigin source_origin, const CBMFileResult *test_owners, bool test_macro_names) {
     CBMLSPStatus status;
-    bool owners_ok = c_lsp_cross_with_registry_run(arena, source, source_len, module_qn, cpp_mode,
-                                                   reg, include_paths, include_ns_qns,
-                                                   include_count, cached_tree, out, source_origin,
-                                                   test_owners, &status);
+    bool owners_ok = c_lsp_cross_with_registry_run(
+        arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
+        include_count, cached_tree, out, source_origin, test_owners, test_macro_names, &status);
     return owners_ok && status == CBM_LSP_COMPLETE;
 }
 
@@ -7321,7 +7349,7 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
                             const char **include_paths, const char **include_ns_qns,
                             int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
                             CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
-                            CBMLSPStatus *status) {
+                            bool test_macro_names, CBMLSPStatus *status) {
     *status = CBM_LSP_COMPLETE;
     /* Same bytes as the per-file extract (#1546); see
      * c_lsp_cross_with_registry_run. */
@@ -7376,6 +7404,7 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, out);
     ctx.source_origin = source_origin;
     ctx.test_definition_owners = test_owners;
+    ctx.test_macro_names = cpp_mode && test_macro_names;
 
     // Add include mappings
     for (int i = 0; i < include_count; i++) {
@@ -7392,24 +7421,27 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
     return c_test_owners_complete(&ctx);
 }
 
+/* No file result: the extraction default without configuration, as for
+ * cbm_run_c_lsp_cross_with_registry. */
 bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
                          bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
                          const char **include_ns_qns, int include_count, TSTree *cached_tree,
                          CBMResolvedCallArray *out) {
     return cbm_run_c_lsp_cross_status(arena, source, source_len, module_qn, cpp_mode, defs,
                                       def_count, include_paths, include_ns_qns, include_count,
-                                      cached_tree, out) == CBM_LSP_COMPLETE;
+                                      cached_tree, out, cpp_mode) == CBM_LSP_COMPLETE;
 }
 
 CBMLSPStatus cbm_run_c_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
                                         const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
                                         int def_count, const char **include_paths,
                                         const char **include_ns_qns, int include_count,
-                                        TSTree *cached_tree, CBMResolvedCallArray *out) {
+                                        TSTree *cached_tree, CBMResolvedCallArray *out,
+                                        bool test_macro_names) {
     CBMLSPStatus status;
     (void)c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs, def_count,
                           include_paths, include_ns_qns, include_count, cached_tree, out,
-                          CBM_SOURCE_ORIGIN_RAW, NULL, &status);
+                          CBM_SOURCE_ORIGIN_RAW, NULL, test_macro_names, &status);
     return status;
 }
 
@@ -7420,11 +7452,12 @@ bool cbm_run_c_lsp_cross_with_test_owners(CBMArena *arena, const char *source, i
                                           const char **include_ns_qns, int include_count,
                                           TSTree *cached_tree, CBMResolvedCallArray *out,
                                           CBMSourceOrigin source_origin,
-                                          const CBMFileResult *test_owners) {
+                                          const CBMFileResult *test_owners, bool test_macro_names) {
     CBMLSPStatus status;
-    bool owners_ok = c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs,
-                                     def_count, include_paths, include_ns_qns, include_count,
-                                     cached_tree, out, source_origin, test_owners, &status);
+    bool owners_ok =
+        c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs, def_count,
+                        include_paths, include_ns_qns, include_count, cached_tree, out,
+                        source_origin, test_owners, test_macro_names, &status);
     return owners_ok && status == CBM_LSP_COMPLETE;
 }
 

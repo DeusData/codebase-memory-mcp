@@ -3898,6 +3898,43 @@ static void record_included_files(CBMArena *a, CBMFileResult *result,
     result->included_files = list;
 }
 
+static int test_span_order(const void *left, const void *right) {
+    const CBMTestSpan *a = left;
+    const CBMTestSpan *b = right;
+    if (a->start_line != b->start_line) {
+        return a->start_line < b->start_line ? -1 : 1;
+    }
+    if (a->end_line != b->end_line) {
+        return a->end_line < b->end_line ? -1 : 1;
+    }
+    return strcmp(a->qualified_name, b->qualified_name);
+}
+
+/* The raw view's GoogleTest definitions (recorded by the def walk), sorted, the
+ * preprocessor's line map, and the index of the preprocessed view's top-level
+ * definitions that map onto them, for that view of the same file. NULL when
+ * the raw view named no test or the map is missing. */
+static const CBMTestSpanMap *pp_test_span_map(CBMTestSpanMap *map, CBMExtractCtx *raw,
+                                              const CBMPreprocessedSource *pp, TSNode pp_root) {
+    if (raw->test_span_count <= 0 || !pp->original_line_by_expanded_line ||
+        !pp->belongs_to_main_file) {
+        return NULL;
+    }
+    qsort(raw->test_spans, (size_t)raw->test_span_count, sizeof(CBMTestSpan), test_span_order);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    cbm_test_span_test_count((uint64_t)raw->test_span_count);
+#endif
+    *map = (CBMTestSpanMap){raw->test_spans,
+                            raw->test_span_count,
+                            pp->original_line_by_expanded_line,
+                            pp->belongs_to_main_file,
+                            pp->expanded_line_count,
+                            NULL,
+                            0};
+    cbm_test_span_index_view(map, raw->scratch ? raw->scratch : raw->arena, pp_root);
+    return map;
+}
+
 static CBMFileResult *extract_file_ex_body(
     const char *source, int source_len, CBMLanguage language, const char *project,
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
@@ -3916,6 +3953,7 @@ static CBMFileResult *extract_file_ex_body(
         language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
+    result->cpp_test_macro_names = cbm_cpp_test_macro_names_on(language, test_declarations);
     if (!cbm_test_declarations_validate(result, test_declarations)) {
         return result;
     }
@@ -4330,6 +4368,12 @@ static CBMFileResult *extract_file_ex_body(
                     TSNode pp_root = ts_tree_root_node(pp_tree);
 
                     // Build context for expanded source — extract only calls via unified extractor
+                    /* The raw view's GoogleTest definitions, so that this
+                     * view names their bodies the same way however the
+                     * expanded head reads (cbm_test_span_owner_qn). */
+                    CBMTestSpanMap pp_map;
+                    const CBMTestSpanMap *pp_spans =
+                        pp_test_span_map(&pp_map, &ctx, preprocessed, pp_root);
                     CBMExtractCtx pp_ctx = {
                         .arena = a,
                         .scratch = scratch,
@@ -4345,6 +4389,7 @@ static CBMFileResult *extract_file_ex_body(
                          * cannot acquire a raw configured definition identity. */
                         .test_declarations = test_declarations,
                         .test_declarations_raw_source = false,
+                        .pp_test_spans = pp_spans,
                     };
                     // Re-run unified extraction on expanded source.
                     // This adds macro-expanded calls; duplicates with original calls are
@@ -4366,7 +4411,8 @@ static CBMFileResult *extract_file_ex_body(
                     // block). Runs in every mode.
                     if (!result->lsp_skipped) {
                         cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                      language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                                      language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED,
+                                      pp_spans);
                     }
 
                     /* All C-LSP emitters stamp origin directly so rewrite-time
