@@ -5318,10 +5318,22 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "tools/list") != NULL);
+    ASSERT(strstr(sk[0].content, "17 MCP Tools") != NULL);
     ASSERT(strstr(sk[0].content, "15 MCP Tools") == NULL);
-    ASSERT(strstr(sk[0].content, "WHERE NOT EXISTS { (f)<-[:CALLS]-() }") != NULL);
+    ASSERT(strstr(sk[0].content, "WHERE NOT EXISTS { (f)<-[:CALLS]-() } AND NOT EXISTS { "
+                                 "(f)<-[:CALL_REFERENCE]-() }") != NULL);
     ASSERT(strstr(sk[0].content, "not natural-language sentences") != NULL);
+    /* Every tool the server registers is named in the installed skill, so the
+     * list cannot drift from the server again (it missed get_file_outline and
+     * compare_graphs). Names are matched with their backticks. */
+    for (int t = 0; t < cbm_mcp_tool_count(); t++) {
+        char quoted[96];
+        snprintf(quoted, sizeof(quoted), "`%s`", cbm_mcp_tool_name(t));
+        if (!strstr(sk[0].content, quoted)) {
+            printf("  installed skill does not name the tool %s\n", quoted);
+        }
+        ASSERT(strstr(sk[0].content, quoted) != NULL);
+    }
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);

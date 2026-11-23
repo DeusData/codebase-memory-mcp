@@ -1907,6 +1907,49 @@ TEST(cypher_exists_no_callers) {
     PASS();
 }
 
+TEST(cypher_skill_dead_code_recipe_excludes_referenced_callbacks) {
+    /* The installed skill's dead-code recipe: no inbound CALLS and no inbound
+     * CALL_REFERENCE, one edge type per EXISTS. OnEvent is a callback that
+     * Register passes by reference, so it is not a candidate; HandleOrder and
+     * Register have neither kind of caller. NOT EXISTS on CALLS alone would
+     * also list OnEvent. */
+    cbm_store_t *s = setup_cypher_store();
+    cbm_node_t reg = {.project = "test",
+                      .label = "Function",
+                      .name = "Register",
+                      .qualified_name = "test.Register",
+                      .file_path = "event.go"};
+    cbm_node_t cb = {.project = "test",
+                     .label = "Function",
+                     .name = "OnEvent",
+                     .qualified_name = "test.OnEvent",
+                     .file_path = "event.go"};
+    int64_t reg_id = cbm_store_upsert_node(s, &reg);
+    int64_t cb_id = cbm_store_upsert_node(s, &cb);
+    cbm_edge_t ref = {
+        .project = "test", .source_id = reg_id, .target_id = cb_id, .type = "CALL_REFERENCE"};
+    cbm_store_insert_edge(s, &ref);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } AND NOT "
+                                "EXISTS { (f)<-[:CALL_REFERENCE]-() } RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    bool handle = false;
+    bool regd = false;
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT(strcmp(r.rows[i][0], "OnEvent") != 0);
+        handle = handle || strcmp(r.rows[i][0], "HandleOrder") == 0;
+        regd = regd || strcmp(r.rows[i][0], "Register") == 0;
+    }
+    ASSERT(handle && regd);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exists_has_outgoing_calls) {
     /* EXISTS { (f)-[:CALLS]->() } → functions that call something.
      * HandleOrder (→ValidateOrder, →LogError) and ValidateOrder (→SubmitOrder). */
@@ -6542,6 +6585,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue874_where_unsupported_func_error);
     RUN_TEST(cypher_multi_prop_projection_no_alias);
     RUN_TEST(cypher_exists_no_callers);
+    RUN_TEST(cypher_skill_dead_code_recipe_excludes_referenced_callbacks);
     RUN_TEST(cypher_exists_has_outgoing_calls);
     RUN_TEST(cypher_exec_calls_relationship);
     RUN_TEST(cypher_exec_calls_with_where);
