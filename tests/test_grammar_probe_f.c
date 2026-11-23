@@ -6983,6 +6983,164 @@ TEST(probe_gomod_enables_go_imports) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * GROUP 19b — requirements.txt text encodings (#2941)
+ *
+ * pip decodes requirements.txt by its BOM. Windows PowerShell 5.1 writes
+ * `pip freeze > requirements.txt` as UTF-16 LE with a BOM and CRLF, and many
+ * editors save UTF-8 with a BOM. Each package becomes one Package node.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* `ascii` as UTF-16 (little- or big-endian) with a BOM; returns the length. */
+static size_t gpf_utf16_with_bom(const char *ascii, int big_endian, unsigned char *out,
+                                 size_t cap) {
+    size_t n = 0;
+    if (cap < 2) return 0;
+    out[n++] = big_endian ? 0xFE : 0xFF;
+    out[n++] = big_endian ? 0xFF : 0xFE;
+    for (const char *p = ascii; *p && n + 2 <= cap; p++) {
+        out[n++] = big_endian ? 0 : (unsigned char)*p;
+        out[n++] = big_endian ? (unsigned char)*p : 0;
+    }
+    return n;
+}
+
+static int gpf_cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Index a project holding only requirements.txt with these raw bytes; write
+ * the Package node names, sorted and comma-joined, into `out`. */
+static int gpf_requirements_packages(const unsigned char *bytes, size_t len, char *out,
+                                     size_t out_sz) {
+    GpfProj lp;
+    memset(&lp, 0, sizeof(lp));
+    out[0] = '\0';
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_gpf_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) return 0;
+    gpf_to_fwd_slashes(lp.tmpdir);
+    char path[700];
+    snprintf(path, sizeof(path), "%s/requirements.txt", lp.tmpdir);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        th_rmtree(lp.tmpdir);
+        return 0;
+    }
+    size_t wrote = fwrite(bytes, 1, len, f);
+    fclose(f);
+    cbm_store_t *store = wrote == len ? gpf_open_indexed(&lp) : NULL;
+    int ok = 0;
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (store &&
+        cbm_store_find_nodes_by_label(store, lp.project, "Package", &nodes, &count) ==
+            CBM_STORE_OK) {
+        const char *names[64];
+        int k = 0;
+        for (int i = 0; i < count && k < 64; i++) names[k++] = nodes[i].name;
+        qsort(names, (size_t)k, sizeof(names[0]), gpf_cmp_str);
+        for (int i = 0; i < k; i++) {
+            if (i) strncat(out, ",", out_sz - strlen(out) - 1);
+            strncat(out, names[i], out_sz - strlen(out) - 1);
+        }
+        cbm_store_free_nodes(nodes, count);
+        ok = 1;
+    }
+    gpf_cleanup(&lp, store);
+    return ok;
+}
+
+static const char GPF_REQS[] = "requests==2.32.3\r\nuvicorn==0.30.0\r\n";
+
+/* RED before #2941: the file read as one bogus package, "\xff\xfe" + "r". */
+TEST(probe_requirements_utf16le_bom_issue2941) {
+    unsigned char buf[256];
+    size_t n = gpf_utf16_with_bom(GPF_REQS, 0, buf, sizeof(buf));
+    char names[256];
+    ASSERT_TRUE(gpf_requirements_packages(buf, n, names, sizeof(names)));
+    ASSERT_STR_EQ(names, "requests,uvicorn");
+    PASS();
+}
+
+TEST(probe_requirements_utf16be_bom_issue2941) {
+    unsigned char buf[256];
+    size_t n = gpf_utf16_with_bom(GPF_REQS, 1, buf, sizeof(buf));
+    char names[256];
+    ASSERT_TRUE(gpf_requirements_packages(buf, n, names, sizeof(names)));
+    ASSERT_STR_EQ(names, "requests,uvicorn");
+    PASS();
+}
+
+/* RED before #2941: the BOM stuck to the first name ("\xEF\xBB\xBFrequests"). */
+TEST(probe_requirements_utf8_bom_issue2941) {
+    unsigned char buf[256];
+    static const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    memcpy(buf, bom, sizeof(bom));
+    memcpy(buf + sizeof(bom), GPF_REQS, sizeof(GPF_REQS) - 1);
+    char names[256];
+    ASSERT_TRUE(gpf_requirements_packages(buf, sizeof(bom) + sizeof(GPF_REQS) - 1, names,
+                                          sizeof(names)));
+    ASSERT_STR_EQ(names, "requests,uvicorn");
+    PASS();
+}
+
+/* GREEN guard: plain UTF-8 reads as before. */
+TEST(probe_requirements_utf8_plain_issue2941) {
+    char names[256];
+    ASSERT_TRUE(gpf_requirements_packages((const unsigned char *)GPF_REQS, sizeof(GPF_REQS) - 1,
+                                          names, sizeof(names)));
+    ASSERT_STR_EQ(names, "requests,uvicorn");
+    PASS();
+}
+
+/* UTF-16 bytes from explicit code units (BOM included), so a test can hold
+ * surrogates. */
+static size_t gpf_utf16_units(const uint16_t *units, size_t count, int big_endian,
+                              unsigned char *out, size_t cap) {
+    size_t n = 0;
+    for (size_t i = 0; i < count && n + 2 <= cap; i++) {
+        unsigned char hi = (unsigned char)(units[i] >> 8);
+        unsigned char lo = (unsigned char)(units[i] & 0xFF);
+        out[n++] = big_endian ? hi : lo;
+        out[n++] = big_endian ? lo : hi;
+    }
+    return n;
+}
+
+/* GREEN guard for the transcoder's multi-byte paths: a 2-byte (U+00E9), a
+ * 3-byte (U+540D) and a 4-byte code point (U+1F600, a surrogate pair), and an
+ * unpaired low surrogate (-> U+FFFD), each inside a package name, come out as
+ * exact UTF-8 from both byte orders. */
+TEST(probe_requirements_utf16_non_ascii_issue2941) {
+    static const uint16_t units[] = {
+        0xFEFF, 'c',    'a', 'f', 0x00E9, '=', '=',  '1',  '\r', '\n', 0x540D,
+        '=',    '=',    '1', '\r', '\n',  0xD83D, 0xDE00, '=', '=',  '1',  '\r',
+        '\n',   'x',    0xDC00, 'y', '=',  '=',  '1',  '\r', '\n',
+    };
+    for (int big_endian = 0; big_endian <= 1; big_endian++) {
+        unsigned char buf[256];
+        size_t n = gpf_utf16_units(units, sizeof(units) / sizeof(units[0]), big_endian, buf,
+                                   sizeof(buf));
+        char names[256];
+        ASSERT_TRUE(gpf_requirements_packages(buf, n, names, sizeof(names)));
+        ASSERT_STR_EQ(names, "caf\xC3\xA9,x\xEF\xBF\xBDy,\xE5\x90\x8D,\xF0\x9F\x98\x80");
+    }
+    PASS();
+}
+
+/* GREEN guard: a file that is only a BOM (UTF-8, UTF-16 LE, UTF-16 BE)
+ * decodes to empty text and yields no Package. */
+TEST(probe_requirements_bom_only_issue2941) {
+    static const unsigned char boms[3][3] = {{0xEF, 0xBB, 0xBF}, {0xFF, 0xFE, 0}, {0xFE, 0xFF, 0}};
+    static const size_t lens[3] = {3, 2, 2};
+    for (int k = 0; k < 3; k++) {
+        char names[256];
+        ASSERT_TRUE(gpf_requirements_packages(boms[k], lens[k], names, sizeof(names)));
+        ASSERT_STR_EQ(names, "");
+    }
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * SUITE wiring
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -7208,4 +7366,12 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_gomod_simple);
     RUN_TEST(probe_gomod_depends_on_edges);
     RUN_TEST(probe_gomod_enables_go_imports);
+
+    /* requirements.txt encodings (#2941) */
+    RUN_TEST(probe_requirements_utf16le_bom_issue2941);
+    RUN_TEST(probe_requirements_utf16be_bom_issue2941);
+    RUN_TEST(probe_requirements_utf8_bom_issue2941);
+    RUN_TEST(probe_requirements_utf8_plain_issue2941);
+    RUN_TEST(probe_requirements_utf16_non_ascii_issue2941);
+    RUN_TEST(probe_requirements_bom_only_issue2941);
 }

@@ -24,7 +24,8 @@
 #          scripts/test-impact/predict.py map it to suites with the lane
 #          selector's run-all triggers. Writes DIR/prediction.json and
 #          DIR/summary.md (appended to $GITHUB_STEP_SUMMARY when set). The
-#          graph is only consulted when C sources changed.
+#          graph is only consulted when C sources changed and the lane
+#          selector has not already required every suite.
 # Exit: 0 = prediction written · 1 = the tooling broke · 2 = usage error.
 set -euo pipefail
 
@@ -135,7 +136,8 @@ VERSION=$("$BINARY" --version 2>/dev/null | head -1 || true)
 DETECT_ARGS=()
 T_INDEX="-"
 T_DETECT="-"
-if [ "$(python3 "$PREDICT" --needs-graph --changed "$OUT/changed-files.txt")" = yes ]; then
+if [ "$(python3 "$PREDICT" --needs-graph --changed "$OUT/changed-files.txt" \
+    --selection "$OUT/selection.json")" = yes ]; then
     python3 -c 'import json, sys; json.dump({"repo_path": sys.argv[1]}, open(sys.argv[2], "w"))' \
         "$ROOT" "$WORK/index-args.json"
     t0=$(date +%s)
