@@ -571,8 +571,12 @@ static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn)
 
 /* ── constant resolution ────────────────────────────────────────── */
 
-/* Class-table probe by dotted path: this file first, then the project. */
-static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) {
+/* Class-table probe by dotted path: this file first, then the project.
+ * *ambiguous is set when the project declares `path` under several package
+ * roots, none of them the caller's: the constant exists, so Ruby would bind
+ * it here and the caller must not fall through to an outer one. */
+static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path, bool *ambiguous) {
+    *ambiguous = false;
     for (int i = 0; i < ctx->class_count; i++) {
         if (strcmp(ctx->classes[i].path, path) == 0)
             return ctx->classes[i].qn;
@@ -587,7 +591,11 @@ static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) 
     if (c)
         return c->qn;
     c = ruby_shared_find_path(sh, path);
-    return c && !c->path_next ? c->qn : NULL;
+    if (c && c->path_next) {
+        *ambiguous = true;
+        return NULL;
+    }
+    return c ? c->qn : NULL;
 }
 
 const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
@@ -607,9 +615,12 @@ const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
         while (prefix[0]) {
             const char *cand =
                 cbm_arena_sprintf(ctx->arena, "%s.%s", ruby_dotted(ctx->arena, prefix), path);
-            const char *qn = ruby_class_qn_by_path(ctx, cand);
+            bool ambiguous = false;
+            const char *qn = ruby_class_qn_by_path(ctx, cand, &ambiguous);
             if (qn)
                 return qn;
+            if (ambiguous)
+                return NULL; /* declared here in several other roots: fail closed */
             char *last_dot = strrchr(prefix, '.');
             if (last_dot)
                 *last_dot = '\0';
@@ -617,10 +628,15 @@ const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
                 prefix[0] = '\0';
         }
     }
-    const char *qn = ruby_class_qn_by_path(ctx, path);
+    bool ambiguous = false;
+    const char *qn = ruby_class_qn_by_path(ctx, path, &ambiguous);
     if (qn)
         return qn;
-    /* Stdlib types are keyed by their dotted bare path. */
+    /* Stdlib types are keyed by their dotted bare path. A top-level constant
+     * several roots declare and stdlib also has is a reopening of that one
+     * global class (`class String` patched in two gems), so stdlib still
+     * answers; without a stdlib type an ambiguous constant stays unresolved. */
+    (void)ambiguous;
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, path);
     if (t)
         return t->qualified_name;
@@ -2304,7 +2320,10 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         ci->group_head = sh->by_path[ruby_shared_path_slot(sh, ci->root, ci->path)];
     }
     /* Heads sharing a constant path across package roots, chained from one
-     * by_pp entry, so a lookup can tell "one root" from "several". */
+     * by_pp entry, so a lookup can tell "one root" from "several". A later
+     * head is linked right after the first one, O(1) per head: the only
+     * reader asks whether a second head exists, so the order behind the
+     * first does not matter (no tail walk, per the LSP registry checklist). */
     for (int i = 0; i < sh->class_count; i++) {
         if (sh->classes[i].group_head != i + 1)
             continue;
@@ -2313,10 +2332,8 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
         while (sh->by_pp[h]) {
             RubyClassInfo *first = &sh->classes[sh->by_pp[h] - 1];
             if (strcmp(first->path, sh->classes[i].path) == 0) {
-                RubyClassInfo *tail = first;
-                while (tail->path_next)
-                    tail = &sh->classes[tail->path_next - 1];
-                tail->path_next = i + 1;
+                sh->classes[i].path_next = first->path_next;
+                first->path_next = i + 1;
                 placed = true;
                 break;
             }

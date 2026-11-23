@@ -2063,6 +2063,64 @@ TEST(rubylsp_cross_same_named_classes_stay_in_their_package) {
     PASS();
 }
 
+TEST(rubylsp_cross_ambiguous_nested_constant_does_not_fall_through) {
+    /* Inside `module M`, `X` names M::X when M::X exists. Two packages
+     * declare M::X and a third declares a top-level X. A caller in a fourth
+     * package, inside module M, must not land on the top-level X (Ruby binds
+     * M::X there; which package's is unknown, so nothing). A caller in
+     * alpha binds alpha's M::X. Three packages share M::X so the per-path
+     * chain holds more than two heads. */
+    CBMLSPDef defs[8];
+    cross_def(&defs[0], "proj.alpha.lib.mx.M.X", "X", "Class", "proj.alpha.lib.mx", NULL, NULL);
+    cross_def(&defs[1], "proj.alpha.lib.mx.M.X.hello", "hello", "Method", "proj.alpha.lib.mx",
+              "proj.alpha.lib.mx.M.X", NULL);
+    cross_def(&defs[2], "proj.beta.lib.mx.M.X", "X", "Class", "proj.beta.lib.mx", NULL, NULL);
+    cross_def(&defs[3], "proj.beta.lib.mx.M.X.hello", "hello", "Method", "proj.beta.lib.mx",
+              "proj.beta.lib.mx.M.X", NULL);
+    cross_def(&defs[4], "proj.eta.lib.mx.M.X", "X", "Class", "proj.eta.lib.mx", NULL, NULL);
+    cross_def(&defs[5], "proj.eta.lib.mx.M.X.hello", "hello", "Method", "proj.eta.lib.mx",
+              "proj.eta.lib.mx.M.X", NULL);
+    cross_def(&defs[6], "proj.gamma.lib.x.X", "X", "Class", "proj.gamma.lib.x", NULL, NULL);
+    cross_def(&defs[7], "proj.gamma.lib.x.X.hello", "hello", "Method", "proj.gamma.lib.x",
+              "proj.gamma.lib.x.X", NULL);
+
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, 8);
+    ASSERT(sh != NULL);
+
+    const char *src =
+        "module M\n  class Caller\n    def run\n      X.new.hello\n    end\n  end\nend\n";
+    const char *mods[2] = {"proj.delta.lib.caller", "proj.alpha.lib.caller"};
+    const char *callers[2] = {"proj.delta.lib.caller.M.Caller.run",
+                              "proj.alpha.lib.caller.M.Caller.run"};
+    bool delta_none = false;
+    bool alpha_own = false;
+    for (int i = 0; i < 2; i++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMResolvedCallArray o;
+        memset(&o, 0, sizeof(o));
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), mods[i], sh, NULL, NULL, 0,
+                                             NULL, &o);
+        bool top = out_has(&o, callers[i], "proj.gamma.lib.x.X.hello");
+        bool alpha = out_has(&o, callers[i], "proj.alpha.lib.mx.M.X.hello");
+        bool beta = out_has(&o, callers[i], "proj.beta.lib.mx.M.X.hello");
+        bool eta = out_has(&o, callers[i], "proj.eta.lib.mx.M.X.hello");
+        if (i == 0)
+            delta_none = !top && !alpha && !beta && !eta;
+        else
+            alpha_own = alpha && !top && !beta && !eta;
+        if (!(i == 0 ? delta_none : alpha_own))
+            out_dump(&o);
+        cbm_arena_destroy(&a);
+    }
+    cbm_arena_destroy(&build);
+    ASSERT(delta_none);
+    ASSERT(alpha_own);
+    PASS();
+}
+
 TEST(rubylsp_cross_registry_is_def_order_independent) {
     bool f[4];
     bool r[4];
@@ -2315,6 +2373,7 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
     RUN_TEST(rubylsp_cross_reopened_class_work_is_bounded);
     RUN_TEST(rubylsp_cross_same_named_classes_stay_in_their_package);
+    RUN_TEST(rubylsp_cross_ambiguous_nested_constant_does_not_fall_through);
     RUN_TEST(rubylsp_cross_registry_is_def_order_independent);
     RUN_TEST(rubylsp_extractor_flags_singleton_methods_and_mixins);
     RUN_TEST(rubylsp_cross_singleton_and_instance_do_not_shadow);
