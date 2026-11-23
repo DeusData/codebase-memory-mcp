@@ -2687,6 +2687,7 @@ TEST(test_policy_repository_rules_map_every_kind_of_path) {
         {"graph-ui/package.json", "repo-data"},
         {"graph-ui/src/main.tsx", "repo-data"},
         {"tools/tree-sitter-pascal/src/parser.c", "repo-data"},
+        {"tools/tree-sitter-haskell/src/parser.c", "repo-data"},
         {"tests/fuzz/corpus/cypher/match.seed", "repo-data"},
         {"flake.nix", "repo-data"},
         {"DCO", "repo-data"},

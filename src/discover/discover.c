@@ -48,7 +48,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */
     ".cache", ".eggs", ".env", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
-    ".venv", "__pycache__", "env", "htmlcov", "site-packages", "venv",
+    ".venv", "__pycache__", "htmlcov", "site-packages", "venv",
     /* JS/TS */
     ".npm", ".nyc_output", ".pnpm-store", ".yarn", "bower_components", "coverage", "node_modules",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".turbo", ".parcel-cache", ".docusaurus", ".expo",
@@ -59,9 +59,37 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".cargo", ".stack-work", ".dart_tool", "zig-cache", "zig-out", ".metals", ".bloop", ".bsp",
     ".ccls-cache", ".clangd", "elm-stuff", "_opam", ".cpcache", ".shadow-cljs",
     /* Deploy */
-    ".vercel", ".netlify", "deploy", "deployed",
+    ".vercel", ".netlify",
     /* Misc */
     ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+
+/* Directories walked for their deployment and configuration files only. Build
+ * output copied into deploy/ made duplicate classes of the real source
+ * (discover_deploy_excluded_full_mode), while the manifests, charts, Terraform,
+ * Dockerfiles and scripts that deploy a project live there too. A file in such a
+ * directory, at any depth, is kept by its language
+ * (cbm_language_is_deployment_config), never by its folder. */
+static const char *CONFIG_ONLY_DIRS[] = {"deploy", "deployed", NULL};
+
+/* A directory named env is skipped only when it is a Python environment:
+ * `python -m venv` and virtualenv (since 20) write pyvenv.cfg, older
+ * virtualenv an activate script in bin/ (POSIX) or Scripts/ (Windows), and
+ * conda conda-meta/history into every environment, the base one included.
+ * Any other env directory, a Go package or a folder of settings, is walked
+ * like any other. A marker is its exact stored name, never a lookup the file
+ * system may answer case-insensitively. One marker list for the walk (the
+ * directory listings) and the pinned inventory (its file list). */
+static const char VENV_DIR_NAME[] = "env";
+const char *const CBM_DISCOVER_VENV_MARKERS[] = {"pyvenv.cfg", "bin/activate", "Scripts/activate",
+                                                 "conda-meta/history", NULL};
+
+/* Package manifests: what the package map reads (pass_pkgmap.c), and what a
+ * config-only directory drops by name. */
+static const char *PACKAGE_MANIFESTS[] = {"package.json",   "go.mod",        "Cargo.toml",
+                                          "pyproject.toml", "composer.json", "pubspec.yaml",
+                                          "pom.xml",        "build.gradle",  "build.gradle.kts",
+                                          "mix.exs",        "Package.swift", NULL};
+static const char PACKAGE_MANIFEST_SUFFIX[] = ".gemspec";
 
 /* Always-skip directories matched by relative-PATH suffix, not by basename:
  * generated build output whose last path component alone ("views") is far too
@@ -444,6 +472,22 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     }
 
     return false;
+}
+
+bool cbm_discover_config_only_dir(const char *dirname) {
+    return dirname && str_in_list(dirname, CONFIG_ONLY_DIRS);
+}
+
+bool cbm_discover_venv_candidate(const char *name) {
+    return name && strcmp(name, VENV_DIR_NAME) == 0;
+}
+
+bool cbm_discover_is_package_manifest(const char *basename) {
+    if (!basename) {
+        return false;
+    }
+    return str_in_list(basename, PACKAGE_MANIFESTS) ||
+           ends_with(basename, strlen(basename), PACKAGE_MANIFEST_SUFFIX);
 }
 
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
@@ -858,24 +902,35 @@ static bool dir_is_cache_tree(const char *abs_path) {
  * which yield to tracked content; built-in skips and .cbmignore never do. */
 typedef enum { DIR_KEEP, DIR_SKIP, DIR_GIT_IGNORED } dir_verdict_t;
 
+static bool dir_is_venv_on_disk(const char *abs_dir);
+
+/* *config_only: the directory is walked for its configuration files only
+ * (CONFIG_ONLY_DIRS); its subdirectories inherit that from the walk frame. */
 static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_path,
-                                       const cbm_discover_opts_t *opts,
+                                       const char *abs_path, const cbm_discover_opts_t *opts,
                                        const gitignore_link_t *ignore_chain,
                                        const cbm_gitignore_t *global_gi,
-                                       const cbm_gitignore_t *cbmignore) {
-    bool builtin_skip = cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) &&
-                        (cbm_discover_is_safety_core_directory(entry_name) ||
-                         !cbm_discover_path_in_jvm_package(rel_path));
-    if (builtin_skip || cbm_discover_path_has_skip_suffix(rel_path)) {
+                                       const cbm_gitignore_t *cbmignore, bool *config_only) {
+    *config_only = false;
+    bool safety = cbm_discover_is_safety_core_directory(entry_name);
+    bool named = cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
+                 (cbm_discover_venv_candidate(entry_name) && dir_is_venv_on_disk(abs_path));
+    bool config = !named && cbm_discover_config_only_dir(entry_name);
+    /* Below a JVM source root every directory is a package: no built-in rule. */
+    bool package = (named || config) && !safety && cbm_discover_path_in_jvm_package(rel_path);
+    bool builtin_skip = named && !package;
+    config = config && !package;
+    if (builtin_skip || config || cbm_discover_path_has_skip_suffix(rel_path)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
-         * non-negatable safety core. Fall through so .gitignore/global/local
-         * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !cbm_discover_is_safety_core_directory(entry_name) &&
-                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
-        if (!unskipped) {
+         * non-negatable safety core — and walks a config-only one in full.
+         * Fall through so .gitignore/global/local rules still apply. */
+        bool unskipped =
+            cbmignore && !safety && cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!unskipped && !config) {
             return DIR_SKIP;
         }
+        *config_only = !unskipped;
     }
     bool git_ignored = gitignore_chain_result(ignore_chain, rel_path, true) > 0;
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
@@ -992,6 +1047,90 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
     }
     return 0;
 #endif
+}
+
+/* True when the listing of `dir` holds an entry stored exactly as `name`
+ * (byte comparison, so letter case decides on every platform) that is a
+ * directory (`directory`) or a regular file, checked by safe_stat: no
+ * symlink or junction is followed out of the repository, no content read. */
+static bool dir_lists_exact(const char *dir, const char *name, size_t name_len, bool directory) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    bool listed = false;
+    cbm_dirent_t *entry;
+    while (!listed && (entry = cbm_readdir(d)) != NULL) {
+        listed = strlen(entry->name) == name_len && memcmp(entry->name, name, name_len) == 0;
+    }
+    cbm_closedir(d);
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+    if (!listed || written < 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    struct stat st;
+    bool is_symlink = false;
+    return safe_stat(path, &st, &is_symlink) == 0 &&
+           (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode));
+}
+
+/* One venv marker below abs_dir, one path component at a time: each one is
+ * an exact entry of the directory before it, a directory on the way, a
+ * regular file at the end. */
+static bool venv_marker_listed(const char *abs_dir, const char *marker) {
+    char dir[CBM_SZ_4K];
+    int written = snprintf(dir, sizeof(dir), "%s", abs_dir);
+    if (written < 0 || (size_t)written >= sizeof(dir)) {
+        return false;
+    }
+    for (const char *part = marker; *part;) {
+        const char *slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        if (!dir_lists_exact(dir, part, len, slash != NULL)) {
+            return false;
+        }
+        if (!slash) {
+            return true;
+        }
+        size_t used = strlen(dir);
+        written = snprintf(dir + used, sizeof(dir) - used, "/%.*s", (int)len, part);
+        if (written < 0 || (size_t)written >= sizeof(dir) - used) {
+            return false;
+        }
+        part = slash + SKIP_ONE;
+    }
+    return false;
+}
+
+/* Once per directory named env the walk meets: its listing is read once to
+ * see which markers can be there, and a marker's subdirectory (bin, Scripts,
+ * conda-meta) only when it is listed. */
+static bool dir_is_venv_on_disk(const char *abs_dir) {
+    /* the list's slots; the last one is its NULL terminator */
+    enum { SLOTS = sizeof(CBM_DISCOVER_VENV_MARKERS) / sizeof(CBM_DISCOVER_VENV_MARKERS[0]) };
+    bool first[SLOTS] = {false};
+    cbm_dir_t *d = abs_dir ? cbm_opendir(abs_dir) : NULL;
+    if (!d) {
+        return false;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        for (int i = 0; i < SLOTS - SKIP_ONE; i++) {
+            const char *marker = CBM_DISCOVER_VENV_MARKERS[i];
+            const char *slash = strchr(marker, '/');
+            size_t len = slash ? (size_t)(slash - marker) : strlen(marker);
+            first[i] =
+                first[i] || (strlen(entry->name) == len && memcmp(entry->name, marker, len) == 0);
+        }
+    }
+    cbm_closedir(d);
+    for (int i = 0; i < SLOTS - SKIP_ONE; i++) {
+        if (first[i] && venv_marker_listed(abs_dir, CBM_DISCOVER_VENV_MARKERS[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ── Sphinx documentation sets ────────────────────────────────────
@@ -1146,7 +1285,8 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, const sphinx_suffixes_t *sphinx,
-                                  bool in_ignored_dir, const struct stat *st, file_list_t *out) {
+                                  bool in_ignored_dir, bool config_only, const struct stat *st,
+                                  file_list_t *out) {
     const char *skip_reason =
         file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size,
                          tracked_has_file(out->tracked, rel_path), in_ignored_dir);
@@ -1165,6 +1305,13 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
     if (lang == CBM_LANG_COUNT) {
         return;
     }
+    if (config_only &&
+        (!cbm_language_is_deployment_config(lang) || cbm_discover_is_package_manifest(name))) {
+        /* Program source and package manifests in deploy/ or deployed/: the
+         * built-in skip list's rule for those directories (#963 records it). */
+        file_list_add_ignored(out, rel_path, "skip-list");
+        return;
+    }
     fl_add(out, abs_path, rel_path, lang, st);
 }
 
@@ -1174,6 +1321,7 @@ typedef struct {
     const gitignore_link_t *ignore_chain; /* deepest .gitignore governing this dir */
     sphinx_suffixes_t sphinx;             /* the documentation set's extra reST suffixes */
     bool git_ignored; /* ignored by git's rules, entered only for its tracked content */
+    bool config_only; /* in or below a CONFIG_ONLY_DIRS directory: configuration files only */
 } walk_frame_t;
 /* Initial capacity only — the stack grows on demand. A single directory can
  * hold more pending sibling frames than any fixed cap (dotnet/runtime has 855
@@ -1211,7 +1359,8 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
  * context. Grows the stack geometrically; the caller's `parent` must not
  * point into the stack array (walk_dir pops into a local copy). */
 static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char *rel_path,
-                             const walk_frame_t *parent, bool git_ignored, file_list_t *out) {
+                             const walk_frame_t *parent, bool git_ignored, bool config_only,
+                             file_list_t *out) {
     if (ws->top >= ws->cap) {
         int new_cap = ws->cap * 2;
         walk_frame_t *grown = realloc(ws->frames, (size_t)new_cap * sizeof(*grown));
@@ -1233,6 +1382,7 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
     slot->ignore_chain = parent->ignore_chain;
     slot->sphinx = parent->sphinx;
     slot->git_ignored = git_ignored;
+    slot->config_only = config_only;
     ws->top++;
 }
 
@@ -1276,23 +1426,27 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     if (S_ISDIR(st.st_mode)) {
-        dir_verdict_t verdict = dir_is_cache_tree(abs_path)
-                                    ? DIR_SKIP
-                                    : directory_verdict(entry->name, rel_path, opts,
-                                                        frame->ignore_chain, global_gi, cbmignore);
+        bool config_only = false;
+        dir_verdict_t verdict =
+            dir_is_cache_tree(abs_path)
+                ? DIR_SKIP
+                : directory_verdict(entry->name, rel_path, abs_path, opts, frame->ignore_chain,
+                                    global_gi, cbmignore, &config_only);
         if (verdict == DIR_KEEP && frame->git_ignored) {
             verdict = DIR_GIT_IGNORED; /* below a git-ignored directory, as in git */
         }
         if (verdict == DIR_KEEP ||
             (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
-            walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED, out);
+            walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED,
+                             frame->config_only || config_only, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
         }
     } else if (S_ISREG(st.st_mode)) {
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, frame->ignore_chain, global_gi,
-                              cbmignore, &frame->sphinx, frame->git_ignored, &st, out);
+                              cbmignore, &frame->sphinx, frame->git_ignored, frame->config_only,
+                              &st, out);
     }
 }
 
