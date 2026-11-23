@@ -130,6 +130,18 @@ for changed, want in ((["README.md"], "no"), (["src/store/store.c"], "yes"),
     if out != want:
         failures.append(f"--needs-graph for {changed}: {out!r}, expected {want!r}")
 
+for selection, want in ((NARROW, "yes"), ({"tier": "T5-core", "full": True}, "no")):
+    (work / "needs.txt").write_text("src/store/store.c\n")
+    (work / "selection.json").write_text(json.dumps(selection))
+    proc = subprocess.run([sys.executable, predict, "--needs-graph", "--changed",
+                           str(work / "needs.txt"), "--selection", str(work / "selection.json")],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or proc.stdout.strip() != want:
+        failures.append(f"--needs-graph with {selection}: {proc.stdout!r}, expected {want!r}")
+expect("run-all without indexing still selects every suite",
+       predict_for("full-no-graph", ["Makefile.cbm", "src/store/store.c"],
+                   {"tier": "T5-core", "full": True}), "all", ALL)
+
 if failures:
     print("TEST-IMPACT PREDICTION CONTRACT VIOLATED:")
     for failure in failures:
