@@ -2454,6 +2454,65 @@ TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955) {
     PASS();
 }
 
+/* #2683: a hook sends HELLO_UNPROVEN with a build adopted from the cohort and
+ * never hashes itself. The daemon admits it only on a proven image: the same
+ * file as its own is proven without hashing; an image it cannot examine gets
+ * PROOF_REQUIRED instead of the claim-based admission a plain HELLO gets; an
+ * image that hashes differently is rejected. Asserted on the hash count. */
+TEST(daemon_runtime_unproven_hello_requires_a_proven_image_issue2683) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "unproven-hello", &identity);
+    cbm_daemon_runtime_connect_result_t owner_result = {0};
+    cbm_daemon_runtime_client_t *owner =
+        started ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                    RUNTIME_TEST_TIMEOUT_MS, &owner_result)
+                : NULL;
+    uint64_t hashes_before = cbm_daemon_runtime_peer_image_hashes_for_testing();
+
+    cbm_daemon_runtime_connect_result_t same = {0};
+    cbm_daemon_runtime_client_t *same_client =
+        owner ? cbm_daemon_runtime_client_connect_unproven(fixture.endpoint, &identity,
+                                                           RUNTIME_TEST_TIMEOUT_MS, &same)
+              : NULL;
+    bool same_admitted = same_client != NULL && same.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
+    if (same_client) {
+        same_admitted =
+            cbm_daemon_runtime_client_close(same_client, RUNTIME_TEST_TIMEOUT_MS) && same_admitted;
+    }
+    uint64_t same_file_hashes = cbm_daemon_runtime_peer_image_hashes_for_testing() - hashes_before;
+
+    cbm_daemon_runtime_connect_result_t unexamined = {0};
+    cbm_daemon_runtime_force_peer_image_unverified_for_testing(true);
+    cbm_daemon_runtime_client_t *unexamined_client =
+        owner ? cbm_daemon_runtime_client_connect_unproven(fixture.endpoint, &identity,
+                                                           RUNTIME_TEST_TIMEOUT_MS, &unexamined)
+              : NULL;
+    cbm_daemon_runtime_force_peer_image_unverified_for_testing(false);
+
+    cbm_daemon_runtime_connect_result_t changed = {0};
+    cbm_daemon_runtime_force_peer_image_mismatch_for_testing(true);
+    cbm_daemon_runtime_client_t *changed_client =
+        owner ? cbm_daemon_runtime_client_connect_unproven(fixture.endpoint, &identity,
+                                                           RUNTIME_TEST_TIMEOUT_MS, &changed)
+              : NULL;
+    cbm_daemon_runtime_force_peer_image_mismatch_for_testing(false);
+
+    bool owner_closed = owner && cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(owner_closed);
+    ASSERT_TRUE(same_admitted);
+    ASSERT_EQ(same_file_hashes, 0);
+    ASSERT_NULL(unexamined_client);
+    ASSERT_EQ(unexamined.status, CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED);
+    ASSERT_NULL(changed_client);
+    ASSERT_EQ(changed.status, CBM_DAEMON_RUNTIME_CONNECT_REJECTED);
+    PASS();
+}
+
 TEST(daemon_runtime_unexpected_frame_payload_is_freed_once) {
     static const uint8_t unexpected_payload[] = {0xde, 0xad, 0xbe, 0xef};
     cbm_daemon_build_identity_t identity =
@@ -5992,6 +6051,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);
     RUN_TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539);
     RUN_TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955);
+    RUN_TEST(daemon_runtime_unproven_hello_requires_a_proven_image_issue2683);
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);

@@ -87,6 +87,13 @@ typedef enum {
      * otherwise begins the normal stopping sequence — including for a
      * PERMANENT generation, which this op and process kill alone may end. */
     CBM_DAEMON_RUNTIME_OP_STOP = 11,
+    /* #2683: a HELLO whose build fingerprint was adopted from the cohort, not
+     * computed by hashing the client's own image. Same payload and response
+     * as HELLO; the daemon must prove the peer image itself, so an image it
+     * cannot examine is answered CONNECT_PROOF_REQUIRED instead of being
+     * admitted on the claim. A daemon that predates this op closes the
+     * connection without an answer. */
+    CBM_DAEMON_RUNTIME_OP_HELLO_UNPROVEN = 12,
 } cbm_daemon_runtime_operation_t;
 
 typedef enum {
@@ -206,6 +213,9 @@ typedef enum {
     CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED = 1,
     CBM_DAEMON_RUNTIME_CONNECT_CONFLICT = 2,
     CBM_DAEMON_RUNTIME_CONNECT_REJECTED = 3,
+    /* Answer to OP_HELLO_UNPROVEN when the daemon could not examine the peer
+     * image: retry with a plain HELLO carrying a self-computed fingerprint. */
+    CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED = 4,
 } cbm_daemon_runtime_connect_status_t;
 
 typedef struct {
@@ -386,6 +396,16 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service);
  * mismatch result (and persists it) before closing a rejected connection.
  * Client exchange timeouts must be finite, not CBM_DAEMON_IPC_WAIT_FOREVER. */
 cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
+    const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
+    uint32_t timeout_ms, cbm_daemon_runtime_connect_result_t *result_out);
+
+/* As cbm_daemon_runtime_client_connect, but identity->build_fingerprint was
+ * adopted from the active cohort instead of computed from this process's own
+ * image (#2683). Sends OP_HELLO_UNPROVEN: the daemon admits only a peer image
+ * it proves to be its own build (same file, a verified copy, or a full hash),
+ * and answers CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED when it cannot
+ * examine the image at all. */
+cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect_unproven(
     const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
     uint32_t timeout_ms, cbm_daemon_runtime_connect_result_t *result_out);
 

@@ -62,6 +62,10 @@ bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]);
 bool cbm_daemon_build_fingerprint_file(const char *path,
                                        char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* Test-seam builds only (CBM_ENABLE_TEST_SEAMS): bytes this process has hashed
+ * as executable images. #2683 asserts a hook client leaves it at zero. */
+uint64_t cbm_daemon_image_bytes_hashed_for_testing(void);
+
 cbm_daemon_hello_status_t cbm_daemon_hello_compare(const cbm_daemon_build_identity_t *active,
                                                    const cbm_daemon_build_identity_t *requested,
                                                    cbm_daemon_conflict_t *conflict_out);
