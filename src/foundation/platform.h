@@ -199,6 +199,12 @@ const char *cbm_app_local_dir(void);
  * Returns static buffer or NULL if home is unavailable. */
 const char *cbm_resolve_cache_dir(void);
 
+/* A process that may only read the cache directory (CBM_IN_PROCESS) says so
+ * once at startup, before any thread exists. Code that would otherwise stage
+ * scratch files under the cache directory then uses cbm_tmpdir() instead. */
+void cbm_set_cache_dir_read_only(bool read_only);
+bool cbm_cache_dir_read_only(void);
+
 /* ── File system ───────────────────────────────────────────────── */
 
 /* Check if a path exists. */

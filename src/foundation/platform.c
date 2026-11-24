@@ -730,6 +730,16 @@ const char *cbm_resolve_cache_dir(void) {
     return buf;
 }
 
+static bool g_cache_dir_read_only = false;
+
+void cbm_set_cache_dir_read_only(bool read_only) {
+    g_cache_dir_read_only = read_only;
+}
+
+bool cbm_cache_dir_read_only(void) {
+    return g_cache_dir_read_only;
+}
+
 /* ── CPU scheduling priority ────────────────── */
 
 #ifndef _WIN32

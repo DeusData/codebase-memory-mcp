@@ -100,6 +100,14 @@ int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
  * cache root as well as daemon-private artifacts. */
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
 
+/* The same trust boundary, checked without changing anything: no component is
+ * created, and the final directory is neither chmodded nor stripped of an
+ * ACL nor (on Windows) re-owned or given a new DACL. It must already be owned
+ * by the current user and owner-only: on POSIX no group/other mode bits (so
+ * 0500 passes) and no extended ACL. For a cache that this process must only
+ * read, e.g. a read-only mount. */
+bool cbm_daemon_ipc_private_directory_verify(const char *directory_path);
+
 /* Human-readable reason for this process's most recent private-namespace
  * validation refusal (empty string when none). Diagnostic only — callers
  * append it to their error messages; policy decisions never read it. */

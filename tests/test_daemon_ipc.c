@@ -891,6 +891,76 @@ TEST(daemon_ipc_windows_private_directory_ace_is_inheritable) {
     PASS();
 }
 
+/* #2072: the verify-only check (CBM_IN_PROCESS) never repairs. A directory
+ * secure() left owner-only passes it. Once another account may READ it -- a
+ * grant win_file_acl_secure() lets through, since it looks only for mutation
+ * rights -- it is refused, like a POSIX group or other mode bit, and its DACL
+ * is left exactly as it was. A missing one is refused without being created. */
+TEST(daemon_ipc_windows_private_directory_verify_never_repairs) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char missing_parent[TEST_PATH_CAP] = {0};
+    char missing[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool owner_only_accepted = false;
+    bool read_granted = false;
+    bool shared_refused = false;
+    bool grant_kept = false;
+    bool missing_refused = false;
+    bool missing_absent = false;
+
+    if (ipc_test_parent_new(parent, "win-verify-cache")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        int parent_written =
+            snprintf(missing_parent, sizeof(missing_parent), "%s/missing", parent);
+        int missing_written = snprintf(missing, sizeof(missing), "%s/cache", missing_parent);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache) && parent_written > 0 &&
+                   parent_written < (int)sizeof(missing_parent) && missing_written > 0 &&
+                   missing_written < (int)sizeof(missing);
+    }
+    if (paths_ok) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+    }
+    if (secured) {
+        owner_only_accepted = cbm_daemon_ipc_private_directory_verify(cache);
+        read_granted = ipc_test_win_grant_everyone_rights(cache, FILE_GENERIC_READ);
+    }
+    if (read_granted) {
+        shared_refused = !cbm_daemon_ipc_private_directory_verify(cache);
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        ACL_SIZE_INFORMATION information;
+        memset(&information, 0, sizeof(information));
+        grant_kept = GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL,
+                                           NULL, &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+                     dacl &&
+                     GetAclInformation(dacl, &information, sizeof(information),
+                                       AclSizeInformation) &&
+                     information.AceCount == 2U;
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+    if (paths_ok) {
+        missing_refused = !cbm_daemon_ipc_private_directory_verify(missing);
+        missing_absent = GetFileAttributesA(missing_parent) == INVALID_FILE_ATTRIBUTES;
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(owner_only_accepted);
+    ASSERT_TRUE(read_granted);
+    ASSERT_TRUE(shared_refused);
+    ASSERT_TRUE(grant_kept);
+    ASSERT_TRUE(missing_refused);
+    ASSERT_TRUE(missing_absent);
+    PASS();
+}
+
 typedef struct {
     int calls;
     bool plant_file; /* false: play a racer that creates the DIRECTORY first */
@@ -5394,6 +5464,80 @@ TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor) {
     PASS();
 }
 
+static long long ipc_test_ctime_ns(const struct stat *status) {
+#ifdef __APPLE__
+    return (long long)status->st_ctimespec.tv_sec * 1000000000LL + status->st_ctimespec.tv_nsec;
+#else
+    return (long long)status->st_ctim.tv_sec * 1000000000LL + status->st_ctim.tv_nsec;
+#endif
+}
+
+/* #2072: the verify-only check (CBM_IN_PROCESS) accepts an owner-only cache
+ * without touching it -- 0500 included, which a read-only mount or snapshot
+ * may carry -- and refuses, still without touching it, one with a group or
+ * other bit, and one that does not exist. Where the hardening check above
+ * turns 0755 into 0700, this one leaves mode and ctime exactly as it found
+ * them: even a chmod to the same mode would move ctime. */
+TEST(daemon_ipc_posix_private_directory_verify_never_changes_it) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char missing_parent[TEST_PATH_CAP] = {0};
+    char missing[TEST_PATH_CAP] = {0};
+    char detail[512] = {0};
+    static const mode_t accepted_modes[] = {0700, 0500};
+    bool accepted[2] = {false, false};
+    struct stat before = {0};
+    struct stat after = {0};
+    bool paths_ok = false;
+    bool shared_refused = false;
+    bool missing_refused = false;
+    bool missing_absent = false;
+
+    if (ipc_test_parent_new(parent, "verify-cache-root")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        int parent_written =
+            snprintf(missing_parent, sizeof(missing_parent), "%s/missing", parent);
+        int missing_written = snprintf(missing, sizeof(missing), "%s/cache", missing_parent);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache) && parent_written > 0 &&
+                   parent_written < (int)sizeof(missing_parent) && missing_written > 0 &&
+                   missing_written < (int)sizeof(missing) && mkdir(cache, 0700) == 0;
+    }
+    for (size_t i = 0; paths_ok && i < 2; i++) {
+        accepted[i] = chmod(cache, accepted_modes[i]) == 0 && lstat(cache, &before) == 0 &&
+                      cbm_daemon_ipc_private_directory_verify(cache) &&
+                      lstat(cache, &after) == 0 && (after.st_mode & 07777) == accepted_modes[i] &&
+                      ipc_test_ctime_ns(&after) == ipc_test_ctime_ns(&before);
+    }
+    if (paths_ok && chmod(cache, 0750) == 0 && lstat(cache, &before) == 0) {
+        shared_refused = !cbm_daemon_ipc_private_directory_verify(cache);
+        const char *why = cbm_daemon_ipc_validation_detail();
+        (void)snprintf(detail, sizeof(detail), "%s", why ? why : "");
+        shared_refused = shared_refused && lstat(cache, &after) == 0 &&
+                         (after.st_mode & 07777) == 0750 &&
+                         ipc_test_ctime_ns(&after) == ipc_test_ctime_ns(&before);
+    }
+    if (paths_ok) {
+        missing_refused = !cbm_daemon_ipc_private_directory_verify(missing);
+        errno = 0;
+        missing_absent = lstat(missing_parent, &after) != 0 && errno == ENOENT;
+    }
+
+    (void)chmod(cache, 0700);
+    (void)rmdir(cache);
+    (void)rmdir(missing);
+    (void)rmdir(missing_parent);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(accepted[0]);
+    ASSERT_TRUE(accepted[1]);
+    ASSERT_TRUE(shared_refused);
+    ASSERT_NOT_NULL(strstr(detail, "grants group or other access"));
+    ASSERT_TRUE(missing_refused);
+    ASSERT_TRUE(missing_absent);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only) {
     char parent[TEST_PATH_CAP] = {0};
     char logs[TEST_PATH_CAP] = {0};
@@ -6169,6 +6313,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
+    RUN_TEST(daemon_ipc_windows_private_directory_verify_never_repairs);
     RUN_TEST(daemon_ipc_windows_private_directory_survives_lost_creation_race);
     RUN_TEST(daemon_ipc_windows_private_directory_refuses_and_names_a_planted_file);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
@@ -6240,6 +6385,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_log_creates_first_ever_cache_tree_safely);
     RUN_TEST(daemon_ipc_posix_private_directory_hardens_existing_cache_root);
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
+    RUN_TEST(daemon_ipc_posix_private_directory_verify_never_changes_it);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
 #ifndef _WIN32
