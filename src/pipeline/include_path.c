@@ -176,7 +176,7 @@ struct cbm_include_universe {
     /* false when an indexed path did not fit the rule's buffers: then no
      * uniqueness and no absence is proven */
     bool complete;
-    bool cfml_complete;  /* CFML templates can name any indexed file */
+    bool all_paths;      /* CFML templates can name any indexed file */
     uint64_t tail_steps; /* suffix keys made while building */
 };
 
@@ -283,7 +283,7 @@ cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, i
     /* Keep the usual name-filtered inventory in repos without CFML. */
     bool has_cfml = ip_has_cfml(files, count);
     u->complete = true;
-    u->cfml_complete = has_cfml;
+    u->all_paths = has_cfml;
     for (int i = 0; files && i < count; i++) {
         const char *rel = files[i].rel_path;
         if (!rel || !rel[0]) {
@@ -297,8 +297,11 @@ cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, i
         }
         if (strlen(rel) >= IP_PATH_MAX) {
             u->complete = u->complete && !listed_name;
-            u->cfml_complete = false; /* a path the rule cannot hold */
-            continue;
+            if (!has_cfml) {
+                continue;
+            }
+            /* CFML still counts long paths when checking tail uniqueness. */
+            listed_name = false;
         }
         if (!ip_list_add(u, rel, listed_name)) {
             cbm_include_universe_free(u);
@@ -325,7 +328,7 @@ static int ip_exists(const cbm_include_universe_t *u, const cbm_gbuf_t *graph, c
     if (cbm_ht_get(u->listed, rel)) {
         return IP_EXISTS_YES;
     }
-    return (template ? u->cfml_complete : u->complete) ? IP_EXISTS_NO : IP_EXISTS_UNKNOWN;
+    return (template ? u->all_paths : u->complete) ? IP_EXISTS_NO : IP_EXISTS_UNKNOWN;
 }
 
 /* Of the candidates, the one that names a file; NULL when none does, when
@@ -373,7 +376,7 @@ static const char *ip_unique_tail(const cbm_include_universe_t *u,
     const char *base = strrchr(key, '/');
     base = base ? base + SKIP_ONE : key;
     bool complete =
-        row->lang == CBM_LANG_CFML ? u->cfml_complete : u->complete && ip_row_names(row, base);
+        row->lang == CBM_LANG_CFML ? u->all_paths : u->complete && ip_row_names(row, base);
     if (!base[0] || !complete) {
         return NULL; /* a name the universe does not keep, or not whole */
     }

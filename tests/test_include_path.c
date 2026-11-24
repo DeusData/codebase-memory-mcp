@@ -32,6 +32,9 @@ static cbm_include_path_verdict_t ip_ask(cbm_include_universe_t *u, CBMLanguage 
     CBMImport imp;
     memset(&imp, 0, sizeof(imp));
     imp.module_path = path;
+    if (lang == CBM_LANG_CFML) {
+        imp.kind = CBM_IMPORT_KIND_TEMPLATE;
+    }
     out[0] = '\0';
     return cbm_include_path_resolve(u, NULL, NULL, rel, lang, &imp, out, out_sz);
 }
@@ -361,6 +364,33 @@ TEST(include_path_edges_name_only_indexed_files) {
     PASS();
 }
 
+TEST(include_path_cfml_long_paths_preserve_tail_counts) {
+    char long_path[1200];
+    size_t prefix = 0;
+    for (int i = 0; i < 6; i++) {
+        memset(long_path + prefix, 'a', 180);
+        prefix += 180;
+        long_path[prefix++] = '/';
+    }
+    strcpy(long_path + prefix, "views/shared.cfm");
+    cbm_file_info_t files[] = {
+        {.rel_path = "index.cfm", .language = CBM_LANG_CFML},
+        {.rel_path = "site/views/local.cfm"},
+        {.rel_path = "site/views/shared.cfm"},
+        {.rel_path = long_path},
+    };
+    cbm_include_universe_t *u = cbm_include_universe_new(files, 4);
+    ASSERT_NOT_NULL(u);
+    char got[1024];
+    ASSERT_EQ(ip_ask(u, CBM_LANG_CFML, "index.cfm", "/views/local.cfm", got, sizeof(got)),
+              CBM_INCLUDE_PATH_FILE);
+    ASSERT_STR_EQ(got, "site/views/local.cfm");
+    ASSERT_EQ(ip_ask(u, CBM_LANG_CFML, "index.cfm", "/views/shared.cfm", got, sizeof(got)),
+              CBM_INCLUDE_PATH_NO_FILE);
+    cbm_include_universe_free(u);
+    PASS();
+}
+
 TEST(include_path_cfml_template_edges) {
     static const struct {
         const char *path;
@@ -372,13 +402,16 @@ TEST(include_path_cfml_template_edges) {
                           "<cfelse>\n"
                           "    <cfinclude template='../shared/branch.cfm' />\n"
                           "</cfif>\n"
-         "<cfinclude template='/views/footer.html' />\n"
+                          "<cfinclude template='/views/footer.html' />\n"
+                          "<cfinclude template='o''brien.cfm' />\n"
                           "<cfinclude template='#var#.cfm' />\n"
                           "<cfinclude template='missing.cfm' />\n"
                           "<cfinclude template='elsewhere.cfm' />\n"
                           "<cfinclude template='/duplicate.cfm' />\n"},
         {"app/Widget.cfc", "<cfcomponent><cfinclude template='local.cfm'></cfcomponent>\n"},
         {"app/local.cfm", "<p>Local</p>\n"},
+        {"app/o'brien.cfm", "<p>Actual target</p>\n"},
+        {"app/o''brien.cfm", "<p>Doubled-quote filename</p>\n"},
         {"site/views/panel.cfm", "<p>Panel</p>\n"},
         {"site/views/footer.html", "<p>Footer</p>\n"},
         {"shared/branch.cfm", "<p>Branch</p>\n"},
@@ -403,7 +436,9 @@ TEST(include_path_cfml_template_edges) {
     ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "site.views.panel"), 1);
     ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "site.views.footer"), 1);
     ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "shared.branch"), 1);
-    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "%"), 4);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "app.o'brien"), 1);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "app.o''brien"), 0);
+    ASSERT_EQ(ip_imports(db, "app.index.cfm.__file__", "%"), 5);
     ASSERT_EQ(ip_imports(db, "app.Widget.cfc.__file__", "app.local"), 1);
     th_cleanup(tmp);
     PASS();
@@ -417,5 +452,6 @@ SUITE(include_path) {
     RUN_TEST(include_path_inventory_digest_follows_indexed_names);
     RUN_TEST(include_path_universe_grows_linearly);
     RUN_TEST(include_path_edges_name_only_indexed_files);
+    RUN_TEST(include_path_cfml_long_paths_preserve_tail_counts);
     RUN_TEST(include_path_cfml_template_edges);
 }

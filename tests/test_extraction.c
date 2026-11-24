@@ -733,12 +733,14 @@ TEST(extract_cfml_template_imports) {
                                "</cfif>\n"
                                "<cfsetting template='unrelated.cfm'>\n"
                                "<cfmodule name='tags.only'>\n"
-                               "<cfinclude template=missing.cfm />\n",
+        "<cfinclude template=missing.cfm />\n"
+        "<cfinclude template='o''brien.cfm' />\n"
+        "<cfinclude template=\"a\"\"b.cfm\" />\n",
                                CBM_LANG_CFML, "app", "index.cfm");
     ASSERT_NOT_NULL(r);
-    ASSERT_EQ(r->imports.count, 4);
+    ASSERT_EQ(r->imports.count, 6);
     const char *const paths[] = {"local.cfm", "/views/panel.cfm", "partials/#var#.cfm",
-                                 "missing.cfm"};
+                                 "missing.cfm", "o'brien.cfm", "a\"b.cfm"};
     for (int i = 0; i < r->imports.count; i++) {
         const CBMImport *imp = &r->imports.items[i];
         ASSERT_STR_EQ(imp->module_path, paths[i]);
