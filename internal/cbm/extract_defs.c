@@ -7928,7 +7928,10 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Return type — use func_node (inner function for templates)
     static const char *rt_fields[] = {"result", "return_type", "type", NULL};
-    for (const char **f = rt_fields; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
+    // tree-sitter-c-sharp names a method's return type `returns`.
+    static const char *cs_rt_fields[] = {"returns", "type", NULL};
+    const char **rt_list = ctx->language == CBM_LANG_CSHARP ? cs_rt_fields : rt_fields;
+    for (const char **f = rt_list; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
             def.return_type = c_declared_return_type(ctx, func_node, rt);
@@ -10366,7 +10369,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     // Return type (same fields as extract_func_def)
     {
         static const char *rt_fields[] = {"result", "return_type", "type", NULL};
-        for (const char **f = rt_fields; *f; f++) {
+        static const char *cs_rt_fields[] = {"returns", "type", NULL};
+        const char **rt_list = ctx->language == CBM_LANG_CSHARP ? cs_rt_fields : rt_fields;
+        for (const char **f = rt_list; *f; f++) {
             TSNode rt = ts_node_child_by_field_name(child, *f, (uint32_t)strlen(*f));
             if (!ts_node_is_null(rt)) {
                 def.return_type = c_declared_return_type(ctx, child, rt);
