@@ -3062,7 +3062,7 @@ struct mk {
     void *ud;
     sh_hits_t *deps; /* NULL: the rules' prerequisites are not recorded */
     const char *rel; /* with `deps`: the makefile */
-    int in_error;    /* inside a region the grammar could not parse */
+    int in_error;    /* depth of the regions the grammar could not parse */
 };
 
 static const char MK_UNKNOWN[] = "${__cbm_unknown}";
@@ -3493,6 +3493,13 @@ static void mk_collect_error(mk_t *m, TSNode err, bool cond) {
             depth += mk_directive_delta(m->src + scan, m->src + le);
             depth = depth < 0 ? 0 : depth;
             scan = le + SKIP_ONE;
+        }
+        /* The grammar resumed before a rule that stands at the start of its
+         * line: its prerequisites are read as written. Anything else in the
+         * region (an indented rule, one nested in another node) is not. */
+        if (m->deps && m->in_error == SKIP_ONE && strcmp(ts_node_type(c), "rule") == 0 &&
+            ts_node_start_point(c).column == 0) {
+            mk_rule_deps(m, c);
         }
         mk_collect_one(m, c, cond || depth > 0);
     }

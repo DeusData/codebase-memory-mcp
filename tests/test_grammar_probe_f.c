@@ -4912,6 +4912,61 @@ TEST(probe_make_repeated_names_cost_linear_work) {
     PASS();
 }
 
+/* The Make grammar cannot parse a nested conditional indented with tabs
+ * inside an indented one (`envs` below): everything from there to the end of
+ * the file is one error region. The rules after it are still rules, and
+ * each has its node. A rule standing at the start of its line there has its
+ * prerequisites like any other. No edge for what the grammar read
+ * differently inside the region: a rule line indented with spaces, a rule
+ * under a conditional that follows a recipe; and none for what is no rule
+ * line at all: a define body, a recipe's continuation line. */
+TEST(probe_make_prerequisites_after_a_region_the_grammar_cannot_parse) {
+    static const GpfFile files[] = {{"Makefile", "all: build pack\n\n"
+                                                 "envs:\n"
+                                                 "  ifeq ($(A),)\n"
+                                                 " \t\texport A := 1\n"
+                                                 " \telse\n"
+                                                 "\t\tifeq ($(B),)\n"
+                                                 "\t\t\texport A := 2\n"
+                                                 "\t\telse\n"
+                                                 "\t\t\texport A := 3\n"
+                                                 "\t\tendif\n"
+                                                 " \tendif\n\n"
+                                                 "build: envs\n"
+                                                 "\techo build\n\n"
+                                                 "pack: build\n"
+                                                 "\tdocker run \\\n"
+                                                 "-v out:/out build\n\n"
+                                                 "define HELP\n"
+                                                 "usage: build\n"
+                                                 "endef\n\n"
+                                                 "  check: build\n"
+                                                 "\techo check\n\n"
+                                                 "ifeq ($(C),)\n"
+                                                 "late: pack\n"
+                                                 "\techo late\n"
+                                                 "endif\n\n"
+                                                 "usage:\n"
+                                                 "\techo \"$(HELP)\"\n\n"
+                                                 "lint: build | envs\n"
+                                                 "\techo lint\n"}};
+    char *got = gpf_make_prerequisites(files, 1);
+    static const char want[] = "Makefile:all -> Makefile:build (prerequisite:1)\n"
+                               "Makefile:all -> Makefile:pack (prerequisite:1)\n"
+                               "Makefile:build -> Makefile:envs (prerequisite:14)\n"
+                               "Makefile:lint -> Makefile:build (prerequisite:36)\n"
+                               "Makefile:lint -> Makefile:envs (prerequisite:36 order-only)\n"
+                               "Makefile:pack -> Makefile:build (prerequisite:17)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "make prerequisites in an error region got:\n%s\nwant:\n%s\n",
+                got ? got : "(null)", want);
+        free(got);
+        FAIL("make prerequisites in an error region");
+    }
+    free(got);
+    PASS();
+}
+
 /* make TARGET SPAWNS the rule of TARGET the makefile reads: the
  * directory's Makefile (-C, --directory=), a -f file, a rule of a file it
  * includes; from scripts, CI steps and recipes ($(MAKE)), on the line of
@@ -7798,6 +7853,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_make_rules_have_a_node_per_target);
     RUN_TEST(probe_make_prerequisites_depend_on_their_rules);
     RUN_TEST(probe_make_repeated_names_cost_linear_work);
+    RUN_TEST(probe_make_prerequisites_after_a_region_the_grammar_cannot_parse);
     RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
