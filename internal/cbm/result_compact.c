@@ -640,6 +640,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
     tmp.field_types.cap = tmp.field_types.count;
     tmp.doc_links.cap = tmp.doc_links.count;
+    tmp.scope.cap = tmp.scope.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */

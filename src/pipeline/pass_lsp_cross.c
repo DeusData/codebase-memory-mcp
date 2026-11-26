@@ -2362,7 +2362,7 @@ static bool pxc_c_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
         if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
                 w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->reg, f->imp_keys,
                 f->imp_vals, f->imp_count, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW,
-                f->result)) {
+                f->result, f->result->cpp_test_macro_names)) {
             cbm_pipeline_test_owner_error(f->result);
             return false; /* no append and no fallback on an invalid proof */
         }
@@ -2370,7 +2370,7 @@ static bool pxc_c_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
     }
     CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
         w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->reg, f->imp_keys,
-        f->imp_vals, f->imp_count, f->result->cached_tree, w->out);
+        f->imp_vals, f->imp_count, f->result->cached_tree, w->out, f->result->cpp_test_macro_names);
     if (status != CBM_LSP_COMPLETE)
         cbm_c_lsp_record_failure(f->result, status);
     return true;
@@ -2385,15 +2385,16 @@ static bool pxc_c_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     if (f->result->has_test_definition_owners) {
         if (!cbm_run_c_lsp_cross_with_test_owners(
                 w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->defs, w->def_count,
-                NULL, NULL, 0, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW, f->result)) {
+                NULL, NULL, 0, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW, f->result,
+                f->result->cpp_test_macro_names)) {
             cbm_pipeline_test_owner_error(f->result);
             return false; /* out may be partial: never append it */
         }
         return true;
     }
-    CBMLSPStatus status = cbm_run_c_lsp_cross_status(w->scratch, f->source, f->source_len,
-                                                     f->module_qn, cpp_mode, w->defs, w->def_count,
-                                                     NULL, NULL, 0, f->result->cached_tree, w->out);
+    CBMLSPStatus status = cbm_run_c_lsp_cross_status(
+        w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->defs, w->def_count, NULL,
+        NULL, 0, f->result->cached_tree, w->out, f->result->cpp_test_macro_names);
     if (status != CBM_LSP_COMPLETE)
         cbm_c_lsp_record_failure(f->result, status);
     return true;

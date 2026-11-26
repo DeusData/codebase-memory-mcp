@@ -1,12 +1,15 @@
 #include "objectscript_common.h"
 #include "tree_sitter/parser.h"
 #include <string.h>
+#include <wctype.h>
 
 // There is no way to extend enums, so keep this in sync with base.h
 // All new entries should be appended at the bottom of the list
 enum TokenType {
-  EXTERNAL_METHOD_BODY_CONTENT = OBJECTSCRIPT_CORE_TOKEN_TYPE_MAX,
-  IRIS_USERNAME,
+   IRIS_USERNAME= OBJECTSCRIPT_CORE_TOKEN_TYPE_MAX,
+   PYTHON_MIME_TYPE,
+   _IS_PYTHON,
+   TEXT_MIME_TYPE,
 };
 
 struct ObjectScript_Udl_Scanner {
@@ -14,57 +17,11 @@ struct ObjectScript_Udl_Scanner {
   struct ObjectScript_Core_Scanner core_scanner;
 };
 
-static bool lex_fenced_text(TSLexer *lexer,
-                            enum TokenType desired_symbol, char l_delim,
-                            char r_delim) {
-  int leftRightDiff = 1;
-  while (!lexer->eof(lexer)) {
-    if (lexer->lookahead == r_delim) {
-      leftRightDiff -= 1;
-    } else if (lexer->lookahead == l_delim) {
-      leftRightDiff += 1;
-    }
-    if (leftRightDiff == 0) {
-      lexer->result_symbol = desired_symbol;
-      return true;
-    }
-    advance(lexer);
-  }
-  return false;
-}
-
 /// This is the interesting function. The rest is infrastructure
-static bool scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
-  // struct Scanner *scanner = (struct Scanner *)payload;
-  //
-  // Tree sitter will mark all terminals as valid on error
-  // The sentinel should never be valid in a good parse, so this ensures
-  // we are not in error recovery mode
-  // printf("Lookahead: '%c'. Col %d. Tag is valid? %d", lexer->lookahead,
-  // lexer->get_column(lexer), valid_symbols[TAG]);
-  // printf("lexer->lookahead: '%c'\n", lexer->lookahead);
-  // printf("====\n");
-  // debug_enum(valid_symbols);
-  // printf("====\n");
+static bool scan(struct ObjectScript_Udl_Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
   if (valid_symbols[SENTINEL]) {
-    //  printf("Thats not good!\n");
-    //  // TODO: ERROR RECOVERY MODE ?? Why would we be better than TS's
-    //  default? if (iswspace(lexer->lookahead)) {
-    //    skip(lexer);
-    //    eat_whitespace(lexer);
-    //    lexer->result_symbol = _WHITESPACE;
-    //    return true;
-    //  }
     return false;
   }
-  if (valid_symbols[EXTERNAL_METHOD_BODY_CONTENT]) {
-    // A valid method_body is one that is whose text fences
-    // are evenly balanced (so far only { })
-    // e.g. VALID: {{{ [^{}]* }}} INVALID: {{{ [^{}]* }
-    return lex_fenced_text(lexer, EXTERNAL_METHOD_BODY_CONTENT, '{',
-                           '}');
-  }
-
   if (valid_symbols[IRIS_USERNAME] && !(lexer->lookahead=='}' || lexer->lookahead=='@' || lexer->lookahead=='*')) {
     int count=0;
     lexer->mark_end(lexer);
@@ -72,7 +29,7 @@ static bool scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
       count++;
       advance(lexer);
     }
-    
+
 
     if(lexer->lookahead=='}') {
       lexer->mark_end(lexer);
@@ -82,12 +39,110 @@ static bool scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
     else {
       return false;
     }
-  
+
   }
 
+  if (valid_symbols[_IS_PYTHON]) {
+      scanner->core_scanner.is_python = true;
+      lexer->result_symbol = _IS_PYTHON;
+      return true;
+  }
 
-  struct ObjectScript_Udl_Scanner *scanner =
-      (struct ObjectScript_Udl_Scanner *)payload;
+  if (valid_symbols[PYTHON_MIME_TYPE]) {
+        lexer->mark_end(lexer);
+        int count = 0;
+        while(iswspace(lexer->lookahead)) {
+            count ++;
+            advance(lexer);
+        }
+        if (count > 0) {
+            lexer -> mark_end(lexer);
+            lexer->result_symbol = _WHITESPACE;
+            return true;
+        }
+        bool has_string = false;
+        if (lexer->lookahead == '"') {
+            has_string = true;
+            advance(lexer);
+        }
+    const char* text_mime = "text/";
+    const char *text_python = "x-python";
+    const char *application_python = "application/python";
+    const char *markdown = "markdown";
+    const char *plain = "plain";
+    bool is_python = true;
+    bool is_text = true;
+    bool is_markdown = false;
+    for (unsigned i = 0; i < 5; i++) {
+        if (lexer->lookahead != text_mime[i]) {
+            is_text = false;
+            break;
+        }
+        if (lexer->eof(lexer)) break;
+        advance(lexer);
+    }
+    if (is_text) {
+        for (unsigned i = 0; i < 8; i++) {
+            if (lexer->lookahead != text_python[i]) {
+                is_python = false;
+                break;
+            }
+            if (lexer->eof(lexer)) break;
+            advance(lexer);
+        } if (!is_python) {
+            is_markdown = true;
+            for (unsigned i = 0; i < 8; i++) {
+                if (lexer->lookahead != markdown[i]) {
+                    is_markdown = false;
+                    break;
+                }
+                if (lexer->eof(lexer)) break;
+                advance(lexer);
+            }
+        } if (!is_markdown && !is_python) {
+            is_markdown = true;
+            for (unsigned i = 0; i < 5; i++) {
+                if (lexer->lookahead != plain[i]) {
+                    is_markdown = false;
+                    break;
+                }
+                if (lexer->eof(lexer)) break;
+                advance(lexer);
+            }
+        }
+    }
+    else {
+        for (unsigned i = 0; i < 18; i++) {
+            if (lexer->lookahead != application_python[i]) {
+                is_python = false;
+                break;
+            }
+            if (lexer->eof(lexer)) break;
+            advance(lexer);
+        }
+    }
+    if (has_string) {
+        advance(lexer);
+    }
+
+    if (is_python) {
+        scanner->core_scanner.is_python = true;
+        lexer->mark_end(lexer);
+        lexer->result_symbol = PYTHON_MIME_TYPE;
+        return true;
+    }
+
+    if (is_markdown) {
+        scanner->core_scanner.is_text = true;
+        lexer->mark_end(lexer);
+        lexer->result_symbol = TEXT_MIME_TYPE;
+        return true;
+    }
+
+    return false;
+
+  }
+
   return ObjectScript_Core_Scanner_scan(&scanner->core_scanner, lexer,
                                         valid_symbols);
 }

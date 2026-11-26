@@ -177,6 +177,42 @@ TEST(scope_facts_survive_compaction) {
     PASS();
 }
 
+/* Compaction leaves every array at its exact count in one exact-size block,
+ * so an event appended afterwards must grow the array into new memory. With a
+ * capacity left at its extraction value, the append would write in place,
+ * over whatever the block holds next. */
+TEST(scope_facts_append_after_compaction_grows_the_array) {
+    CBMFileResult *r = sf_extract(SF_PROTO, CBM_LANG_PROTOBUF, "proto/a.proto");
+    ASSERT_NOT_NULL(r);
+    cbm_result_compact(r);
+    int n = r->scope.count;
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(r->scope.cap, n); /* exactly sized: no headroom to append into */
+    char before[4096];
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        const CBMScopeEvent *e = &r->scope.items[i];
+        off += (size_t)snprintf(before + off, sizeof(before) - off, "%u|%d|%u|%s|%s\n", e->kind,
+                                e->index, e->pos, e->name ? e->name : "-", e->qual ? e->qual : "-");
+    }
+    const CBMScopeEvent *old = r->scope.items;
+    CBMScopeEvent ev = {.pos = UINT32_MAX, .index = -1, .kind = CBM_SCOPE_OPAQUE};
+    cbm_scope_events_push(&r->scope, &r->arena, ev);
+    ASSERT_EQ(r->scope.count, n + 1);
+    ASSERT_TRUE(r->scope.items != old); /* grown, not written in place */
+    char after[4096];
+    off = 0;
+    for (int i = 0; i < n; i++) {
+        const CBMScopeEvent *e = &r->scope.items[i];
+        off += (size_t)snprintf(after + off, sizeof(after) - off, "%u|%d|%u|%s|%s\n", e->kind,
+                                e->index, e->pos, e->name ? e->name : "-", e->qual ? e->qual : "-");
+    }
+    ASSERT_STR_EQ(after, before);
+    ASSERT_EQ(r->scope.items[n].kind, CBM_SCOPE_OPAQUE);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* One file's stored surface row (cbm_lsp_surface_build_rows, no LSP defs). */
 static bool sf_row(CBMFileResult *r, const char *rel, CBMLanguage lang, char **json, char **sha) {
     cbm_file_info_t file = {.rel_path = (char *)rel, .language = lang};
@@ -325,6 +361,7 @@ SUITE(scope_facts) {
     RUN_TEST(scope_facts_language_without_row_records_nothing);
     RUN_TEST(scope_facts_parse_error_is_opaque);
     RUN_TEST(scope_facts_survive_compaction);
+    RUN_TEST(scope_facts_append_after_compaction_grows_the_array);
     RUN_TEST(scope_facts_surface_round_trip);
     RUN_TEST(scope_facts_surface_hash_follows_facts_not_bytes);
     RUN_TEST(scope_facts_work_grows_linearly);

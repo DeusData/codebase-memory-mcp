@@ -1349,6 +1349,7 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "INHERITS"));
     ASSERT_NOT_NULL(strstr(json, "IMPLEMENTS"));
     ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
+    ASSERT_NOT_NULL(strstr(json, "Keywords; [] ignored; else omit query."));
     free(json);
     PASS();
 }
@@ -5203,7 +5204,7 @@ TEST(tool_search_graph_rejects_bm25_and_semantic_query_together) {
 
     char *tools = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(tools);
-    ASSERT_NOT_NULL(strstr(tools, "[] ignored; otherwise omit query."));
+    ASSERT_NOT_NULL(strstr(tools, "Keywords; [] ignored; else omit query."));
     free(tools);
 
     cbm_mcp_server_free(srv);
@@ -20537,7 +20538,8 @@ static bool dc_walk_fixture_open(dc_walk_fixture_t *fx) {
     }
     /* Same git invocation rules as the #1363 fixture above. */
     char cmd[1200];
-    const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
+    const char *steps[] = {"init -q", "config diff.mnemonicPrefix true", "add -A",
+                           "commit -q -m init"};
     for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
         snprintf(cmd, sizeof(cmd),
                  "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=main "
