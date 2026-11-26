@@ -1019,7 +1019,22 @@ static const cbm_pxc_packages_t *pxc_packages_build(const cbm_pipeline_ctx_t *ct
         /* The graph holds a node for every registry symbol on every route
          * (the incremental ones seed the registry from it). */
         pxc_type_index_build_t b = {.t = t, .reg = ctx->registry, .labels = labels, .arena = arena};
-        cbm_gbuf_foreach_node(ctx->gbuf, pxc_type_index_node, &b);
+        /* The nodes of the type labels only (the index sorts what it
+         * gathers, so the order is not read), each live as
+         * cbm_gbuf_foreach_node counts a node live. */
+        for (const char *const *l = labels; *l; l++) {
+            const cbm_gbuf_node_t **nodes = NULL;
+            int count = 0;
+            if (cbm_gbuf_find_by_label(ctx->gbuf, *l, &nodes, &count) != 0) {
+                continue;
+            }
+            for (int i = 0; nodes && i < count; i++) {
+                if (nodes[i] && nodes[i]->qualified_name &&
+                    cbm_gbuf_find_by_qn(ctx->gbuf, nodes[i]->qualified_name)) {
+                    pxc_type_index_node(nodes[i], &b);
+                }
+            }
+        }
         pxc_type_index_seal(t, &b);
     }
     return t;
