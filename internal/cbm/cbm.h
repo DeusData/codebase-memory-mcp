@@ -288,6 +288,14 @@ typedef struct {
      * every other definition, and in every language outside
      * cbm_is_c_preprocessor_lang. */
     const char *variants;
+    /* Ruby only: a `def self.m` / `class << self` method, which lives on the
+     * singleton side of its class. False for every instance method and every
+     * other language. */
+    bool is_singleton;
+    /* Ruby only, on a class/module def: the `include`/`prepend`/`extend`
+     * macros of its body as "|"-separated "<k>:<Const>" pairs, k one of i, p,
+     * e, in source order ("i:Auditable|e:Finders"). NULL when none. */
+    const char *mixin_refs;
     /* Callable identity (#2061): offset of the signature suffix inside
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
