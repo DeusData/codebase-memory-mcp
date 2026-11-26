@@ -2675,6 +2675,112 @@ static bool closure_release_values(cbm_store_t *store, const char *project, cons
     return hit;
 }
 
+/* Is p[0, n) a key of `table`? */
+static bool closure_docker_has(CBMHashTable *table, const char *p, size_t n) {
+    char key[CBM_SZ_4K];
+    if (n == 0 || n >= sizeof(key)) {
+        return false;
+    }
+    memcpy(key, p, n);
+    key[n] = '\0';
+    return cbm_ht_get(table, key) != NULL;
+}
+
+/* A Dockerfile below the repository root reads a COPY / ADD source under its
+ * own directory or under the root, the one of the two that holds the file; a
+ * source both hold is no edge (pass_docker.c dk_repo: REFERENCES_FILE, and
+ * the path mapping behind SPAWNS). Deleting one file of such a pair leaves the
+ * other as the single candidate: an edge the full index draws from a
+ * Dockerfile that did not change, and a repair of the deleted file alone does
+ * not read that Dockerfile again. So a deleted file whose partner path is
+ * still indexed declines. Every Dockerfile's directory counts, whether or not
+ * the Dockerfile names the file: it is not parsed here.
+ *
+ * The two directions, each one lookup per directory level of a path:
+ *  - deleted <dir>/<source>, <source> still a file at the root: the deleted
+ *    path's own prefixes are tried as Dockerfile directories;
+ *  - deleted <source>, <dir>/<source> still a file: every indexed file under
+ *    a Dockerfile directory enters `under` by its path below that directory,
+ *    and the deleted path is looked up there.
+ * A source that is a file under one context and a directory under the other
+ * is no edge either (dk_dir_under_other_context), and the directory goes
+ * with its last file. So the same holds one level up: a deleted file whose
+ * directory, below a Dockerfile directory, is a file at the root, or whose
+ * directory is <source> of a file <dir>/<source>, declines too -- also when
+ * the directory still holds other files, which costs a full run and no edge.
+ * Work is the path depths of the indexed and the deleted files (the deleted
+ * ones squared, a path being short), and only when a file was deleted and a
+ * Dockerfile lies below the root. Returns the reason, or NULL. */
+static const char *closure_docker_context_decline(const cbm_file_info_t *files, int file_count,
+                                                  CBMHashTable *files_by_path, char **deleted,
+                                                  int n_deleted) {
+    CBMHashTable *dirs = NULL; /* directories holding a Dockerfile (keys in `keys`) */
+    CBMArena keys;
+    cbm_arena_init_lazy(&keys, CBM_SZ_4K);
+    const char *decline = NULL;
+    for (int f = 0; n_deleted > 0 && f < file_count && !decline; f++) {
+        const char *rel = files[f].rel_path;
+        const char *slash = files[f].language == CBM_LANG_DOCKERFILE ? strrchr(rel, '/') : NULL;
+        if (!slash) {
+            continue;
+        }
+        dirs = dirs ? dirs : cbm_ht_create(0);
+        char *dir = dirs ? cbm_arena_strndup(&keys, rel, (size_t)(slash - rel)) : NULL;
+        if (!dir) {
+            decline = "alloc";
+        } else {
+            cbm_ht_set(dirs, dir, dir);
+        }
+    }
+    /* <source> of each indexed <dir>/<source> */
+    CBMHashTable *under = dirs && !decline ? cbm_ht_create(0) : NULL;
+    if (dirs && !decline && !under) {
+        decline = "alloc";
+    }
+    for (int f = 0; under && f < file_count; f++) {
+        const char *rel = files[f].rel_path;
+        for (const char *s = strchr(rel, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+            if (s[SKIP_ONE] && closure_docker_has(dirs, rel, (size_t)(s - rel))) {
+                cbm_ht_set(under, s + SKIP_ONE, (void *)rel);
+            }
+        }
+    }
+    for (int i = 0; under && i < n_deleted && !decline; i++) {
+        const char *gone = deleted[i];
+        if (cbm_ht_get(under, gone)) {
+            decline = "docker_context_pair_deleted"; /* <dir>/<gone> is still a file */
+        }
+        for (const char *s = strchr(gone, '/'); s && !decline; s = strchr(s + SKIP_ONE, '/')) {
+            /* a directory of the deleted file that is <source> of a file
+             * <dir>/<source>: under the root it may be no directory now */
+            if (closure_docker_has(under, gone, (size_t)(s - gone))) {
+                decline = "docker_context_pair_deleted";
+            }
+            if (decline || !closure_docker_has(dirs, gone, (size_t)(s - gone))) {
+                continue;
+            }
+            const char *src = s + SKIP_ONE;
+            if (cbm_ht_get(files_by_path, src)) {
+                decline = "docker_context_pair_deleted"; /* <source> is still a file at the root */
+            }
+            /* a directory below <dir> that is a file at the root */
+            for (const char *t = strchr(src, '/'); t && !decline; t = strchr(t + SKIP_ONE, '/')) {
+                if (closure_docker_has(files_by_path, src, (size_t)(t - src))) {
+                    decline = "docker_context_pair_deleted";
+                }
+            }
+        }
+    }
+    if (under) {
+        cbm_ht_free(under);
+    }
+    if (dirs) {
+        cbm_ht_free(dirs);
+    }
+    cbm_arena_destroy(&keys);
+    return decline;
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -3246,6 +3352,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     decline = closure_k8s_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
                                   n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_docker_context_decline(files, file_count, files_by_path,
+                                             changed_paths + n_changed, n_deleted);
     if (decline) {
         goto done;
     }

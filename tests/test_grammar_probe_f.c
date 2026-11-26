@@ -1878,6 +1878,108 @@ static char *gpf_spawns(const GpfFile *files, int nfiles) {
         free(got_);                                                                                \
     } while (0)
 
+/* Every REFERENCES_FILE edge a Dockerfile draws for a COPY / ADD source, as
+ * "source file -> target file (via:line)", sorted, one per line. */
+static char *gpf_copy_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' "
+            "AND json_extract(e.properties,'$.via') IN ('copy','add') ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_COPY_REFS(files, n, want)                                                       \
+    do {                                                                                           \
+        char *got_ = gpf_copy_refs(files, n);                                                      \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "COPY refs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);      \
+            free(got_);                                                                            \
+            FAIL("REFERENCES_FILE edge set");                                                      \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+/* A Dockerfile at the repository root has one context. Each plain source of
+ * a COPY / ADD that is an indexed file is a file the Dockerfile references,
+ * once, at the first instruction naming it. No edge for a directory, a
+ * source of another stage or image (--from), a URL, a glob, a source a
+ * variable supplies (an ARG default can be overridden by the build), a
+ * source no indexed file is, or the Dockerfile itself. */
+TEST(probe_dockerfile_copy_sources_are_file_references) {
+    static const GpfFile files[] = {
+        {"Dockerfile", "ARG CONF=conf/app.yaml\n"
+                       "FROM python:3.12 AS build\n"
+                       "WORKDIR /app\n"
+                       "COPY requirements.txt setup.py ./\n"
+                       "COPY src/ ./src/\n"
+                       "COPY . .\n"
+                       "ADD conf/app.yaml /etc/app.yaml\n"
+                       "ADD https://example.com/tool.tgz /tmp/\n"
+                       "COPY ${CONF} /etc/again.yaml\n"
+                       "COPY *.py /all/\n"
+                       "COPY missing.py /missing.py\n"
+                       "COPY Dockerfile /Dockerfile\n"
+                       "FROM python:3.12-slim\n"
+                       "COPY --from=build /app/setup.py /setup.py\n"
+                       "COPY [\"setup.py\", \"run.sh\", \"/opt/\"]\n"},
+        {"requirements.txt", "flask==3.0.0\n"},
+        {"setup.py", "from setuptools import setup\n\nsetup(name=\"app\")\n"},
+        {"run.sh", "#!/bin/sh\nexec python -m app\n"},
+        {"conf/app.yaml", "name: app\n"},
+        {"src/app.py", "def main():\n    return 0\n"}};
+    GPF_ASSERT_COPY_REFS(files, 6,
+                         "Dockerfile -> conf/app.yaml (add:7)\n"
+                         "Dockerfile -> requirements.txt (copy:4)\n"
+                         "Dockerfile -> run.sh (copy:15)\n"
+                         "Dockerfile -> setup.py (copy:4)");
+    PASS();
+}
+
+/* A Dockerfile below the root can be built with its own directory or with
+ * the repository root as context; the build command decides, and it is not
+ * in the Dockerfile. A source that is a file under exactly one of the two is
+ * that file. A source that is a file under both is no edge, and neither is
+ * one that is a file under one and a directory under the other: with the
+ * other context the instruction copies the directory. */
+TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "FROM alpine:3.20\n"
+                           "COPY entry.sh /entry.sh\n"
+                           "COPY shared/tool.sh /tool.sh\n"
+                           "COPY both.sh /both.sh\n"
+                           "COPY ../outside.sh /outside.sh\n"
+                           "COPY config.yaml /etc/config.yaml\n"},
+        {"svc/entry.sh", "#!/bin/sh\necho entry\n"},
+        {"shared/tool.sh", "#!/bin/sh\necho tool\n"},
+        {"both.sh", "#!/bin/sh\necho root\n"},
+        {"svc/both.sh", "#!/bin/sh\necho svc\n"},
+        {"outside.sh", "#!/bin/sh\necho outside\n"},
+        {"config.yaml", "mode: root\n"},
+        {"svc/config.yaml/part.yaml", "mode: part\n"}};
+    GPF_ASSERT_COPY_REFS(files, 8,
+                         "svc/Dockerfile -> shared/tool.sh (copy:3)\n"
+                         "svc/Dockerfile -> svc/entry.sh (copy:2)");
+    PASS();
+}
+
 /* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
  * ci[/job]])", sorted, one per line: top-level code as "@<file>"; a script
  * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>",
@@ -7061,6 +7163,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_mcp_trace_topology_follows_deploys);
     RUN_TEST(probe_mcp_trace_run);
+    RUN_TEST(probe_dockerfile_copy_sources_are_file_references);
+    RUN_TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_image_without_registry_host_stays_unknown);
