@@ -743,6 +743,27 @@ static const jts_file_t JTS_FILES[] = {
      "    String viaGeneric35(I35 i) { return i.g35(\"x\"); }\n"
      "    String viaVarargs35(C35 c) { return c.v35(\"x\", 1, 2); }\n"
      "}\n"},
+    /* 36: a library class's constructor beside a project class of that name
+     * (javac 21: new lib36/Factory36, invokespecial lib36/Factory36.<init>;
+     * lib36 is compiled for javac, never indexed); the partner imports the
+     * project class (invokespecial p36x/Factory36.<init>). */
+    {"src/main/java/p36x/Factory36.java",
+     "package p36x;\n\n"
+     "public class Factory36 {\n"
+     "    public Factory36(String n) { }\n"
+     "}\n"},
+    {"src/main/java/p36/Use36.java",
+     "package p36;\n\n"
+     "import lib36.Factory36;\n\n"
+     "public class Use36 {\n"
+     "    Object libMake36() { return new Factory36(\"n\"); }\n"
+     "}\n"},
+    {"src/main/java/p36/Own36.java",
+     "package p36;\n\n"
+     "import p36x.Factory36;\n\n"
+     "public class Own36 {\n"
+     "    Object ownMake36() { return new Factory36(\"n\"); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -1172,6 +1193,15 @@ static int jts_check_inherited_overload(jts_index_t *ix) {
     ok &= jts_expect_engine(ix, "viaOverride35", "k35", "p35.B35.k35");
     ok &= jts_expect_engine(ix, "viaGeneric35", "g35", "p35.H35.g35");
     ok &= jts_expect_edge_to(ix, "viaVarargs35", "v35", "p35.B35.v35");
+    return ok;
+}
+
+/* 36: a library class's constructor is a library call, its exact QN: no
+ * edge reaches the project class of that name or its constructor; the
+ * project class's own constructor binds. */
+static int jts_check_library_constructor(jts_index_t *ix) {
+    int ok = jts_expect_none_to(ix, "libMake36", "Factory36", "p36x.Factory36");
+    ok &= jts_expect_engine(ix, "ownMake36", "Factory36", "p36x.Factory36.Factory36");
     return ok;
 }
 
@@ -2115,6 +2145,7 @@ JTS_ROUTES(owner_spelled_supertype, jts_check_owner_spelled_supertype)
 JTS_ROUTES(library_split_package, jts_check_library_split_package)
 JTS_ROUTES(interface_call, jts_check_interface_call)
 JTS_ROUTES(inherited_overload, jts_check_inherited_overload)
+JTS_ROUTES(library_constructor, jts_check_library_constructor)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -2165,6 +2196,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_interface_call_parallel);
     RUN_TEST(java_type_scope_inherited_overload_sequential);
     RUN_TEST(java_type_scope_inherited_overload_parallel);
+    RUN_TEST(java_type_scope_library_constructor_sequential);
+    RUN_TEST(java_type_scope_library_constructor_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);

@@ -3858,8 +3858,19 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
                     cbm_registry_lookup_method_by_args(ctx->registry, qn, short_name, arity);
                 if (!cf)
                     cf = cbm_registry_lookup_method(ctx->registry, qn, short_name);
+                const CBMRegisteredType *ct =
+                    cf ? NULL : cbm_registry_lookup_type(ctx->registry, qn);
                 if (cf) {
                     java_emit_resolved(ctx, cf->qualified_name, "lsp_constructor", 0.95f);
+                } else if ((ct && !java_is_project_type(ct)) ||
+                           (!ct && java_receiver_is_external(ctx, qn))) {
+                    /* A library class's constructor (a JDK seed class, or
+                     * one outside the project's packages): its exact QN,
+                     * which no project method is. The class's own QN has no
+                     * node either, and the call join would bind it to any
+                     * project constructor of that name. */
+                    java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", qn, short_name),
+                                       "lsp_external", 0.90f);
                 } else {
                     /* No explicit constructor in the registry, so there is no
                      * `Class.Class` ctor node to point at. Resolve the `new Foo()`
