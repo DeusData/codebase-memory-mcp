@@ -41,24 +41,35 @@ if "$ROOT/scripts/security-fuzz.sh" "$ECHO_ONLY" \
     exit 1
 fi
 
+# One python3 process answers the requests; the harness needs python3 for its
+# interactive case anyway.  A shell `read` of the 1 MB request costs seconds
+# where the shell runs emulated, and the harness's 10-second hang limit then
+# decides this test instead of its assertions.
+ENV_RESPONDER="$WORKDIR/environment-probe-responder.py"
+cat > "$ENV_RESPONDER" <<'EOF'
+import re
+import sys
+
+# Echo a JSON-RPC result for every request with a numeric id.  This keeps the
+# fixture compatible with both the current fixed ids and a future per-case
+# acknowledgement id without depending on the malformed payload itself: the
+# last id of a line is the one that counts.
+REQUEST_ID = re.compile(rb'"id"\s*:\s*([0-9]+)')
+
+for line in sys.stdin.buffer:
+    ids = REQUEST_ID.findall(line)
+    if not ids:
+        continue
+    result = b'{"isError":true}' if b'"name":"index_repository"' in line else b'{}'
+    sys.stdout.buffer.write(b'{"jsonrpc":"2.0","id":' + ids[-1] + b',"result":' + result + b'}\n')
+    sys.stdout.buffer.flush()
+EOF
+
 ENV_PROBE="$WORKDIR/environment-probe-mcp"
 cat > "$ENV_PROBE" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\t%s\t%s\n' "${HOME-}" "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_FUZZ_ENV_PROBE"
-
-# Echo a JSON-RPC result for every request with a numeric id.  This keeps the
-# fixture compatible with both the current fixed ids and a future per-case
-# acknowledgement id without depending on the malformed payload itself.
-while IFS= read -r line; do
-    id=$(printf '%s\n' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-    if [[ -n "$id" ]]; then
-        if [[ "$line" == *'"name":"index_repository"'* ]]; then
-            printf '{"jsonrpc":"2.0","id":%s,"result":{"isError":true}}\n' "$id"
-        else
-            printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
-        fi
-    fi
-done
+exec python3 "${BASH_SOURCE[0]%/*}/environment-probe-responder.py"
 EOF
 chmod +x "$ENV_PROBE"
 

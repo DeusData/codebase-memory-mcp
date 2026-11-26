@@ -195,6 +195,7 @@ TEST(repro_issue523_crossrepo_http_calls_edge) {
     /* ── Cleanup ──────────────────────────────────────────────── */
     rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    cbm_cross_repo_result_free(&result);
 
     /*
      * WHY RED: result.http_edges == 0 on current code.
@@ -315,6 +316,7 @@ TEST(repro_issue523_scheme_stripped_url_match) {
 
     rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     PASS();
 }
@@ -355,6 +357,7 @@ TEST(repro_issue523_template_fuzzy_match) {
 
     rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     PASS();
 }
@@ -398,6 +401,7 @@ TEST(repro_issue523_reverse_direction_match) {
 
     rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    cbm_cross_repo_result_free(&r);
     ASSERT_GTE(r.http_edges, 1);
     ASSERT_GTE(client_cross, 1);
     PASS();
@@ -464,6 +468,9 @@ TEST(repro_issue523_idempotent_cross_edges) {
 
     rh_cleanup(&client, NULL);
     rh_cleanup(&server, NULL);
+    cbm_cross_repo_result_free(&r1);
+    cbm_cross_repo_result_free(&r2);
+    cbm_cross_repo_result_free(&r3);
 
     ASSERT_EQ(client_1, 1);
     ASSERT_EQ(server_1, 1);

@@ -1,0 +1,8 @@
+{
+  "name": "sharp",
+  "version": "0.0.0-cbm-stub",
+  "description": "Empty stand-in for sharp. CBM Lens never processes images, and the Transformers browser build already replaces sharp with an empty object; this keeps sharp and its LGPL libvips binaries out of the dependency tree.",
+  "license": "MIT",
+  "private": true,
+  "main": "index.js"
+}

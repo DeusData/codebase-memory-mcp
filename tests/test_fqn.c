@@ -7,6 +7,8 @@
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
 #include "../src/foundation/str_util.h"
+#include "../src/foundation/arena.h"
+#include "helpers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,25 @@
  * ================================================================ */
 
 /* ── Basic: project + path + name ─────────────────────────────── */
+
+/* A Dockerfile variant keeps its suffix in both QN implementations (the
+ * pipeline's fqn.c, the extractor's helpers.c) -- else it gets the QN of the
+ * plain Dockerfile beside it. */
+TEST(fqn_dockerfile_variant_keeps_suffix) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("p", "svc/Dockerfile.debug", "GOOS"),
+               "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Dockerfile"), "p.svc.Dockerfile");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/app.py"), "p.svc.app");
+    CBMArena a;
+    cbm_arena_init(&a);
+    ASSERT_STR_EQ(cbm_fqn_compute(&a, "p", "svc/Dockerfile.debug", "GOOS"),
+                  "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/app.py"), "p.svc.app");
+    cbm_arena_destroy(&a);
+    PASS();
+}
 
 TEST(fqn_compute_basic_go) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("myproj", "main.go", "main"), "myproj.main.main");
@@ -609,6 +630,23 @@ TEST(project_name_encodes_unicode_segments_issue571) {
     PASS();
 }
 
+TEST(project_name_unicode_segments_do_not_collide_issue571) {
+    char *first = cbm_project_name_from_path("/Users/dev/\xe5\xbc\x80\xe5\x8f\x91");
+    char *second = cbm_project_name_from_path("/Users/dev/\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_NEQ(first, second);
+    /* Distinct is not enough: each name must carry the hex image of its own
+     * non-ASCII segment, so the segment is preserved rather than replaced. */
+    ASSERT_NOT_NULL(strstr(first, "e5bc80e58f91"));
+    ASSERT_NOT_NULL(strstr(second, "e5908ee7abaf"));
+    ASSERT_TRUE(cbm_validate_project_name(first));
+    ASSERT_TRUE(cbm_validate_project_name(second));
+    free(first);
+    free(second);
+    PASS();
+}
+
 /* issue #624: #571 preserves non-ASCII path segments by hex-encoding each byte
  * (1 byte -> 2 hex chars), so a DEEP non-ASCII path triples in length and can
  * blow past the filesystem's 255-byte filename-component limit. Then
@@ -673,6 +711,7 @@ TEST(project_name_length_capped_issue624) {
 SUITE(fqn) {
     /* fqn_compute: basic extensions */
     RUN_TEST(fqn_compute_basic_go);
+    RUN_TEST(fqn_dockerfile_variant_keeps_suffix);
     RUN_TEST(fqn_compute_basic_py);
     RUN_TEST(fqn_compute_basic_ts);
     RUN_TEST(fqn_compute_basic_js);
@@ -780,6 +819,7 @@ SUITE(fqn) {
     RUN_TEST(project_name_deep_path);
     RUN_TEST(project_name_always_validator_safe_issue349);
     RUN_TEST(project_name_encodes_unicode_segments_issue571);
+    RUN_TEST(project_name_unicode_segments_do_not_collide_issue571);
     RUN_TEST(project_name_length_capped_issue624);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);

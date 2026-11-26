@@ -1,0 +1,298 @@
+{
+  "whyShown": true,
+  "modesNeutral": true,
+  "steps": 11,
+  "orderCorrect": true,
+  "deterministic": true,
+  "playerKeyboardNavigates": true,
+  "twinFollowsStep": true,
+  "stepMarksVisited": true,
+  "exploredCounterRises": true,
+  "exploredBefore": "explored 1 of 15",
+  "exploredAfter": "explored 2 of 15",
+  "entryPointTourStartsAtChosen": true,
+  "entryFirstStep": "Start here: createUser",
+  "entrySteps": 8,
+  "entryHasNoConfigPrelude": true,
+  "closureTruncationHonest": true,
+  "port": 4261,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w4a",
+  "fixture": "fixtures/atlas-sample",
+  "entrySymbol": "createUser",
+  "timings": {
+    "buildMs": 10952,
+    "serverStartMs": 6899,
+    "totalMs": 40416
+  },
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4260,
+    "storageAtStart": [],
+    "whyCards": [
+      {
+        "intent": "bug",
+        "text": "1Hunt a bugSomething is wrong and you want the error paths and what ran, not the shape of the design."
+      },
+      {
+        "intent": "change",
+        "text": "2Scope a changeYou are about to touch something and want what it reaches and what covers it."
+      },
+      {
+        "intent": "understand",
+        "text": "3Understand the projectWalk the files in the order the imports put them in: what everything rests on comes first."
+      },
+      {
+        "intent": "entry",
+        "text": "4Pick my own entry pointYou already know a name. Start there and walk forward over the calls the index recorded."
+      }
+    ],
+    "avoidedWordsFound": [],
+    "whyHeadline": "Why are you here?",
+    "exploredChipAtStart": null,
+    "projectTour": {
+      "id": "getting-started",
+      "kind": "project",
+      "title": "Getting started",
+      "steps": 11,
+      "index": 0,
+      "paths": [
+        "HERKUNFT.md",
+        "src/config.ts",
+        "src/repo/db.ts",
+        "src/types.ts",
+        "src/util/validate.ts",
+        "src/services/orderService.ts",
+        "src/routes/orders.ts",
+        "src/services/userService.ts",
+        "src/routes/users.ts",
+        "src/server.ts",
+        "test/userService.test.ts"
+      ],
+      "titles": [
+        "File: HERKUNFT.md",
+        "Configuration: src/config.ts",
+        "Storage: src/repo/db.ts",
+        "Types: src/types.ts",
+        "Helpers: src/util/validate.ts",
+        "Service: src/services/orderService.ts",
+        "Routes: src/routes/orders.ts",
+        "Service: src/services/userService.ts",
+        "Routes: src/routes/users.ts",
+        "Way in: src/server.ts",
+        "Test: test/userService.test.ts"
+      ],
+      "endNote": ""
+    },
+    "order": {
+      "early": [
+        1,
+        3
+      ],
+      "late": [
+        6,
+        8,
+        9
+      ]
+    },
+    "determinism": {
+      "bytes": 5718,
+      "identical": true
+    },
+    "beforeEnter": {
+      "readerPath": "HERKUNFT.md",
+      "twin": "no symbol",
+      "twinQn": ""
+    },
+    "afterEnter": {
+      "readerPath": "src/config.ts",
+      "twin": "loadConfig",
+      "twinQn": "codeatlasweb-w4a.src.config.loadConfig"
+    },
+    "marksAtStep2": {
+      "seam": {
+        "symbol": "codeatlasweb-w4a.src.config.loadConfig",
+        "explored": 1,
+        "total": 7,
+        "label": "1 of 7",
+        "marks": 1
+      },
+      "chip": "explored 1 of 7"
+    },
+    "marksAtStep3": {
+      "seam": {
+        "symbol": "codeatlasweb-w4a.src.repo.db.query",
+        "explored": 1,
+        "total": 6,
+        "label": "1 of 6",
+        "marks": 2
+      },
+      "chip": "explored 1 of 6"
+    },
+    "afterQuit": {
+      "cardGone": true,
+      "reader": {
+        "readerPath": "src/config.ts",
+        "twin": "loadConfig",
+        "twinQn": ""
+      }
+    },
+    "entryHeadline": "17 ways in the index flagged",
+    "entryRouteNote": "no route is listed: the index reported none for this project, and this surface reads no source files of its own, so an unreported route cannot be recovered here",
+    "entryOffered": [
+      {
+        "name": "loadConfig",
+        "openable": "true",
+        "text": "loadConfigsrc/config.ts:11entry point"
+      },
+      {
+        "name": "isProduction",
+        "openable": "true",
+        "text": "isProductionsrc/config.ts:20entry point"
+      },
+      {
+        "name": "query",
+        "openable": "true",
+        "text": "querysrc/repo/db.ts:17entry point"
+      },
+      {
+        "name": "insert",
+        "openable": "true",
+        "text": "insertsrc/repo/db.ts:31entry point"
+      },
+      {
+        "name": "hotspotScan",
+        "openable": "true",
+        "text": "hotspotScansrc/repo/db.ts:39entry point"
+      },
+      {
+        "name": "walk",
+        "openable": "true",
+        "text": "walksrc/repo/db.ts:58entry point"
+      },
+      {
+        "name": "registerOrderRoutes",
+        "openable": "true",
+        "text": "registerOrderRoutessrc/routes/orders.ts:6entry point"
+      },
+      {
+        "name": "registerUserRoutes",
+        "openable": "true",
+        "text": "registerUserRoutessrc/routes/users.ts:7entry point"
+      },
+      {
+        "name": "createApp",
+        "openable": "true",
+        "text": "createAppsrc/server.ts:32entry point"
+      },
+      {
+        "name": "main",
+        "openable": "true",
+        "text": "mainsrc/server.ts:39entry point"
+      },
+      {
+        "name": "getOrder",
+        "openable": "true",
+        "text": "getOrdersrc/services/orderService.ts:8entry point"
+      },
+      {
+        "name": "create",
+        "openable": "true",
+        "text": "createsrc/services/orderService.ts:30entry point"
+      },
+      {
+        "name": "listUsers",
+        "openable": "true",
+        "text": "listUserssrc/services/userService.ts:18entry point"
+      },
+      {
+        "name": "createUser",
+        "openable": "true",
+        "text": "createUsersrc/services/userService.ts:23entry point"
+      },
+      {
+        "name": "create",
+        "openable": "true",
+        "text": "createsrc/services/userService.ts:40entry point"
+      },
+      {
+        "name": "validateUser",
+        "openable": "true",
+        "text": "validateUsersrc/util/validate.ts:19entry point"
+      },
+      {
+        "name": "validateId",
+        "openable": "true",
+        "text": "validateIdsrc/util/validate.ts:33entry point"
+      }
+    ],
+    "entryTour": {
+      "id": "entry-codeatlasweb-w4a-src-services-userservice-createuser",
+      "kind": "entry",
+      "title": "Forward from createUser",
+      "steps": 8,
+      "index": 0,
+      "paths": [
+        "src/services/userService.ts",
+        "src/repo/db.ts",
+        "src/services/userService.ts",
+        "src/services/userService.ts",
+        "src/types.ts",
+        "src/util/validate.ts",
+        "src/util/validate.ts",
+        "src/repo/db.ts"
+      ],
+      "titles": [
+        "Start here: createUser",
+        "Hop 1: insert",
+        "Hop 1: listUsers",
+        "Hop 1: toUser",
+        "Hop 1: UserEntity",
+        "Hop 1: ValidationError",
+        "Hop 1: validateUser",
+        "Hop 2: query"
+      ],
+      "endNote": ""
+    },
+    "followedRow": "27\nValidationError\nnew\nvalidate.ts:4",
+    "sameSymbolCounter": {
+      "before": {
+        "visited": 1,
+        "total": 15
+      },
+      "after": {
+        "visited": 2,
+        "total": 15
+      }
+    },
+    "defaultWalk": {
+      "endNote": "",
+      "capShown": null
+    },
+    "cappedWalk": {
+      "steps": 3,
+      "endNote": "walk capped at 3 symbols (depth 3), so what follows this is not shown",
+      "capShown": "walk capped at 3 symbols (depth 3), so what follows this is not shown"
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 169,
+      "check_index_coverage": 18,
+      "get_architecture": 4,
+      "get_code_snippet": 20,
+      "search_graph": 4
+    }
+  },
+  "generatedAt": "2026-08-30T18:30:52.469Z",
+  "error": null
+}

@@ -48,6 +48,13 @@ typedef struct {
 // language rows; the table lives in extract_calls.c next to the dispatch code.
 const char **cbm_string_dispatch_suffixes(CBMLanguage lang);
 
+// Returns a NULL-terminated list of node types that wrap conditionally
+// compiled alternatives (#if/#ifdef/#else/#elif blocks) for a language, or
+// NULL when the grammar has none. A definition inside one is still a member
+// of its enclosing scope; its #else twin is a variant of the same definition.
+// Side table for the same -Wmissing-field-initializers reason as above.
+const char **cbm_conditional_block_types(CBMLanguage lang);
+
 // Get the language spec for a given language. Returns NULL for unsupported.
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang);
 

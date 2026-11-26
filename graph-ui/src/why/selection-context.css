@@ -1,0 +1,14 @@
+.selection-context { border: 1px solid var(--atlas-line); padding: 14px; margin: 12px 0; color: var(--atlas-fg); font: 12px/1.55 var(--atlas-ui-font, system-ui); min-width: 0; }
+.selection-context h3 { font-size: 15px; margin: 0 0 4px; }
+.selection-context h4 { font-size: 11px; color: var(--atlas-cyan); margin: 14px 0 5px; text-transform: uppercase; letter-spacing: .06em; }
+.selection-context p { margin: 5px 0; color: var(--atlas-dim); }
+.selection-context-subject { overflow-wrap: anywhere; }
+.selection-context details { margin: 8px 0; }
+.selection-context summary { cursor: pointer; }
+.selection-context pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.selection-context button { font: inherit; color: var(--atlas-cyan); background: var(--atlas-panel); border: 1px solid var(--atlas-line); padding: 6px 8px; cursor: pointer; }
+.selection-context ul { list-style: none; padding: 0; }
+.selection-context-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.selection-context button:focus-visible, .selection-context summary:focus-visible { outline: 2px solid var(--atlas-cyan); outline-offset: 2px; }
+.galaxy-selection-evidence { position: absolute; top: 150px; right: 12px; bottom: 35px; width: min(460px, 45%); overflow: auto; background: var(--atlas-bg); border: 1px solid var(--atlas-line); padding: 12px; z-index: 4; }
+.galaxy-selection-evidence .repo-map-edge { grid-template-columns: 1fr; }

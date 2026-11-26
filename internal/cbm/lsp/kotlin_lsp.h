@@ -48,6 +48,7 @@
 #ifndef CBM_LSP_KOTLIN_LSP_H
 #define CBM_LSP_KOTLIN_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -97,6 +98,7 @@ typedef struct KotlinLSPContext {
     CBMKotlinUseKind *import_kinds;
     int import_count;
     int import_cap;
+    CBMNameRows import_rows; /* import_locals by name, rows in table order */
 
     /* Current declaration context. */
     const char *enclosing_func_qn;      /* function we are resolving inside */
@@ -147,6 +149,13 @@ typedef struct KotlinLSPContext {
      * each field's REAL def QN here (kotlin class properties are minted with
      * module-level QNs, so composing <class>.<member> would miss the node). */
     const void *cross_field_map;
+    /* Cross-file only (NULL per-file): when set, `registry` is a per-file
+     * overlay chained to the cross registry, and kotlin_lsp_process_file
+     * indexes the overlay into this scratch arena once the file's own
+     * declarations are collected. The overlay holds the AST registrations
+     * (typed primary-constructor and body properties), so they are found
+     * before the extraction-built entries of the same QN (#1555). */
+    CBMArena *overlay_index_arena;
 } KotlinLSPContext;
 
 /* Initialize a KotlinLSPContext for processing one file. */

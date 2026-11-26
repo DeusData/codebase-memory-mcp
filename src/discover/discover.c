@@ -10,15 +10,25 @@
  *   5. Language detection for accepted files
  */
 #include "discover/discover.h"
+#include "discover/discover_policy_internal.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_COUNT, CBM_LANG_JSON
 
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/hash_table.h"
 #include "foundation/limits.h"
+#include "foundation/mem_core.h"
+#include "foundation/str_util.h"
+#include "foundation/subprocess.h"
 #include "foundation/workspace.h"
 #include "foundation/platform.h"
+#include "mcp/test_impact_engine.h" // cbm_test_impact_find_git
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
+#include <io.h> // _close
+#else
+#include <unistd.h> // close
 #endif
 #include <ctype.h>
 #include <stdint.h> // int64_t
@@ -38,7 +48,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */
     ".cache", ".eggs", ".env", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
-    ".venv", "__pycache__", "env", "htmlcov", "site-packages", "venv",
+    ".venv", "__pycache__", "htmlcov", "site-packages", "venv",
     /* JS/TS */
     ".npm", ".nyc_output", ".pnpm-store", ".yarn", "bower_components", "coverage", "node_modules",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".turbo", ".parcel-cache", ".docusaurus", ".expo",
@@ -49,9 +59,37 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".cargo", ".stack-work", ".dart_tool", "zig-cache", "zig-out", ".metals", ".bloop", ".bsp",
     ".ccls-cache", ".clangd", "elm-stuff", "_opam", ".cpcache", ".shadow-cljs",
     /* Deploy */
-    ".vercel", ".netlify", "deploy", "deployed",
+    ".vercel", ".netlify",
     /* Misc */
     ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+
+/* Directories walked for their deployment and configuration files only. Build
+ * output copied into deploy/ made duplicate classes of the real source
+ * (discover_deploy_excluded_full_mode), while the manifests, charts, Terraform,
+ * Dockerfiles and scripts that deploy a project live there too. A file in such a
+ * directory, at any depth, is kept by its language
+ * (cbm_language_is_deployment_config), never by its folder. */
+static const char *CONFIG_ONLY_DIRS[] = {"deploy", "deployed", NULL};
+
+/* A directory named env is skipped only when it is a Python environment:
+ * `python -m venv` and virtualenv (since 20) write pyvenv.cfg, older
+ * virtualenv an activate script in bin/ (POSIX) or Scripts/ (Windows), and
+ * conda conda-meta/history into every environment, the base one included.
+ * Any other env directory, a Go package or a folder of settings, is walked
+ * like any other. A marker is its exact stored name, never a lookup the file
+ * system may answer case-insensitively. One marker list for the walk (the
+ * directory listings) and the pinned inventory (its file list). */
+static const char VENV_DIR_NAME[] = "env";
+const char *const CBM_DISCOVER_VENV_MARKERS[] = {"pyvenv.cfg", "bin/activate", "Scripts/activate",
+                                                 "conda-meta/history", NULL};
+
+/* Package manifests: what the package map reads (pass_pkgmap.c), and what a
+ * config-only directory drops by name. */
+static const char *PACKAGE_MANIFESTS[] = {"package.json",   "go.mod",        "Cargo.toml",
+                                          "pyproject.toml", "composer.json", "pubspec.yaml",
+                                          "pom.xml",        "build.gradle",  "build.gradle.kts",
+                                          "mix.exs",        "Package.swift", NULL};
+static const char PACKAGE_MANIFEST_SUFFIX[] = ".gemspec";
 
 /* Always-skip directories matched by relative-PATH suffix, not by basename:
  * generated build output whose last path component alone ("views") is far too
@@ -65,13 +103,23 @@ static const char *ALWAYS_SKIP_DIR_SUFFIXES[] = {
     "storage/framework/views", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    /* Generated */
+    "generated", "gen", "auto-generated",
+    /* Tests */
+    "fixtures", "testdata", "test_data", "__tests__", "__mocks__", "__snapshots__", "__fixtures__",
+    "__test__",
+    /* Docs and samples */
+    "docs", "doc", "documentation", "examples", "example", "samples", "sample",
+    /* Assets */
+    "assets", "static", "public", "media",
+    /* Third-party */
+    "third_party", "thirdparty", "3rdparty",
+    /* Data and integration tests */
+    "migrations", "seeds", "e2e", "integration",
+    /* Localization */
+    "locale", "locales", "i18n", "l10n",
+    /* Tooling and build output */
+    "scripts", "tools", "hack", "bin", "build", "out", NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -80,6 +128,9 @@ static const char *ALWAYS_IGNORED_SUFFIXES[] = {
     ".class",  ".png",     ".jpg",  ".jpeg",  ".gif", ".ico", ".bmp", ".tiff",
     ".webp",   ".svg",     ".wasm", ".node",  ".exe", ".bin", ".dat", ".db",
     ".sqlite", ".sqlite3", ".woff", ".woff2", ".ttf", ".eot", ".otf", NULL};
+
+/* SVG files that carry a diagram (diagram.c): read, not ignored as images. */
+static const char *DIAGRAM_SVG_SUFFIXES[] = {".drawio.svg", ".excalidraw.svg", NULL};
 
 static const char *FAST_IGNORED_SUFFIXES[] = {
     ".zip", ".tar",  ".gz",       ".bz2",  ".xz",  ".rar",    ".7z",      ".jar",
@@ -107,20 +158,6 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
                                       "_string.go", "mock_",    "_mock.",  "_test_helpers.",
                                       ".stories.",  ".spec.",   ".test.",  NULL};
 
-/* ── Ignored JSON filenames ──────────────────────── */
-
-static const char *IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
-
 /* ── Helper: check if string is in NULL-terminated array ─────────── */
 
 static bool str_in_list(const char *s, const char *const *list) {
@@ -134,8 +171,7 @@ static bool str_in_list(const char *s, const char *const *list) {
 
 /* ── Helper: check if string ends with suffix ────────────── */
 
-static bool ends_with(const char *s, const char *suffix) {
-    size_t slen = strlen(s);
+static bool ends_with(const char *s, size_t slen, const char *suffix) {
     size_t sufflen = strlen(suffix);
     if (sufflen > slen) {
         return false;
@@ -348,8 +384,58 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
     return false;
 }
 
+/* JVM source-set language roots: src/<set>/<lang>/ in Maven and Gradle layouts. */
+static const char *JVM_SOURCE_LANG_DIRS[] = {"java", "kotlin", "scala", "groovy", NULL};
+
+static bool component_equals(const char *start, size_t len, const char *word) {
+    return strlen(word) == len && strncmp(start, word, len) == 0;
+}
+
+/* True when rel_path names a directory strictly below a JVM source root
+ * ("src/main/java/com/acme/target", "app/src/test/kotlin/x/tmp"). There every
+ * directory is a package, so a built-in skip name such as "target", "tmp" or
+ * "vendor" is an ordinary package name, not build output (#2661). The root
+ * itself and directories beside it ("src/main/target") are not packages. */
+bool cbm_discover_path_in_jvm_package(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    enum { JVM_MAX_COMPONENTS = 256 };
+    const char *starts[JVM_MAX_COMPONENTS];
+    size_t lens[JVM_MAX_COMPONENTS];
+    size_t count = 0;
+    const char *p = rel_path;
+    while (*p && count < JVM_MAX_COMPONENTS) {
+        while (*p == '/' || *p == '\\') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *start = p;
+        while (*p && *p != '/' && *p != '\\') {
+            p++;
+        }
+        starts[count] = start;
+        lens[count] = (size_t)(p - start);
+        count++;
+    }
+    /* The language root sits at i + 2; the directory must be below it. */
+    for (size_t i = 0; i + 3 < count; i++) {
+        if (!component_equals(starts[i], lens[i], "src")) {
+            continue;
+        }
+        for (int l = 0; JVM_SOURCE_LANG_DIRS[l]; l++) {
+            if (component_equals(starts[i + 2], lens[i + 2], JVM_SOURCE_LANG_DIRS[l])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* True when rel_path equals a suffix rule or ends with "/" + the rule. */
-static bool rel_path_has_skip_suffix(const char *rel_path) {
+bool cbm_discover_path_has_skip_suffix(const char *rel_path) {
     if (!rel_path) {
         return false;
     }
@@ -388,20 +474,42 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
     return false;
 }
 
+bool cbm_discover_config_only_dir(const char *dirname) {
+    return dirname && str_in_list(dirname, CONFIG_ONLY_DIRS);
+}
+
+bool cbm_discover_venv_candidate(const char *name) {
+    return name && strcmp(name, VENV_DIR_NAME) == 0;
+}
+
+bool cbm_discover_is_package_manifest(const char *basename) {
+    if (!basename) {
+        return false;
+    }
+    return str_in_list(basename, PACKAGE_MANIFESTS) ||
+           ends_with(basename, strlen(basename), PACKAGE_MANIFEST_SUFFIX);
+}
+
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
     if (!filename) {
         return false;
     }
 
+    size_t filename_length = strlen(filename);
+    for (int i = 0; DIAGRAM_SVG_SUFFIXES[i]; i++) {
+        if (ends_with(filename, filename_length, DIAGRAM_SVG_SUFFIXES[i])) {
+            return false;
+        }
+    }
     for (int i = 0; ALWAYS_IGNORED_SUFFIXES[i]; i++) {
-        if (ends_with(filename, ALWAYS_IGNORED_SUFFIXES[i])) {
+        if (ends_with(filename, filename_length, ALWAYS_IGNORED_SUFFIXES[i])) {
             return true;
         }
     }
 
     if (mode != CBM_MODE_FULL) {
         for (int i = 0; FAST_IGNORED_SUFFIXES[i]; i++) {
-            if (ends_with(filename, FAST_IGNORED_SUFFIXES[i])) {
+            if (ends_with(filename, filename_length, FAST_IGNORED_SUFFIXES[i])) {
                 return true;
             }
         }
@@ -440,6 +548,25 @@ bool cbm_matches_fast_pattern(const char *filename, cbm_index_mode_t mode) {
 
 /* ── Dynamic file list ────────────────────────── */
 
+/* Paths git tracks under the discovery root, and every directory above one.
+ * git applies ignore rules to untracked paths only, so .gitignore,
+ * info/exclude and the global excludes file never hide a tracked path. Both
+ * tables stay NULL when the root is not in a git repository or git cannot
+ * run, and the ignore rules then apply exactly as before. */
+typedef struct {
+    char *paths;         /* `git ls-files -z` output; holds the keys of `files` */
+    CBMHashTable *files; /* tracked path */
+    CBMHashTable *dirs;  /* directory above a tracked path (owned key) */
+} discover_tracked_t;
+
+static bool tracked_has_file(const discover_tracked_t *tracked, const char *rel_path) {
+    return tracked && tracked->files && cbm_ht_has(tracked->files, rel_path);
+}
+
+static bool tracked_has_dir(const discover_tracked_t *tracked, const char *rel_path) {
+    return tracked && tracked->dirs && cbm_ht_has(tracked->dirs, rel_path);
+}
+
 typedef struct {
     cbm_file_info_t *files;
     int count;
@@ -469,6 +596,7 @@ typedef struct {
     int ignored_count;
     int ignored_cap;
     int ignored_total;
+    const discover_tracked_t *tracked;
 } file_list_t;
 
 static void file_list_resource_violation(file_list_t *fl, cbm_index_resource_t resource,
@@ -725,7 +853,7 @@ static int gitignore_chain_result(const gitignore_link_t *link, const char *rel_
  * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
  * contain parallel checkouts of the same repo whose indexing would duplicate
  * the whole codebase (#802). */
-static bool is_safety_core_dir(const char *name) {
+bool cbm_discover_is_safety_core_directory(const char *name) {
     static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
                                                    ".claude-worktrees", NULL};
     return str_in_list(name, SAFETY_CORE_DIRS);
@@ -769,49 +897,68 @@ static bool dir_is_cache_tree(const char *abs_path) {
     return abs_path[n] == '\0' || abs_path[n] == '/' || abs_path[n] == '\\';
 }
 
-static bool should_skip_directory(const char *entry_name, const char *rel_path,
-                                  const cbm_discover_opts_t *opts,
-                                  const gitignore_link_t *ignore_chain,
-                                  const cbm_gitignore_t *global_gi,
-                                  const cbm_gitignore_t *cbmignore) {
-    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
-        rel_path_has_skip_suffix(rel_path)) {
+/* What the ignore rules say about a directory. DIR_GIT_IGNORED comes from
+ * git's own rules (.gitignore files, info/exclude, the global excludes file),
+ * which yield to tracked content; built-in skips and .cbmignore never do. */
+typedef enum { DIR_KEEP, DIR_SKIP, DIR_GIT_IGNORED } dir_verdict_t;
+
+static bool dir_is_venv_on_disk(const char *abs_dir);
+
+/* *config_only: the directory is walked for its configuration files only
+ * (CONFIG_ONLY_DIRS); its subdirectories inherit that from the walk frame. */
+static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_path,
+                                       const char *abs_path, const cbm_discover_opts_t *opts,
+                                       const gitignore_link_t *ignore_chain,
+                                       const cbm_gitignore_t *global_gi,
+                                       const cbm_gitignore_t *cbmignore, bool *config_only) {
+    *config_only = false;
+    bool safety = cbm_discover_is_safety_core_directory(entry_name);
+    bool named = cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
+                 (cbm_discover_venv_candidate(entry_name) && dir_is_venv_on_disk(abs_path));
+    bool config = !named && cbm_discover_config_only_dir(entry_name);
+    /* Below a JVM source root every directory is a package: no built-in rule. */
+    bool package = (named || config) && !safety && cbm_discover_path_in_jvm_package(rel_path);
+    bool builtin_skip = named && !package;
+    config = config && !package;
+    if (builtin_skip || config || cbm_discover_path_has_skip_suffix(rel_path)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
-         * non-negatable safety core. Fall through so .gitignore/global/local
-         * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
-                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
-        if (!unskipped) {
-            return true;
+         * non-negatable safety core — and walks a config-only one in full.
+         * Fall through so .gitignore/global/local rules still apply. */
+        bool unskipped =
+            cbmignore && !safety && cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!unskipped && !config) {
+            return DIR_SKIP;
         }
+        *config_only = !unskipped;
     }
-    if (gitignore_chain_result(ignore_chain, rel_path, true) > 0) {
-        return true;
-    }
+    bool git_ignored = gitignore_chain_result(ignore_chain, rel_path, true) > 0;
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, true);
         if (cbm_result > 0) {
-            return true;
+            return DIR_SKIP;
         }
-        if (cbm_result < 0 && global_ignored) {
-            return false;
+        if (cbm_result < 0) {
+            global_ignored = false; /* a .cbmignore negation un-ignores a global match */
         }
     }
-    return global_ignored;
+    return git_ignored || global_ignored ? DIR_GIT_IGNORED : DIR_KEEP;
 }
 
 /* Check if a regular file should be skipped (filters + gitignore + size). */
 /* Classify why a file is skipped. Returns a static reason string (the #963
  * "purposely not indexed" class) or NULL to keep the file. Check order and
  * semantics — including the .cbmignore negation un-ignoring a global-gitignore
- * match — are IDENTICAL to the original boolean predicate. */
+ * match — are IDENTICAL to the original boolean predicate. git's own rules
+ * never hide a tracked file; inside a git-ignored directory (entered only for
+ * its tracked content) every untracked file is ignored, as in git. */
 static const char *file_skip_reason(const char *entry_name, const char *rel_path,
                                     const cbm_discover_opts_t *opts,
                                     const gitignore_link_t *ignore_chain,
                                     const cbm_gitignore_t *global_gi,
-                                    const cbm_gitignore_t *cbmignore, off_t file_size) {
+                                    const cbm_gitignore_t *cbmignore, off_t file_size, bool tracked,
+                                    bool in_ignored_dir) {
     cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
     if (cbm_has_ignored_suffix(entry_name, mode)) {
         return "ignored-suffix";
@@ -822,10 +969,11 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
     if (cbm_matches_fast_pattern(entry_name, mode)) {
         return "fast-pattern";
     }
-    if (gitignore_chain_result(ignore_chain, rel_path, false) > 0) {
+    if (!tracked && (in_ignored_dir || gitignore_chain_result(ignore_chain, rel_path, false) > 0)) {
         return "gitignore";
     }
-    bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, false);
+    bool global_ignored =
+        !tracked && global_gi && cbm_gitignore_matches(global_gi, rel_path, false);
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, false);
         if (cbm_result > 0) {
@@ -841,60 +989,11 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
     return global_ignored ? "gitignore" : NULL;
 }
 
-/* Detect language for a file, handling .m disambiguation and JSON filtering. */
+/* Detect language for a file: its name, and its first bytes where the name is
+ * not enough (cbm_language_classify; the pinned test-impact inventory uses the
+ * same rule on git blobs). */
 static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
-    CBMLanguage lang = cbm_language_for_filename(entry_name);
-    if (lang == CBM_LANG_COUNT) {
-        /* Filename/extension detection failed: fall back to a conservative
-         * shebang probe so extensionless scripts get indexed (#1199). Filename
-         * detection stays authoritative — this runs only when it returns
-         * unknown. */
-        return cbm_language_from_shebang(abs_path);
-    }
-    /* Special: .m files need content-based disambiguation */
-    const char *dot = strrchr(entry_name, '.');
-    if (dot && strcmp(dot, ".m") == 0) {
-        lang = cbm_disambiguate_m(abs_path);
-    }
-    /* Special: .cls is shared by ObjectScript UDL, Apex and VB6 class modules */
-    if (dot && strcmp(dot, ".cls") == 0) {
-        lang = cbm_disambiguate_cls(abs_path);
-    }
-    /* Special: .inc is shared by BitBake and ObjectScript include files */
-    if (dot && strcmp(dot, ".inc") == 0) {
-        lang = cbm_disambiguate_inc(abs_path);
-    }
-    /* Special: .cfc components may be script-dialect or tag-dialect (<cfcomponent>) */
-    if (dot && strcmp(dot, ".cfc") == 0) {
-        lang = cbm_disambiguate_cfc(abs_path);
-    }
-    /* Special: .frm is shared by FORM and VB6 forms (#721) */
-    if (dot && strcmp(dot, ".frm") == 0) {
-        lang = cbm_disambiguate_frm(abs_path);
-    }
-    /* Special: .res is also a binary Godot / Windows resource (#2176) */
-    if (dot && strcmp(dot, ".res") == 0) {
-        lang = cbm_disambiguate_res(abs_path);
-    }
-    /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
-     * detected by content; otherwise .xml stays XML. */
-    if (lang == CBM_LANG_XML) {
-        FILE *xf = cbm_fopen(abs_path, "r");
-        if (xf) {
-            char xbuf[CBM_SZ_256];
-            size_t xn = fread(xbuf, SKIP_ONE, sizeof(xbuf) - SKIP_ONE, xf);
-            (void)fclose(xf);
-            xbuf[xn] = '\0';
-            if (strstr(xbuf, "<Export generator=")) {
-                return CBM_LANG_OBJECTSCRIPT_EXPORT;
-            }
-        }
-    }
-    /* Check ignored JSON files */
-    if (lang == CBM_LANG_JSON && str_in_list(entry_name, IGNORED_JSON_FILES)) {
-        return CBM_LANG_COUNT;
-    }
-    return lang;
+    return cbm_language_for_file(entry_name, abs_path);
 }
 
 /* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
@@ -950,15 +1049,247 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
 #endif
 }
 
+/* True when the listing of `dir` holds an entry stored exactly as `name`
+ * (byte comparison, so letter case decides on every platform) that is a
+ * directory (`directory`) or a regular file, checked by safe_stat: no
+ * symlink or junction is followed out of the repository, no content read. */
+static bool dir_lists_exact(const char *dir, const char *name, size_t name_len, bool directory) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    bool listed = false;
+    cbm_dirent_t *entry;
+    while (!listed && (entry = cbm_readdir(d)) != NULL) {
+        listed = strlen(entry->name) == name_len && memcmp(entry->name, name, name_len) == 0;
+    }
+    cbm_closedir(d);
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+    if (!listed || written < 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    struct stat st;
+    bool is_symlink = false;
+    return safe_stat(path, &st, &is_symlink) == 0 &&
+           (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode));
+}
+
+/* One venv marker below abs_dir, one path component at a time: each one is
+ * an exact entry of the directory before it, a directory on the way, a
+ * regular file at the end. */
+static bool venv_marker_listed(const char *abs_dir, const char *marker) {
+    char dir[CBM_SZ_4K];
+    int written = snprintf(dir, sizeof(dir), "%s", abs_dir);
+    if (written < 0 || (size_t)written >= sizeof(dir)) {
+        return false;
+    }
+    for (const char *part = marker; *part;) {
+        const char *slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        if (!dir_lists_exact(dir, part, len, slash != NULL)) {
+            return false;
+        }
+        if (!slash) {
+            return true;
+        }
+        size_t used = strlen(dir);
+        written = snprintf(dir + used, sizeof(dir) - used, "/%.*s", (int)len, part);
+        if (written < 0 || (size_t)written >= sizeof(dir) - used) {
+            return false;
+        }
+        part = slash + SKIP_ONE;
+    }
+    return false;
+}
+
+/* Once per directory named env the walk meets: its listing is read once to
+ * see which markers can be there, and a marker's subdirectory (bin, Scripts,
+ * conda-meta) only when it is listed. */
+static bool dir_is_venv_on_disk(const char *abs_dir) {
+    /* the list's slots; the last one is its NULL terminator */
+    enum { SLOTS = sizeof(CBM_DISCOVER_VENV_MARKERS) / sizeof(CBM_DISCOVER_VENV_MARKERS[0]) };
+    bool first[SLOTS] = {false};
+    cbm_dir_t *d = abs_dir ? cbm_opendir(abs_dir) : NULL;
+    if (!d) {
+        return false;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        for (int i = 0; i < SLOTS - SKIP_ONE; i++) {
+            const char *marker = CBM_DISCOVER_VENV_MARKERS[i];
+            const char *slash = strchr(marker, '/');
+            size_t len = slash ? (size_t)(slash - marker) : strlen(marker);
+            first[i] =
+                first[i] || (strlen(entry->name) == len && memcmp(entry->name, marker, len) == 0);
+        }
+    }
+    cbm_closedir(d);
+    for (int i = 0; i < SLOTS - SKIP_ONE; i++) {
+        if (first[i] && venv_marker_listed(abs_dir, CBM_DISCOVER_VENV_MARKERS[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── Sphinx documentation sets ────────────────────────────────────
+ * A directory with a conf.py is a Sphinx documentation set, and its
+ * `source_suffix` says which file suffixes are reStructuredText (Django's
+ * docs are `.txt`). A file of such a suffix in the set's subtree, of no
+ * language by its name, is reST; a nested conf.py starts its own set. conf.py
+ * is read as text (the first SPHINX_CONF_READ bytes) and never run. */
+
+enum {
+    SPHINX_SUFFIXES = 4,    /* extra reST suffixes one set declares */
+    SPHINX_SUFFIX_LEN = 16, /* ".txt", ".rest": a longer one is no suffix */
+    SPHINX_CONF_READ = 65536,
+};
+
+typedef struct {
+    char ext[SPHINX_SUFFIXES][SPHINX_SUFFIX_LEN];
+    int count;
+} sphinx_suffixes_t;
+
+/* The quoted string at s[i] ('...' or "..."): its span; false otherwise. */
+static bool sphinx_quoted(const char *s, size_t n, size_t i, size_t *a, size_t *b) {
+    if (i >= n || (s[i] != '\'' && s[i] != '"')) {
+        return false;
+    }
+    const char *close = memchr(s + i + SKIP_ONE, s[i], n - i - SKIP_ONE);
+    if (!close) {
+        return false;
+    }
+    *a = i + SKIP_ONE;
+    *b = (size_t)(close - s);
+    return true;
+}
+
+static void sphinx_add(sphinx_suffixes_t *out, const char *s, size_t n) {
+    if (n < PAIR_LEN || n >= SPHINX_SUFFIX_LEN || s[0] != '.' || out->count >= SPHINX_SUFFIXES ||
+        (n == strlen(".rst") && memcmp(s, ".rst", n) == 0)) {
+        return;
+    }
+    for (size_t i = SKIP_ONE; i < n; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '-') {
+            return;
+        }
+    }
+    memcpy(out->ext[out->count], s, n);
+    out->ext[out->count][n] = '\0';
+    out->count++;
+}
+
+/* `source_suffix = '.txt'`, `= ['.rst', '.txt']` or
+ * `= {'.rst': 'restructuredtext', '.txt': 'restructuredtext'}` (a dict
+ * entry counts only when it maps to restructuredtext). */
+static void sphinx_parse(const char *s, size_t n, sphinx_suffixes_t *out) {
+    static const char key[] = "source_suffix";
+    size_t kl = strlen(key);
+    for (size_t line = 0; line < n;) {
+        const char *nl = memchr(s + line, '\n', n - line);
+        size_t end = nl ? (size_t)(nl - s) : n;
+        size_t i = line + kl;
+        if (end >= i && memcmp(s + line, key, kl) == 0) {
+            while (i < n && (s[i] == ' ' || s[i] == '\t')) {
+                i++;
+            }
+            if (i < n && s[i] == '=') {
+                i++;
+                while (i < n && (s[i] == ' ' || s[i] == '\t')) {
+                    i++;
+                }
+                char open = i < n ? s[i] : '\0';
+                char close = '\0';
+                if (open == '[' || open == '(' || open == '{') {
+                    close = open == '[' ? ']' : (open == '(' ? ')' : '}');
+                }
+                /* the value: up to its closing bracket, or this line */
+                size_t stop = end;
+                if (close) {
+                    const char *c = memchr(s + i, close, n - i);
+                    stop = c ? (size_t)(c - s) : end;
+                }
+                size_t k = i;
+                while (k < stop) {
+                    size_t a;
+                    size_t b;
+                    if (!sphinx_quoted(s, stop, k, &a, &b)) {
+                        k++;
+                        continue;
+                    }
+                    k = b + SKIP_ONE;
+                    if (open != '{') {
+                        sphinx_add(out, s + a, b - a);
+                        continue;
+                    }
+                    while (k < stop && (s[k] == ' ' || s[k] == ':')) {
+                        k++;
+                    }
+                    size_t va;
+                    size_t vb;
+                    if (sphinx_quoted(s, stop, k, &va, &vb)) {
+                        if (vb - va == strlen("restructuredtext") &&
+                            memcmp(s + va, "restructuredtext", vb - va) == 0) {
+                            sphinx_add(out, s + a, b - a);
+                        }
+                        k = vb + SKIP_ONE;
+                    }
+                }
+                return; /* the first assignment */
+            }
+        }
+        line = end + SKIP_ONE;
+    }
+}
+
+/* The documentation set this directory starts, if it has a conf.py. */
+static bool sphinx_load(const char *dir, sphinx_suffixes_t *out) {
+    char conf[CBM_SZ_4K];
+    if (snprintf(conf, sizeof(conf), "%s/conf.py", dir) >= (int)sizeof(conf)) {
+        return false;
+    }
+    struct stat st;
+    if (wide_stat(conf, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(conf, "rb");
+    if (!f) {
+        return false;
+    }
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, SPHINX_CONF_READ);
+    size_t n = buf ? fread(buf, SKIP_ONE, SPHINX_CONF_READ, f) : 0;
+    (void)fclose(f);
+    memset(out, 0, sizeof(*out));
+    if (buf) {
+        sphinx_parse(buf, n, out);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, buf);
+    return true;
+}
+
+static bool sphinx_is_rst(const sphinx_suffixes_t *set, const char *name) {
+    size_t nl = strlen(name);
+    for (int i = 0; set && i < set->count; i++) {
+        size_t el = strlen(set->ext[i]);
+        if (nl > el && strcmp(name + nl - el, set->ext[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Process a single regular file entry during directory walk. */
 static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
                                   const cbm_discover_opts_t *opts,
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
-                                  const cbm_gitignore_t *cbmignore, const struct stat *st,
+                                  const cbm_gitignore_t *cbmignore, const sphinx_suffixes_t *sphinx,
+                                  bool in_ignored_dir, bool config_only, const struct stat *st,
                                   file_list_t *out) {
     const char *skip_reason =
-        file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size);
+        file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size,
+                         tracked_has_file(out->tracked, rel_path), in_ignored_dir);
     if (skip_reason) {
         /* Deliberately not indexed (#963) — record so callers can surface it.
          * Unsupported-language files below are NOT recorded: "no grammar for
@@ -968,7 +1299,17 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
         return;
     }
     CBMLanguage lang = detect_file_language(name, abs_path);
+    if (lang == CBM_LANG_COUNT && sphinx_is_rst(sphinx, name)) {
+        lang = CBM_LANG_RST; /* its documentation set's source_suffix */
+    }
     if (lang == CBM_LANG_COUNT) {
+        return;
+    }
+    if (config_only &&
+        (!cbm_language_is_deployment_config(lang) || cbm_discover_is_package_manifest(name))) {
+        /* Program source and package manifests in deploy/ or deployed/: the
+         * built-in skip list's rule for those directories (#963 records it). */
+        file_list_add_ignored(out, rel_path, "skip-list");
         return;
     }
     fl_add(out, abs_path, rel_path, lang, st);
@@ -978,6 +1319,9 @@ typedef struct {
     char dir[CBM_SZ_4K];
     char prefix[CBM_SZ_4K];
     const gitignore_link_t *ignore_chain; /* deepest .gitignore governing this dir */
+    sphinx_suffixes_t sphinx;             /* the documentation set's extra reST suffixes */
+    bool git_ignored; /* ignored by git's rules, entered only for its tracked content */
+    bool config_only; /* in or below a CONFIG_ONLY_DIRS directory: configuration files only */
 } walk_frame_t;
 /* Initial capacity only — the stack grows on demand. A single directory can
  * hold more pending sibling frames than any fixed cap (dotnet/runtime has 855
@@ -1015,7 +1359,8 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
  * context. Grows the stack geometrically; the caller's `parent` must not
  * point into the stack array (walk_dir pops into a local copy). */
 static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char *rel_path,
-                             const walk_frame_t *parent, file_list_t *out) {
+                             const walk_frame_t *parent, bool git_ignored, bool config_only,
+                             file_list_t *out) {
     if (ws->top >= ws->cap) {
         int new_cap = ws->cap * 2;
         walk_frame_t *grown = realloc(ws->frames, (size_t)new_cap * sizeof(*grown));
@@ -1035,6 +1380,9 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
         return;
     }
     slot->ignore_chain = parent->ignore_chain;
+    slot->sphinx = parent->sphinx;
+    slot->git_ignored = git_ignored;
+    slot->config_only = config_only;
     ws->top++;
 }
 
@@ -1061,7 +1409,12 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     struct stat st;
     bool is_symlink = false;
     if (safe_stat(abs_path, &st, &is_symlink) != 0) {
-        if (out->count_only) {
+        /* A count aborts when it cannot observe an entry, because its caller
+         * (auto-index admission) treats an unreliable count as a refusal. A
+         * symlink is not that case: it is skipped deliberately, on every walk.
+         * Failing here made one symlink anywhere in a tree refuse the whole
+         * repo, and the refusal surfaced as "unsafe_or_unavailable_path". */
+        if (out->count_only && !is_symlink) {
             out->failed = true;
         } else if (is_symlink) {
             /* Deliberately not indexed (#963): record so callers can
@@ -1073,17 +1426,27 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (!dir_is_cache_tree(abs_path) &&
-            !should_skip_directory(entry->name, rel_path, opts, frame->ignore_chain, global_gi,
-                                   cbmignore)) {
-            walk_push_subdir(ws, abs_path, rel_path, frame, out);
+        bool config_only = false;
+        dir_verdict_t verdict =
+            dir_is_cache_tree(abs_path)
+                ? DIR_SKIP
+                : directory_verdict(entry->name, rel_path, abs_path, opts, frame->ignore_chain,
+                                    global_gi, cbmignore, &config_only);
+        if (verdict == DIR_KEEP && frame->git_ignored) {
+            verdict = DIR_GIT_IGNORED; /* below a git-ignored directory, as in git */
+        }
+        if (verdict == DIR_KEEP ||
+            (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
+            walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED,
+                             frame->config_only || config_only, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
         }
     } else if (S_ISREG(st.st_mode)) {
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, frame->ignore_chain, global_gi,
-                              cbmignore, &st, out);
+                              cbmignore, &frame->sphinx, frame->git_ignored, frame->config_only,
+                              &st, out);
     }
 }
 
@@ -1177,6 +1540,11 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
             frame.ignore_chain = link;
         }
 
+        sphinx_suffixes_t set;
+        if (sphinx_load(frame.dir, &set)) {
+            frame.sphinx = set; /* a (nested) documentation set starts here */
+        }
+
         cbm_dir_t *d = cbm_opendir(frame.dir);
         if (!d) {
             if (out->count_only) {
@@ -1210,6 +1578,131 @@ static bool discover_path_is_absolute(const char *path) {
 #else
     return false;
 #endif
+}
+
+static void tracked_free_key(const char *key, void *value, void *userdata) {
+    (void)value;
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void tracked_free(discover_tracked_t *tracked) {
+    if (tracked->dirs) {
+        cbm_ht_foreach(tracked->dirs, tracked_free_key, NULL);
+    }
+    cbm_ht_free(tracked->dirs);
+    cbm_ht_free(tracked->files);
+    cbm_free(CBM_MEM_CLASS_OTHER, tracked->paths);
+    memset(tracked, 0, sizeof(*tracked));
+}
+
+/* The bytes of the capture file at path, NUL-terminated; NULL on any failure. */
+static char *tracked_slurp(const char *path, size_t *length) {
+    int64_t size = cbm_file_size(path);
+    if (size < 0 || (uint64_t)size >= SIZE_MAX) {
+        return NULL;
+    }
+    char *buffer = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + SKIP_ONE);
+    FILE *fp = buffer ? cbm_fopen(path, "rb") : NULL;
+    bool ok = fp && fread(buffer, 1, (size_t)size, fp) == (size_t)size;
+    if (fp) {
+        (void)fclose(fp);
+    }
+    if (!ok) {
+        cbm_free(CBM_MEM_CLASS_OTHER, buffer);
+        return NULL;
+    }
+    buffer[size] = '\0';
+    *length = (size_t)size;
+    return buffer;
+}
+
+/* The whole `git ls-files -z` output for repo_path (paths relative to it),
+ * NUL-terminated; NULL when git cannot run or fails. Git runs without a
+ * shell: the repository path is one argv entry, and the child environment
+ * drops repository-local variables so an inherited GIT_DIR cannot redirect -C. */
+static char *tracked_read(const char *repo_path, size_t *length) {
+    *length = 0;
+    char git[CBM_SZ_4K];
+    char capture[CBM_SZ_4K];
+    int n = snprintf(capture, sizeof(capture), "%s/cbm-discover-git-XXXXXX", cbm_tmpdir());
+    if (!cbm_test_impact_find_git(git, sizeof(git)) || n <= 0 || (size_t)n >= sizeof(capture)) {
+        return NULL;
+    }
+    int fd = cbm_mkstemp(capture);
+    if (fd < 0) {
+        return NULL;
+    }
+#ifdef _WIN32
+    (void)_close(fd);
+#else
+    (void)close(fd);
+#endif
+    const char *argv[] = {git,        "-C", repo_path, "-c", "core.fsmonitor=false",
+                          "ls-files", "-z", NULL};
+    cbm_proc_opts_t opts = {.bin = git,
+                            .argv = argv,
+                            .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+                            .strip_git_repo_env = true,
+                            .stdout_file = capture};
+    cbm_proc_result_t result = {0};
+    bool ran = cbm_subprocess_run(&opts, &result) == 0 && result.outcome == CBM_PROC_CLEAN &&
+               result.exit_code == 0;
+    char *buffer = ran ? tracked_slurp(capture, length) : NULL;
+    (void)cbm_unlink(capture);
+    return buffer;
+}
+
+/* Record every directory above `path` (its '/'-separated prefixes). */
+static bool tracked_add_dirs(CBMHashTable *dirs, const char *path) {
+    char prefix[CBM_SZ_4K];
+    for (const char *slash = strchr(path, '/'); slash; slash = strchr(slash + SKIP_ONE, '/')) {
+        size_t n = (size_t)(slash - path);
+        if (n == 0 || n >= sizeof(prefix)) {
+            continue;
+        }
+        memcpy(prefix, path, n);
+        prefix[n] = '\0';
+        if (cbm_ht_has(dirs, prefix)) {
+            continue;
+        }
+        char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, prefix);
+        if (!key) {
+            return false;
+        }
+        cbm_ht_set(dirs, key, key);
+    }
+    return true;
+}
+
+/* Load what git tracks under repo_path; leaves `tracked` empty on any failure,
+ * so the ignore rules then apply exactly as they did without it. */
+static void tracked_load(discover_tracked_t *tracked, const char *repo_path) {
+    memset(tracked, 0, sizeof(*tracked));
+    size_t length = 0;
+    tracked->paths = tracked_read(repo_path, &length);
+    if (!tracked->paths || length == 0) {
+        tracked_free(tracked);
+        return;
+    }
+    tracked->files = cbm_ht_create(CBM_SZ_1K);
+    tracked->dirs = cbm_ht_create(CBM_SZ_256);
+    if (!tracked->files || !tracked->dirs) {
+        tracked_free(tracked);
+        return;
+    }
+    for (size_t at = 0; at < length;) {
+        const char *path = tracked->paths + at;
+        size_t n = strlen(path);
+        if (n > 0) {
+            cbm_ht_set(tracked->files, path, (void *)path);
+            if (!tracked_add_dirs(tracked->dirs, path)) {
+                tracked_free(tracked);
+                return;
+            }
+        }
+        at += n + SKIP_ONE;
+    }
 }
 
 /* Resolve the shared "common" git directory for repo_path.
@@ -1576,10 +2069,16 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         .collect_excluded = !count_only && excluded_out != NULL,
         .collect_ignored = !count_only && ignored_out != NULL,
     };
+    discover_tracked_t tracked = {0};
+    if (is_git_repo) {
+        tracked_load(&tracked, repo_path);
+        fl.tracked = &tracked;
+    }
     walk_cache_dir_snapshot();
     walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
 
     /* Cleanup */
+    tracked_free(&tracked);
     ancestor_ignores_free(&ancestors);
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(global_gi);

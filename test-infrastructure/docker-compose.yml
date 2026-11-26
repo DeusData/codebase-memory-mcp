@@ -20,6 +20,7 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
       - cbm-build:/src/build
       - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-arm64:/root/.ccache
@@ -35,6 +36,7 @@ services:
     platform: linux/amd64
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
       - cbm-build:/src/build
       - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-amd64:/root/.ccache
@@ -57,6 +59,7 @@ services:
     init: true
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
       - cbm-build:/src/build
       - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-arm64:/root/.ccache
@@ -79,6 +82,7 @@ services:
     init: true
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
       - cbm-build:/src/build
       - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-arm64:/root/.ccache
@@ -105,6 +109,7 @@ services:
     init: true
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
       - cbm-build:/src/build
       - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-amd64:/root/.ccache
@@ -232,6 +237,7 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
+      - ${CBM_GIT_COMMON_DIR:-..}:${CBM_GIT_COMMON_DIR:-/.cbm-git-noop}:ro
     entrypoint: ["bash", "scripts/test.sh"]
     command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/alpine"]
 

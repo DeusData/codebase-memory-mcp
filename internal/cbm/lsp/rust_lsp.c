@@ -26,6 +26,7 @@
  */
 
 #include "rust_lsp.h"
+#include "lsp_work.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -306,18 +307,33 @@ static void rust_strip_turbofish(char *path) {
     *write = '\0';
 }
 
+/* In place: `Gen<T>` -> `Gen`, `foo::Bar<'a, T>` -> `foo::Bar` (#763). An
+ * impl's self type keeps its generic arguments in the source text, but every
+ * def-side QN (a method's receiver, the extractor's call scope) strips them.
+ * Unstripped, the LSP's caller QN, `self`/`Self` dispatch and the return-type
+ * harvest never matched a generic impl's methods. Text starting with `<` (a
+ * qualified path) is left alone. Safe on NULL. */
+static void rust_strip_impl_type_args(char *type_text) {
+    if (!type_text) {
+        return;
+    }
+    char *lt = strchr(type_text, '<');
+    if (lt && lt > type_text) {
+        *lt = '\0';
+    }
+}
+
 /* Look up a `use` alias and return its fully-qualified module path,
  * or NULL if absent. The returned pointer aliases into the use map. */
 static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name) {
     if (!ctx || !local_name) {
         return NULL;
     }
-    for (int i = 0; i < ctx->use_count; i++) {
-        if (strcmp(ctx->use_local_names[i], local_name) == 0) {
-            return ctx->use_module_paths[i];
-        }
-    }
-    return NULL;
+    /* The first use of this local name (lsp_name_rows.h): a scan per use made a
+     * file of thousands of `use` items quadratic. */
+    int i = cbm_name_rows_first(&ctx->use_rows, ctx->arena, ctx->use_local_names, ctx->use_count,
+                                local_name);
+    return i >= 0 ? ctx->use_module_paths[i] : NULL;
 }
 
 /* The Rust prelude is auto-imported into every module. We map each name
@@ -2632,6 +2648,7 @@ static const CBMRegisteredFunc *rust_lookup_method_in_trait(RustLSPContext *ctx,
     if (reg->fallback) {
         RustLSPContext fallback_ctx = *ctx;
         fallback_ctx.registry = reg->fallback;
+        fallback_ctx.use_rows = (CBMNameRows){0}; /* the copy must not grow ctx's chains */
         return rust_lookup_method_in_trait(&fallback_ctx, trait_qn, method_name, allow_abstract);
     }
     return NULL;
@@ -4128,6 +4145,32 @@ static bool rust_qn_has_suffix(const char *qualified_name, const char *suffix) {
            (qn_len == suffix_len || qualified_name[qn_len - suffix_len - 1U] == '.');
 }
 
+/* True when the segment that qualifies a call path's tail names a TYPE:
+ * `Store::new`, `Self::helper`, `T::default`, `<T as Tr>::f` (turbofish is
+ * already stripped, so a `>` before the last `::` closes a qualified path).
+ * Such a call is an associated function, never a free function, so the
+ * free-function short-name fallbacks must not bind it: with a project-wide
+ * unique free `new`/`write`, `Store::new()` landed on that function and the
+ * LSP row pre-empted the registry's correct `Store.new`. Module segments are
+ * snake_case, so an ASCII-uppercase initial is a type. `tail` must point just
+ * past the path's last `::`, or equal `path` when there is none. */
+static bool rust_path_qualifier_is_type(const char *path, const char *tail) {
+    if (!path || !tail || tail - path < 3) {
+        return false;
+    }
+    const char *seg_end = tail - 2; /* the last "::" */
+    if (seg_end[-1] == '>') {
+        return true;
+    }
+    const char *seg = path;
+    for (const char *p = path; p + 1 < seg_end; p++) {
+        if (p[0] == ':' && p[1] == ':') {
+            seg = p + 2;
+        }
+    }
+    return seg < seg_end && seg[0] >= 'A' && seg[0] <= 'Z';
+}
+
 /* Resolve only an exact identifier/scoped-path value. No branch, closure, or
  * other composite expression enters this helper. A suffix fallback is admitted
  * only for a qualified import path and only when it identifies one free func. */
@@ -4514,6 +4557,9 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
         } else {
             tail = path;
         }
+        /* `Type::f` is an associated function: the two free-function
+         * fallbacks below never bind it (see rust_path_qualifier_is_type). */
+        const bool assoc_call = rust_path_qualifier_is_type(path, tail);
 
         /* Cross-crate workspace-member resolution (#56): when the call
          * path's head is a declared Cargo workspace member (e.g.
@@ -4524,7 +4570,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * MEMBER crate by matching the registered QN's `.<member>.`
          * path segment plus the call tail. Requires a parsed manifest
          * (threaded through pass_lsp_cross.c); NULL manifest skips this. */
-        if (ctx->cargo_manifest && tail && *tail) {
+        if (!assoc_call && ctx->cargo_manifest && tail && *tail) {
             const char *head_sep = strstr(path, "::");
             if (head_sep && head_sep > path) {
                 char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
@@ -4568,7 +4614,7 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
          * foo; use foo::bar; bar()` a chance to resolve when the
          * intermediate module wasn't tracked through an explicit
          * use-map entry. */
-        if (tail && *tail && ctx->module_qn) {
+        if (!assoc_call && tail && *tail && ctx->module_qn) {
             /* Crate prefix is the first dotted segment of module_qn after
              * the project name, but for simplicity we just match on
              * "starts with first dot-segment". */
@@ -5245,6 +5291,7 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     char *type_text = rust_node_text(ctx, type_node);
     if (!type_text)
         return;
+    rust_strip_impl_type_args(type_text);
 
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
@@ -5508,6 +5555,51 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
     }
 }
 
+/* The first function row of each key, for a pass that patches registered
+ * functions while the function list does not change: the pass starts its old
+ * loop at that row instead of the top. A row the memo cannot take (no memory)
+ * sets `failed`, and every loop starts at the top again. Scratch memory. */
+enum { RUST_FIRST_ROWS_BLOCK = 4096 };
+
+typedef struct {
+    CBMIdxMemo first;
+    CBMArena arena;
+    bool failed;
+} RustFirstRows;
+
+static void rust_first_rows_init(RustFirstRows *rows) {
+    memset(rows, 0, sizeof(*rows));
+    cbm_arena_init_lazy(&rows->arena, RUST_FIRST_ROWS_BLOCK);
+}
+
+static void rust_first_rows_destroy(RustFirstRows *rows) {
+    cbm_arena_destroy(&rows->arena);
+}
+
+static void rust_first_rows_put(RustFirstRows *rows, const char *key, int row) {
+    if (rows->failed)
+        return;
+    CBM_LSP_WORK(1);
+    if (key)
+        cbm_idxmemo_put_if_absent(&rows->first, &rows->arena, key, row);
+    if (!key || cbm_idxmemo_get(&rows->first, key) < 0)
+        rows->failed = true;
+}
+
+/* Where a patch loop over `count` functions starts for this key. */
+static int rust_first_rows_start(const RustFirstRows *rows, const char *key, int count) {
+    CBM_LSP_WORK(1);
+    if (rows->failed || !key)
+        return 0;
+    int row = cbm_idxmemo_get(&rows->first, key);
+    return row >= 0 ? row : count;
+}
+
+/* A method's key: receiver and name, joined by a byte no name holds. */
+static const char *rust_method_key(RustFirstRows *rows, const char *receiver, const char *name) {
+    return cbm_arena_sprintf(&rows->arena, "%s\x1f%s", receiver, name);
+}
+
 /* Build the registry from the per-file `result->defs`, `result->impl_traits`,
  * and a Rust prelude seed. */
 void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
@@ -5673,7 +5765,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         fld_count++;
                     }
                     if (fld_count > 0) {
-                        for (int ti = 0; ti < reg->type_count; ti++) {
+                        /* The type's first registration (type_idx); the loop starts there. */
+                        CBM_LSP_WORK(1);
+                        int first = cbm_idxmemo_get(&type_idx, type_qn);
+                        for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count;
+                             ti++) {
                             if (reg->types[ti].qualified_name &&
                                 strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
                                 const char **names = (const char **)cbm_arena_alloc(
@@ -5705,8 +5801,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     continue;
                 const char *trait_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
 
-                /* Mark as interface and collect method names. */
-                for (int ti = 0; ti < reg->type_count; ti++) {
+                /* Mark as interface and collect method names: the trait's first
+                 * registration (type_idx); the loop starts there. */
+                CBM_LSP_WORK(1);
+                int first = cbm_idxmemo_get(&type_idx, trait_qn);
+                for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count; ti++) {
                     if (!reg->types[ti].qualified_name)
                         continue;
                     if (strcmp(reg->types[ti].qualified_name, trait_qn) == 0) {
@@ -5758,6 +5857,13 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         tmp.registry = reg;
         tmp.module_qn = module_qn;
 
+        /* The first free function of each QN; the patch loop starts there. */
+        RustFirstRows free_rows;
+        rust_first_rows_init(&free_rows);
+        for (int k = 0; k < reg->func_count; k++) {
+            if (reg->funcs[k].qualified_name && !reg->funcs[k].receiver_type)
+                rust_first_rows_put(&free_rows, reg->funcs[k].qualified_name, k);
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -5772,7 +5878,8 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 continue;
             const CBMType *ret = rust_parse_type_node(&tmp, rtn);
             const char *fn_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, fname);
-            for (int k = 0; k < reg->func_count; k++) {
+            for (int k = rust_first_rows_start(&free_rows, fn_qn, reg->func_count);
+                 k < reg->func_count; k++) {
                 CBMRegisteredFunc *rf = &reg->funcs[k];
                 if (!rf->qualified_name)
                     continue;
@@ -5788,6 +5895,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 break;
             }
         }
+        rust_first_rows_destroy(&free_rows);
     }
 
     /* Phase A2: derive-macro synthesis.
@@ -5917,7 +6025,10 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                          * trait QN as an embedded_type on the receiver
                          * AND synthesize the method entries. */
                         CBMRegisteredType *rt = NULL;
-                        for (int ti = 0; ti < reg->type_count; ti++) {
+                        CBM_LSP_WORK(1);
+                        int first = cbm_idxmemo_get(&type_idx, d->qualified_name);
+                        for (int ti = first >= 0 ? first : reg->type_count; ti < reg->type_count;
+                             ti++) {
                             if (reg->types[ti].qualified_name &&
                                 strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0) {
                                 rt = &reg->types[ti];
@@ -5989,6 +6100,16 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
      * registered functions have no return-type signature and chained
      * method calls (`File::open().read()`) break. */
     if (!ts_node_is_null(root)) {
+        /* The first function of each receiver and name; the patch loop starts there. */
+        RustFirstRows method_rows;
+        rust_first_rows_init(&method_rows);
+        for (int k = 0; k < reg->func_count; k++) {
+            const CBMRegisteredFunc *rf = &reg->funcs[k];
+            if (rf->receiver_type && rf->short_name)
+                rust_first_rows_put(
+                    &method_rows, rust_method_key(&method_rows, rf->receiver_type, rf->short_name),
+                    k);
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -5999,6 +6120,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             if (ts_node_is_null(type_node) || ts_node_is_null(body))
                 continue;
             char *type_name = cbm_node_text(arena, type_node, source);
+            rust_strip_impl_type_args(type_name);
             if (!type_name || !type_name[0])
                 continue;
             const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
@@ -6033,7 +6155,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     ret = cbm_type_named(arena, type_qn);
                 }
                 /* Patch the registered function's signature. */
-                for (int k = 0; k < reg->func_count; k++) {
+                const char *key = type_qn ? rust_method_key(&method_rows, type_qn, mname) : NULL;
+                for (int k = rust_first_rows_start(&method_rows, key, reg->func_count);
+                     k < reg->func_count; k++) {
                     CBMRegisteredFunc *rf = &reg->funcs[k];
                     if (!rf->receiver_type || !rf->short_name)
                         continue;
@@ -6050,6 +6174,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 }
             }
         }
+        rust_first_rows_destroy(&method_rows);
     }
 
     /* Phase C: encode `impl Trait for Type` as `embedded_types` on the
@@ -6323,7 +6448,10 @@ static void rust_resolve_against_registry(CBMArena *arena, const char *source, i
  * read-only, and shared across every Rust file's resolve (mirrors C/py/cs/ts).
  * Converts the pipeline's CBMLSPDef into CBMRustLSPDef inline (same field copy as
  * pass_lsp_cross.c's pxc_lspdefs_to_rust, including proven trait provenance).
- * module_qn=NULL is byte-identical because all_defs always carry def_module_qn. */
+ * module_qn=NULL is byte-identical because all_defs always carry def_module_qn.
+ * all_defs is mixed-language: only Rust defs are registered, exactly like the
+ * per-file conversion, so a Perl `new` or a C function can never become the
+ * target of a Rust call (the Go builder filters the same way). */
 CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
     if (!arena)
         return NULL;
@@ -6331,29 +6459,34 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     if (!reg)
         return NULL;
     CBMRustLSPDef *rdefs = NULL;
+    int n = 0;
     if (def_count > 0) {
         rdefs = (CBMRustLSPDef *)cbm_arena_alloc(arena, (size_t)def_count * sizeof(CBMRustLSPDef));
         if (!rdefs)
             return NULL;
         for (int i = 0; i < def_count; i++) {
-            rdefs[i].qualified_name = defs[i].qualified_name;
-            rdefs[i].short_name = defs[i].short_name;
-            rdefs[i].label = defs[i].label;
-            rdefs[i].receiver_type = defs[i].receiver_type;
-            rdefs[i].def_module_qn = defs[i].def_module_qn;
-            rdefs[i].return_types = defs[i].return_types;
-            rdefs[i].embedded_types = defs[i].embedded_types;
-            rdefs[i].field_defs = defs[i].field_defs;
-            rdefs[i].method_names_str = defs[i].method_names_str;
-            rdefs[i].signature_param_types = defs[i].signature_param_types;
-            rdefs[i].signature_param_count = defs[i].signature_param_count;
-            rdefs[i].trait_qn = defs[i].trait_qn;
-            rdefs[i].is_interface = defs[i].is_interface;
-            rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
-            rdefs[i].is_abstract = defs[i].is_abstract;
+            if (defs[i].lang != CBM_LANG_RUST) {
+                continue;
+            }
+            rdefs[n].qualified_name = defs[i].qualified_name;
+            rdefs[n].short_name = defs[i].short_name;
+            rdefs[n].label = defs[i].label;
+            rdefs[n].receiver_type = defs[i].receiver_type;
+            rdefs[n].def_module_qn = defs[i].def_module_qn;
+            rdefs[n].return_types = defs[i].return_types;
+            rdefs[n].embedded_types = defs[i].embedded_types;
+            rdefs[n].field_defs = defs[i].field_defs;
+            rdefs[n].method_names_str = defs[i].method_names_str;
+            rdefs[n].signature_param_types = defs[i].signature_param_types;
+            rdefs[n].signature_param_count = defs[i].signature_param_count;
+            rdefs[n].trait_qn = defs[i].trait_qn;
+            rdefs[n].is_interface = defs[i].is_interface;
+            rdefs[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
+            rdefs[n].is_abstract = defs[i].is_abstract;
+            n++;
         }
     }
-    rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL);
+    rust_populate_cross_registry(reg, arena, n > 0 ? rdefs : NULL, n, /*module_qn=*/NULL);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -6377,7 +6510,7 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -6412,7 +6545,7 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

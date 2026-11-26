@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_TS_LSP_H
 #define CBM_LSP_TS_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -32,6 +33,16 @@ typedef struct {
     const char **import_local_names;
     const char **import_module_qns;
     int import_count;
+    int import_capacity;     // rows the two arrays hold (ts_lsp_add_import)
+    CBMNameRows import_rows; // import_local_names by name, rows in table order
+
+    // Renamed named imports (`import { foo as bar }`): local binding -> the name
+    // the module exports. Parallel arrays of length import_alias_count; a
+    // binding absent here is exported under its local name.
+    const char **import_alias_locals;
+    const char **import_alias_exports;
+    int import_alias_count;
+    size_t import_alias_capacity;
 
     // File / surrounding context.
     const char *module_qn;          // QN of this file's module
@@ -65,20 +76,32 @@ typedef struct {
     // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
     // re-evaluation of shared subexpressions under overload resolution.
     struct TsEvalMemo *eval_memo;
-    // Recursion guard for lookup_member_type: cyclic type graphs (mutually
-    // recursive unions/wrappers across registered types) otherwise recurse
-    // without bound — stack overflow on real repos.
-    int member_depth;
-    // Same guard for lookup_method: its extends/implements walk recursed
-    // without bound on a cyclic heritage chain (#1743).
-    int method_depth;
 } TSLSPContext;
+
+/* The imports with this local name, in table order (lsp_name_rows.h). */
+static inline int ts_import_first(TSLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, name);
+}
+static inline int ts_import_next(const TSLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, name,
+                              row);
+}
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 // Complexity-regression seam: remaining expression-eval budget / warned flag
 // for the calling thread, valid after a cbm_run_ts_lsp on the same thread.
 long cbm_ts_lsp_test_budget_remaining(void);
 bool cbm_ts_lsp_test_budget_warned(void);
+// Registry entries/probes visited by the two AST signature passes in the last run.
+unsigned long cbm_ts_lsp_test_signature_lookup_work(void);
+// Inspect signature-index selection and checked walker addition without huge ASTs.
+int cbm_ts_lsp_test_signature_func_index(CBMTypeRegistry *reg, const char *qn);
+int cbm_ts_lsp_test_walk_pending_count(int top, uint32_t count);
+// Maximum recursive calls in one member/method lookup during the last TS LSP run,
+// including attempts rejected by the depth or visited-type guard.
+int cbm_ts_lsp_test_max_member_lookup_steps(void);
+int cbm_ts_lsp_test_max_method_lookup_steps(void);
 #endif
 
 // --- Initialization ---

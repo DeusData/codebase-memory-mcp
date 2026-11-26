@@ -1,0 +1,1933 @@
+{
+  "status": "ready",
+  "project": "cbm-pr2068",
+  "file_path": "src/ui/http_server.c",
+  "scope": "file",
+  "computed_at": 1788983594,
+  "cache_seconds": 30,
+  "snapshot": {
+    "indexed_at": "2026-09-09T19:51:51Z",
+    "generation": "u0911bd5153455afeg2",
+    "index_revision": "unknown",
+    "freshness": "The index does not record a Git revision; equivalence to HEAD or the worktree is unverified.",
+    "coverage_recording": "complete",
+    "coverage": [
+      {
+        "kind": "not_indexed_dir",
+        "count": 9
+      },
+      {
+        "kind": "not_indexed_file",
+        "count": 187
+      },
+      {
+        "kind": "parse_partial",
+        "count": 85
+      }
+    ]
+  },
+  "structural": {
+    "findings": [
+      {
+        "id": 28306,
+        "name": "repo_info_strips_credentials_from_remote",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.repo_info_strips_credentials_from_remote",
+        "file_path": "tests/test_httpd.c",
+        "line": 2466,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74217,
+            "type": "CALLS",
+            "from": {
+              "id": 28306,
+              "name": "repo_info_strips_credentials_from_remote",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.repo_info_strips_credentials_from_remote",
+              "file_path": "tests/test_httpd.c",
+              "line": 2466
+            },
+            "to": {
+              "id": 28082,
+              "name": "cbm_ui_git_strip_credentials",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_git_strip_credentials",
+              "file_path": "src/ui/http_server.c",
+              "line": 247
+            }
+          }
+        ]
+      },
+      {
+        "id": 787,
+        "name": "test_httpd.c",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.c.__file__",
+        "file_path": "tests/test_httpd.c",
+        "line": 0,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74354,
+            "type": "CALLS",
+            "from": {
+              "id": 787,
+              "name": "test_httpd.c",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.c.__file__",
+              "file_path": "tests/test_httpd.c",
+              "line": 0
+            },
+            "to": {
+              "id": 28082,
+              "name": "cbm_ui_git_strip_credentials",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_git_strip_credentials",
+              "file_path": "src/ui/http_server.c",
+              "line": 247
+            }
+          }
+        ]
+      },
+      {
+        "id": 28305,
+        "name": "repo_info_web_base_normalizes_to_https",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.repo_info_web_base_normalizes_to_https",
+        "file_path": "tests/test_httpd.c",
+        "line": 2439,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74216,
+            "type": "CALLS",
+            "from": {
+              "id": 28305,
+              "name": "repo_info_web_base_normalizes_to_https",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.repo_info_web_base_normalizes_to_https",
+              "file_path": "tests/test_httpd.c",
+              "line": 2439
+            },
+            "to": {
+              "id": 28083,
+              "name": "cbm_ui_git_web_base",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_git_web_base",
+              "file_path": "src/ui/http_server.c",
+              "line": 273
+            }
+          }
+        ]
+      },
+      {
+        "id": 5090,
+        "name": "host_cleanup_force_terminate",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_cleanup_force_terminate",
+        "file_path": "src/daemon/host.c",
+        "line": 179,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58443,
+            "type": "CALLS",
+            "from": {
+              "id": 5090,
+              "name": "host_cleanup_force_terminate",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_cleanup_force_terminate",
+              "file_path": "src/daemon/host.c",
+              "line": 179
+            },
+            "to": {
+              "id": 28088,
+              "name": "cbm_ui_log_init",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_init",
+              "file_path": "src/ui/http_server.c",
+              "line": 424
+            }
+          }
+        ]
+      },
+      {
+        "id": 5142,
+        "name": "cbm_daemon_host_force_terminate_for_test",
+        "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_force_terminate_for_test",
+        "file_path": "src/daemon/host.c",
+        "line": 934,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58527,
+            "type": "CALLS",
+            "from": {
+              "id": 5142,
+              "name": "cbm_daemon_host_force_terminate_for_test",
+              "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_force_terminate_for_test",
+              "file_path": "src/daemon/host.c",
+              "line": 934
+            },
+            "to": {
+              "id": 28088,
+              "name": "cbm_ui_log_init",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_init",
+              "file_path": "src/ui/http_server.c",
+              "line": 424
+            }
+          }
+        ]
+      },
+      {
+        "id": 5143,
+        "name": "cbm_daemon_host_run",
+        "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_run",
+        "file_path": "src/daemon/host.c",
+        "line": 948,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58530,
+            "type": "CALLS",
+            "from": {
+              "id": 5143,
+              "name": "cbm_daemon_host_run",
+              "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_run",
+              "file_path": "src/daemon/host.c",
+              "line": 948
+            },
+            "to": {
+              "id": 28088,
+              "name": "cbm_ui_log_init",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_init",
+              "file_path": "src/ui/http_server.c",
+              "line": 424
+            }
+          }
+        ]
+      },
+      {
+        "id": 5085,
+        "name": "host_log_sink",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_log_sink",
+        "file_path": "src/daemon/host.c",
+        "line": 112,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58431,
+            "type": "CALLS",
+            "from": {
+              "id": 5085,
+              "name": "host_log_sink",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_log_sink",
+              "file_path": "src/daemon/host.c",
+              "line": 112
+            },
+            "to": {
+              "id": 28091,
+              "name": "cbm_ui_log_append",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_append",
+              "file_path": "src/ui/http_server.c",
+              "line": 479
+            }
+          }
+        ]
+      },
+      {
+        "id": 28266,
+        "name": "ui_agent_events_and_errors_use_daemon_port_and_survive_restart",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_agent_events_and_errors_use_daemon_port_and_survive_restart",
+        "file_path": "tests/test_httpd.c",
+        "line": 1280,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73939,
+            "type": "CALLS",
+            "from": {
+              "id": 28266,
+              "name": "ui_agent_events_and_errors_use_daemon_port_and_survive_restart",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_agent_events_and_errors_use_daemon_port_and_survive_restart",
+              "file_path": "tests/test_httpd.c",
+              "line": 1280
+            },
+            "to": {
+              "id": 28091,
+              "name": "cbm_ui_log_append",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_append",
+              "file_path": "src/ui/http_server.c",
+              "line": 479
+            }
+          }
+        ]
+      },
+      {
+        "id": 28313,
+        "name": "ui_server_logs_escape_dense_no_overflow",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_logs_escape_dense_no_overflow",
+        "file_path": "tests/test_httpd.c",
+        "line": 2750,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74245,
+            "type": "CALLS",
+            "from": {
+              "id": 28313,
+              "name": "ui_server_logs_escape_dense_no_overflow",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_logs_escape_dense_no_overflow",
+              "file_path": "tests/test_httpd.c",
+              "line": 2750
+            },
+            "to": {
+              "id": 28091,
+              "name": "cbm_ui_log_append",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_ui_log_append",
+              "file_path": "src/ui/http_server.c",
+              "line": 479
+            }
+          }
+        ]
+      },
+      {
+        "id": 28222,
+        "name": "httpd_resolves_bare_binary_path_from_path",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.httpd_resolves_bare_binary_path_from_path",
+        "file_path": "tests/test_httpd.c",
+        "line": 433,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73793,
+            "type": "CALLS",
+            "from": {
+              "id": 28222,
+              "name": "httpd_resolves_bare_binary_path_from_path",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.httpd_resolves_bare_binary_path_from_path",
+              "file_path": "tests/test_httpd.c",
+              "line": 433
+            },
+            "to": {
+              "id": 28122,
+              "name": "cbm_http_server_resolve_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_resolve_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1513
+            }
+          }
+        ]
+      },
+      {
+        "id": 32116,
+        "name": "main_resolve_executable",
+        "qualified_name": "cbm-pr2068.src.main.main_resolve_executable",
+        "file_path": "src/main.c",
+        "line": 1223,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 77991,
+            "type": "CALLS",
+            "from": {
+              "id": 32116,
+              "name": "main_resolve_executable",
+              "qualified_name": "cbm-pr2068.src.main.main_resolve_executable",
+              "file_path": "src/main.c",
+              "line": 1223
+            },
+            "to": {
+              "id": 28122,
+              "name": "cbm_http_server_resolve_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_resolve_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1513
+            }
+          }
+        ]
+      },
+      {
+        "id": 32134,
+        "name": "main_local_cli_daemon_execute",
+        "qualified_name": "cbm-pr2068.src.main.main_local_cli_daemon_execute",
+        "file_path": "src/main.c",
+        "line": 1642,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 78037,
+            "type": "CALLS",
+            "from": {
+              "id": 32134,
+              "name": "main_local_cli_daemon_execute",
+              "qualified_name": "cbm-pr2068.src.main.main_local_cli_daemon_execute",
+              "file_path": "src/main.c",
+              "line": 1642
+            },
+            "to": {
+              "id": 28122,
+              "name": "cbm_http_server_resolve_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_resolve_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1513
+            }
+          }
+        ]
+      },
+      {
+        "id": 5366,
+        "name": "cbm_index_worker_start_with_log",
+        "qualified_name": "cbm-pr2068.src.mcp.index_supervisor.cbm_index_worker_start_with_log",
+        "file_path": "src/mcp/index_supervisor.c",
+        "line": 621,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 92228,
+            "type": "CALLS",
+            "from": {
+              "id": 5366,
+              "name": "cbm_index_worker_start_with_log",
+              "qualified_name": "cbm-pr2068.src.mcp.index_supervisor.cbm_index_worker_start_with_log",
+              "file_path": "src/mcp/index_supervisor.c",
+              "line": 621
+            },
+            "to": {
+              "id": 28122,
+              "name": "cbm_http_server_resolve_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_resolve_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1513
+            }
+          }
+        ]
+      },
+      {
+        "id": 29268,
+        "name": "tf_maybe_run_deleted_self_probe",
+        "qualified_name": "cbm-pr2068.tests.test_main.tf_maybe_run_deleted_self_probe",
+        "file_path": "tests/test_main.c",
+        "line": 644,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 149620,
+            "type": "CALLS",
+            "from": {
+              "id": 29268,
+              "name": "tf_maybe_run_deleted_self_probe",
+              "qualified_name": "cbm-pr2068.tests.test_main.tf_maybe_run_deleted_self_probe",
+              "file_path": "tests/test_main.c",
+              "line": 644
+            },
+            "to": {
+              "id": 28122,
+              "name": "cbm_http_server_resolve_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_resolve_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1513
+            }
+          }
+        ]
+      },
+      {
+        "id": 32163,
+        "name": "main",
+        "qualified_name": "cbm-pr2068.src.main.main",
+        "file_path": "src/main.c",
+        "line": 2546,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 78132,
+            "type": "CALLS",
+            "from": {
+              "id": 32163,
+              "name": "main",
+              "qualified_name": "cbm-pr2068.src.main.main",
+              "file_path": "src/main.c",
+              "line": 2546
+            },
+            "to": {
+              "id": 28123,
+              "name": "cbm_http_server_set_binary_path",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_set_binary_path",
+              "file_path": "src/ui/http_server.c",
+              "line": 1573
+            }
+          }
+        ]
+      },
+      {
+        "id": 17040,
+        "name": "atlas_attach_observed_marks_hops",
+        "qualified_name": "cbm-pr2068.tests.test_ui.atlas_attach_observed_marks_hops",
+        "file_path": "tests/test_ui.c",
+        "line": 1852,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 52575,
+            "type": "CALLS",
+            "from": {
+              "id": 17040,
+              "name": "atlas_attach_observed_marks_hops",
+              "qualified_name": "cbm-pr2068.tests.test_ui.atlas_attach_observed_marks_hops",
+              "file_path": "tests/test_ui.c",
+              "line": 1852
+            },
+            "to": {
+              "id": 28145,
+              "name": "cbm_atlas_attach_observed",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_atlas_attach_observed",
+              "file_path": "src/ui/http_server.c",
+              "line": 2484
+            }
+          }
+        ]
+      },
+      {
+        "id": 722,
+        "name": "test_ui.c",
+        "qualified_name": "cbm-pr2068.tests.test_ui.c.__file__",
+        "file_path": "tests/test_ui.c",
+        "line": 0,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 52665,
+            "type": "CALLS",
+            "from": {
+              "id": 722,
+              "name": "test_ui.c",
+              "qualified_name": "cbm-pr2068.tests.test_ui.c.__file__",
+              "file_path": "tests/test_ui.c",
+              "line": 0
+            },
+            "to": {
+              "id": 28145,
+              "name": "cbm_atlas_attach_observed",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_atlas_attach_observed",
+              "file_path": "src/ui/http_server.c",
+              "line": 2484
+            }
+          }
+        ]
+      },
+      {
+        "id": 5108,
+        "name": "host_http_server_new_default",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_new_default",
+        "file_path": "src/daemon/host.c",
+        "line": 328,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58466,
+            "type": "CALLS",
+            "from": {
+              "id": 5108,
+              "name": "host_http_server_new_default",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_new_default",
+              "file_path": "src/daemon/host.c",
+              "line": 328
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 5136,
+        "name": "cbm_daemon_host_http_thread_create_failure_lifecycle_for_test",
+        "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_http_thread_create_failure_lifecycle_for_test",
+        "file_path": "src/daemon/host.c",
+        "line": 829,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58511,
+            "type": "CALLS",
+            "from": {
+              "id": 5136,
+              "name": "cbm_daemon_host_http_thread_create_failure_lifecycle_for_test",
+              "qualified_name": "cbm-pr2068.src.daemon.host.cbm_daemon_host_http_thread_create_failure_lifecycle_for_test",
+              "file_path": "src/daemon/host.c",
+              "line": 829
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28229,
+        "name": "th_server_start",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start",
+        "file_path": "tests/test_httpd.c",
+        "line": 607,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73815,
+            "type": "CALLS",
+            "from": {
+              "id": 28229,
+              "name": "th_server_start",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start",
+              "file_path": "tests/test_httpd.c",
+              "line": 607
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28230,
+        "name": "th_server_start_with_watcher",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start_with_watcher",
+        "file_path": "tests/test_httpd.c",
+        "line": 618,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73818,
+            "type": "CALLS",
+            "from": {
+              "id": 28230,
+              "name": "th_server_start_with_watcher",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start_with_watcher",
+              "file_path": "tests/test_httpd.c",
+              "line": 618
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28239,
+        "name": "th_server_start_with_mutation_guard",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start_with_mutation_guard",
+        "file_path": "tests/test_httpd.c",
+        "line": 722,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73827,
+            "type": "CALLS",
+            "from": {
+              "id": 28239,
+              "name": "th_server_start_with_mutation_guard",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_start_with_mutation_guard",
+              "file_path": "tests/test_httpd.c",
+              "line": 722
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28251,
+        "name": "ui_server_readiness_proof_is_exact_and_generation_bound",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_readiness_proof_is_exact_and_generation_bound",
+        "file_path": "tests/test_httpd.c",
+        "line": 869,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73869,
+            "type": "CALLS",
+            "from": {
+              "id": 28251,
+              "name": "ui_server_readiness_proof_is_exact_and_generation_bound",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_readiness_proof_is_exact_and_generation_bound",
+              "file_path": "tests/test_httpd.c",
+              "line": 869
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28255,
+        "name": "ui_server_routes_indexing_through_joinable_daemon_executor",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_routes_indexing_through_joinable_daemon_executor",
+        "file_path": "tests/test_httpd.c",
+        "line": 999,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73888,
+            "type": "CALLS",
+            "from": {
+              "id": 28255,
+              "name": "ui_server_routes_indexing_through_joinable_daemon_executor",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_routes_indexing_through_joinable_daemon_executor",
+              "file_path": "tests/test_httpd.c",
+              "line": 999
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28256,
+        "name": "ui_server_free_never_joins_active_index_worker",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_never_joins_active_index_worker",
+        "file_path": "tests/test_httpd.c",
+        "line": 1032,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73898,
+            "type": "CALLS",
+            "from": {
+              "id": 28256,
+              "name": "ui_server_free_never_joins_active_index_worker",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_never_joins_active_index_worker",
+              "file_path": "tests/test_httpd.c",
+              "line": 1032
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28297,
+        "name": "ui_server_free_refuses_active_loop",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_refuses_active_loop",
+        "file_path": "tests/test_httpd.c",
+        "line": 2236,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74171,
+            "type": "CALLS",
+            "from": {
+              "id": 28297,
+              "name": "ui_server_free_refuses_active_loop",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_refuses_active_loop",
+              "file_path": "tests/test_httpd.c",
+              "line": 2236
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28298,
+        "name": "ui_server_free_refuses_scheduled_run_before_child_starts",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_refuses_scheduled_run_before_child_starts",
+        "file_path": "tests/test_httpd.c",
+        "line": 2253,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74178,
+            "type": "CALLS",
+            "from": {
+              "id": 28298,
+              "name": "ui_server_free_refuses_scheduled_run_before_child_starts",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_free_refuses_scheduled_run_before_child_starts",
+              "file_path": "tests/test_httpd.c",
+              "line": 2253
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 28315,
+        "name": "ui_server_index_status_long_paths_no_overflow",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_index_status_long_paths_no_overflow",
+        "file_path": "tests/test_httpd.c",
+        "line": 2805,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74252,
+            "type": "CALLS",
+            "from": {
+              "id": 28315,
+              "name": "ui_server_index_status_long_paths_no_overflow",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_index_status_long_paths_no_overflow",
+              "file_path": "tests/test_httpd.c",
+              "line": 2805
+            },
+            "to": {
+              "id": 28172,
+              "name": "cbm_http_server_new",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_new",
+              "file_path": "src/ui/http_server.c",
+              "line": 3318
+            }
+          }
+        ]
+      },
+      {
+        "id": 5111,
+        "name": "host_http_server_free_default",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_free_default",
+        "file_path": "src/daemon/host.c",
+        "line": 348,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58472,
+            "type": "CALLS",
+            "from": {
+              "id": 5111,
+              "name": "host_http_server_free_default",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_free_default",
+              "file_path": "src/daemon/host.c",
+              "line": 348
+            },
+            "to": {
+              "id": 28173,
+              "name": "cbm_http_server_free",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_free",
+              "file_path": "src/ui/http_server.c",
+              "line": 3361
+            }
+          }
+        ]
+      },
+      {
+        "id": 5135,
+        "name": "host_http_thread_create_failure_for_test",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread_create_failure_for_test",
+        "file_path": "src/daemon/host.c",
+        "line": 817,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58510,
+            "type": "CALLS",
+            "from": {
+              "id": 5135,
+              "name": "host_http_thread_create_failure_for_test",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread_create_failure_for_test",
+              "file_path": "src/daemon/host.c",
+              "line": 817
+            },
+            "to": {
+              "id": 28173,
+              "name": "cbm_http_server_free",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_free",
+              "file_path": "src/ui/http_server.c",
+              "line": 3361
+            }
+          }
+        ]
+      },
+      {
+        "id": 28240,
+        "name": "th_server_stop",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_stop",
+        "file_path": "tests/test_httpd.c",
+        "line": 738,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73834,
+            "type": "CALLS",
+            "from": {
+              "id": 28240,
+              "name": "th_server_stop",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_stop",
+              "file_path": "tests/test_httpd.c",
+              "line": 738
+            },
+            "to": {
+              "id": 28173,
+              "name": "cbm_http_server_free",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_free",
+              "file_path": "src/ui/http_server.c",
+              "line": 3361
+            }
+          }
+        ]
+      },
+      {
+        "id": 28304,
+        "name": "ui_server_stop_interrupts_partial_request_within_one_second",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_stop_interrupts_partial_request_within_one_second",
+        "file_path": "tests/test_httpd.c",
+        "line": 2401,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74215,
+            "type": "CALLS",
+            "from": {
+              "id": 28304,
+              "name": "ui_server_stop_interrupts_partial_request_within_one_second",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_stop_interrupts_partial_request_within_one_second",
+              "file_path": "tests/test_httpd.c",
+              "line": 2401
+            },
+            "to": {
+              "id": 28173,
+              "name": "cbm_http_server_free",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_free",
+              "file_path": "src/ui/http_server.c",
+              "line": 3361
+            }
+          }
+        ]
+      },
+      {
+        "id": 5110,
+        "name": "host_http_server_stop_default",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_stop_default",
+        "file_path": "src/daemon/host.c",
+        "line": 343,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58471,
+            "type": "CALLS",
+            "from": {
+              "id": 5110,
+              "name": "host_http_server_stop_default",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_server_stop_default",
+              "file_path": "src/daemon/host.c",
+              "line": 343
+            },
+            "to": {
+              "id": 28174,
+              "name": "cbm_http_server_stop",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_stop",
+              "file_path": "src/ui/http_server.c",
+              "line": 3390
+            }
+          }
+        ]
+      },
+      {
+        "id": 5113,
+        "name": "host_http_thread_schedule_create",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread_schedule_create",
+        "file_path": "src/daemon/host.c",
+        "line": 362,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58474,
+            "type": "CALLS",
+            "from": {
+              "id": 5113,
+              "name": "host_http_thread_schedule_create",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread_schedule_create",
+              "file_path": "src/daemon/host.c",
+              "line": 362
+            },
+            "to": {
+              "id": 28175,
+              "name": "cbm_http_server_schedule_run",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_schedule_run",
+              "file_path": "src/ui/http_server.c",
+              "line": 3397
+            }
+          }
+        ]
+      },
+      {
+        "id": 28228,
+        "name": "th_server_thread_start",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_thread_start",
+        "file_path": "tests/test_httpd.c",
+        "line": 598,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73812,
+            "type": "CALLS",
+            "from": {
+              "id": 28228,
+              "name": "th_server_thread_start",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_thread_start",
+              "file_path": "tests/test_httpd.c",
+              "line": 598
+            },
+            "to": {
+              "id": 28175,
+              "name": "cbm_http_server_schedule_run",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_schedule_run",
+              "file_path": "src/ui/http_server.c",
+              "line": 3397
+            }
+          }
+        ]
+      },
+      {
+        "id": 5102,
+        "name": "host_http_thread",
+        "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread",
+        "file_path": "src/daemon/host.c",
+        "line": 290,
+        "distance": 1,
+        "test_candidate": false,
+        "path": [
+          {
+            "edge_id": 58460,
+            "type": "CALLS",
+            "from": {
+              "id": 5102,
+              "name": "host_http_thread",
+              "qualified_name": "cbm-pr2068.src.daemon.host.host_http_thread",
+              "file_path": "src/daemon/host.c",
+              "line": 290
+            },
+            "to": {
+              "id": 28177,
+              "name": "cbm_http_server_run",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_run",
+              "file_path": "src/ui/http_server.c",
+              "line": 3413
+            }
+          }
+        ]
+      },
+      {
+        "id": 28227,
+        "name": "th_server_thread",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_thread",
+        "file_path": "tests/test_httpd.c",
+        "line": 593,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73811,
+            "type": "CALLS",
+            "from": {
+              "id": 28227,
+              "name": "th_server_thread",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_server_thread",
+              "file_path": "tests/test_httpd.c",
+              "line": 593
+            },
+            "to": {
+              "id": 28177,
+              "name": "cbm_http_server_run",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_run",
+              "file_path": "src/ui/http_server.c",
+              "line": 3413
+            }
+          }
+        ]
+      },
+      {
+        "id": 28234,
+        "name": "th_wait_http_server_activity",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.th_wait_http_server_activity",
+        "file_path": "tests/test_httpd.c",
+        "line": 672,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73824,
+            "type": "CALLS",
+            "from": {
+              "id": 28234,
+              "name": "th_wait_http_server_activity",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.th_wait_http_server_activity",
+              "file_path": "tests/test_httpd.c",
+              "line": 672
+            },
+            "to": {
+              "id": 28178,
+              "name": "cbm_http_server_activity_for_test",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_activity_for_test",
+              "file_path": "src/ui/http_server.c",
+              "line": 3457
+            }
+          }
+        ]
+      },
+      {
+        "id": 28246,
+        "name": "ui_delete_request",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_delete_request",
+        "file_path": "tests/test_httpd.c",
+        "line": 808,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73850,
+            "type": "CALLS",
+            "from": {
+              "id": 28246,
+              "name": "ui_delete_request",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_delete_request",
+              "file_path": "tests/test_httpd.c",
+              "line": 808
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28247,
+        "name": "ui_adr_post_request",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_adr_post_request",
+        "file_path": "tests/test_httpd.c",
+        "line": 814,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73852,
+            "type": "CALLS",
+            "from": {
+              "id": 28247,
+              "name": "ui_adr_post_request",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_adr_post_request",
+              "file_path": "tests/test_httpd.c",
+              "line": 814
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28248,
+        "name": "ui_adr_get_request",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_adr_get_request",
+        "file_path": "tests/test_httpd.c",
+        "line": 833,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73854,
+            "type": "CALLS",
+            "from": {
+              "id": 28248,
+              "name": "ui_adr_get_request",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_adr_get_request",
+              "file_path": "tests/test_httpd.c",
+              "line": 833
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28252,
+        "name": "ui_server_unknown_path_404",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_unknown_path_404",
+        "file_path": "tests/test_httpd.c",
+        "line": 932,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73873,
+            "type": "CALLS",
+            "from": {
+              "id": 28252,
+              "name": "ui_server_unknown_path_404",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_unknown_path_404",
+              "file_path": "tests/test_httpd.c",
+              "line": 932
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28253,
+        "name": "ui_server_process_kill_route_is_unavailable",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_process_kill_route_is_unavailable",
+        "file_path": "tests/test_httpd.c",
+        "line": 954,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73878,
+            "type": "CALLS",
+            "from": {
+              "id": 28253,
+              "name": "ui_server_process_kill_route_is_unavailable",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_process_kill_route_is_unavailable",
+              "file_path": "tests/test_httpd.c",
+              "line": 954
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28254,
+        "name": "ui_server_process_measurements_declare_platform_semantics",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_process_measurements_declare_platform_semantics",
+        "file_path": "tests/test_httpd.c",
+        "line": 976,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73884,
+            "type": "CALLS",
+            "from": {
+              "id": 28254,
+              "name": "ui_server_process_measurements_declare_platform_semantics",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_process_measurements_declare_platform_semantics",
+              "file_path": "tests/test_httpd.c",
+              "line": 976
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28267,
+        "name": "ui_log_post_writes_jsonl_and_tail_reads_it",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_post_writes_jsonl_and_tail_reads_it",
+        "file_path": "tests/test_httpd.c",
+        "line": 1321,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73944,
+            "type": "CALLS",
+            "from": {
+              "id": 28267,
+              "name": "ui_log_post_writes_jsonl_and_tail_reads_it",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_post_writes_jsonl_and_tail_reads_it",
+              "file_path": "tests/test_httpd.c",
+              "line": 1321
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28268,
+        "name": "ui_log_post_refuses_bad_bodies",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_post_refuses_bad_bodies",
+        "file_path": "tests/test_httpd.c",
+        "line": 1395,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73954,
+            "type": "CALLS",
+            "from": {
+              "id": 28268,
+              "name": "ui_log_post_refuses_bad_bodies",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_post_refuses_bad_bodies",
+              "file_path": "tests/test_httpd.c",
+              "line": 1395
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28269,
+        "name": "ui_log_rotates_at_configured_size",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_rotates_at_configured_size",
+        "file_path": "tests/test_httpd.c",
+        "line": 1445,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73964,
+            "type": "CALLS",
+            "from": {
+              "id": 28269,
+              "name": "ui_log_rotates_at_configured_size",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_log_rotates_at_configured_size",
+              "file_path": "tests/test_httpd.c",
+              "line": 1445
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28271,
+        "name": "ui_server_root_without_embedded_assets_is_not_found",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_root_without_embedded_assets_is_not_found",
+        "file_path": "tests/test_httpd.c",
+        "line": 1525,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73974,
+            "type": "CALLS",
+            "from": {
+              "id": 28271,
+              "name": "ui_server_root_without_embedded_assets_is_not_found",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_root_without_embedded_assets_is_not_found",
+              "file_path": "tests/test_httpd.c",
+              "line": 1525
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28272,
+        "name": "ui_server_same_origin_request_is_allowed",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_same_origin_request_is_allowed",
+        "file_path": "tests/test_httpd.c",
+        "line": 1543,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73978,
+            "type": "CALLS",
+            "from": {
+              "id": 28272,
+              "name": "ui_server_same_origin_request_is_allowed",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_same_origin_request_is_allowed",
+              "file_path": "tests/test_httpd.c",
+              "line": 1543
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28273,
+        "name": "ui_server_rejects_foreign_and_null_origins",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_rejects_foreign_and_null_origins",
+        "file_path": "tests/test_httpd.c",
+        "line": 1565,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73983,
+            "type": "CALLS",
+            "from": {
+              "id": 28273,
+              "name": "ui_server_rejects_foreign_and_null_origins",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_rejects_foreign_and_null_origins",
+              "file_path": "tests/test_httpd.c",
+              "line": 1565
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28274,
+        "name": "ui_server_mutations_require_json_content_type",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_mutations_require_json_content_type",
+        "file_path": "tests/test_httpd.c",
+        "line": 1607,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73988,
+            "type": "CALLS",
+            "from": {
+              "id": 28274,
+              "name": "ui_server_mutations_require_json_content_type",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_mutations_require_json_content_type",
+              "file_path": "tests/test_httpd.c",
+              "line": 1607
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28275,
+        "name": "ui_server_rpc_allows_only_ui_read_tools",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_rpc_allows_only_ui_read_tools",
+        "file_path": "tests/test_httpd.c",
+        "line": 1646,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73994,
+            "type": "CALLS",
+            "from": {
+              "id": 28275,
+              "name": "ui_server_rpc_allows_only_ui_read_tools",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_rpc_allows_only_ui_read_tools",
+              "file_path": "tests/test_httpd.c",
+              "line": 1646
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28276,
+        "name": "ui_server_atlas_routes_are_wired",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_atlas_routes_are_wired",
+        "file_path": "tests/test_httpd.c",
+        "line": 1747,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 73999,
+            "type": "CALLS",
+            "from": {
+              "id": 28276,
+              "name": "ui_server_atlas_routes_are_wired",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_atlas_routes_are_wired",
+              "file_path": "tests/test_httpd.c",
+              "line": 1747
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28277,
+        "name": "ui_server_oversized_body_rejected",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_oversized_body_rejected",
+        "file_path": "tests/test_httpd.c",
+        "line": 1769,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74004,
+            "type": "CALLS",
+            "from": {
+              "id": 28277,
+              "name": "ui_server_oversized_body_rejected",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_oversized_body_rejected",
+              "file_path": "tests/test_httpd.c",
+              "line": 1769
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28278,
+        "name": "ui_server_encoded_slash_not_routed",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_encoded_slash_not_routed",
+        "file_path": "tests/test_httpd.c",
+        "line": 1783,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74009,
+            "type": "CALLS",
+            "from": {
+              "id": 28278,
+              "name": "ui_server_encoded_slash_not_routed",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_encoded_slash_not_routed",
+              "file_path": "tests/test_httpd.c",
+              "line": 1783
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28279,
+        "name": "ui_server_nul_in_target_rejected",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_nul_in_target_rejected",
+        "file_path": "tests/test_httpd.c",
+        "line": 1797,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74014,
+            "type": "CALLS",
+            "from": {
+              "id": 28279,
+              "name": "ui_server_nul_in_target_rejected",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_nul_in_target_rejected",
+              "file_path": "tests/test_httpd.c",
+              "line": 1797
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28280,
+        "name": "ui_server_browse_traversal_probe",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_browse_traversal_probe",
+        "file_path": "tests/test_httpd.c",
+        "line": 1809,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74019,
+            "type": "CALLS",
+            "from": {
+              "id": 28280,
+              "name": "ui_server_browse_traversal_probe",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_browse_traversal_probe",
+              "file_path": "tests/test_httpd.c",
+              "line": 1809
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28291,
+        "name": "ui_server_ui_config_detects_zh_accept_language",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_detects_zh_accept_language",
+        "file_path": "tests/test_httpd.c",
+        "line": 2099,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74131,
+            "type": "CALLS",
+            "from": {
+              "id": 28291,
+              "name": "ui_server_ui_config_detects_zh_accept_language",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_detects_zh_accept_language",
+              "file_path": "tests/test_httpd.c",
+              "line": 2099
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28292,
+        "name": "ui_server_ui_config_includes_serving_version_issue1820",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_includes_serving_version_issue1820",
+        "file_path": "tests/test_httpd.c",
+        "line": 2117,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74136,
+            "type": "CALLS",
+            "from": {
+              "id": 28292,
+              "name": "ui_server_ui_config_includes_serving_version_issue1820",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_includes_serving_version_issue1820",
+              "file_path": "tests/test_httpd.c",
+              "line": 2117
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      },
+      {
+        "id": 28293,
+        "name": "ui_server_ui_config_prefers_config_lang",
+        "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_prefers_config_lang",
+        "file_path": "tests/test_httpd.c",
+        "line": 2134,
+        "distance": 1,
+        "test_candidate": true,
+        "path": [
+          {
+            "edge_id": 74147,
+            "type": "CALLS",
+            "from": {
+              "id": 28293,
+              "name": "ui_server_ui_config_prefers_config_lang",
+              "qualified_name": "cbm-pr2068.tests.test_httpd.ui_server_ui_config_prefers_config_lang",
+              "file_path": "tests/test_httpd.c",
+              "line": 2134
+            },
+            "to": {
+              "id": 28180,
+              "name": "cbm_http_server_port",
+              "qualified_name": "cbm-pr2068.src.ui.http_server.cbm_http_server_port",
+              "file_path": "src/ui/http_server.c",
+              "line": 3465
+            }
+          }
+        ]
+      }
+    ],
+    "basis": "CALLS and IMPORTS; reverse dependency paths",
+    "max_depth": 4,
+    "visit_cap": 600,
+    "result_cap": 60,
+    "available": true,
+    "seed_count": 128,
+    "reachable": 115,
+    "direct": 66,
+    "test_candidates": 81,
+    "truncated": true
+  },
+  "history": {
+    "commits": [
+      {
+        "hash": "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c",
+        "subject": "feat(ui): frontend log file, written by the page and served by the server",
+        "time": 1788823593,
+        "files": 23
+      },
+      {
+        "hash": "62af5b87ee7123b7b0f0510ea9d22759d05f92d8",
+        "subject": "feat(ui): wire CodeAtlasWeb into the build, the dev-proxy contract and the CSP",
+        "time": 1788632113,
+        "files": 7
+      },
+      {
+        "hash": "e0785b353af1af3812d5d14cad55c839efc5749d",
+        "subject": "feat(ui): show serving binary version",
+        "time": 1788375031,
+        "files": 4
+      }
+    ],
+    "cochanges": [
+      {
+        "file_path": "tests/test_httpd.c",
+        "shared_commits": 3,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c",
+          "62af5b87ee7123b7b0f0510ea9d22759d05f92d8",
+          "e0785b353af1af3812d5d14cad55c839efc5749d"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/App.tsx",
+        "shared_commits": 2,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c",
+          "e0785b353af1af3812d5d14cad55c839efc5749d"
+        ]
+      },
+      {
+        "file_path": "src/ui/http_server.h",
+        "shared_commits": 2,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c",
+          "62af5b87ee7123b7b0f0510ea9d22759d05f92d8"
+        ]
+      },
+      {
+        "file_path": "Makefile.cbm",
+        "shared_commits": 1,
+        "commit_refs": [
+          "62af5b87ee7123b7b0f0510ea9d22759d05f92d8"
+        ]
+      },
+      {
+        "file_path": "README.md",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/INVENTAR.md",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/README.md",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/index.html",
+        "shared_commits": 1,
+        "commit_refs": [
+          "62af5b87ee7123b7b0f0510ea9d22759d05f92d8"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/App.test.tsx",
+        "shared_commits": 1,
+        "commit_refs": [
+          "e0785b353af1af3812d5d14cad55c839efc5749d"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/atlas-api.test.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/atlas-api.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/ui-log-install.test.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/ui-log-install.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/ui-log-transport.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      },
+      {
+        "file_path": "graph-ui/src/app/ui-log.test.ts",
+        "shared_commits": 1,
+        "commit_refs": [
+          "9dc882a82f45d662d8ec0dbd93c10ac8f7dc620c"
+        ]
+      }
+    ],
+    "commit_cap": 200,
+    "mass_change_threshold": 30,
+    "window_days": 548,
+    "meaning": "Co-changes are historical association, not functional dependencies or defect probabilities.",
+    "head": "80f4f41f9bcb9daf60afc5f607bcbcba24a4b196",
+    "shallow": false,
+    "worktree_status_known": true,
+    "selection_uncommitted": true,
+    "available": true,
+    "truncated": true,
+    "commits_scanned": 200,
+    "commits_considered": 98,
+    "selection_commits": 3,
+    "merges_excluded": 98,
+    "mass_changes_excluded": 4,
+    "read_errors": 0,
+    "cochanges_omitted": 12
+  }
+}

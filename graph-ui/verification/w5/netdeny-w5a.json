@@ -1,0 +1,53 @@
+{
+  "command": "node tools/smoke-w5a.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 105,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 60963,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4141",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4300",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4301",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59461",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59462",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59463",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59464",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59465",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:59467",
+      "seen": 1
+    }
+  ],
+  "generatedAt": "2026-08-30T18:44:57.329Z"
+}

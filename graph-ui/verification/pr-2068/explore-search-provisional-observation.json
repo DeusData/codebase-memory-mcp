@@ -1,0 +1,318 @@
+{
+  "startedAt": "2026-09-09T21:35:17.162Z",
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "file": "src/daemon/application.c",
+  "method": "Fresh browser, global search, ordinary clicks; no storage seeding, API mocks or repository changes.",
+  "actions": [
+    {
+      "description": "Start exploring",
+      "before": {
+        "x": 983.9375,
+        "y": 729.984375,
+        "width": 119.0625,
+        "height": 42.796875
+      }
+    },
+    {
+      "description": "Explore",
+      "before": {
+        "x": 215.5,
+        "y": 12,
+        "width": 71.125,
+        "height": 36.796875
+      }
+    },
+    {
+      "description": "Global Search",
+      "before": {
+        "x": 926.234375,
+        "y": 12,
+        "width": 128.3125,
+        "height": 36.796875
+      }
+    }
+  ],
+  "screenshots": [
+    {
+      "name": "explore-context-e2e-failure.png",
+      "at": "2026-09-09T21:35:26.749Z"
+    }
+  ],
+  "pageErrors": [],
+  "externalRequests": [],
+  "rpc": [
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "scopes": [
+          "."
+        ],
+        "scope_limit": 1000,
+        "scope_offset": 0,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.file_path LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.200.091f738e1a18a620"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.400.cb42711816aa71ad"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.600.d3fa4a361333dc33"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.800.e8b36b579cb3c296"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1000.da6c2036e2b3c897"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1200.79e8c9ef92925ae8"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1400.f499d0468edfc056"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.6212d9a8bcbbe31e.541f13f99a79fdc0bbaa2a8d414b0e09.1600.dd8036e46d49c249"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.121.e6a98e1d3bd78078"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.241.e4825367cfca3bc8"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.365.ba5d587a5b2ded55"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.484.19e2f2ece8a900a4"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.595.ed3402094d14b609"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.714.989114d932a9814d"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.834.b4a4064c94c5b0ce"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.939.187e9e45e4ce55cd"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1039.223d2df82e90e69b"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1148.f8186429ec21d175"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1258.0316b3b252728ae3"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1376.9df877499e2bece4"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.94f3b2766ad6647c.866990f0ba54ca9fb5f71f4f06d53ca0.1494.184c2bb05af101e6"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.ub2c1b42d30fb1da2g2.a412b05a6d0e32c2.0dfebd232438b67b93f4cd0f499992d3.131.9db46e591a2eac1e"
+      }
+    }
+  ],
+  "checks": {
+    "searchResults": [
+      "CBM_DAEMON_APPLICATION_INTERNAL_Hsrc/daemon/application_internal.hL5loadedsrc + daemon + application",
+      "CBM_DAEMON_APPLICATION_Hsrc/daemon/application.hL11loadedsrc + daemon + application",
+      "CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAXsrc/daemon/runtime.hL60loadedsrc + daemon + application",
+      "CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALIDsrc/daemon/runtime.hL129loadedsrc + daemon + application",
+      "O_CLOEXECsrc/daemon/ipc.cL320loadedsrc + daemon + application",
+      "O_DIRECTORYsrc/daemon/ipc.cL323loadedsrc + daemon + application",
+      "O_NOFOLLOWsrc/daemon/ipc.cL326loadedsrc + daemon + application",
+      "MATRIX_A_CASEStests/repro/repro_call_argument_matrix_a.cL1188loadedsrc + daemon + application",
+      "CARD_BUDGET_CLASS_Agraph-ui/src/compiler/card-compiler.tsL59loadedsrc + daemon + application",
+      "NOT_A_CALLABLEgraph-ui/src/traces/bug-paths.test.tsL170loadedsrc + daemon + application"
+    ],
+    "firstSearchPath": "src/daemon/application_internal.h"
+  },
+  "success": false,
+  "error": "AssertionError [ERR_ASSERTION]: A complete path should select that exact file before similar symbol names\n+ actual - expected\n\n+ 'src/daemon/application_internal.h'\n- 'src/daemon/application.c'\n                         ^\n",
+  "finishedAt": "2026-09-09T21:35:26.753Z"
+}

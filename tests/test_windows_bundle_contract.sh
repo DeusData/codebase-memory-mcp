@@ -335,6 +335,32 @@ for relative, needles in exact_archive_guards.items():
         "allowlist",
     )
 
+# install.ps1 reports two different archive failures differently (#1218). A
+# checksum-verified archive whose root file set differs from the allowlist is a
+# release/installer version skew, not tampering, and must say so; a hostile
+# entry (unsafe path, duplicate or case conflict) stays "unsafe". Both exit 1.
+# The layout verdict may only be reached after EVERY entry cleared the hostile
+# checks, or an unexpected entry listed first would mask a later "../" entry.
+installer_archive = read("install.ps1")
+require(
+    "unsafe or incomplete release archive" not in installer_archive
+    and "error: unsafe release archive: " in installer_archive
+    and "error: release archive layout does not match this installer: " in installer_archive,
+    "install.ps1 must report a checksum-verified layout mismatch separately from an unsafe "
+    "archive (#1218)",
+)
+hostile_last = max(
+    installer_archive.find('throw "unsafe zip entry path:'),
+    installer_archive.find('throw "duplicate or case-conflicting zip entry:'),
+)
+layout_verdict = installer_archive.find("$LayoutMismatch = $true")
+require(
+    hostile_last != -1 and layout_verdict > hostile_last
+    and installer_archive.count("$LayoutMismatch = $true") == 1,
+    "install.ps1 must screen every zip entry for unsafe paths and duplicates before it "
+    "classifies an archive as a layout mismatch (#1218)",
+)
+
 # A portable mutation refusal must point to the owning package manager.
 guidance_contracts = {
     "pkg/npm/bin.js": (

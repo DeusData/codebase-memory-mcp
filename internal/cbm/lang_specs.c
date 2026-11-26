@@ -365,14 +365,16 @@ static const char *cpp_branch_types[] = {"if_statement",    "for_statement",    
                                          "while_statement", "switch_statement", "case_statement",
                                          "try_statement",   "catch_clause",     NULL};
 static const char *cpp_var_types[] = {"declaration", NULL};
+/* No update_expression here, unlike C: a bare C++ name can be an implicit-this
+ * member, so a local counter's `i++` would bind by name to an unrelated member. */
 static const char *cpp_assign_types[] = {"assignment_expression", NULL};
 static const char *cpp_throw_types[] = {"throw_statement", NULL};
 
 // ==================== C# ====================
-static const char *cs_func_types[] = {"destructor_declaration",      "local_function_statement",
-                                      "function_pointer_type",       "constructor_declaration",
-                                      "anonymous_method_expression", "lambda_expression",
-                                      "method_declaration",          NULL};
+static const char *cs_func_types[] = {
+    "destructor_declaration",  "local_function_statement",    "function_pointer_type",
+    "constructor_declaration", "anonymous_method_expression", "lambda_expression",
+    "method_declaration",      "operator_declaration",        NULL};
 static const char *cs_class_types[] = {"class_declaration",
                                        "struct_declaration",
                                        "enum_declaration",
@@ -490,7 +492,7 @@ static const char *c_branch_types[] = {"if_statement",
                                        "case_statement",
                                        NULL};
 static const char *c_var_types[] = {"declaration", NULL};
-static const char *c_assign_types[] = {"assignment_expression", NULL};
+static const char *c_assign_types[] = {"assignment_expression", "update_expression", NULL};
 
 // ==================== BASH ====================
 static const char *bash_func_types[] = {"function_definition", NULL};
@@ -570,8 +572,11 @@ static const char *objc_assign_types[] = {"assignment_expression", NULL};
 // protocol_function_declaration: a protocol's method requirements. Needed here as
 // well as in the name resolvers — extract_class_methods gates on this set, so
 // without the entry the requirement is walked and then discarded.
-static const char *swift_func_types[] = {"function_declaration", "protocol_function_declaration",
-                                         "macro_declaration", NULL};
+static const char *swift_func_types[] = {
+    "function_declaration", "protocol_function_declaration",
+    "macro_declaration",    "init_declaration",
+    "deinit_declaration",   NULL,
+};
 // KNOWN GAP: struct_declaration and enum_declaration are not node types in the
 // vendored tree-sitter-swift grammar — it models both as class_declaration — so
 // these two entries never match anything, and a bare Swift `enum` is labeled
@@ -1039,6 +1044,7 @@ static const char *solidity_field_types[] = {"state_variable_declaration", "stru
 static const char *solidity_call_types[] = {"call_expression", "call", "new_expression", NULL};
 static const char *solidity_import_types[] = {"import_directive", "import", "using_directive",
                                               NULL};
+static const char *solidity_decorator_types[] = {"modifier_invocation", NULL};
 static const char *solidity_branch_types[] = {"if_statement",    "for_statement",
                                               "while_statement", "do_while_statement",
                                               "try_statement",   NULL};
@@ -1695,8 +1701,11 @@ static const char *objectscript_udl_func_types[] = {"method", "classmethod", "qu
 static const char *objectscript_udl_class_types[] = {"class_definition", NULL};
 static const char *objectscript_udl_field_types[] = {
     "property", "parameter", "index", "trigger", "xdata", "storage", "foreignkey", NULL};
-static const char *objectscript_udl_call_types[] = {"class_method_call", "method_call",
-                                                    "relative_dot_method", "macro", NULL};
+/* Instance calls (`Do obj.M()`) have no call node of their own: the grammar
+ * hides method_call, leaving do_parameter/job_argument with an oref_method
+ * child. cbm_is_call_site() matches those via cbm_objectscript_is_instance_call. */
+static const char *objectscript_udl_call_types[] = {"class_method_call", "relative_dot_method",
+                                                    "macro", NULL};
 static const char *objectscript_udl_module_types[] = {"source_file", NULL};
 /* Branching nodes for cyclomatic complexity (verified against grammar node-types) */
 static const char *objectscript_udl_branch_types[] = {
@@ -2116,7 +2125,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                            solidity_field_types, solidity_module_types, solidity_call_types,
                            solidity_import_types, empty_types, solidity_branch_types,
                            solidity_var_types, solidity_assign_types, solidity_throw_types, NULL,
-                           empty_types, NULL, NULL, tree_sitter_solidity, NULL},
+                           solidity_decorator_types, NULL, NULL, tree_sitter_solidity, NULL},
 
     // CBM_LANG_TYPST
     [CBM_LANG_TYPST] = {CBM_LANG_TYPST, typst_func_types, empty_types, empty_types,
@@ -2713,6 +2722,25 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                                        empty_types, NULL, NULL, tree_sitter_objectscript_routine,
                                        NULL},
 
+    // CBM_LANG_OPENAPI — openapi.json / swagger.json: the JSON grammar without
+    // JSON's node per key (thousands in a generated spec); cbm_extract_openapi
+    // (openapi.c) reads the operations from the tree.
+    [CBM_LANG_OPENAPI] = {CBM_LANG_OPENAPI, empty_types, empty_types, empty_types,
+                          json_module_types, empty_types, empty_types, empty_types, empty_types,
+                          empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                          tree_sitter_json, NULL},
+
+    // CBM_LANG_PDF — PDF documents. No grammar row: extraction reads the text
+    // layer itself (cbm_pdf_extract_document, doc_pdf.c) before any grammar is
+    // looked up, so this language never reaches cbm_lang_spec()/cbm_ts_language().
+    // Left as a zero spec.
+
+    // CBM_LANG_ASCIIDOC — AsciiDoc documents. No grammar row, as PDF: extraction
+    // reads the file itself (cbm_adoc_extract_document, doc_adoc.c). Zero spec.
+
+    // CBM_LANG_DIAGRAM — diagram files. No grammar row, as PDF: extraction reads
+    // the file itself (cbm_extract_diagram_file, diagram.c). Zero spec.
+
     // CBM_LANG_OBJECTSCRIPT_EXPORT — Studio Export XML. No grammar row: the
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
@@ -2736,6 +2764,28 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
 _Static_assert(sizeof(lang_specs) / sizeof(lang_specs[0]) == CBM_LANG_COUNT,
                "lang_specs array size must match CBM_LANG_COUNT");
+
+/* Conditional-compilation blocks per grammar (the `*_in_field_declaration_list`
+ * / `*_in_top_level` forms are aliased to these names by the grammars). */
+static const char *c_family_conditional_types[] = {
+    "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef", NULL};
+
+const char **cbm_conditional_block_types(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_GLSL:
+    case CBM_LANG_HLSL:
+    case CBM_LANG_ISPC:
+    case CBM_LANG_SLANG:
+        return c_family_conditional_types;
+    default:
+        return NULL;
+    }
+}
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
     if (lang < 0 || lang >= CBM_LANG_COUNT) {

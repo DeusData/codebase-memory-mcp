@@ -1,0 +1,8 @@
+{
+  "name": "atlas-sample-large",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cap-Mess-Fixture fuer CodeAtlas. Never built, installed or executed by the monorepo.",
+  "main": "src/index.ts",
+  "license": "UNLICENSED"
+}

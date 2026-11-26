@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>CodeAtlasWeb W0 Spike: Serverquelle in read-only Monaco</title>
+<!--
+  W0-Spike. Wegwerf-Beweiscode, NICHT die Produktarchitektur.
+  Zweck: zeigen, dass der gebaute C-Server (PR 1860) echten Quelltext über
+  /rpc get_code_snippet liefert und Monaco ihn read-only mit genau einer
+  Decoration an der Call-Site rendert. Kein CDN: Monaco kommt aus
+  /node_modules/monaco-editor/min/vs.
+-->
+<style>
+  :root {
+    --atlas-bg: #06090b;
+    --atlas-panel: #0b1013;
+    --atlas-line: #16211f;
+    --atlas-phosphor: #33ff99;
+    --atlas-dim: #7d9a8e;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--atlas-bg);
+    color: var(--atlas-phosphor);
+    font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    flex: 0 0 auto;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    display: flex;
+    gap: 18px;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+
+  header .brand { color: var(--atlas-phosphor); font-weight: 700; }
+  header .meta { color: var(--atlas-dim); }
+  header .meta b { color: var(--atlas-phosphor); font-weight: 500; }
+
+  #editor {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+  }
+
+  #status {
+    flex: 0 0 auto;
+    padding: 8px 16px;
+    border-top: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-dim);
+    font-size: 12px;
+  }
+
+  #status.failed { color: #ff6b6b; }
+
+  /* Die eine Decoration an der Call-Site: Zeilenlicht plus Badge "1". */
+  .atlas-callsite-line {
+    background: rgba(51, 255, 153, 0.10);
+    box-shadow: inset 2px 0 0 0 var(--atlas-phosphor);
+  }
+
+  .atlas-callsite-glyph {
+    position: relative;
+  }
+
+  .atlas-callsite-glyph::after {
+    content: "1";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    background: var(--atlas-phosphor);
+    color: var(--atlas-bg);
+    font: 700 10px/15px "SF Mono", Menlo, Consolas, monospace;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <span class="brand">CODEATLAS W0 SPIKE</span>
+    <span class="meta">quelle <b id="hdr-source">/rpc get_code_snippet</b></span>
+    <span class="meta">symbol <b id="hdr-qn">...</b></span>
+    <span class="meta">datei <b id="hdr-file">...</b></span>
+    <span class="meta">modus <b id="hdr-mode">read-only</b></span>
+  </header>
+  <div id="editor"></div>
+  <div id="status">lade ...</div>
+
+  <script src="/node_modules/monaco-editor/min/vs/loader.js"></script>
+  <script src="/spike/spike.js"></script>
+</body>
+</html>

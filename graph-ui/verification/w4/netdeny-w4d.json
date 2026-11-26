@@ -1,0 +1,33 @@
+{
+  "command": "node tools/smoke-w4d.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 63,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 34573,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4321",
+      "seen": 3
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:62756",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:62757",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:62848",
+      "seen": 1
+    }
+  ],
+  "generatedAt": "2026-08-28T21:43:16.671Z"
+}

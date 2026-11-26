@@ -1,0 +1,8 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: web
+spec:
+  chartRef:
+    kind: OCIRepository
+    name: web-chart

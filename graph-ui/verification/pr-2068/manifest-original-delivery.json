@@ -1,0 +1,283 @@
+{
+  "recorded_at": "2026-09-09T19:56:02.134160+00:00",
+  "branch": "feat/codeatlas-web",
+  "head": "80f4f41f9bcb9daf60afc5f607bcbcba24a4b196",
+  "application_origin": "http://127.0.0.1:9749",
+  "separate_archify_example": "http://127.0.0.1:9750/gallery/artifacts/agent-tool-call.workflow.html",
+  "synthetic_artifacts": "agents-* and errors-* use explicitly marked event/file fixtures; map-* and after-* use the real repository",
+  "sources_sha256": {
+    "Makefile.cbm": "857970d2bce7bb29ad7c2081feb44c4047efc1a82c274c998bbf78fc1eb9a0db",
+    "docs/development/pr-2068-delivery.md": "26917b8aef13f76f3e227f5991bd923605112b2b98e5fb7f19c59fc2d69c9da7",
+    "docs/development/pr-2068-error-repro.md": "7fc19d2f3fb1045ae5aa367dd4c251e7f8e8bdad20ed6d05516692f730a6fedd",
+    "docs/development/pr-2068-research.md": "78450735c0fd80ea26d9329054534c05ce8e1d1a07478740005c5aca6e9d35ed",
+    "docs/development/pr-2068-worklog.md": "32afe0607e9047499680293952f331c1a252c309541f7f092f2b32c88567b642",
+    "graph-ui/README.md": "982750e308e85909e0ca6a9624428d319518bca0ef05f4918151208f92b31a0a",
+    "graph-ui/agents/hooks/atlas-trace.py": "4f323c2a2bf62dd177900cb953c9a45de00403fccd34691270dc3d51df6d6749",
+    "graph-ui/agents/hooks/test_atlas_trace.py": "a4a7caea4d110477284cc4d23f5d43b0e97c8441fd674550a18a0e2c4437acf2",
+    "graph-ui/src/App.tsx": "1521fc5ec8dd2060b5b13c6e1d7fa68864e4023e41c672fe2477f0c181855ef2",
+    "graph-ui/src/agents/AgentsHud.test.tsx": "1f0c46cc149e844674b5b3eaec740bce8c7b6a5619b347bc5e8c4c64700a5e2c",
+    "graph-ui/src/agents/activity-strings.ts": "4c7ed7cc493e537967006e0ed8325fe49e729c015d437969177a0d451ac12a3f",
+    "graph-ui/src/agents/agent-source.test.tsx": "1c69dd3fdfb13602499bf6316ab0f4cf2bbfe003f167e650498cfe2b1bc07fad",
+    "graph-ui/src/agents/agent-source.ts": "653ad73b9c557d92f71d6222415bd459328f85252e59d9b8a050396316a226f7",
+    "graph-ui/src/agents/agent-store.test.ts": "cfb3450d3b3825e4599aaa35383b3e75747db5ba97695b509cdfaed0cfcc69c5",
+    "graph-ui/src/agents/agent-store.ts": "ad2a82b072e9fd0667c8d086da8b5bd73e766082fd6a2e40e55d0f241b95dce3",
+    "graph-ui/src/agents/agent-strings.ts": "b038d72950cbf257e2197191274653121331f67179cda628167e93e03f681a55",
+    "graph-ui/src/app/AtlasChrome.tsx": "8bd9e0227d2798b9c5e613f2874bb89e0947b0dcbedbdf15f1a9144b04a4eaef",
+    "graph-ui/src/app/atlas-api.ts": "6dd470dcd754f2cfb8c611c67848c54ac767ac5f4d5c18a24dbdb7517447223c",
+    "graph-ui/src/app/tree-model.test.ts": "cd202fc04ea8008cf65b345defb17cb8cd80d456ff29d5cf5ab3a1d46aa9df32",
+    "graph-ui/src/app/tree-model.ts": "8cbd528256ab0d81af3d2a8331b61aaf852014296484ed95d2d582545e753c03",
+    "graph-ui/src/app/workspace-strings.ts": "dad50c227c074042f060a13367e68d960b98c880f9cdda8e64f2f82c60720af9",
+    "graph-ui/src/architecture/ArchitecturePanel.tsx": "3270556333b8932b458e3934bfdaced7819e9e15ed9d285486e5e809f4cda94a",
+    "graph-ui/src/architecture/RepositoryMap.test.tsx": "fbbc33103099e3cdc4115684d507af749c5aea4d43247b86b8458bd026551244",
+    "graph-ui/src/architecture/RepositoryMap.tsx": "63c0226e00fee31e5fd13ed9f89226e5f353691f92ee70ec3d769eb803ab5f15",
+    "graph-ui/src/architecture/architecture.css": "456560c9d2cfb3e6eaecbd03803a97bc8e7a8d461389f902c336e1a4da80995a",
+    "graph-ui/src/architecture/repository-map.test.ts": "c55a08bc6a54d95edf10a148615ef547c7b67266539d76500f05992a75e55ccb",
+    "graph-ui/src/architecture/repository-map.ts": "2228ed7519d4dbb505f4d6ae10c87a5a0c7f17e837876e4ef4ccaf4624f5d404",
+    "graph-ui/src/architecture/repository-source.test.ts": "ebb55c3e230d7c34defc2ab765a101149d6bafc863b38400104034cebb96625c",
+    "graph-ui/src/architecture/repository-source.ts": "8dc7fc2794bc8eee6596203f1da52f7af08f851ec18d243cc9305ac86f909d1e",
+    "graph-ui/src/architecture/strings.ts": "26c33428d55382ad8cb4f635bf8076fe53336367ccfed492dd02138612920901",
+    "graph-ui/src/diagnostics/DaemonAlerts.test.tsx": "889cba47539f890add26463806eb6e6464c47923a3aa8a1d2727a2c0cc95c636",
+    "graph-ui/src/diagnostics/DaemonAlerts.tsx": "051ed5ad10f1b7d799cfadbba8963fa13c92d43eb57bc9d43a4b5a90858ed3ae",
+    "graph-ui/src/diagnostics/DiagnosticsPanel.test.tsx": "0277c8339779f024bb57d0b4973ff18f23866ef993b1d56fa814f777b0d11d14",
+    "graph-ui/src/diagnostics/DiagnosticsPanel.tsx": "1629843afa6af3cdd1bf6eb7d69e7bf04c2e16455f9e8900c5c7b6badacefedb",
+    "graph-ui/src/diagnostics/diagnostics-model.test.ts": "1e8190591b4b6a28e4dba954abfb2255c418ba2c244edbb16a3d047fc9d40039",
+    "graph-ui/src/diagnostics/diagnostics-model.ts": "d2d29c5d70ead8176798f43421ba0be738213448b45fb1506fc117ac927c777f",
+    "graph-ui/src/diagnostics/diagnostics.css": "0d5b02d7105fecdcf2209d647d1d2ee92455a34d255f01faf6b5d76292e4130e",
+    "graph-ui/src/diagnostics/useDaemonLogFeed.ts": "4a6a7c17b8b68851652e110e672e511b9e65b83f00f755976671f46df4a1a1a9",
+    "graph-ui/src/galaxy/GalaxyPanel.tsx": "7c765057a36273079f32c868669c1a8bb97a4f7d47bce41f08fa1b0ce88f8ea1",
+    "graph-ui/src/galaxy/types.ts": "515a1ee451d9343f70fd7e6e50cd607cb0210123ee9c581a995a264cc109e06b",
+    "graph-ui/src/impact/ImpactPanel.test.tsx": "d1a0f8da348bb4ff25db8ed5512f4dae5b30e6abe07a74d7543d5d805b206c08",
+    "graph-ui/src/impact/ImpactPanel.tsx": "d667678e121c3210bd9c2e4035172849c5ff5f3374ea3ef33816d20fa63dfda8",
+    "graph-ui/src/impact/SelectionImpactWidget.tsx": "ee11bc752eb2b34f9c85581a84b1995bbce9db9f9e94f0157755f3d1f8068f50",
+    "graph-ui/src/impact/impact-strings.ts": "207300527e8da21061c0583d473f2954624cb3032da33c653faab37ffbea7562",
+    "graph-ui/src/impact/selection-impact.css": "0e1fcc3613386c6ab6748d8d377dc909099a5c8affb9316f37775a2f7dd2775a",
+    "graph-ui/src/impact/selection-impact.test.tsx": "24f715ce9f487191a4cc8a6da75308cc9dbe13614f5271399d64180d6f12d764",
+    "graph-ui/src/impact/selection-impact.ts": "49d97a99074ad546cc396d54f7550fdbe21af0bca7f053e982c1329503eea6a3",
+    "graph-ui/src/projects/projects-model.ts": "dcd9bd49e83eb89e6ee75a0d1e835be18d6f27e61baaffde6e83c062044b202e",
+    "graph-ui/src/styles/workspace.css": "3f4addbe24225ad6bb364ccbf19435c07bc9d6df00212f89ae605f5e4d1b7fcb",
+    "graph-ui/src/system/SystemWorkspace.test.tsx": "ffdfbfb14af372b7569ef0a8ee26a61c1771671da7215348693c80b96948d0e9",
+    "graph-ui/src/system/SystemWorkspace.tsx": "6c0a2d4a0eda0f722ac5efd2b43c31e417bcb24ad0a32f802115ae0f19cb48b6",
+    "graph-ui/src/system/system.css": "0429ca7f80392d1f9f2ad596688afd3766dbac23c0ae592857a048a2261c6b95",
+    "graph-ui/src/twin/SelectedCodePanel.tsx": "a3f44cd2db4bd4b81fe04016f3d29e031d45a9ee6c92ac8ff96257bc440b2644",
+    "graph-ui/src/why/SelectionContext.tsx": "8c9ae19960be1a43cd142c7f0e0a7158952376e9c80e91eb80bef1db8696e920",
+    "graph-ui/src/why/selection-context.css": "ebcd840cd4e9b168d326a2af52205007f0df826b9c469380667049f16537c33b",
+    "graph-ui/src/why/selection-context.test.ts": "48587f7a21f763f65c56549b11fc347100e0b2fa21a5828b86acd30a3d14ce8a",
+    "graph-ui/src/why/selection-context.ts": "51bae05ed7654cdf307d765ce364a15b8171be78edf26620d5df8acfa4d9834f",
+    "graph-ui/src/why/why-model.ts": "40c36c4abb17ef2c72749275328b97427dfe8412b289fca2126aadbe72123973",
+    "graph-ui/tools/capture-pr2068-baseline.mjs": "d1b2e2bb450662b41dbc4f21acc1eedc89566414f28c933e903530203483040c",
+    "graph-ui/tools/capture-pr2068-current.mjs": "3088c79c86222af75c491c7c9610b811b50b4c05f108e019a9407b0fd9601dda",
+    "graph-ui/tools/pr-2068-agents-e2e.mjs": "d47e481e41521fa13aada2dc5bc0a25deea37cc689f12605511ce91b50395e88",
+    "graph-ui/tools/pr-2068-errors-e2e.mjs": "16fa1e423c4ed01c48b7a7d8563a4d55e0cf8344928d7e7433d2b833d6c10062",
+    "graph-ui/tools/pr-2068-map-e2e.mjs": "697308998b77c73cddceb7d84c9770013dfba3b4d24a21f706587ee5df9530ab",
+    "src/daemon/application.c": "7ffabd425f4c86a2e586a6fd121350b207c4cb3d8014bad1ffff6f3e672be724",
+    "src/pipeline/pipeline.c": "e7d1b358b3326418e82d46b209af10d80e1b8a7ab79456d220cbf6eecfe65e55",
+    "src/ui/activity.c": "483c4dab240342033b07f328b95c71613bf1de504090264092a32891577dac86",
+    "src/ui/activity.h": "a6e32f61612d2a96584e2a8d028f330c7f01889d527e8a1bd53723c22c5bcd83",
+    "src/ui/atlas.h": "d6689b63d09c7a89b766ebefce378194492345d762b67dd4bb47c7fcaaf3216b",
+    "src/ui/atlas_impact.c": "8b00e44d5b348a1ce03b89da30a64265fa7a10a693c8cbbfedebff6bca9943f7",
+    "src/ui/atlas_repository.c": "d01bda21526b55b9ad6320bcc397bdd3c4b1caca397ab9d339e6782f4549b5cf",
+    "src/ui/http_server.c": "21dce55c0bd0da7655a9ff09941c8be8d3368896e14e7e1c6fd954c914aed1a3",
+    "src/ui/http_server.h": "548c3abcc026f8f2613de7d8af2f2fe5312cbfcdf46dd7bf561dda0438e757c7",
+    "tests/test_daemon_application.c": "1a2f4b323e79846f047977535efe5aeb571d21872544f5c3cec8814e392909c6",
+    "tests/test_httpd.c": "a2c147f85ae8276620cd9769e76fd1311c8c69f7872be7a5b42f5f2721a56564",
+    "tests/test_ui.c": "649cd1cf09d701bc1ada49b0ab5975948d1fded8c351265afb4cc65c58d31d73"
+  },
+  "artifacts": {
+    "after-architecture-relationship.png": {
+      "sha256": "a490eef3fbcd1ba6a79d5f726b10dd999bed3f815a8c3b3b1aee93c5350aaee4",
+      "bytes": 199912
+    },
+    "after-architecture.png": {
+      "sha256": "d708c35bb94ac22dd57e76bad1602c87b8cfbbd2af92aa2c20e232c42ec27818",
+      "bytes": 185092
+    },
+    "after-context-and-impact.png": {
+      "sha256": "0be618b5620c73d877f1961ebb41d084220bc9ef4aad0d1e9d15b395f34eae8a",
+      "bytes": 195005
+    },
+    "after-project-readme.png": {
+      "sha256": "48f9e24a364e030fbee8794ba988f5fdb9edb2cad8520b8933d8965d8056ac39",
+      "bytes": 179684
+    },
+    "after-selection-context.png": {
+      "sha256": "8daf58b56cdfd51631f99ee49ad0f862e45a16826127696bfb28f987bcc6307f",
+      "bytes": 163796
+    },
+    "after-source-evidence.png": {
+      "sha256": "704aca633b799be6b816206fc0b88022dba3125edca4bf27cb7034ef5807b17c",
+      "bytes": 339559
+    },
+    "agents-after-restart.json": {
+      "sha256": "0b8f73621743dc0460f6c94b56f48a99eff9dcc9c45bbc83b101d21136174c9c",
+      "bytes": 4406
+    },
+    "agents-before-restart.json": {
+      "sha256": "b6f5bdb5d1c048cc72ef94a0992ed7b02906a811d0de45284a92b0caa18ce5a0",
+      "bytes": 10071
+    },
+    "agents-browser-reload.png": {
+      "sha256": "3ee7e475984a66e4dc1df94f8fefee7f6eb67b9c44d4e79d8821ce13ec1106b7",
+      "bytes": 171775
+    },
+    "agents-connection-interrupted.png": {
+      "sha256": "ead7c41fa58c34b57f5fca193ed37c1579f11b0797687b79f61c99ac0f9cf8d9",
+      "bytes": 164742
+    },
+    "agents-daemon-restart.png": {
+      "sha256": "37faa9a4a118d723927ae49fca5e1017f4a96c7db0fb99e36d654d3d8f2df2a2",
+      "bytes": 177809
+    },
+    "agents-hook-evidence.png": {
+      "sha256": "d14dd195e8b379b95318e0dcde6a5fa3bd4afcfefdde30b0b462677c53327d07",
+      "bytes": 165174
+    },
+    "agents-reconnected.png": {
+      "sha256": "1efb88f0e66493942b43d525e2702db22ddca0526dc48ca93ec13c237ef1f2e1",
+      "bytes": 191848
+    },
+    "agents-source-navigation.png": {
+      "sha256": "896adea903f6a70e2a3f88f4c846a5935927ef9c4d210ee59cf1e7817a8f4448",
+      "bytes": 276186
+    },
+    "before-agents.png": {
+      "sha256": "076d6459c517188ec7620aafe871c60a1c1833d22f62bfef6924520e48af9e2b",
+      "bytes": 86224
+    },
+    "before-architecture.png": {
+      "sha256": "3a022c0c56ba40570515c27c7c013a0f7802b6918d9a88de50e9ac63b0ec04a6",
+      "bytes": 210673
+    },
+    "before-browser.json": {
+      "sha256": "1530f4e33628ef8dcc669268056264a20f36933ffefd2395d30c942be8a477da",
+      "bytes": 214
+    },
+    "before-dom.txt": {
+      "sha256": "7e7ea7bc1e541ab6873424bedb91955c7d1f3408df893bbcdee1b6ae09cecaf9",
+      "bytes": 2935
+    },
+    "before-galaxy.png": {
+      "sha256": "cb26c30669f98b3091ff4633f4cc967b8f84f5d17ad5b9983ed02d54f7a9458f",
+      "bytes": 426554
+    },
+    "before-system.png": {
+      "sha256": "a605f5bc34906d6704154d46b3ea2fc6faf4bcba85393d261731706dd2fb7c87",
+      "bytes": 168053
+    },
+    "errors-after-galaxy.png": {
+      "sha256": "1d86f29483b7927e92b68c5b09a2f2e4d458c56b57324f54ae425f93747cee1e",
+      "bytes": 99990
+    },
+    "errors-after-system.png": {
+      "sha256": "7b6f60ce88c6c2c4a0dbe57bf7e9ef15593ed926d7537eabd0e536da9220da60",
+      "bytes": 104280
+    },
+    "errors-e2e-attempt1.json": {
+      "sha256": "773bf4fa4f66ddc43cfbe5771f308d8048c8d2f497f2fe6bd4fcedc1eab0dab2",
+      "bytes": 2782
+    },
+    "errors-e2e-attempt2.json": {
+      "sha256": "8afdad78fa04dd0289d7d8189db55fa784a5803b07a2378a85adff09db29efb7",
+      "bytes": 11604
+    },
+    "errors-e2e-attempt3.json": {
+      "sha256": "2e9dc6745e177cbd315199da65bdfdb0094fad2f9e15cc0400b54e6aa8451e5e",
+      "bytes": 11527
+    },
+    "errors-e2e.json": {
+      "sha256": "f08c5e35ec39211586d28bb617326cbfdd900a88708a672631b089a14e9b8d2c",
+      "bytes": 29416
+    },
+    "errors-local-diagnosis.png": {
+      "sha256": "e6b776caf83d911628dc03a2084abc25efeea3bd9630e731250c5725a815cc35",
+      "bytes": 197833
+    },
+    "errors-local-report.png": {
+      "sha256": "28c8e71925e68eaadd321328ac67c2569b5d89e92e6f34c93b86e7ec13e2aade",
+      "bytes": 213750
+    },
+    "errors-reviewed-local-report.txt": {
+      "sha256": "f2a26e4b0668b3a1dbae2fda28930e93680491127edc0bd67dad017027cae5ed",
+      "bytes": 85
+    },
+    "frontend-acceptance.log": {
+      "sha256": "417ea64e699a8d826df0ce258c9ff1672f54090ff3433b6518cca2fe13614c0f",
+      "bytes": 13602
+    },
+    "frontend-build.log": {
+      "sha256": "95eb22692c94126a595398a51ea84c75c835a032b650997d17af43a50372b252",
+      "bytes": 8771
+    },
+    "frontend-unit-tests.log": {
+      "sha256": "27a8e4fd2d3e1d6c98fc02e082e6945d3d0503f35a8a8a2e034ba639cd7861ea",
+      "bytes": 308
+    },
+    "hook-tests.log": {
+      "sha256": "903a371054920cecf53d6e8054f10298ffa960bbb71e7c70d5f2485c5a7350d9",
+      "bytes": 101
+    },
+    "impact-evidence-check.json": {
+      "sha256": "179faed786d2880387cc2065f6faf097c38b28147fb0c5fa22d3369f6997ceb1",
+      "bytes": 720
+    },
+    "impact-real-response.json": {
+      "sha256": "b669ed025f7eb275f53bbbf79daae4a463afa17b15479a0ae57ea36adf191de3",
+      "bytes": 64252
+    },
+    "map-e2e.json": {
+      "sha256": "ed7f4b23deea5483787825cb704e90d1ec58341b589e87b67b70064e071f3bef",
+      "bytes": 32835
+    },
+    "native-activity-tests.log": {
+      "sha256": "53df698e8ed064720b9952c3d7b699bd03ce36c8ce2b8eb23f09979acd50ae27",
+      "bytes": 62268
+    },
+    "native-final-job-status-tests.log": {
+      "sha256": "eecd08b5bf059bc888292a7ee009ed36bf770af51224f5801f91b61a4da263c4",
+      "bytes": 57367
+    },
+    "native-full-tests.log": {
+      "sha256": "3e43457c76d1039feabbe5d2d35af917739d2a695437d01a602fe5e3d9376720",
+      "bytes": 7878
+    },
+    "native-lint.log": {
+      "sha256": "1debed8dce243dce5d13d17203922a5fca3619fa4d7b7e6ee6261f19fbaea168",
+      "bytes": 6057167
+    },
+    "promises.json": {
+      "sha256": "fc014ec86b3d1c6eaed3dce4dbdc02fd6b6227ed8cb93f147af8589ba6948105",
+      "bytes": 2994
+    },
+    "repository-snapshot.json": {
+      "sha256": "e908b7b6002e7b747cb4d8aee36044b4074f816e4359185521c20fc745b70dc0",
+      "bytes": 552
+    },
+    "research-archify-chapter.png": {
+      "sha256": "00ffad71ff365fbdfe696f1c3bde1645c1eb1ae0d61a80beb6a5a2ff3b04fafb",
+      "bytes": 456143
+    },
+    "research-archify-overview.png": {
+      "sha256": "cc4a9598a5a36c7622d4d7005fa01a32b436b4ad9a93fd097b08c607c93e809a",
+      "bytes": 395053
+    },
+    "research-archify-route.png": {
+      "sha256": "338771f7ef0e7c091d36ef41685e78a1a3005b304641f6597fcff66a6175578e",
+      "bytes": 452382
+    },
+    "research-captures.json": {
+      "sha256": "ba0b0fc2f3a62168276f2422689cad22ff8da567f1e92e53903de0746223f9bd",
+      "bytes": 2675
+    },
+    "research-gitnexus-entry.png": {
+      "sha256": "a7dfea24fe0d20a508c726e22b04f9487b7a59b80bcfe3e4a7b5bc04e15f2423",
+      "bytes": 89805
+    },
+    "research-graphify-example-selected.png": {
+      "sha256": "2c48b1d886d32149e80af0cfd8e3234c5a4853a0efe1e20dbdf88e9de1d1a1b2",
+      "bytes": 302115
+    },
+    "stylegate.json": {
+      "sha256": "faa1e4a757ac80dab9ddea09a8d4b6c6a1a323516a49d389a8429dd3600284e8",
+      "bytes": 11351
+    }
+  }
+}

@@ -1255,6 +1255,180 @@ TEST(csharp_local_name_last_segment) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * ES named imports keep the member their local binds
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static const CBMImport *imp_by_local(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* `navigate` from `{ get as navigate }` binds axios's `get`: the call
+ * resolvers spell a call through it as axios.get. The member is set for a
+ * named import only (aliased or not) and survives compaction into the
+ * result's one exact arena block. */
+TEST(es_named_import_member_survives_compaction) {
+    CBMFileResult *r = do_extract("import ax from 'axios';\n"
+                                  "import * as ns from 'axios';\n"
+                                  "import { get as navigate, post } from 'axios';\n",
+                                  CBM_LANG_TYPESCRIPT, "member.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_result_compact(r);
+    const CBMImport *aliased = imp_by_local(r, "navigate");
+    const CBMImport *plain = imp_by_local(r, "post");
+    const CBMImport *def = imp_by_local(r, "ax");
+    const CBMImport *ns = imp_by_local(r, "ns");
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NOT_NULL(def);
+    ASSERT_NOT_NULL(ns);
+    ASSERT_STR_EQ(aliased->module_path, "axios");
+    ASSERT_STR_EQ(aliased->member, "get");
+    ASSERT_STR_EQ(plain->member, "post");
+    ASSERT_NULL(def->member);
+    ASSERT_NULL(ns->member);
+    uintptr_t member_addr = (uintptr_t)aliased->member;
+    uintptr_t arena_addr = (uintptr_t)r->arena.blocks[0];
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT(member_addr >= arena_addr);
+    ASSERT(member_addr - arena_addr < r->arena.used);
+    cbm_free_result(r);
+
+    CBMFileResult *py =
+        do_extract("from paho.mqtt import publish as send\n", CBM_LANG_PYTHON, "member.py");
+    ASSERT_NOT_NULL(py);
+    const CBMImport *send = imp_by_local(py, "send");
+    ASSERT_NOT_NULL(send);
+    ASSERT_STR_EQ(send->module_path, "paho.mqtt.publish");
+    ASSERT_NULL(send->member);
+    cbm_free_result(py);
+    PASS();
+}
+
+/* #1128: a JS/TS import whose statement binds no local name keeps the path's
+ * last segment as local_name (the import map still keys on it) but says so, so
+ * the same-module bound-receiver guard does not read `require('node:stream')`
+ * as binding every `stream` parameter. A lazy `x = require('x')` and
+ * `const x = require('x').member` do bind that very name. */
+static const CBMImport *imp_by_path(const CBMFileResult *r, const char *module_path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, module_path) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(js_import_local_name_synthesized) {
+    CBMFileResult *r = do_extract("import axios from 'axios';\n"
+                                  "import * as fs from 'node:fs';\n"
+                                  "import { client as http } from './client';\n"
+                                  "import './polyfills';\n"
+                                  "export * from './reexported';\n"
+                                  "const db = require('./database');\n"
+                                  "let winston;\n"
+                                  "winston = require('winston');\n"
+                                  "let store;\n"
+                                  "store = require('./kv-store');\n"
+                                  "const dns = require('dns').promises;\n"
+                                  "const { join } = require('path');\n"
+                                  "require('./side-effect');\n"
+                                  "const R = require('node:stream').Readable;\n",
+                                  CBM_LANG_JAVASCRIPT, "synth.js");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *path;
+        bool synthesized;
+    } cases[] = {
+        {"axios", false},      {"node:fs", false},      {"./client", false},
+        {"./polyfills", true}, {"./reexported", true},  {"./database", false},
+        {"winston", false},    {"./kv-store", true},    {"dns", false},
+        {"path", true},        {"./side-effect", true}, {"node:stream", true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const CBMImport *imp = imp_by_path(r, cases[i].path);
+        if (!imp || imp->local_name_synthesized != cases[i].synthesized) {
+            printf("  FAIL [%s]: %s\n", cases[i].path, imp ? "flag" : "missing");
+        }
+        ASSERT_NOT_NULL(imp);
+        ASSERT_EQ(imp->local_name_synthesized, cases[i].synthesized);
+    }
+    /* The stand-in names themselves are unchanged (the import map keys on them). */
+    ASSERT_STR_EQ(imp_by_path(r, "./side-effect")->local_name, "side-effect");
+    ASSERT_STR_EQ(imp_by_path(r, "./kv-store")->local_name, "kv-store");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1128: an AMD factory binds each parameter to the dependency at the same
+ * position (`exports`/`module`/`require` are the module itself or the loader),
+ * for the factory's body only. The fact rides the call (no IMPORTS edge). */
+static const CBMCall *call_by_callee(const CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return &r->calls.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(js_amd_dependency_receiver_flag) {
+    CBMFileResult *r = do_extract(
+        "define('m', ['api', 'exports', 'alerts'], function (api, exports, alerts) {\n"
+        "  api.get(1);\n"
+        "  api.client.load(2);\n"
+        "  exports.put(3);\n"
+        "  alerts.alert(4);\n"
+        "  other.post(5);\n"
+        "});\n"
+        "require(['hooks'], (hooks) => { hooks.fire(6); });\n"
+        "require(['runner'], h => { h.run(7); });\n"
+        "api.after(8);\n"
+        "define(function (require) { const util = require('util'); util.format(9); });\n",
+        CBM_LANG_JAVASCRIPT, "amd.js");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *callee;
+        bool amd;
+    } cases[] = {
+        {"api.get", true},      {"api.client.load", true}, {"exports.put", false},
+        {"alerts.alert", true}, {"other.post", false},     {"hooks.fire", true},
+        {"h.run", true},        {"api.after", false},      {"util.format", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const CBMCall *call = call_by_callee(r, cases[i].callee);
+        if (!call || call->receiver_is_amd_dependency != cases[i].amd) {
+            printf("  FAIL [%s]: %s\n", cases[i].callee, call ? "flag" : "missing");
+        }
+        ASSERT_NOT_NULL(call);
+        ASSERT_EQ(call->receiver_is_amd_dependency, cases[i].amd);
+        ASSERT_TRUE(call->is_method);
+    }
+    /* AMD dependencies mint no import (and so no IMPORTS edge). */
+    ASSERT_NULL(imp_by_path(r, "api"));
+    ASSERT_NULL(imp_by_path(r, "hooks"));
+    cbm_free_result(r);
+
+    /* TypeScript parameter shape (`api: Api`). */
+    CBMFileResult *t = do_extract("define(['api'], function (api: Api) {\n"
+                                  "  api.get(1);\n"
+                                  "});\n",
+                                  CBM_LANG_TYPESCRIPT, "amd.ts");
+    ASSERT_NOT_NULL(t);
+    const CBMCall *typed = call_by_callee(t, "api.get");
+    ASSERT_NOT_NULL(typed);
+    ASSERT_TRUE(typed->receiver_is_amd_dependency);
+    cbm_free_result(t);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE declaration — do NOT register in test_main.c; the main workstream will
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1294,4 +1468,11 @@ SUITE(extraction_imports) {
     RUN_TEST(rust_local_name_last_segment);
     RUN_TEST(java_local_name_last_segment);
     RUN_TEST(csharp_local_name_last_segment);
+
+    /* ES named-import member (call resolution spells calls through it) */
+    RUN_TEST(es_named_import_member_survives_compaction);
+
+    /* #1128 binding facts for the same-module bound-receiver guard */
+    RUN_TEST(js_import_local_name_synthesized);
+    RUN_TEST(js_amd_dependency_receiver_flag);
 }

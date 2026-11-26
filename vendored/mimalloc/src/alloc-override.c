@@ -127,7 +127,7 @@ typedef void* mi_nothrow_t;
 #elif defined(_MSC_VER)
   _Check_return_ _Ret_maybenull_ _Post_writable_byte_size_(_Size) _ACRTIMP _CRTALLOCATOR _CRT_HYBRIDPATCHABLE
   void* __cdecl _expand(_Pre_notnull_ void* _Block, _In_ _CRT_GUARDOVERFLOW size_t _Size) {
-    return mi_expand(_Block, _Size);
+    return mi__expand(_Block, _Size);
   }
   _Check_return_ _ACRTIMP 
   size_t __cdecl _msize_base(_Pre_notnull_ void* _Block) _CRT_NOEXCEPT {
@@ -293,7 +293,7 @@ typedef void* mi_nothrow_t;
   void _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete(void*, std::align_val_t, std::nothrow_t const&)
   void _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); mi_free_aligned(p,al); } // operator delete[](void*, std::align_val_t, std::nothrow_t const&)
 
-  #if (MI_INTPTR_SIZE==8) || (MI_INTPTR_SIZE==4 && defined(__EMSCRIPTEN__))  // pr #1257
+  #if (MI_SIZE_SIZE==8) || (MI_SIZE_SIZE==4 && defined(__EMSCRIPTEN__))  // pr #1257
     void* _Znwm(size_t n)                             MI_FORWARD1(mi_new,n)  // new 64-bit
     void* _Znam(size_t n)                             MI_FORWARD1(mi_new,n)  // new[] 64-bit
     void* _ZnwmRKSt9nothrow_t(size_t n, mi_nothrow_t tag) { MI_UNUSED(tag); return mi_new_nothrow(n); }
@@ -302,7 +302,7 @@ typedef void* mi_nothrow_t;
     void* _ZnamSt11align_val_t(size_t n, size_t al)   MI_FORWARD2(mi_new_aligned, n, al)
     void* _ZnwmSt11align_val_tRKSt9nothrow_t(size_t n, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); return mi_new_aligned_nothrow(n,al); }
     void* _ZnamSt11align_val_tRKSt9nothrow_t(size_t n, size_t al, mi_nothrow_t tag) { MI_UNUSED(tag); return mi_new_aligned_nothrow(n,al); }
-  #elif (MI_INTPTR_SIZE==4)
+  #elif (MI_SIZE_SIZE==4)
     void* _Znwj(size_t n)                             MI_FORWARD1(mi_new,n)  // new 64-bit
     void* _Znaj(size_t n)                             MI_FORWARD1(mi_new,n)  // new[] 64-bit
     void* _ZnwjRKSt9nothrow_t(size_t n, mi_nothrow_t tag) { MI_UNUSED(tag); return mi_new_nothrow(n); }
@@ -324,14 +324,25 @@ typedef void* mi_nothrow_t;
 extern "C" {
 #endif
 
+// defined here instead alloc-posix so we can alias it
+mi_decl_nodiscard size_t mi_malloc_size(const void* p) mi_attr_noexcept {
+  if (!mi_is_in_heap_region(p)) return 0;
+  return mi_usable_size(p);
+}
+
+mi_decl_nodiscard size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept {
+  if (!mi_is_in_heap_region(p)) return 0;
+  return mi_usable_size(p);
+}
+
 #ifndef MI_OSX_IS_INTERPOSED
   // Forward Posix/Unix calls as well
   void*  reallocf(void* p, size_t newsize) MI_FORWARD2(mi_reallocf,p,newsize)
-  size_t malloc_size(const void* p)        MI_FORWARD1(mi_usable_size,p)
+  size_t malloc_size(const void* p)        MI_FORWARD1(mi_malloc_size,p)
   #if !defined(__ANDROID__) && !defined(__FreeBSD__) && !defined(__DragonFly__)
-  size_t malloc_usable_size(void *p)       MI_FORWARD1(mi_usable_size,p)
+  size_t malloc_usable_size(void *p)       MI_FORWARD1(mi_malloc_usable_size,p)
   #else
-  size_t malloc_usable_size(const void *p) MI_FORWARD1(mi_usable_size,p)
+  size_t malloc_usable_size(const void *p) MI_FORWARD1(mi_malloc_usable_size,p)
   #endif
 
   // No forwarding here due to aliasing/name mangling issues

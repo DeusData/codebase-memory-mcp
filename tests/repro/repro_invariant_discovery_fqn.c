@@ -140,7 +140,9 @@ TEST(invariant_discovery_always_skip_dirs) {
         { ".ruff_cache",             1 }, /* GREEN */
         { ".eggs",                   1 }, /* GREEN */
         { ".env",                    1 }, /* GREEN */
-        { "env",                     1 }, /* GREEN */
+        /* "env" left this table on 2026-11-17 (maintainer decision): it is
+         * skipped only as a Python virtual environment, pinned by
+         * discover_env_skipped_only_as_virtualenv in tests/test_discover.c. */
         { "htmlcov",                 1 }, /* GREEN */
         { "site-packages",           1 }, /* GREEN */
 
@@ -193,6 +195,9 @@ TEST(invariant_discovery_always_skip_dirs) {
         /* Deploy */
         { ".vercel",                 1 }, /* GREEN */
         { ".netlify",                1 }, /* GREEN */
+        /* The canary is program source (stub.py), which deploy/ and deployed/
+         * keep skipping; their configuration files are indexed
+         * (discover_deploy_indexes_config_files_only). */
         { "deploy",                  1 }, /* GREEN */
         { "deployed",                1 }, /* GREEN */
 
@@ -288,7 +293,6 @@ TEST(invariant_discovery_fast_skip_dirs) {
         { "public" },
         { "third_party" },
         { "thirdparty" },
-        { "external" },
         { "migrations" },
         { "build" },  /* build is in FAST_SKIP_DIRS, not ALWAYS */
         { "bin" },

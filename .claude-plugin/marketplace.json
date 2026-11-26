@@ -1,0 +1,15 @@
+{
+  "name": "codebase-memory",
+  "description": "The codebase-memory-mcp code knowledge graph server, as a Claude Code plugin.",
+  "owner": {
+    "name": "DeusData",
+    "url": "https://github.com/DeusData"
+  },
+  "plugins": [
+    {
+      "name": "codebase-memory",
+      "source": "./plugin",
+      "description": "Codebase knowledge graph for AI agents: sub-ms queries, 99% fewer tokens."
+    }
+  ]
+}

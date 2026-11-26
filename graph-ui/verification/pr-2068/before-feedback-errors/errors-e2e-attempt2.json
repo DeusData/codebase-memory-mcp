@@ -1,0 +1,373 @@
+{
+  "startedAt": "2026-09-09T19:29:58.785Z",
+  "origin": "http://127.0.0.1:9749",
+  "fixture": "/tmp/cbm-2068-error-fixture",
+  "project": "pr2068-error-fixture",
+  "syntheticFixture": true,
+  "actions": [
+    {
+      "action": "Created synthetic C fixtures initially readable, including malformed partial.c and excluded.c",
+      "path": "/tmp/cbm-2068-error-fixture"
+    },
+    {
+      "action": "POST /api/index",
+      "project": "pr2068-error-fixture",
+      "root": "/tmp/cbm-2068-error-fixture",
+      "acknowledgement": {
+        "status": "indexing",
+        "slot": 0,
+        "path": "/tmp/cbm-2068-error-fixture"
+      }
+    },
+    {
+      "action": "Index terminal state",
+      "project": "pr2068-error-fixture",
+      "job": {
+        "slot": 0,
+        "status": "done",
+        "path": "/tmp/cbm-2068-error-fixture",
+        "error": ""
+      }
+    },
+    {
+      "action": "Set unreadable.c chmod 000; real EACCES verified; next reindex must fail",
+      "path": "/tmp/cbm-2068-error-fixture"
+    }
+  ],
+  "directRequests": [
+    {
+      "at": "2026-09-09T19:29:58.817Z",
+      "method": "POST",
+      "path": "/api/index",
+      "status": 202
+    },
+    {
+      "at": "2026-09-09T19:29:58.819Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:59.323Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:59.825Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:30:00.327Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:30:00.828Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:30:01.330Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:30:01.333Z",
+      "method": "POST",
+      "path": "/rpc",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:30:01.335Z",
+      "method": "POST",
+      "path": "/rpc",
+      "status": 200
+    }
+  ],
+  "browserRequests": [
+    {
+      "at": "2026-09-09T19:30:01.788Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:30:01.817Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-BLSH1buz.js"
+    },
+    {
+      "at": "2026-09-09T19:30:01.817Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-D2YGlcrX.css"
+    },
+    {
+      "at": "2026-09-09T19:30:02.202Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:02.214Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/layout?project=pr2068-error-fixture&max_nodes=5000"
+    },
+    {
+      "at": "2026-09-09T19:30:02.214Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/repository-map?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:30:02.216Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "at": "2026-09-09T19:30:02.218Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:30:02.218Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "at": "2026-09-09T19:30:02.219Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:30:02.219Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "get_architecture"
+    },
+    {
+      "at": "2026-09-09T19:30:02.249Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "check_index_coverage"
+    },
+    {
+      "at": "2026-09-09T19:30:02.249Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:30:02.250Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:30:02.258Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:30:02.262Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:30:05.319Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/api/ui-log"
+    },
+    {
+      "at": "2026-09-09T19:30:05.319Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:08.341Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:11.348Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:14.354Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:17.359Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:20.366Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:23.372Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:26.378Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:30:29.397Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    }
+  ],
+  "blockedExternalRequests": [],
+  "screenshots": [],
+  "checks": {
+    "coverageContainsPartial": true,
+    "coverageContainsExclusion": true
+  },
+  "cleanup": [
+    "unreadable.c restored to 0600"
+  ],
+  "indexWithCoverage": {
+    "slot": 0,
+    "status": "done",
+    "path": "/tmp/cbm-2068-error-fixture",
+    "error": ""
+  },
+  "indexStatus": {
+    "project": "pr2068-error-fixture",
+    "nodes": 10,
+    "edges": 9,
+    "status": "ready",
+    "root_path": "/private/tmp/cbm-2068-error-fixture",
+    "indexed_at": "2026-09-09T19:29:28Z",
+    "parse_partial": {
+      "files": [],
+      "count": 1,
+      "truncated": true,
+      "omitted": 1
+    },
+    "skipped": {
+      "files": [],
+      "count": 0,
+      "truncated": false
+    },
+    "not_indexed": {
+      "dirs": [],
+      "dirs_count": 0,
+      "files": [],
+      "files_count": 1,
+      "truncated": true,
+      "files_omitted": 1
+    }
+  },
+  "coverage": {
+    "project": "pr2068-error-fixture",
+    "signal": "best_effort",
+    "indexed_at": "2026-09-09T19:29:28Z",
+    "metadata": {
+      "generation": "2026-09-09T19:29:28Z",
+      "index_mode": "full",
+      "recorded_at": "2026-09-09T19:29:28Z",
+      "recording_status": "complete",
+      "ignored_files_stored": 1,
+      "ignored_files_total": 1,
+      "hash_records_complete": true,
+      "coverage_version": 3,
+      "generation_matches": true
+    },
+    "paths": [
+      {
+        "requested_path": "unreadable.c",
+        "path": "unreadable.c",
+        "status": "no_recorded_issue",
+        "freshness": "metadata_changed",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": []
+      },
+      {
+        "requested_path": "partial.c",
+        "path": "partial.c",
+        "status": "partial",
+        "freshness": "metadata_changed",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": [
+          {
+            "path": "partial.c",
+            "kind": "parse_partial",
+            "match": "exact",
+            "ranges": [
+              {
+                "start": 2,
+                "end": 2
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "requested_path": "excluded.c",
+        "path": "excluded.c",
+        "status": "excluded",
+        "freshness": "not_tracked",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": [
+          {
+            "path": "excluded.c",
+            "kind": "not_indexed_file",
+            "match": "exact",
+            "detail": "cbmignore"
+          }
+        ]
+      }
+    ],
+    "path_total": 3,
+    "path_returned": 3,
+    "path_has_more": false,
+    "scopes": [
+      {
+        "requested_scope": ".",
+        "scope": ".",
+        "total": 2,
+        "returned": 2,
+        "truncated": false,
+        "entries": [
+          {
+            "path": "excluded.c",
+            "kind": "not_indexed_file",
+            "detail": "cbmignore"
+          },
+          {
+            "path": "partial.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 2,
+                "end": 2
+              }
+            ]
+          }
+        ],
+        "status": "known_gaps"
+      }
+    ],
+    "scope_total": 2,
+    "scope_returned": 2,
+    "scope_truncated": false,
+    "has_more": false,
+    "caveat": "Best-effort signal only. No recorded issue does not prove graph or source completeness; read flagged source and qualify claims when metadata is changed or unavailable."
+  },
+  "failure": "locator.click: Timeout 30000ms exceeded.\nCall log:\n\u001b[2m  - waiting for locator('[data-workspace-tab=\"system\"]')\u001b[22m\n\u001b[2m    - locator resolved to <button role=\"tab\" type=\"button\" tabindex=\"-1\" aria-selected=\"false\" data-workspace-tab=\"system\">System</button>\u001b[22m\n\u001b[2m  - attempting click action\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div class=\"cbm-welcome-backdrop\">…</div> intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m    - waiting 20ms\u001b[22m\n\u001b[2m    2 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m      - element is visible, enabled and stable\u001b[22m\n\u001b[2m      - scrolling into view if needed\u001b[22m\n\u001b[2m      - done scrolling\u001b[22m\n\u001b[2m      - <div class=\"cbm-welcome-backdrop\">…</div> intercepts pointer events\u001b[22m\n\u001b[2m    - retrying click action\u001b[22m\n\u001b[2m      - waiting 100ms\u001b[22m\n\u001b[2m    51 × waiting for element to be visible, enabled and stable\u001b[22m\n\u001b[2m       - element is visible, enabled and stable\u001b[22m\n\u001b[2m       - scrolling into view if needed\u001b[22m\n\u001b[2m       - done scrolling\u001b[22m\n\u001b[2m       - <div class=\"cbm-welcome-backdrop\">…</div> intercepts pointer events\u001b[22m\n\u001b[2m     - retrying click action\u001b[22m\n\u001b[2m       - waiting 500ms\u001b[22m\n\n    at failedJobWhileWatching (/Users/bernhard/Desktop/codebasememorymcp_branch 2068/graph-ui/tools/pr-2068-errors-e2e.mjs:80:63)\n    at async main (/Users/bernhard/Desktop/codebasememorymcp_branch 2068/graph-ui/tools/pr-2068-errors-e2e.mjs:130:5)\n    at async file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:158:7"
+}

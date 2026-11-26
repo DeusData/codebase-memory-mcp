@@ -147,6 +147,44 @@ static const char *PERL_MALFORMED = "package Broken;\n"
                                     "} ] } ]\n"
                                     "sub after_error { return 2; }\n";
 
+/* #1261: a `Language = python` method body is lexed by the ObjectScript
+ * grammar's external scanner. Up to intersystems/tree-sitter-objectscript
+ * a7ffcdf it only balanced braces, so a brace inside a Python string, comment
+ * or docstring ran the body past its closing `}` and the following methods were
+ * lost in an ERROR region. Since upstream v1.9.15 the scanner lexes these
+ * bodies with Python's string, triple-quote and `#`-comment rules. */
+static const char *OBJECTSCRIPT_PYTHON_BODY_BRACES =
+    "Class Demo.Py Extends %RegisteredObject\n"
+    "{\n"
+    "ClassMethod Fmt() As %String [ Language = python ]\n"
+    "{\n"
+    "    s = \"open { only\"\n"
+    "    return s\n"
+    "}\n"
+    "ClassMethod Note() As %String [ Language = python ]\n"
+    "{\n"
+    "    # a } in a comment\n"
+    "    return 'x'\n"
+    "}\n"
+    "ClassMethod Doc() As %String [ Language = python ]\n"
+    "{\n"
+    "    \"\"\"docstring with { and no close\"\"\"\n"
+    "    return 'y'\n"
+    "}\n"
+    "ClassMethod After() As %String\n"
+    "{\n"
+    "    Quit \"after\"\n"
+    "}\n"
+    "}\n";
+
+/* The refreshed scanner must still report a Python body that never closes. */
+static const char *OBJECTSCRIPT_PYTHON_BODY_UNCLOSED =
+    "Class Demo.Broken Extends %RegisteredObject\n"
+    "{\n"
+    "ClassMethod Fmt() As %String [ Language = python ]\n"
+    "{\n"
+    "    return \"x\"\n";
+
 /* ── Tests ────────────────────────────────────────────────────────────────── */
 
 TEST(c_ifdef_split_brace_sets_parse_incomplete) {
@@ -507,16 +545,38 @@ TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
 }
 
 /* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
- * still be flagged. A Makefile whose final recipe line lacks its newline really
- * does drop the recipe from the tree — cbm's flag is honest there. */
+ * still be flagged. The construct here is broken whether or not the line is
+ * terminated, so neither the zero-width rule nor the virtual final newline
+ * (#2078) may excuse it.
+ *
+ * This guard used a Makefile whose final recipe line lacks its newline, which
+ * really did drop the recipe from the tree. Since #2078 the parser sees that
+ * line terminated and the recipe parses, so there is no loss left to report --
+ * see makefile_unterminated_recipe_is_parsed_issue2078. */
 TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
-    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1,"; /* unclosed at EOF */
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
     if (!flagged) {
         FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
+/* #2078: the recipe the old #1610 guard lost is now parsed -- the file is not
+ * flagged, with or without a trailing blank. */
+TEST(makefile_unterminated_recipe_is_parsed_issue2078) {
+    const char *cases[] = {"all:\n\techo hi", "all:\n\techo hi "};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MAKEFILE, "Makefile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final recipe line must parse like a terminated one");
+        }
     }
     PASS();
 }
@@ -550,6 +610,40 @@ TEST(perl_malformed_source_remains_partial_issue1838) {
     ASSERT_TRUE(r->parse_incomplete);
     ASSERT_GTE(r->error_region_count, 1);
     ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_python_body_braces_parse_completely_issue1261) {
+    CBMFileResult *r =
+        do_extract(OBJECTSCRIPT_PYTHON_BODY_BRACES, CBM_LANG_OBJECTSCRIPT_UDL, "Py.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool partial = r->parse_incomplete;
+    int error_regions = r->error_region_count;
+    bool all_methods =
+        has_def(r, "Fmt") && has_def(r, "Note") && has_def(r, "Doc") && has_def(r, "After");
+    if (partial || error_regions != 0 || !all_methods) {
+        fprintf(stderr,
+                "  ObjectScript Python-body result: partial=%d regions=%d ranges=%s "
+                "Fmt=%d Note=%d Doc=%d After=%d\n",
+                partial, error_regions, r->error_ranges ? r->error_ranges : "(none)",
+                has_def(r, "Fmt"), has_def(r, "Note"), has_def(r, "Doc"), has_def(r, "After"));
+        cbm_free_result(r);
+        FAIL("braces inside Python strings, comments and docstrings must not run a "
+             "Language = python body past its closing brace");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_unclosed_python_body_remains_partial_issue1261) {
+    CBMFileResult *r =
+        do_extract(OBJECTSCRIPT_PYTHON_BODY_UNCLOSED, CBM_LANG_OBJECTSCRIPT_UDL, "Broken.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
     cbm_free_result(r);
     PASS();
 }
@@ -611,11 +705,12 @@ TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746) {
     PASS();
 }
 
-/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too — the
- * Makefile recipe really is dropped, and only zero-width nodes are excused. */
+/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too, and
+ * only zero-width nodes are excused. (Formerly the unterminated Makefile
+ * recipe, which #2078 now parses -- see the #1610 guard above.) */
 TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
-    const char *src = "all:\n\techo hi ";
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1, ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
@@ -1453,6 +1548,7 @@ static const char *const JSX_AMP_BODIES[] = {
     "<p title=\"a&\">x</p>",                   /* '&' right before the quote */
     "<p>Tom &Jerry</p>",                       /* '&' + letter in JSX text */
     "<p>Tom & Jerry</p>",                      /* '&' + space in JSX text */
+    "<th className=\"p-4 font-semibold\">Role & Dept</th>", /* #2481 report reproduction */
     "<p>x &1 y</p>",                           /* '&' + digit in JSX text */
     /* controls: references keep parsing; '& ' / '&1' in attributes */
     "<p title=\"x&amp;y&#38;z & w &1\">A&amp;B &#38; C</p>",
@@ -1615,7 +1711,1047 @@ TEST(cs_malformed_conditional_remains_partial_issue1748) {
     PASS();
 }
 
+/* ── #2078: every file is parsed as if it ended with a newline ───────────────
+ *
+ * Several grammars need a line terminator that a file's last line may simply
+ * not have. tree-sitter-markdown is the sharpest case: an opening code fence,
+ * an ATX heading or a bare list marker as the final bytes of a file leaves a
+ * WIDTH-BEARING ERROR (so the #1610 zero-width rule cannot excuse it), and a
+ * file that is only "```" came back as a whole-file error. Appending one "\n"
+ * made every one of these clean -- the reporter proved it on 21 real files.
+ *
+ * cbm now feeds the parser one virtual "\n" past EOF when the last byte is not
+ * already a newline, then clamps the tree back to the real length, so no
+ * consumer sees a byte, a line or a range that is not in the file. */
+TEST(markdown_unterminated_last_line_is_clean_issue2078) {
+    const char *cases[] = {
+        "text\n```", /* opening fence at EOF (upstream PR #262, closed unmerged) */
+        "```",       /* the whole file is one opening fence */
+        "# Top",     /* ATX heading */
+        "- ",        /* bare list marker */
+    };
+    int flagged = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete || r->parse_unusable) {
+            fprintf(stderr, "  case %zu flagged: partial=%d unusable=%d ranges=%s\n", i,
+                    r->parse_incomplete, r->parse_unusable,
+                    r->error_ranges ? r->error_ranges : "(none)");
+            flagged++;
+        }
+        cbm_free_result(r);
+    }
+    if (flagged) {
+        FAIL("a markdown file must not be flagged only because its last line is unterminated");
+    }
+    PASS();
+}
+
+/* Controls: the same bytes WITH the newline were already clean and stay so. */
+TEST(markdown_terminated_last_line_controls_unchanged_issue2078) {
+    const char *cases[] = {"text\n```\n", "```\n", "# Top\n", "- \n"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_FALSE(r->parse_unusable);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Everything extraction reports, as one string, so two results compare
+ * byte-for-byte: defs (every text field and range), calls (exact byte spans),
+ * imports and the coverage verdict. */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} dump_buf_t;
+
+static void dump_str(dump_buf_t *b, const char *tag, const char *s) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%s", tag, s ? s : "~");
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+static void dump_num(dump_buf_t *b, const char *tag, long v) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%ld", tag, v);
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+/* The Module def spans the whole file, and its end line follows the line
+ * convention for a terminated last line (#1967), so it is compared on its own
+ * rather than through the dump. */
+static char *dump_extraction(const CBMFileResult *r) {
+    dump_buf_t b = {(char *)calloc(1u << 16, 1), 1u << 16, 0};
+    if (!b.buf) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Module") == 0) {
+            continue;
+        }
+        dump_str(&b, "\nD", d->qualified_name);
+        dump_str(&b, "name", d->name);
+        dump_str(&b, "label", d->label);
+        dump_num(&b, "start", d->start_line);
+        dump_num(&b, "end", d->end_line);
+        dump_num(&b, "lines", d->lines);
+        dump_num(&b, "cx", d->complexity);
+        dump_num(&b, "params", d->param_count);
+        dump_str(&b, "sig", d->signature);
+        dump_str(&b, "ret", d->return_type);
+        dump_str(&b, "doc", d->docstring);
+        dump_str(&b, "prof", d->structural_profile);
+        dump_str(&b, "tok", d->body_tokens);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        dump_str(&b, "\nC", c->callee_name);
+        dump_str(&b, "in", c->enclosing_func_qn);
+        dump_num(&b, "line", c->start_line);
+        dump_num(&b, "from", (long)c->site_start_byte);
+        dump_num(&b, "to", (long)c->site_end_byte);
+        dump_num(&b, "args", c->arg_count);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        dump_str(&b, "\nI", r->imports.items[i].local_name);
+        dump_str(&b, "path", r->imports.items[i].module_path);
+    }
+    dump_str(&b, "\nP", r->error_ranges);
+    dump_num(&b, "partial", r->parse_incomplete);
+    dump_num(&b, "unusable", r->parse_unusable);
+    dump_str(&b, "", "\n");
+    return b.buf;
+}
+
+static uint32_t module_end_line(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return r->defs.items[i].end_line;
+        }
+    }
+    return 0;
+}
+
+static char *extract_dump(const char *src, CBMLanguage lang, const char *path,
+                          uint32_t *module_end) {
+    CBMFileResult *r = do_extract(src, lang, path);
+    if (!r) {
+        return NULL;
+    }
+    char *d = dump_extraction(r);
+    if (module_end) {
+        *module_end = module_end_line(r);
+    }
+    cbm_free_result(r);
+    return d;
+}
+
+/* GUARD: for code grammars a trailing newline is insignificant, so a file
+ * without one must extract byte-identically to the same file with one -- every
+ * def, range, text field and call byte span. The virtual newline may never
+ * show up as phantom content or a phantom line. */
+TEST(code_without_final_newline_extracts_identically_issue2078) {
+    struct {
+        const char *src; /* no trailing newline */
+        CBMLanguage lang;
+        const char *path;
+        uint32_t lines;
+    } cases[] = {
+        {"#include <stdio.h>\n\nstatic int beta(int x) {\n    return x + 1;\n}\n\n"
+         "void alpha(void) { printf(\"a\"); beta(2); }",
+         CBM_LANG_C, "a.c", 7},
+        {"import os\n\n\nclass K:\n    def m(self, a):\n        return os.path.join(a)\n\n\n"
+         "def f(x):\n    \"\"\"doc\"\"\"\n    return K().m(x)",
+         CBM_LANG_PYTHON, "a.py", 11},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t n = strlen(cases[i].src);
+        char *terminated = (char *)malloc(n + 2);
+        ASSERT_NOT_NULL(terminated);
+        memcpy(terminated, cases[i].src, n);
+        terminated[n] = '\n';
+        terminated[n + 1] = '\0';
+        uint32_t bare_module_end = 0;
+        char *bare = extract_dump(cases[i].src, cases[i].lang, cases[i].path, &bare_module_end);
+        char *term = extract_dump(terminated, cases[i].lang, cases[i].path, NULL);
+        free(terminated);
+        ASSERT_NOT_NULL(bare);
+        ASSERT_NOT_NULL(term);
+        bool same = strcmp(bare, term) == 0;
+        if (!same) {
+            fprintf(stderr, "  %s differs:\n--- without final newline%s--- with final newline%s",
+                    cases[i].path, bare, term);
+        }
+        free(bare);
+        free(term);
+        if (!same) {
+            FAIL("extraction must not depend on whether the last line is terminated");
+        }
+        if (bare_module_end != cases[i].lines) {
+            fprintf(stderr, "  %s: module ends on line %u, file has %u\n", cases[i].path,
+                    bare_module_end, cases[i].lines);
+            FAIL("the virtual newline must not add a line to the module");
+        }
+    }
+    PASS();
+}
+
+/* GUARD against phantom content: a heading on an unterminated last line is a
+ * one-line file. No def may end past line 1, no text may carry the virtual
+ * newline, and the result must equal the terminated file's. */
+TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078) {
+    CBMFileResult *r = do_extract("# Top", CBM_LANG_MARKDOWN, "top.md");
+    ASSERT_NOT_NULL(r);
+    bool found = has_def(r, "Top");
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->end_line > 1 || d->start_line > 1) {
+            fprintf(stderr, "  def %s spans %u-%u\n", d->name ? d->name : "?", d->start_line,
+                    d->end_line);
+            cbm_free_result(r);
+            FAIL("no def may reach past the last real line");
+        }
+        if ((d->name && strchr(d->name, '\n')) || (d->signature && strchr(d->signature, '\n'))) {
+            cbm_free_result(r);
+            FAIL("no extracted text may contain the virtual newline");
+        }
+    }
+    cbm_free_result(r);
+    if (!found) {
+        /* Before #2078 the unterminated heading was silently dropped: no
+         * Section, and no parse_partial flag to say so. */
+        FAIL("the heading on an unterminated last line must be extracted as a Section");
+    }
+    PASS();
+}
+
+/* GUARD: the empty file and a file that is exactly "\n" get no virtual
+ * newline (nothing is unterminated) and stay clean. */
+TEST(empty_and_newline_only_files_unchanged_issue2078) {
+    const char *srcs[] = {"", "\n"};
+    CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_PYTHON, CBM_LANG_C};
+    const char *paths[] = {"e.md", "e.py", "e.c"};
+    for (size_t s = 0; s < 2; s++) {
+        for (size_t l = 0; l < 3; l++) {
+            CBMFileResult *r = do_extract(srcs[s], langs[l], paths[l]);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->parse_incomplete);
+            ASSERT_FALSE(r->parse_unusable);
+            cbm_free_result(r);
+        }
+    }
+    PASS();
+}
+
+/* #1967: every line counter over one source buffer answers the same
+ * question the same way. A trailing newline ends the last line; it does not
+ * open a new one. */
+TEST(source_line_count_one_convention) {
+    ASSERT_EQ(cbm_source_line_count("", 0), 1u);
+    ASSERT_EQ(cbm_source_line_count("a", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\n", 2), 1u);
+    ASSERT_EQ(cbm_source_line_count("\n", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\nb", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\nb\n", 4), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\n\n", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\r\nb\r\n", 6), 2u);
+    /* src_len bounds the count, not a NUL terminator. */
+    ASSERT_EQ(cbm_source_line_count("a\nb\nc", 2), 1u);
+    PASS();
+}
+
+/* ── #2211: Pascal/Delphi identifiers with non-ASCII letters ─────────────────
+ * Delphi accepts non-ASCII letters in identifiers; 1C integrations call its
+ * OLE API through late-bound Variants with Cyrillic member names. Upstream
+ * tree-sitter-pascal's identifier token was ASCII-only, so every such name was
+ * an ERROR node and the unit came out parse_partial. The Cyrillic text is
+ * written as UTF-8 hex escapes (the source stays ASCII); a `" "` split follows
+ * an escape run whenever the next character is a hex digit. */
+
+/* The reporter's snippet (#2211), verbatim apart from the escaping:
+ * v8_Base.<Dokumenty>.<SchetNaOplatuPostavshchika>.<NaytiPoNomeru>(...),
+ * v8_dst.<Pustaya>(), v8_Base.<Spravochniki>.<Nomenklatura>.<NaytiPoKodu>(...),
+ * NM.<PoluchitObyekt>().<Zapisat>() -- <...> = the Cyrillic name, transliterated. */
+static const char *PAS_CYRILLIC_MEMBERS =
+    "unit Demo;\n"
+    "interface\n"
+    "procedure Demo1C;\n"
+    "implementation\n"
+    "procedure Demo1C;\n"
+    "var\n"
+    "  v8_Base, v8_dst, NM: Variant;\n"
+    "begin\n"
+    "  v8_dst := "
+    "v8_Base.\xd0\x94\xd0\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82\xd1\x8b."
+    "\xd0\xa1\xd1\x87\xd0\xb5\xd1\x82\xd0\x9d\xd0\xb0\xd0\x9e\xd0\xbf\xd0\xbb\xd0\xb0\xd1\x82\xd1"
+    "\x83\xd0\x9f\xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd1\x89\xd0\xb8\xd0\xba\xd0\xb0."
+    "\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd1"
+    "\x80\xd1\x83('1', Now);\n"
+    "  if v8_dst.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then Exit;\n"
+    "  NM := "
+    "v8_Base.\xd0\xa1\xd0\xbf\xd1\x80\xd0\xb0\xd0\xb2\xd0\xbe\xd1\x87\xd0\xbd\xd0\xb8\xd0\xba\xd0"
+    "\xb8.\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xba\xd0\xbb\xd0\xb0\xd1\x82\xd1\x83\xd1\x80"
+    "\xd0\xb0.\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9a\xd0\xbe\xd0\xb4\xd1"
+    "\x83('123', 0);\n"
+    "  if not NM.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then\n"
+    "    "
+    "NM."
+    "\xd0\x9f\xd0\xbe\xd0\xbb\xd1\x83\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c\xd0\x9e\xd0\xb1\xd1\x8a\xd0"
+    "\xb5\xd0\xba\xd1\x82().\xd0\x97\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x81\xd0\xb0\xd1\x82\xd1\x8c();\n"
+    "end;\n"
+    "end.\n";
+
+/* A procedure whose own name, parameter and locals are Cyrillic (<ObrabotatDokument>,
+ * <Imya>, <Schyotchik>2), plus the keyword-boundary cases the wider identifier token must
+ * not swallow: `begin<Znachenie>` is ONE identifier, `&begin` is an escaped
+ * identifier, and upper-case BEGIN/END still open and close a block. An ASCII
+ * neighbour follows, so a keyword lost to the identifier token would surface as
+ * a missing definition as well as an ERROR. */
+#define PAS_CYR_PROC_NAME                                                                          \
+    "\xd0\x9e\xd0\xb1\xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0\xd1\x82\xd1\x8c\xd0\x94\xd0" \
+    "\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82"
+#define PAS_CYR_COUNTER "\xd0\xa1\xd1\x87\xd1\x91\xd1\x82\xd1\x87\xd0\xb8\xd0\xba"
+#define PAS_CYR_VALUE "begin\xd0\x97\xd0\xbd\xd0\xb0\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5"
+static const char *PAS_CYRILLIC_PROC =
+    "unit Kw;\n"
+    "interface\n"
+    "implementation\n"
+    "procedure " PAS_CYR_PROC_NAME "(const \xd0\x98\xd0\xbc\xd1\x8f: string);\n"
+    "var\n"
+    "  " PAS_CYR_VALUE ", &begin: Integer;\n"
+    "  " PAS_CYR_COUNTER "2: Integer;\n"
+    "begin\n"
+    "  BEGIN " PAS_CYR_COUNTER "2 := 1; END;\n"
+    "  " PAS_CYR_VALUE " := " PAS_CYR_COUNTER "2;\n"
+    "end;\n"
+    "procedure AfterIt;\n"
+    "begin\n"
+    "end;\n"
+    "end.\n";
+
+/* ASCII control: the same shapes with ASCII names parsed before the fork and
+ * must still parse identically. */
+static const char *PAS_ASCII_CONTROL = "unit Plain;\n"
+                                       "interface\n"
+                                       "procedure Run;\n"
+                                       "implementation\n"
+                                       "procedure Run;\n"
+                                       "var\n"
+                                       "  Base, Doc: Variant;\n"
+                                       "begin\n"
+                                       "  Doc := Base.Documents.Invoice.FindByNumber('1', Now);\n"
+                                       "  if Doc.IsEmpty() then Exit;\n"
+                                       "  Doc.GetObject().Write();\n"
+                                       "end;\n"
+                                       "end.\n";
+
+/* Genuinely broken Pascal (a doubled `:=` and stray parens) must stay flagged:
+ * the wider identifier token must not make the parser accept garbage. */
+static const char *PAS_BROKEN = "unit Broken;\n"
+                                "interface\n"
+                                "implementation\n"
+                                "procedure Bad;\n"
+                                "begin\n"
+                                "  x := := 1 )) ;\n"
+                                "end;\n"
+                                "procedure Good;\n"
+                                "begin\n"
+                                "end;\n"
+                                "end.\n";
+
+TEST(pascal_cyrillic_member_calls_not_partial_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_MEMBERS, CBM_LANG_PASCAL, "Demo.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "Demo1C"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_cyrillic_procedure_name_extracted_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_PROC, CBM_LANG_PASCAL, "Kw.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, PAS_CYR_PROC_NAME));
+    ASSERT_TRUE(has_def(r, "AfterIt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_ascii_control_still_clean_issue2211) {
+    CBMFileResult *r = do_extract(PAS_ASCII_CONTROL, CBM_LANG_PASCAL, "Plain.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, "Run"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_broken_source_still_flagged_issue2211) {
+    CBMFileResult *r = do_extract(PAS_BROKEN, CBM_LANG_PASCAL, "Broken.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_TRUE(has_def(r, "Good"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── VB.NET: the vendored grammar parses real VB.NET (#1178, #1179) ────────
+ * tools/tree-sitter-vbnet (tree-sitter-vbnet + CodeGraph's real-world patch)
+ * is vendored ahead of VB.NET extraction: no CBMLanguage routes to it yet, so
+ * these cases parse through tree_sitter_vbnet() directly. The sample is the
+ * shape extraction must index -- Imports, a WinForms Designer partial class,
+ * Handles, Namespace, Inherits/Implements, MustOverride, #Region, Sub New,
+ * Property, Function -- plus names that begin with a keyword. It is RED on the
+ * alternatives: unpatched upstream leaves ERROR nodes at the Designer's Single
+ * literals (8.25!, 6.0!) and at MustOverride, and the patch revision before
+ * 2026-10-06 turns `Sub NewItem()` into an ERROR and `Public SharedCache` into
+ * a Shared field named Cache. */
+extern const TSLanguage *tree_sitter_vbnet(void);
+
+static const char VB_REAL_SOURCE[] =
+    "Imports System\n"
+    "Imports System.Collections.Generic\n"
+    "Imports System.Windows.Forms\n"
+    "\n"
+    "<Global.Microsoft.VisualBasic.CompilerServices.DesignerGenerated()> _\n"
+    "Partial Class MainForm\n"
+    "    Inherits System.Windows.Forms.Form\n"
+    "\n"
+    "    <System.Diagnostics.DebuggerStepThrough()> _\n"
+    "    Private Sub InitializeComponent()\n"
+    "        Me.btnSave = New System.Windows.Forms.Button()\n"
+    "        Me.SuspendLayout()\n"
+    "        Me.btnSave.Font = New System.Drawing.Font(\"Segoe UI\", 8.25!)\n"
+    "        Me.btnSave.Text = \"Save\"\n"
+    "        Me.AutoScaleDimensions = New System.Drawing.SizeF(6.0!, 13.0!)\n"
+    "        Me.Controls.Add(Me.btnSave)\n"
+    "        Me.ResumeLayout(False)\n"
+    "    End Sub\n"
+    "\n"
+    "    Friend WithEvents btnSave As System.Windows.Forms.Button\n"
+    "End Class\n"
+    "\n"
+    "Partial Class MainForm\n"
+    "    Private Sub btnSave_Click(sender As Object, e As EventArgs) Handles btnSave.Click\n"
+    "        MessageBox.Show(\"Saved\")\n"
+    "    End Sub\n"
+    "End Class\n"
+    "\n"
+    "Namespace Contoso.Billing\n"
+    "    Public MustInherit Class EntityBase\n"
+    "        Public MustOverride Function Describe() As String\n"
+    "    End Class\n"
+    "\n"
+    "    Public Class Customer\n"
+    "        Inherits EntityBase\n"
+    "        Implements IComparable(Of Customer), IDisposable\n"
+    "\n"
+    "#Region \"Fields\"\n"
+    "        Private _name As String\n"
+    "        Public SharedCache As Integer\n"
+    "        Public Dimension As Integer\n"
+    "#End Region\n"
+    "\n"
+    "        Public Sub New(name As String)\n"
+    "            _name = name\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Sub NewItem()\n"
+    "            Dimension = 0\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Property Name As String\n"
+    "            Get\n"
+    "                Return _name\n"
+    "            End Get\n"
+    "            Set(value As String)\n"
+    "                _name = value\n"
+    "            End Set\n"
+    "        End Property\n"
+    "\n"
+    "        Public Overrides Function Describe() As String\n"
+    "            Return _name\n"
+    "        End Function\n"
+    "\n"
+    "        Public Sub Dispose() Implements IDisposable.Dispose\n"
+    "            _name = Nothing\n"
+    "        End Sub\n"
+    "\n"
+    "        Public Function CompareTo(o As Customer) As Integer _\n"
+    "            Implements IComparable(Of Customer).CompareTo\n"
+    "            Return String.Compare(_name, o.Name)\n"
+    "        End Function\n"
+    "    End Class\n"
+    "End Namespace\n";
+
+/* Counts the `identifier` nodes under `node` whose text is exactly `text`. */
+static int vb_identifier_count(TSNode node, const char *src, const char *text) {
+    int hits = 0;
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        uint32_t start = ts_node_start_byte(node);
+        uint32_t len = ts_node_end_byte(node) - start;
+        if (strlen(text) == len && memcmp(src + start, text, len) == 0) {
+            hits++;
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vb_identifier_count(ts_node_child(node, i), src, text);
+    }
+    return hits;
+}
+
+TEST(vbnet_vendored_grammar_parses_real_vb_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    /* The vendored runtime accepts the generated ABI (15). */
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree =
+        ts_parser_parse_string(parser, NULL, VB_REAL_SOURCE, (uint32_t)strlen(VB_REAL_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_STR_EQ(ts_node_type(root), "source_file");
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* Names that begin with a keyword stay whole identifiers. */
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "SharedCache"), 1);
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "Dimension"), 1);
+    ASSERT_GTE(vb_identifier_count(root, VB_REAL_SOURCE, "NewItem"), 1);
+    ASSERT_EQ(vb_identifier_count(root, VB_REAL_SOURCE, "Cache"), 0);
+    ASSERT_EQ(vb_identifier_count(root, VB_REAL_SOURCE, "ension"), 0);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vbnet_vendored_grammar_still_flags_broken_source) {
+    static const char broken[] = "Public Class Broken\n    Public Sub (\nEnd Class\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, broken, (uint32_t)strlen(broken));
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+/* ── VB6 / VBA: the vendored grammar parses real VB6 and VBA (#2564, #721) ──
+ * tools/tree-sitter-vba (harumiWeb/tree-sitter-vba v0.14.5, vba dialect) is
+ * vendored ahead of VB6/VBA extraction: no CBMLanguage routes to it yet, so
+ * these cases parse through tree_sitter_vba() directly. The class module is
+ * dual-target VB6 the way real control libraries write it: the VB6 IDE class
+ * header and Attribute lines, a Declare kept in both #If VBA7 branches
+ * (PtrSafe, LongPtr) plus the LongPtr shim enum VB6 needs, Implements, an
+ * Event, Property Get/Let/Set, a label, and bare calls with plain and member
+ * callees. It is RED on the alternatives: upstream's vb6 dialect rejects
+ * PtrSafe, and the vba dialect at v0.13.0 (the pin PR #2564 carried) leaves
+ * an ERROR at `Case Target Is Nothing` and turns `Err.Raise a, b, c` after
+ * the label into an expression_statement, losing the callee. The form is CRLF,
+ * as the VB6 IDE writes it. */
+extern const TSLanguage *tree_sitter_vba(void);
+
+static const char VBA_CLASS_SOURCE[] =
+    "VERSION 1.0 CLASS\n"
+    "BEGIN\n"
+    "  MultiUse = -1  'True\n"
+    "  Persistable = 0  'NotPersistable\n"
+    "  DataBindingBehavior = 0  'vbNone\n"
+    "  DataSourceBehavior  = 0  'vbNone\n"
+    "  MTSTransactionMode  = 0  'NotAnMTSObject\n"
+    "END\n"
+    "Attribute VB_Name = \"Account\"\n"
+    "Attribute VB_GlobalNameSpace = False\n"
+    "Attribute VB_Creatable = True\n"
+    "Attribute VB_PredeclaredId = False\n"
+    "Attribute VB_Exposed = True\n"
+    "Option Explicit\n"
+    "Implements IComparable\n"
+    "\n"
+    "#If VBA7 Then\n"
+    "Private Declare PtrSafe Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" "
+        "(ByRef Destination As Any, ByRef Source As Any, ByVal Length As LongPtr)\n"
+    "#Else\n"
+    "Private Declare Sub CopyMemory Lib \"kernel32\" Alias \"RtlMoveMemory\" (ByRef "
+        "Destination As Any, ByRef Source As Any, ByVal Length As Long)\n"
+    "#End If\n"
+    "\n"
+    "#If (VBA7 = 0) Then\n"
+    "Private Enum LongPtr\n"
+    "    [_]\n"
+    "End Enum\n"
+    "#End If\n"
+    "\n"
+    "Public Event Changed(ByVal OldValue As Currency)\n"
+    "\n"
+    "Private Type BalanceInfo\n"
+    "    Amount As Currency\n"
+    "    Stamp As Date\n"
+    "End Type\n"
+    "\n"
+    "Private mOwner As String\n"
+    "Private mInfo As BalanceInfo\n"
+    "Private mHistory As Collection\n"
+    "\n"
+    "Private Sub Class_Initialize()\n"
+    "    Set mHistory = New Collection\n"
+    "End Sub\n"
+    "\n"
+    "Public Property Get Owner() As String\n"
+    "    Owner = mOwner\n"
+    "End Property\n"
+    "\n"
+    "Public Property Let Owner(ByVal Value As String)\n"
+    "    mOwner = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Property Set History(ByVal Value As Collection)\n"
+    "    Set mHistory = Value\n"
+    "End Property\n"
+    "\n"
+    "Public Function Deposit(ByVal Amount As Currency) As Boolean\n"
+    "    On Error GoTo Fail\n"
+    "    Dim Old As Currency\n"
+    "    Old = mInfo.Amount\n"
+    "    mInfo.Amount = mInfo.Amount + Amount\n"
+    "    mHistory.Add Amount\n"
+    "    ' audit trail\n"
+    "    LogLine Format$(Amount, \"0.00\"), True\n"
+    "    RaiseEvent Changed(Old)\n"
+    "    Deposit = True\n"
+    "    Exit Function\n"
+    "Fail:\n"
+    "    Err.Raise vbObjectError + 513, \"Account.Deposit\", \"deposit failed\"\n"
+    "End Function\n"
+    "\n"
+    "Public Sub Apply(ByVal Target As Object)\n"
+    "    Dim Entry As Variant\n"
+    "    For Each Entry In mHistory\n"
+    "        CallByName Target, \"Owner\", VbLet, mOwner\n"
+    "    Next\n"
+    "    Select Case True\n"
+    "    Case Target Is Nothing\n"
+    "        Exit Sub\n"
+    "    Case Else\n"
+    "        With Target\n"
+    "            .Refresh\n"
+    "        End With\n"
+    "    End Select\n"
+    "End Sub\n"
+    "\n"
+    "Private Function IComparable_CompareTo(ByVal Other As Object) As Long\n"
+    "    IComparable_CompareTo = StrComp(mOwner, Other.Owner, vbTextCompare)\n"
+    "End Function\n";
+
+static const char VBA_FORM_SOURCE[] =
+    "VERSION 5.00\r\n"
+    "Begin VB.Form frmMain\r\n"
+    "   Caption         =   \"Accounts\"\r\n"
+    "   ClientHeight    =   3090\r\n"
+    "   ClientLeft      =   60\r\n"
+    "   ClientTop       =   450\r\n"
+    "   ClientWidth     =   4680\r\n"
+    "   LinkTopic       =   \"Form1\"\r\n"
+    "   ScaleHeight     =   3090\r\n"
+    "   ScaleWidth      =   4680\r\n"
+    "   StartUpPosition =   3  'Windows Default\r\n"
+    "   Begin VB.CommandButton cmdDeposit\r\n"
+    "      Caption         =   \"Deposit\"\r\n"
+    "      Height          =   495\r\n"
+    "      Left            =   1680\r\n"
+    "      TabIndex        =   0\r\n"
+    "      Top             =   1200\r\n"
+    "      Width           =   1215\r\n"
+    "   End\r\n"
+    "End\r\n"
+    "Attribute VB_Name = \"frmMain\"\r\n"
+    "Attribute VB_GlobalNameSpace = False\r\n"
+    "Attribute VB_Creatable = False\r\n"
+    "Attribute VB_PredeclaredId = True\r\n"
+    "Attribute VB_Exposed = False\r\n"
+    "Option Explicit\r\n"
+    "\r\n"
+    "Private WithEvents mAccount As Account\r\n"
+    "\r\n"
+    "Private Sub cmdDeposit_Click()\r\n"
+    "    If mAccount.Deposit(100) Then MsgBox \"Done\", vbInformation, Me.Caption\r\n"
+    "End Sub\r\n"
+    "\r\n"
+    "Private Sub mAccount_Changed(ByVal OldValue As Currency)\r\n"
+    "    Debug.Print \"was \"; OldValue\r\n"
+    "End Sub\r\n";
+
+/* Counts the nodes of `type` under `node`. */
+static int vba_type_count(TSNode node, const char *type) {
+    int hits = strcmp(ts_node_type(node), type) == 0 ? 1 : 0;
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_type_count(ts_node_child(node, i), type);
+    }
+    return hits;
+}
+
+/* Counts the call_statement nodes under `node` whose callee text is exactly
+ * `callee`. */
+static int vba_callee_count(TSNode node, const char *src, const char *callee) {
+    int hits = 0;
+    if (strcmp(ts_node_type(node), "call_statement") == 0) {
+        TSNode target = ts_node_child_by_field_name(node, "callee", 6);
+        if (!ts_node_is_null(target)) {
+            uint32_t start = ts_node_start_byte(target);
+            uint32_t len = ts_node_end_byte(target) - start;
+            if (strlen(callee) == len && memcmp(src + start, callee, len) == 0) {
+                hits++;
+            }
+        }
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        hits += vba_callee_count(ts_node_child(node, i), src, callee);
+    }
+    return hits;
+}
+
+TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    /* The vendored runtime accepts the generated ABI (15). */
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_CLASS_SOURCE,
+                                          (uint32_t)strlen(VBA_CLASS_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_STR_EQ(ts_node_type(root), "source_file");
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* Every procedure is a declaration node an extractor can index. */
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "function_declaration"), 2);
+    ASSERT_EQ(vba_type_count(root, "property_get_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_let_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "property_set_declaration"), 1);
+    ASSERT_EQ(vba_type_count(root, "declare_sub_statement"), 2);
+    /* Bare calls keep their callee; none is split into an expression. */
+    ASSERT_EQ(vba_type_count(root, "expression_statement"), 0);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "Err.Raise"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "CallByName"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "LogLine"), 1);
+    ASSERT_EQ(vba_callee_count(root, VBA_CLASS_SOURCE, "mHistory.Add"), 1);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_parses_vb6_form_clean) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, VBA_FORM_SOURCE,
+                                          (uint32_t)strlen(VBA_FORM_SOURCE));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_FALSE(ts_node_has_error(root));
+    /* The designer header is structure, not code: the form and its button
+     * are two nested begin blocks ahead of the two event handlers. */
+    ASSERT_STR_EQ(ts_node_type(ts_node_named_child(root, 0)), "frm_version_statement");
+    ASSERT_EQ(vba_type_count(root, "frm_begin_block"), 2);
+    ASSERT_EQ(vba_type_count(root, "sub_declaration"), 2);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vba_vendored_grammar_still_flags_broken_source) {
+    static const char broken[] = "Public Sub Broken(\n    x = \nEnd Sub\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vba()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, broken, (uint32_t)strlen(broken));
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+/* ── SQLite migrations (#2246) ───────────────────────────────────────────────
+ * The vendored SQL grammar is a self-maintained fork of DerekStride/tree-sitter-sql
+ * (tools/tree-sitter-sql + patches/sqlite-dialect.patch). Upstream rejected
+ * forms that valid SQLite migrations use, so those files were reported
+ * parse_partial. The first two tests and their inputs are Kerf's, from #2246,
+ * carried over as written; the others pin the remaining forms seen in real
+ * SQLite migration sets (vaultwarden, atuin), plus controls that keep "fixed"
+ * from meaning "stopped reporting errors". */
+static const char *SQLITE_VALID_MIGRATION =
+    "PRAGMA foreign_keys = ON;\n"
+    "CREATE TABLE IF NOT EXISTS registrations (\n"
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "  name TEXT NOT NULL\n"
+    ");\n"
+    "CREATE TRIGGER IF NOT EXISTS registrations_guard\n"
+    "BEFORE UPDATE ON registrations\n"
+    "BEGIN\n"
+    "  SELECT RAISE(ABORT, 'registrations are immutable');\n"
+    "END;\n"
+    "CREATE UNIQUE INDEX IF NOT EXISTS registrations_name ON registrations(name)\n"
+    "  WHERE name IS NOT NULL;\n";
+
+static const char *SQLITE_MALFORMED =
+    "CREATE TABLE broken ???;\n";
+
+TEST(sqlite_valid_migration_not_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_VALID_MIGRATION, CBM_LANG_SQL, "migration.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_malformed_still_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_MALFORMED, CBM_LANG_SQL, "broken.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->error_region_count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `key` is not reserved in SQLite, so it is a common column name. After the
+ * first column the grammar also accepts MySQL's `KEY name (cols)` index there,
+ * which took `key TEXT NOT NULL` for a malformed index (vaultwarden, atuin-kv). */
+static const char *SQLITE_KEY_COLUMN = "CREATE TABLE kv (\n"
+                                       "  namespace TEXT NOT NULL,\n"
+                                       "  key TEXT NOT NULL,\n"
+                                       "  value TEXT NOT NULL\n"
+                                       ");\n"
+                                       "CREATE UNIQUE INDEX idx_kv ON kv (namespace, key);\n";
+
+/* Control: MySQL's KEY index inside CREATE TABLE still parses as an index. */
+static const char *MYSQL_KEY_INDEX = "CREATE TABLE t (\n"
+                                     "  id INT NOT NULL,\n"
+                                     "  KEY idx_id (id)\n"
+                                     ");\n";
+
+static const char *SQLITE_WITHOUT_ROWID = "CREATE TABLE history_uploads (\n"
+                                          "  user_id TEXT NOT NULL,\n"
+                                          "  history_id TEXT NOT NULL,\n"
+                                          "  PRIMARY KEY (user_id, history_id)\n"
+                                          ") WITHOUT ROWID;\n";
+
+/* atuin's ai_session schema: a trigger with an unparenthesized WHEN condition
+ * and an INSERT OR IGNORE body, then an fts5 virtual table. */
+static const char *SQLITE_TRIGGER_WHEN_AND_FTS5 =
+    "CREATE TABLE sessions (id INTEGER PRIMARY KEY, root_harness INTEGER);\n"
+    "CREATE TABLE regrouped (session INTEGER PRIMARY KEY);\n"
+    "CREATE TRIGGER sessions_regrouped AFTER UPDATE OF root_harness ON sessions\n"
+    "WHEN OLD.root_harness IS NOT NEW.root_harness\n"
+    "BEGIN\n"
+    "    INSERT OR IGNORE INTO regrouped (session) VALUES (NEW.id);\n"
+    "END;\n"
+    "CREATE VIRTUAL TABLE messages_fts USING fts5(\n"
+    "    title,\n"
+    "    body,\n"
+    "    tokenize = 'unicode61',\n"
+    "    content = '',\n"
+    "    contentless_delete = 1\n"
+    ");\n";
+
+static const char *SQLITE_PRAGMA_FORMS = "PRAGMA journal_mode = WAL;\n"
+                                         "PRAGMA main.cache_size = -2000;\n"
+                                         "PRAGMA table_info(registrations);\n"
+                                         "PRAGMA optimize;\n";
+
+/* Invalid SQLite (its ALTER TABLE has no DROP INDEX), shipped in a real down
+ * migration (atuin-scripts): it must stay flagged. */
+static const char *SQLITE_ALTER_DROP_INDEX = "alter table scripts drop index name_uniq_idx;\n";
+
+static int sqlite_has_labeled_def(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 0 when the file parsed without any error region; the ASSERTs return 1. */
+static int sqlite_check_clean(CBMFileResult *r) {
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    return 0;
+}
+
+TEST(sqlite_key_column_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_KEY_COLUMN, CBM_LANG_SQL, "create_kv_db.up.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "kv"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(mysql_key_index_in_create_table_still_clean_issue2246) {
+    CBMFileResult *r = do_extract(MYSQL_KEY_INDEX, CBM_LANG_SQL, "mysql_schema.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "t"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_without_rowid_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_WITHOUT_ROWID, CBM_LANG_SQL, "0003_queue_owners.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "history_uploads"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_TRIGGER_WHEN_AND_FTS5, CBM_LANG_SQL, "0001_init.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "regrouped"));
+    /* The virtual table is a table: it is extracted like one. */
+    ASSERT_TRUE(sqlite_has_labeled_def(r, "Table", "messages_fts"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_pragma_forms_not_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_PRAGMA_FORMS, CBM_LANG_SQL, "pragmas.sql");
+    ASSERT_EQ(sqlite_check_clean(r), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_alter_table_drop_index_still_flagged_issue2246) {
+    CBMFileResult *r = do_extract(SQLITE_ALTER_DROP_INDEX, CBM_LANG_SQL, "unique_names.down.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->error_region_count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── jsonnet: the external scanner's state belongs to one parser ─────────────
+ * Upstream's jsonnet scanner kept its state (inside a string? which quote?) in
+ * process globals, so every worker's parser shared it: on go/grafana__loki a
+ * different set of jsonnet files came back parse_partial on every index, with
+ * their definitions and edges, and none does when parsed one at a time. The
+ * local patch moves the state into the per-parser payload and resets it on
+ * every deserialize (grammars/MANIFEST.md, "Local source patches").
+ *
+ * No threads here: the input callback hands parser A one byte per call, and
+ * when A first reads the byte after its opening quote -- A's scanner is then
+ * inside scan_string_start -- the callback runs a complete parse of `)'` on
+ * parser B. That parse ends on a string end, which clears B's state; with
+ * shared globals it cleared A's too, mid-scan, and A's string broke. The
+ * second test pins the other half: a parse that ends inside a string must not
+ * leave that state to the next parse. */
+extern const TSLanguage *tree_sitter_jsonnet(void);
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint32_t trigger; /* byte at which parser B runs */
+    bool fired;
+    TSParser *other;
+} jsonnet_interleave_t;
+
+static const char *jsonnet_read_one_byte(void *payload, uint32_t byte_index, TSPoint position,
+                                         uint32_t *bytes_read) {
+    (void)position;
+    jsonnet_interleave_t *x = (jsonnet_interleave_t *)payload;
+    if (byte_index >= x->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    if (!x->fired && byte_index == x->trigger) {
+        static const char resets_on_string_end[] = ")'\n";
+        x->fired = true;
+        TSTree *other = ts_parser_parse_string(x->other, NULL, resets_on_string_end,
+                                               (uint32_t)strlen(resets_on_string_end));
+        ts_tree_delete(other);
+    }
+    *bytes_read = 1;
+    return x->src + byte_index;
+}
+
+TEST(jsonnet_scanner_state_is_per_parser) {
+    static const char src[] = "{\n  name: 'query-scheduler-discovery',\n  port: 9095,\n}\n";
+    TSParser *a = ts_parser_new();
+    TSParser *b = ts_parser_new();
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(ts_parser_set_language(a, tree_sitter_jsonnet()));
+    ASSERT_TRUE(ts_parser_set_language(b, tree_sitter_jsonnet()));
+
+    /* Control: on its own the source parses clean. */
+    TSTree *alone = ts_parser_parse_string(a, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(alone);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(alone)));
+    ts_tree_delete(alone);
+
+    jsonnet_interleave_t x = {src, (uint32_t)strlen(src), 0, false, b};
+    x.trigger = (uint32_t)(strchr(src, '\'') - src) + 1;
+    TSInput input = {&x, jsonnet_read_one_byte, TSInputEncodingUTF8, NULL};
+    TSTree *tree = ts_parser_parse(a, NULL, input);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_TRUE(x.fired); /* B really ran inside A's string */
+    /* has_error covers ERROR and MISSING nodes alike. */
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(tree)));
+    ts_tree_delete(tree);
+    ts_parser_delete(b);
+    ts_parser_delete(a);
+    PASS();
+}
+
+TEST(jsonnet_scanner_state_not_carried_between_parses) {
+    static const char unterminated[] = "local s = 'unterminated\n";
+    static const char text_block[] = "local doc = |||\n  a text block\n|||;\ndoc\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_jsonnet()));
+
+    /* A parse that ends inside a string... */
+    TSTree *first =
+        ts_parser_parse_string(parser, NULL, unterminated, (uint32_t)strlen(unterminated));
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(ts_node_has_error(ts_tree_root_node(first)));
+    ts_tree_delete(first);
+
+    /* ...must not decide how the next file lexes: ||| blocks are lexed only by
+     * the external scanner, which a carried-over "inside a string" disabled. */
+    TSTree *next = ts_parser_parse_string(parser, NULL, text_block, (uint32_t)strlen(text_block));
+    ASSERT_NOT_NULL(next);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(next)));
+    ts_tree_delete(next);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(parse_coverage) {
+    RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
@@ -1640,6 +2776,7 @@ SUITE(parse_coverage) {
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(makefile_unterminated_recipe_is_parsed_issue2078);
     RUN_TEST(c_ifdef_split_range_narrows_to_dropped_branch);
     RUN_TEST(c_ifdef_split_range_excludes_lines_the_preprocessor_explained);
     RUN_TEST(c_ifdef_split_range_never_starts_on_a_directive);
@@ -1647,6 +2784,8 @@ SUITE(parse_coverage) {
     RUN_TEST(c_clean_file_stays_unflagged_after_refinement);
     RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
     RUN_TEST(perl_malformed_source_remains_partial_issue1838);
+    RUN_TEST(objectscript_python_body_braces_parse_completely_issue1261);
+    RUN_TEST(objectscript_unclosed_python_body_remains_partial_issue1261);
     RUN_TEST(dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
     RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
@@ -1666,4 +2805,32 @@ SUITE(parse_coverage) {
     RUN_TEST(cs_collection_expression_in_conditional_is_complete_issue1748);
     RUN_TEST(cs_calls_inside_collection_expression_extracted_issue1748);
     RUN_TEST(cs_malformed_conditional_remains_partial_issue1748);
+    RUN_TEST(markdown_unterminated_last_line_is_clean_issue2078);
+    RUN_TEST(markdown_terminated_last_line_controls_unchanged_issue2078);
+    RUN_TEST(code_without_final_newline_extracts_identically_issue2078);
+    RUN_TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078);
+    RUN_TEST(empty_and_newline_only_files_unchanged_issue2078);
+
+    RUN_TEST(pascal_cyrillic_member_calls_not_partial_issue2211);
+    RUN_TEST(pascal_cyrillic_procedure_name_extracted_issue2211);
+    RUN_TEST(pascal_ascii_control_still_clean_issue2211);
+    RUN_TEST(pascal_broken_source_still_flagged_issue2211);
+    RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
+    RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
+    RUN_TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean);
+    RUN_TEST(vba_vendored_grammar_parses_vb6_form_clean);
+    RUN_TEST(vba_vendored_grammar_still_flags_broken_source);
+
+    RUN_TEST(sqlite_valid_migration_not_flagged);
+    RUN_TEST(sqlite_malformed_still_flagged);
+    RUN_TEST(sqlite_key_column_not_flagged_issue2246);
+    RUN_TEST(mysql_key_index_in_create_table_still_clean_issue2246);
+    RUN_TEST(sqlite_without_rowid_not_flagged_issue2246);
+    RUN_TEST(sqlite_trigger_when_body_and_fts5_not_flagged_issue2246);
+    RUN_TEST(sqlite_pragma_forms_not_flagged_issue2246);
+    RUN_TEST(sqlite_alter_table_drop_index_still_flagged_issue2246);
+    /* Per-parser first: on the unpatched scanner, the carried-over state the
+     * second test leaves behind would hide the first one's defect. */
+    RUN_TEST(jsonnet_scanner_state_is_per_parser);
+    RUN_TEST(jsonnet_scanner_state_not_carried_between_parses);
 }

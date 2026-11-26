@@ -38,13 +38,14 @@ run_suite() {
     # excluded suite and the cause it is excluded for).
     #
     # This leg used to force it empty to settle whether the local arm64
-    # exclusions were an aarch64 artifact. It answered that: the five
-    # deep-recursion suites overflow on x86-64 too, `cli` fails for an unrelated
-    # install-path reason, and `incremental` was a shadow-memory RSS artifact
-    # that is now fixed in the test rather than skipped. Keeping the override
-    # would re-red the gate for causes already recorded, so the question is
-    # closed and the venues share one list. scripts/msan.sh still warns loudly
-    # that the lane is partial, which is the honest signal to keep.
+    # exclusions were an aarch64 artifact. They were not: `cli` fails for an
+    # install-path reason, `incremental` was a shadow-memory RSS artifact (now
+    # fixed in the test), and the five suites that "overflowed" on both
+    # architectures were hiding real uninitialized reads whose reports crashed
+    # under the slow unwinder. With fast unwinding (scripts/msan.sh) those reports
+    # print, the reads are fixed, and the five suites are back in the lane.
+    # Only `cli` is still excluded, and scripts/msan.sh warns that the lane is
+    # partial while anything is.
     echo "=== MSan suite (exclusions per scripts/msan.sh) ==="
     docker run --rm -v "$PWD:/src" -w /src "$IMAGE"
 }

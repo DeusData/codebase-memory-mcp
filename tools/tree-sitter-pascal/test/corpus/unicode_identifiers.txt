@@ -1,0 +1,196 @@
+================================================================================
+Cyrillic member names in late-bound Variant calls (#2211)
+================================================================================
+
+unit Demo;
+interface
+procedure Demo1C;
+implementation
+procedure Demo1C;
+var
+  v8_Base, v8_dst, NM: Variant;
+begin
+  v8_dst := v8_Base.Документы.СчетНаОплатуПоставщика.НайтиПоНомеру('1', Now);
+  if v8_dst.Пустая() then Exit;
+  NM := v8_Base.Справочники.Номенклатура.НайтиПоКоду('123', 0);
+  if not NM.Пустая() then
+    NM.ПолучитьОбъект().Записать();
+end;
+end.
+
+--------------------------------------------------------------------------------
+
+(root
+  (unit
+    (kUnit)
+    (moduleName
+      (identifier))
+    (interface
+      (kInterface)
+      (declProc
+        (kProcedure)
+        (identifier)))
+    (implementation
+      (kImplementation)
+      (defProc
+        (declProc
+          (kProcedure)
+          (identifier))
+        (declVars
+          (kVar)
+          (declVar
+            (identifier)
+            (identifier)
+            (identifier)
+            (type
+              (typeref
+                (identifier)))))
+        (block
+          (kBegin)
+          (assignment
+            (identifier)
+            (kAssign)
+            (exprCall
+              (exprDot
+                (exprDot
+                  (exprDot
+                    (identifier)
+                    (kDot)
+                    (identifier))
+                  (kDot)
+                  (identifier))
+                (kDot)
+                (identifier))
+              (exprArgs
+                (literalString)
+                (identifier))))
+          (if
+            (kIf)
+            (exprCall
+              (exprDot
+                (identifier)
+                (kDot)
+                (identifier)))
+            (kThen)
+            (statement
+              (identifier)))
+          (assignment
+            (identifier)
+            (kAssign)
+            (exprCall
+              (exprDot
+                (exprDot
+                  (exprDot
+                    (identifier)
+                    (kDot)
+                    (identifier))
+                  (kDot)
+                  (identifier))
+                (kDot)
+                (identifier))
+              (exprArgs
+                (literalString)
+                (literalNumber))))
+          (if
+            (kIf)
+            (exprUnary
+              (kNot)
+              (exprCall
+                (exprDot
+                  (identifier)
+                  (kDot)
+                  (identifier))))
+            (kThen)
+            (statement
+              (exprCall
+                (exprDot
+                  (exprCall
+                    (exprDot
+                      (identifier)
+                      (kDot)
+                      (identifier)))
+                  (kDot)
+                  (identifier)))))
+          (kEnd))))
+    (kEnd)
+    (kEndDot)))
+
+================================================================================
+Cyrillic procedure, parameter and variable names (#2211)
+================================================================================
+
+procedure ОбработатьДокумент(const Имя: string);
+var
+  Счётчик2: Integer;
+begin
+  Счётчик2 := Length(Имя);
+end;
+
+--------------------------------------------------------------------------------
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier)
+      (declArgs
+        (declArg
+          (kConst)
+          (identifier)
+          (type
+            (declString
+              (kString))))))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (assignment
+        (identifier)
+        (kAssign)
+        (exprCall
+          (identifier)
+          (exprArgs
+            (identifier))))
+      (kEnd))))
+
+================================================================================
+Keywords still lex as keywords next to non-ASCII identifiers (#2211)
+================================================================================
+
+procedure P;
+var
+  beginЗначение, &begin: Integer;
+begin
+  BEGIN beginЗначение := 1; END;
+end;
+
+--------------------------------------------------------------------------------
+
+(root
+  (defProc
+    (declProc
+      (kProcedure)
+      (identifier))
+    (declVars
+      (kVar)
+      (declVar
+        (identifier)
+        (identifier)
+        (type
+          (typeref
+            (identifier)))))
+    (block
+      (kBegin)
+      (block
+        (kBegin)
+        (assignment
+          (identifier)
+          (kAssign)
+          (literalNumber))
+        (kEnd))
+      (kEnd))))

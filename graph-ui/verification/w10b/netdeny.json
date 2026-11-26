@@ -1,0 +1,33 @@
+{
+  "command": "node tools/smoke-w10b.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 110,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 66753,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4641",
+      "seen": 3
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50305",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50306",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50466",
+      "seen": 1
+    }
+  ],
+  "generatedAt": "2026-08-30T17:36:40.469Z"
+}

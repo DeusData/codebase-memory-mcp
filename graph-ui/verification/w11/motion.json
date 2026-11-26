@@ -1,0 +1,5012 @@
+{
+  "transitionIsCurved": true,
+  "transitionSamples": [
+    {
+      "at": "start",
+      "t": 0,
+      "x": -130.59,
+      "y": -567.2,
+      "z": -42.61
+    },
+    {
+      "at": "middle",
+      "t": 238,
+      "x": -143.31,
+      "y": 18.28,
+      "z": -36.45
+    },
+    {
+      "at": "end",
+      "t": 450,
+      "x": -385.68,
+      "y": 381.36,
+      "z": -31.99
+    }
+  ],
+  "transitionMs": 460,
+  "cometTailPresent": true,
+  "neverInTwoPlaces": true,
+  "trailNodes": 10,
+  "trailBelowEdges": true,
+  "trailDashed": true,
+  "trailInLegend": true,
+  "trailWindowSwitchable": true,
+  "trailsToggleOff": true,
+  "sameNodeDifferentRadii": true,
+  "radiiDeterministic": true,
+  "burstMakesOneWave": true,
+  "followSpringNoOvershoot": true,
+  "followLineShowsMeasuredOnly": true,
+  "pulseFollowsActivity": true,
+  "pulseFrames": 10,
+  "pulseStopsWhenIdle": true,
+  "pulseDistinctFromNodeGlow": true,
+  "timelineTracksPerActor": 8,
+  "timelinePauseKeepsEvents": true,
+  "timelineScrubMarkedAsReplay": true,
+  "cinemaFillsViewport": true,
+  "cinemaHasTicker": true,
+  "cinemaEscapeKeepsCamera": true,
+  "cinemaSizes": [
+    {
+      "viewport": {
+        "width": 1680,
+        "height": 1050
+      },
+      "fills": true,
+      "panel": {
+        "fullscreen": true,
+        "replay": false,
+        "x": 0,
+        "y": 0,
+        "width": 1680,
+        "height": 1050,
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        }
+      },
+      "hud": {
+        "x": 1360,
+        "y": 80,
+        "width": 320,
+        "height": 970
+      },
+      "column": true,
+      "timeline": {
+        "x": 0,
+        "y": 907,
+        "width": 1360,
+        "height": 143
+      },
+      "hudOverTimeline": false,
+      "rows": [
+        {
+          "actor": "you",
+          "lines": 2,
+          "name": "you",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "implementer",
+          "lines": 2,
+          "name": "implementer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "tracer",
+          "lines": 2,
+          "name": "tracer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "indexer",
+          "lines": 2,
+          "name": "indexer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "reviewer",
+          "lines": 2,
+          "name": "reviewer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "packer",
+          "lines": 2,
+          "name": "packer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "checker",
+          "lines": 2,
+          "name": "checker",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "explorer",
+          "lines": 2,
+          "name": "explorer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "planner",
+          "lines": 2,
+          "name": "planner",
+          "nameClipped": false,
+          "placeClipped": false
+        }
+      ],
+      "overlapViolations": 0,
+      "clippingViolations": 0
+    },
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "fills": true,
+      "panel": {
+        "fullscreen": true,
+        "replay": false,
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 900,
+        "viewport": {
+          "width": 1440,
+          "height": 900
+        }
+      },
+      "hud": {
+        "x": 1120,
+        "y": 80,
+        "width": 320,
+        "height": 820
+      },
+      "column": true,
+      "timeline": {
+        "x": 0,
+        "y": 757,
+        "width": 1120,
+        "height": 143
+      },
+      "hudOverTimeline": false,
+      "rows": [
+        {
+          "actor": "you",
+          "lines": 2,
+          "name": "you",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "implementer",
+          "lines": 2,
+          "name": "implementer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "tracer",
+          "lines": 2,
+          "name": "tracer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "indexer",
+          "lines": 2,
+          "name": "indexer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "reviewer",
+          "lines": 2,
+          "name": "reviewer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "packer",
+          "lines": 2,
+          "name": "packer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "checker",
+          "lines": 2,
+          "name": "checker",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "explorer",
+          "lines": 2,
+          "name": "explorer",
+          "nameClipped": false,
+          "placeClipped": false
+        },
+        {
+          "actor": "planner",
+          "lines": 2,
+          "name": "planner",
+          "nameClipped": false,
+          "placeClipped": false
+        }
+      ],
+      "overlapViolations": 0,
+      "clippingViolations": 0
+    }
+  ],
+  "idleHasNoAnimation": true,
+  "idleAgentFadesNotDisappears": true,
+  "framesPerSecondMin": 56.53,
+  "drawnBodiesCap": 8,
+  "capReported": true,
+  "effectsToggleable": true,
+  "thriftProfileKeepsCinemaUsable": true,
+  "frameSeriesCount": 16,
+  "contactSheetWritten": true,
+  "videoWritten": true,
+  "framesDifferBetweenSteps": true,
+  "hudNamesReadable": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "port": 4521,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w11b",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "events": "fixtures/agent-events/w11b-replay.jsonl (nur gelesen)",
+  "method": "Vier Akte, vier Bruecken, vier frische Wiedergaben: die Wiedergabe schiebt die Zeitstempel EINMAL auf die Gegenwart, und ein Lauf, der danach zwei Minuten misst, misst an gealterten Zeiten. Die Bahn wird nicht abgefragt, sondern vom Koerper selbst aufgezeichnet (agentMotion) und hier aus ihren Punkten nachgerechnet. Die Bahnradien rechnet dieser Lauf unabhaengig aus der Regel nach. Der Puls wird an zwei Instrumenten gemessen: die Koerpergroesse aus dem DOM, das Knotenlicht aus den Pixeln. Die Bildserie hat gleiche Abstaende der GESTEUERTEN Zeit, ein Bild je Wiedergabeschritt.",
+  "timings": {
+    "buildMs": 10831,
+    "totalMs": 156364
+  },
+  "generatedAt": "2026-08-30T18:38:50.005Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "act-a-panel",
+        "candidates": 226,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "act-c-panel-trails",
+        "candidates": 226,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "fullscreen-1680x1050",
+        "candidates": 231,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "fullscreen-1440x900",
+        "candidates": 229,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "fullscreen-thrifty",
+        "candidates": 228,
+        "overlaps": [],
+        "clipped": []
+      }
+    ],
+    "shots": [
+      {
+        "name": "timeline",
+        "atRest": true,
+        "bytes": 372986,
+        "regions": [],
+        "why": ""
+      },
+      {
+        "name": "follow",
+        "atRest": true,
+        "bytes": 249998,
+        "regions": [],
+        "why": ""
+      },
+      {
+        "name": "trails",
+        "atRest": true,
+        "bytes": 377564,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 985
+          },
+          {
+            "name": "atlas-agents-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 110
+          }
+        ],
+        "why": ""
+      },
+      {
+        "name": "cinema",
+        "atRest": true,
+        "bytes": 234314,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 985
+          }
+        ],
+        "why": ""
+      }
+    ],
+    "bridgeLog": [
+      "[4522 stdout] [agent-bridge] replay on http://127.0.0.1:4522",
+      "[4522 stdout] [agent-bridge] file: /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl\n[agent-bridge] events read: 73, unreadable lines: 0",
+      "[4523 stdout] [agent-bridge] replay on http://127.0.0.1:4523",
+      "[4523 stdout] [agent-bridge] file: /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl\n[agent-bridge] events read: 73, unreadable lines: 0",
+      "[4524 stdout] [agent-bridge] replay on http://127.0.0.1:4524",
+      "[4524 stdout] [agent-bridge] file: /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl\n[agent-bridge] events read: 73, unreadable lines: 0",
+      "[4525 stdout] [agent-bridge] replay on http://127.0.0.1:4525",
+      "[4525 stdout] [agent-bridge] file: /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl\n[agent-bridge] events read: 73, unreadable lines: 0"
+    ],
+    "acts": {
+      "a": {
+        "health": {
+          "mode": "replay",
+          "file": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl",
+          "events": 73,
+          "unreadable": 0,
+          "emitted": 0,
+          "fileExists": true
+        },
+        "traces": [
+          {
+            "actor": "implementer",
+            "fromNode": 69,
+            "toNode": 59,
+            "chord": 982.27,
+            "samples": 27,
+            "durationMs": 461,
+            "curvature": 0.14443,
+            "middleOffset": 139.764,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "implementer",
+            "fromNode": 59,
+            "toNode": 51,
+            "chord": 841.74,
+            "samples": 27,
+            "durationMs": 457,
+            "curvature": 0.13629,
+            "middleOffset": 107.825,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "implementer",
+            "fromNode": 35,
+            "toNode": 58,
+            "chord": 716.69,
+            "samples": 27,
+            "durationMs": 460,
+            "curvature": 0.13539,
+            "middleOffset": 97.034,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "reviewer",
+            "fromNode": 47,
+            "toNode": 58,
+            "chord": 692.27,
+            "samples": 26,
+            "durationMs": 464,
+            "curvature": 0.14769,
+            "middleOffset": 102.239,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "indexer",
+            "fromNode": 5,
+            "toNode": 58,
+            "chord": 667.58,
+            "samples": 26,
+            "durationMs": 459,
+            "curvature": 0.14994,
+            "middleOffset": 93.151,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "checker",
+            "fromNode": 71,
+            "toNode": 29,
+            "chord": 629.63,
+            "samples": 27,
+            "durationMs": 452,
+            "curvature": 0.14566,
+            "middleOffset": 91.709,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "checker",
+            "fromNode": 27,
+            "toNode": 71,
+            "chord": 622.18,
+            "samples": 27,
+            "durationMs": 460,
+            "curvature": 0.14669,
+            "middleOffset": 91.268,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "checker",
+            "fromNode": 5,
+            "toNode": 71,
+            "chord": 572.9,
+            "samples": 27,
+            "durationMs": 463,
+            "curvature": 0.13261,
+            "middleOffset": 75.969,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "explorer",
+            "fromNode": 62,
+            "toNode": 5,
+            "chord": 566.58,
+            "samples": 24,
+            "durationMs": 457,
+            "curvature": 0.13907,
+            "middleOffset": 78.223,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "implementer",
+            "fromNode": 58,
+            "toNode": 49,
+            "chord": 566.01,
+            "samples": 27,
+            "durationMs": 462,
+            "curvature": 0.14259,
+            "middleOffset": 74.717,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "indexer",
+            "fromNode": 67,
+            "toNode": 5,
+            "chord": 524.86,
+            "samples": 28,
+            "durationMs": 452,
+            "curvature": 0.1187,
+            "middleOffset": 57.906,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "tracer",
+            "fromNode": 35,
+            "toNode": 57,
+            "chord": 461.28,
+            "samples": 27,
+            "durationMs": 459,
+            "curvature": 0.14629,
+            "middleOffset": 67.481,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "packer",
+            "fromNode": 52,
+            "toNode": 36,
+            "chord": 450.44,
+            "samples": 27,
+            "durationMs": 461,
+            "curvature": 0.13444,
+            "middleOffset": 60.557,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "indexer",
+            "fromNode": 5,
+            "toNode": 67,
+            "chord": 352.34,
+            "samples": 27,
+            "durationMs": 454,
+            "curvature": 0.14941,
+            "middleOffset": 52.643,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "implementer",
+            "fromNode": 50,
+            "toNode": 69,
+            "chord": 311.34,
+            "samples": 27,
+            "durationMs": 456,
+            "curvature": 0.14414,
+            "middleOffset": 44.878,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "packer",
+            "fromNode": 28,
+            "toNode": 52,
+            "chord": 229.24,
+            "samples": 25,
+            "durationMs": 455,
+            "curvature": 0.14352,
+            "middleOffset": 32.899,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "reviewer",
+            "fromNode": 58,
+            "toNode": 59,
+            "chord": 188.57,
+            "samples": 27,
+            "durationMs": 463,
+            "curvature": 0.12171,
+            "middleOffset": 22.951,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "reviewer",
+            "fromNode": 59,
+            "toNode": 58,
+            "chord": 167.32,
+            "samples": 27,
+            "durationMs": 459,
+            "curvature": 0.1475,
+            "middleOffset": 24.679,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "tracer",
+            "fromNode": 54,
+            "toNode": 58,
+            "chord": 93.3,
+            "samples": 27,
+            "durationMs": 466,
+            "curvature": 0.06254,
+            "middleOffset": 2.285,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "tracer",
+            "fromNode": 57,
+            "toNode": 54,
+            "chord": 83,
+            "samples": 28,
+            "durationMs": 465,
+            "curvature": 0.12128,
+            "middleOffset": 8.439,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          },
+          {
+            "actor": "implementer",
+            "fromNode": 49,
+            "toNode": 50,
+            "chord": 32.42,
+            "samples": 26,
+            "durationMs": 462,
+            "curvature": 0.11191,
+            "middleOffset": 2.504,
+            "firstOffset": 0,
+            "lastOffset": 0,
+            "timesIncrease": true,
+            "done": true
+          }
+        ],
+        "bestTrace": {
+          "actor": "implementer",
+          "fromNode": 69,
+          "toNode": 59,
+          "chord": 982.27,
+          "samples": 27,
+          "durationMs": 461,
+          "curvature": 0.14443,
+          "middleOffset": 139.764,
+          "firstOffset": 0,
+          "lastOffset": 0,
+          "timesIncrease": true,
+          "done": true,
+          "from": {
+            "x": -130.59203373775094,
+            "y": -567.2040402179207,
+            "z": -42.61256408691406
+          },
+          "to": {
+            "x": -385.6756111347253,
+            "y": 381.36455423285685,
+            "z": -31.99329948425293
+          }
+        },
+        "tailSeen": [
+          {
+            "actor": "reviewer",
+            "points": 12,
+            "at": 1788115007239
+          },
+          {
+            "actor": "implementer",
+            "points": 12,
+            "at": 1788115007239
+          },
+          {
+            "actor": "tracer",
+            "points": 12,
+            "at": 1788115007239
+          },
+          {
+            "actor": "checker",
+            "points": 12,
+            "at": 1788115007239
+          },
+          {
+            "actor": "reviewer",
+            "points": 12,
+            "at": 1788115007294
+          },
+          {
+            "actor": "implementer",
+            "points": 12,
+            "at": 1788115007294
+          },
+          {
+            "actor": "tracer",
+            "points": 12,
+            "at": 1788115007294
+          },
+          {
+            "actor": "checker",
+            "points": 12,
+            "at": 1788115007294
+          },
+          {
+            "actor": "reviewer",
+            "points": 12,
+            "at": 1788115007347
+          },
+          {
+            "actor": "implementer",
+            "points": 12,
+            "at": 1788115007347
+          },
+          {
+            "actor": "tracer",
+            "points": 12,
+            "at": 1788115007347
+          },
+          {
+            "actor": "checker",
+            "points": 12,
+            "at": 1788115007347
+          }
+        ],
+        "tailObservations": 38,
+        "bodyCounts": {
+          "samples": 126,
+          "max": 1
+        },
+        "seam": {
+          "on": true,
+          "layerOn": true,
+          "sourceState": "connected",
+          "origin": "http://127.0.0.1:4522",
+          "requests": 1,
+          "drops": 0,
+          "mode": "replay",
+          "file": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11b-replay.jsonl",
+          "error": "",
+          "port": 4522,
+          "events": 74,
+          "missed": 0,
+          "perMinute": 26,
+          "unreadable": 0,
+          "size": "compact",
+          "filter": "both",
+          "follow": false,
+          "trails": true,
+          "fullscreen": false,
+          "trailWindowMs": 300000,
+          "shown": 9,
+          "cap": 8,
+          "capped": 1,
+          "drawn": 8,
+          "transitionMs": 450,
+          "effects": {
+            "tails": true,
+            "trails": true,
+            "waves": true,
+            "timeline": true
+          },
+          "timeline": {
+            "mode": "live",
+            "from": 1788114722904,
+            "to": 1788115022904,
+            "windowMs": 300000,
+            "tracks": 9,
+            "ticks": 74,
+            "shown": false,
+            "width": 439
+          },
+          "radii": {
+            "implementer": 15,
+            "you": 49,
+            "reviewer": 15,
+            "indexer": 49,
+            "tracer": 83,
+            "packer": 34,
+            "checker": 18,
+            "explorer": 34
+          },
+          "positions": {
+            "you": {
+              "x": -249.9304057250211,
+              "y": -511.6893135238419,
+              "z": -45.42461013793945
+            },
+            "reviewer": {
+              "x": -371.8946847764883,
+              "y": 170.9917200543752,
+              "z": -33.60540771484375
+            },
+            "implementer": {
+              "x": -237.2323778846816,
+              "y": -477.2797477819047,
+              "z": -45.42461013793945
+            },
+            "explorer": {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            "packer": {
+              "x": 117.77622698741067,
+              "y": -492.44066557147005,
+              "z": -57.4183464050293
+            },
+            "indexer": {
+              "x": -324.4130050370939,
+              "y": 213.4534586737722,
+              "z": -33.60540771484375
+            },
+            "tracer": {
+              "x": -276.4953220717551,
+              "y": 186.58353301813028,
+              "z": -33.60540771484375
+            },
+            "checker": {
+              "x": -438.92873965687915,
+              "y": -107.050598796206,
+              "z": -17.362289428710938
+            },
+            "planner": {
+              "x": -399.05559112345566,
+              "y": -399.8592271413419,
+              "z": -39.90866470336914
+            }
+          },
+          "pulses": {
+            "you": 1.001004878340935,
+            "reviewer": 1.1606247952815807,
+            "implementer": 1.0431579302039287,
+            "explorer": 1,
+            "packer": 1.001004878340935,
+            "indexer": 1.0014420179444046,
+            "tracer": 1.1106710737419643,
+            "checker": 1.0014420179444046,
+            "planner": 1
+          },
+          "tails": {
+            "you": 0,
+            "reviewer": 0,
+            "implementer": 0,
+            "explorer": 0,
+            "packer": 0,
+            "indexer": 0,
+            "tracer": 0,
+            "checker": 0,
+            "planner": 0
+          },
+          "motion": {
+            "reviewer": {
+              "actor": "reviewer",
+              "fromNode": 59,
+              "toNode": 58,
+              "from": {
+                "x": -366.0722648536801,
+                "y": 351.6834826776474,
+                "z": -31.99329948425293
+              },
+              "to": {
+                "x": -373.04191473372134,
+                "y": 184.50789929317062,
+                "z": -33.60540771484375
+              },
+              "durationMs": 459.39999997615996,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": -366.0722648536801,
+                  "y": 351.6834826776474,
+                  "z": -31.99329948425293
+                },
+                {
+                  "t": 15.299999952318103,
+                  "x": -366.0575413262344,
+                  "y": 351.65912009083513,
+                  "z": -31.99355293345814
+                },
+                {
+                  "t": 32.199999928474426,
+                  "x": -365.9360095799896,
+                  "y": 351.45576025622967,
+                  "z": -31.99566205192725
+                },
+                {
+                  "t": 49.10000002384186,
+                  "x": -365.59371438291845,
+                  "y": 350.87374532668275,
+                  "z": -32.001675955889404
+                },
+                {
+                  "t": 78.5,
+                  "x": -364.1659552893664,
+                  "y": 348.35638547556005,
+                  "z": -32.027530959461735
+                },
+                {
+                  "t": 94.29999995231628,
+                  "x": -362.8355279195542,
+                  "y": 345.89813096085305,
+                  "z": -32.052640055506615
+                },
+                {
+                  "t": 110.10000002384186,
+                  "x": -361.06018262011565,
+                  "y": 342.44649442304967,
+                  "z": -32.0877444041217
+                },
+                {
+                  "t": 131.19999992847443,
+                  "x": -358.00524637182696,
+                  "y": 335.98586400811416,
+                  "z": -32.153114708927085
+                },
+                {
+                  "t": 148.19999992847443,
+                  "x": -355.065522354658,
+                  "y": 328.98084704983074,
+                  "z": -32.22363518455975
+                },
+                {
+                  "t": 165.60000002384186,
+                  "x": -351.8072590793659,
+                  "y": 319.8989264777548,
+                  "z": -32.31466379386048
+                },
+                {
+                  "t": 183.29999995231628,
+                  "x": -348.5594121369494,
+                  "y": 308.43329783747356,
+                  "z": -32.42911635677291
+                },
+                {
+                  "t": 201.19999992847625,
+                  "x": -345.8564258817131,
+                  "y": 294.3028794795921,
+                  "z": -32.56966843078408
+                },
+                {
+                  "t": 218.50000000000182,
+                  "x": -344.49350898642024,
+                  "y": 277.988706434081,
+                  "z": -32.73149426314197
+                },
+                {
+                  "t": 236.19999992847625,
+                  "x": -345.2121904872211,
+                  "y": 259.55724193870407,
+                  "z": -32.913831977702074
+                },
+                {
+                  "t": 254.7999999523181,
+                  "x": -347.9901293940777,
+                  "y": 242.7538740151743,
+                  "z": -33.07908018625778
+                },
+                {
+                  "t": 273.5,
+                  "x": -351.87941715222763,
+                  "y": 228.69161206597775,
+                  "z": -33.216317082961666
+                },
+                {
+                  "t": 291.19999992847625,
+                  "x": -355.89461196184584,
+                  "y": 217.75458507872364,
+                  "z": -33.322028403779704
+                },
+                {
+                  "t": 308.89999997615996,
+                  "x": -359.786827176546,
+                  "y": 208.8906477779331,
+                  "z": -33.40661627159501
+                },
+                {
+                  "t": 325.7999999523163,
+                  "x": -363.12944023976934,
+                  "y": 202.1488475845104,
+                  "z": -33.469832146630466
+                },
+                {
+                  "t": 342.60000002384186,
+                  "x": -365.9517036135992,
+                  "y": 196.9107936205671,
+                  "z": -33.51774205841973
+                },
+                {
+                  "t": 359.39999997615996,
+                  "x": -368.22058590668894,
+                  "y": 192.93376419291693,
+                  "z": -33.5527816085421
+                },
+                {
+                  "t": 376.6999999284744,
+                  "x": -369.98647803107445,
+                  "y": 189.94758634030669,
+                  "z": -33.5775382537798
+                },
+                {
+                  "t": 393.89999997615814,
+                  "x": -371.2245891148744,
+                  "y": 187.88308298199559,
+                  "z": -33.592913607594866
+                },
+                {
+                  "t": 410.1999999284744,
+                  "x": -372.0032962391972,
+                  "y": 186.56611687962854,
+                  "z": -33.600946369279875
+                },
+                {
+                  "t": 426.5000000000018,
+                  "x": -372.494466874444,
+                  "y": 185.6870281083461,
+                  "z": -33.60448933946474
+                },
+                {
+                  "t": 442.89999997615996,
+                  "x": -372.80499596421794,
+                  "y": 185.06027696890962,
+                  "z": -33.60538238738039
+                },
+                {
+                  "t": 450,
+                  "x": -373.04191473372134,
+                  "y": 184.50789929317062,
+                  "z": -33.60540771484375
+                }
+              ],
+              "curvature": 0.1475
+            },
+            "implementer": {
+              "actor": "implementer",
+              "fromNode": 59,
+              "toNode": 51,
+              "from": {
+                "x": -358.6029845053038,
+                "y": 369.9777480014992,
+                "z": -31.99329948425293
+              },
+              "to": {
+                "x": -257.3458621813036,
+                "y": -465.65173499567396,
+                "z": -45.42461013793945
+              },
+              "durationMs": 457.3000000715256,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": -358.6029845053038,
+                  "y": 369.9777480014992,
+                  "z": -31.99329948425293
+                },
+                {
+                  "t": 21.300000071525574,
+                  "x": -358.75281488809,
+                  "y": 369.60393126551554,
+                  "z": -31.998996922920536
+                },
+                {
+                  "t": 40.90000009537107,
+                  "x": -359.662613366376,
+                  "y": 367.3311338558099,
+                  "z": -32.03363715075979
+                },
+                {
+                  "t": 56.200000047683716,
+                  "x": -361.33972980216834,
+                  "y": 363.1123973746229,
+                  "z": -32.097952028683565
+                },
+                {
+                  "t": 91.30000007152557,
+                  "x": -369.9887093740169,
+                  "y": 340.57858714219196,
+                  "z": -32.441996496477984
+                },
+                {
+                  "t": 116.20000004768372,
+                  "x": -381.01442327106207,
+                  "y": 309.48451138707924,
+                  "z": -32.91833674959299
+                },
+                {
+                  "t": 133.10000002384186,
+                  "x": -390.6934792562057,
+                  "y": 279.24306413346704,
+                  "z": -33.38349220677618
+                },
+                {
+                  "t": 149.70000004768372,
+                  "x": -401.3699702511806,
+                  "y": 241.21001812627088,
+                  "z": -33.971208205852875
+                },
+                {
+                  "t": 166.30000007152557,
+                  "x": -412.2492973456969,
+                  "y": 194.01336547939434,
+                  "z": -34.704849329338046
+                },
+                {
+                  "t": 182.40000009536743,
+                  "x": -421.5786210417881,
+                  "y": 138.6892090655234,
+                  "z": -35.57109361023522
+                },
+                {
+                  "t": 199.10000002384186,
+                  "x": -427.8425213919705,
+                  "y": 70.61582054847321,
+                  "z": -36.6465306082048
+                },
+                {
+                  "t": 215.30000007152557,
+                  "x": -427.75923996614455,
+                  "y": -6.4550920999007815,
+                  "z": -37.87730314090589
+                },
+                {
+                  "t": 232.20000004768372,
+                  "x": -417.64478384582407,
+                  "y": -96.477830910868,
+                  "z": -39.333247291903646
+                },
+                {
+                  "t": 246.60000002384186,
+                  "x": -402.32529244216175,
+                  "y": -165.54273113621406,
+                  "z": -40.46333069052638
+                },
+                {
+                  "t": 263,
+                  "x": -381.0119756730561,
+                  "y": -232.4916089337128,
+                  "z": -41.569243688753446
+                },
+                {
+                  "t": 279.2000000476837,
+                  "x": -358.5726184579038,
+                  "y": -287.60914788821657,
+                  "z": -42.48693043427619
+                },
+                {
+                  "t": 295.40000009536743,
+                  "x": -336.7468505351038,
+                  "y": -332.9510617651325,
+                  "z": -43.246051208450766
+                },
+                {
+                  "t": 311.10000002384186,
+                  "x": -317.4482982798824,
+                  "y": -368.5932541516181,
+                  "z": -43.84464472089252
+                },
+                {
+                  "t": 327,
+                  "x": -300.5359140901761,
+                  "y": -397.3273314752521,
+                  "z": -44.32748496867992
+                },
+                {
+                  "t": 343.00000000000364,
+                  "x": -286.57254285283676,
+                  "y": -419.69199868818566,
+                  "z": -44.70235244368991
+                },
+                {
+                  "t": 359.50000000000364,
+                  "x": -275.45403075916073,
+                  "y": -436.82696242642646,
+                  "z": -44.987604961166376
+                },
+                {
+                  "t": 375.90000009537107,
+                  "x": -267.5142853465567,
+                  "y": -448.8327023936659,
+                  "z": -45.18472935021657
+                },
+                {
+                  "t": 392.00000000000364,
+                  "x": -262.36718728746746,
+                  "y": -456.63897842153676,
+                  "z": -45.30957650790327
+                },
+                {
+                  "t": 408.70000004768735,
+                  "x": -259.27737402530494,
+                  "y": -461.4961487894567,
+                  "z": -45.383077358332216
+                },
+                {
+                  "t": 424.70000004768735,
+                  "x": -257.8927825994996,
+                  "y": -463.92605776262434,
+                  "z": -45.41506235790241
+                },
+                {
+                  "t": 440.7000000476837,
+                  "x": -257.45035613881254,
+                  "y": -465.028507103397,
+                  "z": -45.42413590722001
+                },
+                {
+                  "t": 450,
+                  "x": -257.3458621813036,
+                  "y": -465.65173499567396,
+                  "z": -45.42461013793945
+                }
+              ],
+              "curvature": 0.13629
+            },
+            "packer": {
+              "actor": "packer",
+              "fromNode": 52,
+              "toNode": 36,
+              "from": {
+                "x": -315.2769268362639,
+                "y": -500.6361991116491,
+                "z": -35.74911880493164
+              },
+              "to": {
+                "x": 135.1590101105685,
+                "y": -501.9681671945683,
+                "z": -57.4183464050293
+              },
+              "durationMs": 461.2999999523199,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": -315.2769268362639,
+                  "y": -500.6361991116491,
+                  "z": -35.74911880493164
+                },
+                {
+                  "t": 16,
+                  "x": -315.19776831346513,
+                  "y": -500.67957705673865,
+                  "z": -35.75301486666004
+                },
+                {
+                  "t": 32,
+                  "x": -314.6433034246214,
+                  "y": -500.98349864736133,
+                  "z": -35.7802872987588
+                },
+                {
+                  "t": 48.10000002384186,
+                  "x": -313.123823857902,
+                  "y": -501.81398133852787,
+                  "z": -35.854971302832766
+                },
+                {
+                  "t": 79.89999997615814,
+                  "x": -305.39671346416867,
+                  "y": -505.9599845905196,
+                  "z": -36.23430252350899
+                },
+                {
+                  "t": 96.50000000000182,
+                  "x": -297.8600678192262,
+                  "y": -509.86917270823744,
+                  "z": -36.603885950956794
+                },
+                {
+                  "t": 112.89999997615996,
+                  "x": -287.36877989293595,
+                  "y": -515.082769389139,
+                  "z": -37.117943105775026
+                },
+                {
+                  "t": 129.60000002384368,
+                  "x": -273.03594663820485,
+                  "y": -521.7705307716868,
+                  "z": -37.81964574707444
+                },
+                {
+                  "t": 146.20000004768735,
+                  "x": -254.59844726489055,
+                  "y": -529.6289480195251,
+                  "z": -38.72152391633926
+                },
+                {
+                  "t": 163.10000002384368,
+                  "x": -230.97438464289368,
+                  "y": -538.4667648650789,
+                  "z": -39.8760550950517
+                },
+                {
+                  "t": 179.79999995231992,
+                  "x": -202.26069474408453,
+                  "y": -547.3399039540518,
+                  "z": -41.27797052996792
+                },
+                {
+                  "t": 196.7999999523181,
+                  "x": -166.9709680509212,
+                  "y": -555.4301507598273,
+                  "z": -42.999171499995214
+                },
+                {
+                  "t": 214.10000002384368,
+                  "x": -124.1738928890415,
+                  "y": -561.0710234855187,
+                  "z": -45.08415235614439
+                },
+                {
+                  "t": 231.39999997615996,
+                  "x": -74.88405907307745,
+                  "y": -561.9046491060374,
+                  "z": -47.48223724395109
+                },
+                {
+                  "t": 249.29999995231992,
+                  "x": -28.591501335665534,
+                  "y": -557.21774068133,
+                  "z": -49.72867115764378
+                },
+                {
+                  "t": 267.1000000238455,
+                  "x": 10.079874648657373,
+                  "y": -549.2889402586902,
+                  "z": -51.59856064661638
+                },
+                {
+                  "t": 284.70000004768735,
+                  "x": 41.72792264660366,
+                  "y": -540.1265809009316,
+                  "z": -53.12214689241199
+                },
+                {
+                  "t": 302.20000004768735,
+                  "x": 67.31563631527285,
+                  "y": -531.0056040025345,
+                  "z": -54.347280171711425
+                },
+                {
+                  "t": 320.6000000238455,
+                  "x": 88.56525801890739,
+                  "y": -522.3202783345407,
+                  "z": -55.35739045279378
+                },
+                {
+                  "t": 338.70000004768735,
+                  "x": 104.49162824752256,
+                  "y": -515.2094532578623,
+                  "z": -56.10689750370466
+                },
+                {
+                  "t": 356.8999999761636,
+                  "x": 116.21869482813183,
+                  "y": -509.7131424232808,
+                  "z": -56.650781827061415
+                },
+                {
+                  "t": 374.7000000476892,
+                  "x": 124.19434881540624,
+                  "y": -505.92818511774203,
+                  "z": -57.01222974207768
+                },
+                {
+                  "t": 393.1000000238473,
+                  "x": 129.50588683588273,
+                  "y": -503.4885613723301,
+                  "z": -57.24311873760569
+                },
+                {
+                  "t": 410.2999999523199,
+                  "x": 132.40865044241258,
+                  "y": -502.3015801901101,
+                  "z": -57.35882990237311
+                },
+                {
+                  "t": 427.7999999523199,
+                  "x": 133.94531491112522,
+                  "y": -501.86473789787925,
+                  "z": -57.40793942293555
+                },
+                {
+                  "t": 444.3999999761636,
+                  "x": 134.65145501039277,
+                  "y": -501.8609901493546,
+                  "z": -57.41817936138057
+                },
+                {
+                  "t": 450,
+                  "x": 135.1590101105685,
+                  "y": -501.9681671945683,
+                  "z": -57.4183464050293
+                }
+              ],
+              "curvature": 0.13444
+            },
+            "tracer": {
+              "actor": "tracer",
+              "fromNode": 54,
+              "toNode": 58,
+              "from": {
+                "x": -343.9349822038551,
+                "y": 192.44423098666323,
+                "z": -37.18421936035156
+              },
+              "to": {
+                "x": -435.0791629893503,
+                "y": 212.3748346050216,
+                "z": -33.60540771484375
+              },
+              "durationMs": 465.69999992847806,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": -343.9349822038551,
+                  "y": 192.44423098666323,
+                  "z": -37.18421936035156
+                },
+                {
+                  "t": 17.49999999999818,
+                  "x": -343.95810193938496,
+                  "y": 192.44580687822668,
+                  "z": -37.18337743141164
+                },
+                {
+                  "t": 35.49999999999818,
+                  "x": -344.1287827259289,
+                  "y": 192.45464077909273,
+                  "z": -37.17719112411093
+                },
+                {
+                  "t": 65.59999990463257,
+                  "x": -345.1633834420031,
+                  "y": 192.48470198713585,
+                  "z": -37.13987148602921
+                },
+                {
+                  "t": 83.39999997615814,
+                  "x": -346.4610561470821,
+                  "y": 192.50418011836393,
+                  "z": -37.09308976467176
+                },
+                {
+                  "t": 101.09999990463257,
+                  "x": -348.4302799540367,
+                  "y": 192.52360314194866,
+                  "z": -37.02188339145743
+                },
+                {
+                  "t": 118.5999999046362,
+                  "x": -351.17061507970266,
+                  "y": 192.5555588700634,
+                  "z": -36.92215053752782
+                },
+                {
+                  "t": 135.50000000000364,
+                  "x": -354.67293175252246,
+                  "y": 192.6315301265086,
+                  "z": -36.79339720319571
+                },
+                {
+                  "t": 157.29999995231992,
+                  "x": -360.5752768373894,
+                  "y": 192.90251139158283,
+                  "z": -36.57278835281328
+                },
+                {
+                  "t": 174.19999992847806,
+                  "x": -366.30958165939995,
+                  "y": 193.38987380676005,
+                  "z": -36.353784172126254
+                },
+                {
+                  "t": 191.79999995231992,
+                  "x": -373.41053764204116,
+                  "y": 194.36691936561965,
+                  "z": -36.07579235038249
+                },
+                {
+                  "t": 208.0999999046362,
+                  "x": -381.0337993681741,
+                  "y": 195.95496001861412,
+                  "z": -35.76849882413719
+                },
+                {
+                  "t": 224.29999995231992,
+                  "x": -389.60250249240227,
+                  "y": 198.51375608238766,
+                  "z": -35.411462754580846
+                },
+                {
+                  "t": 241.29999995231628,
+                  "x": -398.38727253723914,
+                  "y": 202.0124168036283,
+                  "z": -35.0334091350707
+                },
+                {
+                  "t": 257.39999997615814,
+                  "x": -405.3473654260029,
+                  "y": 205.33601712470877,
+                  "z": -34.727762442850405
+                },
+                {
+                  "t": 273.1999999284744,
+                  "x": -411.0934845025299,
+                  "y": 208.3821059363897,
+                  "z": -34.4735843115082
+                },
+                {
+                  "t": 290.5,
+                  "x": -416.3385247543526,
+                  "y": 211.29510283514793,
+                  "z": -34.242853647040555
+                },
+                {
+                  "t": 306.89999997615814,
+                  "x": -420.44506770036503,
+                  "y": 213.54169423655603,
+                  "z": -34.06574928359875
+                },
+                {
+                  "t": 323.7999999523163,
+                  "x": -423.917927779687,
+                  "y": 215.2780032935245,
+                  "z": -33.92115480514042
+                },
+                {
+                  "t": 339.5999999046362,
+                  "x": -426.5595709967579,
+                  "y": 216.36287303565285,
+                  "z": -33.816789963317454
+                },
+                {
+                  "t": 355.50000000000364,
+                  "x": -428.7049425292056,
+                  "y": 216.9534119717863,
+                  "z": -33.73798121343993
+                },
+                {
+                  "t": 372.3999999761618,
+                  "x": -430.4991194895607,
+                  "y": 217.08218525820683,
+                  "z": -33.678816232775944
+                },
+                {
+                  "t": 388.1999999284744,
+                  "x": -431.79342352128276,
+                  "y": 216.803123999568,
+                  "z": -33.64248660433982
+                },
+                {
+                  "t": 404.59999990463257,
+                  "x": -432.81771529161614,
+                  "y": 216.18420618163069,
+                  "z": -33.62010810472497
+                },
+                {
+                  "t": 421.09999990463257,
+                  "x": -433.59634769057993,
+                  "y": 215.30986201332695,
+                  "z": -33.60919959693479
+                },
+                {
+                  "t": 449,
+                  "x": -434.56858279293914,
+                  "y": 213.5093875885612,
+                  "z": -33.60540787193836
+                },
+                {
+                  "t": 450,
+                  "x": -435.0791629893503,
+                  "y": 212.3748346050216,
+                  "z": -33.60540771484375
+                }
+              ],
+              "curvature": 0.06254
+            },
+            "explorer": {
+              "actor": "explorer",
+              "fromNode": 62,
+              "toNode": 5,
+              "from": {
+                "x": -403.5325244017823,
+                "y": -269.21894189291436,
+                "z": -42.28419126063144
+              },
+              "to": {
+                "x": 162.15477131816326,
+                "y": -237.35803664961355,
+                "z": -4.218759536743164
+              },
+              "durationMs": 456.8999999761613,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": -403.5325244017823,
+                  "y": -269.21894189291436,
+                  "z": -42.28419126063144
+                },
+                {
+                  "t": 16.5,
+                  "x": -403.42449675304243,
+                  "y": -269.1502064253113,
+                  "z": -42.27668532142781
+                },
+                {
+                  "t": 33.60000002384186,
+                  "x": -402.620257988891,
+                  "y": -268.6392901413108,
+                  "z": -42.22080851577239
+                },
+                {
+                  "t": 50.10000002384231,
+                  "x": -400.507899331906,
+                  "y": -267.3040848223009,
+                  "z": -42.07407174645527
+                },
+                {
+                  "t": 82.19999992847443,
+                  "x": -390.1653242486415,
+                  "y": -260.907170941773,
+                  "z": -41.356147059823066
+                },
+                {
+                  "t": 99.29999995231674,
+                  "x": -379.952973094864,
+                  "y": -254.81921595661402,
+                  "z": -40.64812475128652
+                },
+                {
+                  "t": 115.50000000000045,
+                  "x": -366.3976614004623,
+                  "y": -247.0875613763529,
+                  "z": -39.709654113786684
+                },
+                {
+                  "t": 131.7999999523172,
+                  "x": -348.2935390432992,
+                  "y": -237.37947377226308,
+                  "z": -38.45859230627034
+                },
+                {
+                  "t": 148.0000000000009,
+                  "x": -325.21237558699744,
+                  "y": -226.0210865223903,
+                  "z": -36.86744669924655
+                },
+                {
+                  "t": 166.0000000000009,
+                  "x": -292.8101662284621,
+                  "y": -211.98557625144386,
+                  "z": -34.64095166346894
+                },
+                {
+                  "t": 187.00000000000136,
+                  "x": -244.80720689224609,
+                  "y": -195.2436477745968,
+                  "z": -31.357767762133737
+                },
+                {
+                  "t": 200.60000002384368,
+                  "x": -207.17112289667463,
+                  "y": -185.4548010152171,
+                  "z": -28.79623975050006
+                },
+                {
+                  "t": 215.7999999523181,
+                  "x": -158.38375352517747,
+                  "y": -177.0650785488054,
+                  "z": -25.49199387679663
+                },
+                {
+                  "t": 231.2999999523181,
+                  "x": -102.01982467313937,
+                  "y": -173.31946586806347,
+                  "z": -21.697074419244775
+                },
+                {
+                  "t": 303.60000002384413,
+                  "x": 82.12057962936676,
+                  "y": -204.12365050759746,
+                  "z": -9.461718273330895
+                },
+                {
+                  "t": 319.299999952319,
+                  "x": 105.13721698893711,
+                  "y": -212.47672516287437,
+                  "z": -7.949370592884636
+                },
+                {
+                  "t": 336.19999992847715,
+                  "x": 124.47987348831845,
+                  "y": -220.251545361383,
+                  "z": -6.681280842812114
+                },
+                {
+                  "t": 350.39999997616087,
+                  "x": 136.8800195228867,
+                  "y": -225.59645841483652,
+                  "z": -5.869699290915685
+                },
+                {
+                  "t": 366.79999995231947,
+                  "x": 147.41402959008693,
+                  "y": -230.3573683709145,
+                  "z": -5.1810876854843
+                },
+                {
+                  "t": 381.79999995231856,
+                  "x": 154.03295100782944,
+                  "y": -233.45207036143802,
+                  "z": -4.748796716676351
+                },
+                {
+                  "t": 397.10000002384504,
+                  "x": 158.36366545738315,
+                  "y": -235.5199355507651,
+                  "z": -4.466114270034552
+                },
+                {
+                  "t": 412.5000000000032,
+                  "x": 160.80410441658321,
+                  "y": -236.70018784865638,
+                  "z": -4.306873962029919
+                },
+                {
+                  "t": 440.8999999761613,
+                  "x": 162.13546902376794,
+                  "y": -237.3486121204951,
+                  "z": -4.220018686512163
+                },
+                {
+                  "t": 450,
+                  "x": 162.15477131816326,
+                  "y": -237.35803664961355,
+                  "z": -4.218759536743164
+                }
+              ],
+              "curvature": 0.13907
+            },
+            "checker": {
+              "actor": "checker",
+              "fromNode": 5,
+              "toNode": 71,
+              "from": {
+                "x": 107.0668541283156,
+                "y": -211.88384130440033,
+                "z": -4.218759536743164
+              },
+              "to": {
+                "x": -452.53858986699987,
+                "y": -89.19885551958477,
+                "z": -17.362289428710938
+              },
+              "durationMs": 462.60000002384186,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": 107.0668541283156,
+                  "y": -211.88384130440033,
+                  "z": -4.218759536743164
+                },
+                {
+                  "t": 18.90000009536743,
+                  "x": 106.8803869515575,
+                  "y": -211.93517440514069,
+                  "z": -4.222654648172671
+                },
+                {
+                  "t": 35.40000009536743,
+                  "x": 105.84137666782063,
+                  "y": -212.22136431397445,
+                  "z": -4.244353895712044
+                },
+                {
+                  "t": 54,
+                  "x": 102.71788227629222,
+                  "y": -213.0761675600386,
+                  "z": -4.3096076153564455
+                },
+                {
+                  "t": 82.60000002384186,
+                  "x": 91.52713128829849,
+                  "y": -216.0416288608578,
+                  "z": -4.543902687223788
+                },
+                {
+                  "t": 98.80000007152557,
+                  "x": 80.52261325535277,
+                  "y": -218.79437582233172,
+                  "z": -4.775182829419411
+                },
+                {
+                  "t": 115.10000002384186,
+                  "x": 65.21178083362055,
+                  "y": -222.34054577518717,
+                  "z": -5.098511892301746
+                },
+                {
+                  "t": 130.80000007152557,
+                  "x": 45.85902511337879,
+                  "y": -226.33327022815354,
+                  "z": -5.509853052150403
+                },
+                {
+                  "t": 147,
+                  "x": 20.594918506052515,
+                  "y": -230.69329438062945,
+                  "z": -6.051438823569969
+                },
+                {
+                  "t": 162.70000004768372,
+                  "x": -9.499742082052403,
+                  "y": -234.5786442805682,
+                  "z": -6.70359208059245
+                },
+                {
+                  "t": 178.40000009536743,
+                  "x": -45.52113224627395,
+                  "y": -237.27697485955144,
+                  "z": -7.494571902643273
+                },
+                {
+                  "t": 194.10000002384004,
+                  "x": -87.78902097361538,
+                  "y": -237.59426924405554,
+                  "z": -8.437774576213883
+                },
+                {
+                  "t": 209.99999999999818,
+                  "x": -137.191495761233,
+                  "y": -233.83589670401554,
+                  "z": -9.561847836529628
+                },
+                {
+                  "t": 225.7000000476819,
+                  "x": -192.58366298101942,
+                  "y": -223.96369344980457,
+                  "z": -10.851670333018358
+                },
+                {
+                  "t": 241.60000002384004,
+                  "x": -246.56464083773005,
+                  "y": -208.19656787513674,
+                  "z": -12.140400729439946
+                },
+                {
+                  "t": 257.4999999999982,
+                  "x": -291.8406194085161,
+                  "y": -190.00017210307152,
+                  "z": -13.246750929280285
+                },
+                {
+                  "t": 273.80000007152375,
+                  "x": -330.3245297786707,
+                  "y": -170.76666446048807,
+                  "z": -14.206179082772312
+                },
+                {
+                  "t": 289.80000007152375,
+                  "x": -361.2527320215911,
+                  "y": -152.70359284511972,
+                  "z": -14.990249464038918
+                },
+                {
+                  "t": 307.7000000476819,
+                  "x": -388.8557175346625,
+                  "y": -134.59039103019853,
+                  "z": -15.69983722876053
+                },
+                {
+                  "t": 325.3000000715256,
+                  "x": -409.7738678754435,
+                  "y": -119.64052571873168,
+                  "z": -16.243537423156088
+                },
+                {
+                  "t": 343.60000002384004,
+                  "x": -425.95720478928575,
+                  "y": -107.42699756993758,
+                  "z": -16.66733016118189
+                },
+                {
+                  "t": 363.10000002384186,
+                  "x": -437.98850357723876,
+                  "y": -98.10794562801868,
+                  "z": -16.98367793305135
+                },
+                {
+                  "t": 382.3000000715256,
+                  "x": -445.57957177742253,
+                  "y": -92.2956166611767,
+                  "z": -17.18326987427911
+                },
+                {
+                  "t": 398,
+                  "x": -449.32064688173665,
+                  "y": -89.61838677361845,
+                  "z": -17.281166336209438
+                },
+                {
+                  "t": 415.8000000715256,
+                  "x": -451.566116517504,
+                  "y": -88.31670033305588,
+                  "z": -17.33921065214431
+                },
+                {
+                  "t": 433.10000002384186,
+                  "x": -452.38170815688363,
+                  "y": -88.25032540811806,
+                  "z": -17.359504625062943
+                },
+                {
+                  "t": 450,
+                  "x": -452.53858986699987,
+                  "y": -89.19885551958477,
+                  "z": -17.362289428710938
+                }
+              ],
+              "curvature": 0.13261
+            },
+            "indexer": {
+              "actor": "indexer",
+              "fromNode": 5,
+              "toNode": 58,
+              "from": {
+                "x": 171.36573869999356,
+                "y": -291.06004132556006,
+                "z": -4.218759536743164
+              },
+              "to": {
+                "x": -310.83894216073963,
+                "y": 170.61812730565555,
+                "z": -33.60540771484375
+              },
+              "durationMs": 458.8999999761563,
+              "done": true,
+              "samples": [
+                {
+                  "t": 0,
+                  "x": 171.36573869999356,
+                  "y": -291.06004132556006,
+                  "z": -4.218759536743164
+                },
+                {
+                  "t": 15.399999976158142,
+                  "x": 171.2470442041216,
+                  "y": -291.035174476176,
+                  "z": -4.223470770618524
+                },
+                {
+                  "t": 31.200000047683716,
+                  "x": 170.37962591261032,
+                  "y": -290.85113493272627,
+                  "z": -4.257936997801265
+                },
+                {
+                  "t": 49.299999952316284,
+                  "x": 167.48254532222552,
+                  "y": -290.22244406258176,
+                  "z": -4.373325284809273
+                },
+                {
+                  "t": 75.5,
+                  "x": 157.49191204571403,
+                  "y": -287.9401496915562,
+                  "z": -4.773913389864918
+                },
+                {
+                  "t": 94.20000004768372,
+                  "x": 144.59191487647962,
+                  "y": -284.7639100714461,
+                  "z": -5.297023802230268
+                },
+                {
+                  "t": 111.89999997615814,
+                  "x": 126.8799056158777,
+                  "y": -279.99639871873285,
+                  "z": -6.026194848702374
+                },
+                {
+                  "t": 130.39999997615814,
+                  "x": 101.85433514029555,
+                  "y": -272.44506891441426,
+                  "z": -7.079017988065617
+                },
+                {
+                  "t": 147.39999997615814,
+                  "x": 72.5059226942218,
+                  "y": -262.3093905605764,
+                  "z": -8.349852364581619
+                },
+                {
+                  "t": 165.10000002384186,
+                  "x": 35.27856697873064,
+                  "y": -247.28857361990978,
+                  "z": -10.023913246334752
+                },
+                {
+                  "t": 182.79999995231628,
+                  "x": -8.589102622781677,
+                  "y": -226.08250792594805,
+                  "z": -12.098303398989035
+                },
+                {
+                  "t": 213.10000002384186,
+                  "x": -96.97491554676827,
+                  "y": -168.9145647352887,
+                  "z": -16.701871127714902
+                },
+                {
+                  "t": 231.10000002384186,
+                  "x": -153.85865287736746,
+                  "y": -118.2606402533118,
+                  "z": -20.075034126199668
+                },
+                {
+                  "t": 250.2999999523181,
+                  "x": -202.3817250151052,
+                  "y": -62.183805586548615,
+                  "z": -23.332185115399188
+                },
+                {
+                  "t": 268.60000002384186,
+                  "x": -236.19887705321543,
+                  "y": -12.793148254033483,
+                  "z": -25.905520717642634
+                },
+                {
+                  "t": 288.2000000476837,
+                  "x": -262.27688332243366,
+                  "y": 33.88028405309346,
+                  "z": -28.141440875018574
+                },
+                {
+                  "t": 305.10000002384004,
+                  "x": -278.3947719249775,
+                  "y": 68.15761615755335,
+                  "z": -29.680968020929527
+                },
+                {
+                  "t": 322.3999999761563,
+                  "x": -290.2797111625346,
+                  "y": 97.26544574323368,
+                  "z": -30.925471071479414
+                },
+                {
+                  "t": 340.9999999999982,
+                  "x": -299.1125599382072,
+                  "y": 121.95759065185732,
+                  "z": -31.934886492196206
+                },
+                {
+                  "t": 358.79999995231447,
+                  "x": -304.690950251158,
+                  "y": 139.6453065363299,
+                  "z": -32.626916300781104
+                },
+                {
+                  "t": 376.7000000476837,
+                  "x": -308.19374654896126,
+                  "y": 152.2755858148653,
+                  "z": -33.097383484421115
+                },
+                {
+                  "t": 393.8999999761563,
+                  "x": -310.0923718592162,
+                  "y": 160.34497686441966,
+                  "z": -33.377656297751955
+                },
+                {
+                  "t": 409.60000002384004,
+                  "x": -310.9217096530828,
+                  "y": 164.97509110903792,
+                  "z": -33.52034943450969
+                },
+                {
+                  "t": 425.79999995231265,
+                  "x": -311.16678441840054,
+                  "y": 167.7838411885901,
+                  "z": -33.58712592955425
+                },
+                {
+                  "t": 442.4999999999982,
+                  "x": -311.0520312564042,
+                  "y": 169.42223707791914,
+                  "z": -33.60486351765526
+                },
+                {
+                  "t": 450,
+                  "x": -310.83894216073963,
+                  "y": 170.61812730565555,
+                  "z": -33.60540771484375
+                }
+              ],
+              "curvature": 0.14994
+            }
+          },
+          "camera": {
+            "position": {
+              "x": -71.4604805100243,
+              "y": -83.32068033491134,
+              "z": -1137.7787357769766
+            },
+            "at": 1788115023072
+          },
+          "renderOrders": {
+            "trail": -2,
+            "others": 0,
+            "objects": 17,
+            "trails": 5,
+            "dash": [
+              8,
+              10
+            ]
+          },
+          "waves": [
+            {
+              "actor": "implementer",
+              "key": "implementer:a1f2c3d4:20",
+              "nodeId": 51,
+              "events": 5,
+              "from": 1788114998692,
+              "to": 1788115000492
+            },
+            {
+              "actor": "reviewer",
+              "key": "reviewer:d5b1e807:8",
+              "nodeId": 58,
+              "events": 1,
+              "from": 1788114995492,
+              "to": 1788114995492
+            }
+          ],
+          "ticker": [
+            {
+              "ts": 1788115003479,
+              "actor": "you",
+              "kind": "read",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "you reading createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115000492,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115000042,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788114999592,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788114999142,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788114998692,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            }
+          ],
+          "actors": [
+            {
+              "id": "you",
+              "name": "you",
+              "you": true,
+              "color": "#F2F5FF",
+              "letter": "Y",
+              "kind": "read",
+              "kindLetter": "R",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 51,
+              "qualifiedName": "codeatlasweb-w11b.src.services.userService.createUser",
+              "placeName": "createUser",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 1,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/services/userService.ts"
+              ],
+              "lastTool": "Open",
+              "lastPath": "src/services/userService.ts",
+              "lastLines": [
+                23,
+                36
+              ],
+              "angle": 261.3245714310292,
+              "idle": false,
+              "sinceMs": 19425,
+              "recentEvents": 1,
+              "pulseMs": 2600,
+              "pulseAmplitude": 0.14,
+              "trail": [
+                51
+              ],
+              "drawn": true
+            },
+            {
+              "id": "implementer",
+              "name": "implementer",
+              "you": false,
+              "color": "hsl(181 92% 72%)",
+              "letter": "I",
+              "kind": "write",
+              "kindLetter": "W",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 51,
+              "qualifiedName": "codeatlasweb-w11b.src.services.userService.createUser",
+              "placeName": "createUser",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 24,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                2,
+                2,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/services/userService.ts",
+                "src/repo/db.ts",
+                "src/util/validate.ts",
+                "src/config.ts",
+                "src/routes/orders.ts",
+                "src/routes/users.ts"
+              ],
+              "lastTool": "Edit",
+              "lastPath": "src/services/userService.ts",
+              "lastLines": [
+                23,
+                36
+              ],
+              "angle": 290.7200000066173,
+              "idle": false,
+              "sinceMs": 22412,
+              "recentEvents": 11,
+              "pulseMs": 873,
+              "pulseAmplitude": 0.5127,
+              "trail": [
+                51,
+                59,
+                69,
+                50,
+                49,
+                58,
+                57,
+                35,
+                62,
+                64
+              ],
+              "drawn": true
+            },
+            {
+              "id": "tracer",
+              "name": "tracer",
+              "you": false,
+              "color": "hsl(272 92% 72%)",
+              "letter": "T",
+              "kind": "read",
+              "kindLetter": "R",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 58,
+              "qualifiedName": "codeatlasweb-w11b.src.repo.db.hotspotScan",
+              "placeName": "hotspotScan",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 10,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/repo/db.ts",
+                "src/config.ts",
+                "src/server.ts",
+                "src/services/orderService.ts",
+                "src/types.ts"
+              ],
+              "lastTool": "Read",
+              "lastPath": "src/repo/db.ts",
+              "lastLines": [
+                39,
+                54
+              ],
+              "angle": 5.324571431029199,
+              "idle": false,
+              "sinceMs": 26212,
+              "recentEvents": 3,
+              "pulseMs": 2255,
+              "pulseAmplitude": 0.2145,
+              "trail": [
+                58,
+                54,
+                57,
+                35,
+                56,
+                40,
+                59,
+                44,
+                46,
+                32
+              ],
+              "drawn": true
+            },
+            {
+              "id": "indexer",
+              "name": "indexer",
+              "you": false,
+              "color": "hsl(276 92% 72%)",
+              "letter": "N",
+              "kind": "search",
+              "kindLetter": "S",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 58,
+              "qualifiedName": "codeatlasweb-w11b.src.repo.db.hotspotScan",
+              "placeName": "hotspotScan",
+              "why": "",
+              "ghosts": [
+                58
+              ],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 9,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/repo/db.ts",
+                "src",
+                "src/util/validate.ts"
+              ],
+              "lastTool": "Glob",
+              "lastPath": "src/repo/db.ts",
+              "lastLines": [
+                39,
+                54
+              ],
+              "angle": 44.874285718382,
+              "idle": false,
+              "sinceMs": 26812,
+              "recentEvents": 4,
+              "pulseMs": 2082,
+              "pulseAmplitude": 0.2518,
+              "trail": [
+                58,
+                5,
+                67
+              ],
+              "drawn": true
+            },
+            {
+              "id": "reviewer",
+              "name": "reviewer",
+              "you": false,
+              "color": "hsl(182 92% 72%)",
+              "letter": "R",
+              "kind": "write",
+              "kindLetter": "W",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 58,
+              "qualifiedName": "codeatlasweb-w11b.src.repo.db.hotspotScan",
+              "placeName": "hotspotScan",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 8,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/repo/db.ts",
+                "src/services/orderService.ts",
+                "src/util/validate.ts",
+                "src/config.ts"
+              ],
+              "lastTool": "Edit",
+              "lastPath": "src/repo/db.ts",
+              "lastLines": [
+                39,
+                54
+              ],
+              "angle": 211.7338461472582,
+              "idle": false,
+              "sinceMs": 27412,
+              "recentEvents": 2,
+              "pulseMs": 2427,
+              "pulseAmplitude": 0.1773,
+              "trail": [
+                58,
+                59,
+                47,
+                70,
+                36,
+                57,
+                56
+              ],
+              "drawn": true
+            },
+            {
+              "id": "packer",
+              "name": "packer",
+              "you": false,
+              "color": "hsl(171 92% 72%)",
+              "letter": "P",
+              "kind": "read",
+              "kindLetter": "R",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 36,
+              "qualifiedName": "codeatlasweb-w11b.src.config.isProduction",
+              "placeName": "isProduction",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 6,
+              "missed": 0,
+              "strip": [
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/config.ts",
+                "src/services/userService.ts",
+                "src/types.ts",
+                "src/routes/users.ts",
+                "src/server.ts"
+              ],
+              "lastTool": "Read",
+              "lastPath": "src/config.ts",
+              "lastLines": [
+                20,
+                22
+              ],
+              "angle": 224.3245714310292,
+              "idle": false,
+              "sinceMs": 29412,
+              "recentEvents": 1,
+              "pulseMs": 2600,
+              "pulseAmplitude": 0.14,
+              "trail": [
+                36,
+                52,
+                28,
+                64,
+                43,
+                35
+              ],
+              "drawn": true
+            },
+            {
+              "id": "checker",
+              "name": "checker",
+              "you": false,
+              "color": "hsl(288 92% 72%)",
+              "letter": "C",
+              "kind": "test",
+              "kindLetter": "T",
+              "placement": "file",
+              "uncertain": false,
+              "nodeId": 71,
+              "qualifiedName": "codeatlasweb-w11b.test.userService.test",
+              "placeName": "test/userService.test.ts",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": 71,
+              "intent": "",
+              "count": 10,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src",
+                "src/types.ts",
+                "src/config.ts",
+                "src/repo/db.ts"
+              ],
+              "lastTool": "Bash",
+              "lastPath": "",
+              "lastLines": [],
+              "angle": 255.89750000537606,
+              "idle": false,
+              "sinceMs": 32412,
+              "recentEvents": 4,
+              "pulseMs": 2082,
+              "pulseAmplitude": 0.2518,
+              "trail": [
+                71,
+                5,
+                29,
+                27,
+                34,
+                54
+              ],
+              "drawn": true
+            },
+            {
+              "id": "explorer",
+              "name": "explorer",
+              "you": false,
+              "color": "hsl(198 92% 72%)",
+              "letter": "E",
+              "kind": "search",
+              "kindLetter": "S",
+              "placement": "file",
+              "uncertain": true,
+              "nodeId": 5,
+              "qualifiedName": "codeatlasweb-w11b.src",
+              "placeName": "src",
+              "why": "",
+              "ghosts": [
+                29,
+                46,
+                13,
+                8,
+                62,
+                61
+              ],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 4,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src",
+                "src/routes/orders.ts"
+              ],
+              "lastTool": "Grep",
+              "lastPath": "src",
+              "lastLines": [],
+              "angle": 1.9885714326588868,
+              "idle": true,
+              "sinceMs": 97412,
+              "recentEvents": 0,
+              "pulseMs": 0,
+              "pulseAmplitude": 0,
+              "trail": [
+                5,
+                62
+              ],
+              "drawn": true
+            },
+            {
+              "id": "planner",
+              "name": "planner",
+              "you": false,
+              "color": "hsl(335 92% 72%)",
+              "letter": "L",
+              "kind": "read",
+              "kindLetter": "R",
+              "placement": "range",
+              "uncertain": false,
+              "nodeId": 43,
+              "qualifiedName": "codeatlasweb-w11b.src.server.createApp",
+              "placeName": "createApp",
+              "why": "",
+              "ghosts": [],
+              "testedNodeId": -1,
+              "intent": "",
+              "count": 2,
+              "missed": 0,
+              "strip": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "paths": [
+                "src/server.ts",
+                "package.json"
+              ],
+              "lastTool": "Read",
+              "lastPath": "src/server.ts",
+              "lastLines": [
+                32,
+                37
+              ],
+              "angle": 306.1908571440836,
+              "idle": true,
+              "sinceMs": 107412,
+              "recentEvents": 0,
+              "pulseMs": 0,
+              "pulseAmplitude": 0,
+              "trail": [
+                43
+              ],
+              "drawn": false
+            }
+          ],
+          "unmapped": [
+            {
+              "ts": 1788114857892,
+              "agent": "planner",
+              "tool": "Read",
+              "path": "package.json",
+              "detail": "read the scripts of the fixture repository",
+              "why": "the index has no node for this path"
+            }
+          ],
+          "angles": {
+            "you": 297.0057142857206,
+            "reviewer": 307.7984615417795,
+            "implementer": 26.784615384632616,
+            "explorer": 1.9885714326588868,
+            "packer": 260.0057142857206,
+            "indexer": 104.34285714286762,
+            "tracer": 41.005714285720614,
+            "checker": 333.96125000269603,
+            "planner": 306.1908571440836
+          }
+        },
+        "trails": {
+          "lengths": {
+            "you": 1,
+            "implementer": 10,
+            "tracer": 10,
+            "indexer": 3,
+            "reviewer": 7,
+            "packer": 6,
+            "checker": 6,
+            "explorer": 2,
+            "planner": 1
+          },
+          "renderOrders": {
+            "trail": -2,
+            "others": 0,
+            "objects": 17,
+            "trails": 5,
+            "dash": [
+              8,
+              10
+            ]
+          }
+        },
+        "legend": {
+          "present": true,
+          "text": "agent trail (dashed)a dashed line behind a live agent is the path it walked: the last symbols one actor touched, newest first, drawn UNDER the real edges. It is not a relation in the code. The solid coloured lines above come from the index and stay; this one comes from events and fades with the window picked at the timeline."
+        },
+        "windows": {
+          "offered": [
+            0,
+            60000,
+            300000,
+            900000
+          ],
+          "measured": [
+            {
+              "option": 900000,
+              "trailWindowMs": 900000,
+              "trails": {
+                "you": 1,
+                "implementer": 10,
+                "tracer": 10,
+                "indexer": 3,
+                "reviewer": 7,
+                "packer": 6,
+                "checker": 6,
+                "explorer": 2,
+                "planner": 1
+              }
+            },
+            {
+              "option": 0,
+              "trailWindowMs": 0,
+              "trails": {
+                "you": 1,
+                "implementer": 10,
+                "tracer": 10,
+                "indexer": 3,
+                "reviewer": 7,
+                "packer": 6,
+                "checker": 6,
+                "explorer": 2,
+                "planner": 1
+              }
+            },
+            {
+              "option": 60000,
+              "trailWindowMs": 60000,
+              "trails": {
+                "you": 1,
+                "implementer": 6,
+                "tracer": 3,
+                "indexer": 3,
+                "reviewer": 2,
+                "packer": 1,
+                "checker": 3,
+                "explorer": 0,
+                "planner": 0
+              }
+            },
+            {
+              "option": 300000,
+              "trailWindowMs": 300000,
+              "trails": {
+                "you": 1,
+                "implementer": 10,
+                "tracer": 10,
+                "indexer": 3,
+                "reviewer": 7,
+                "packer": 6,
+                "checker": 6,
+                "explorer": 2,
+                "planner": 1
+              }
+            }
+          ]
+        },
+        "trailsOff": {
+          "trail": -2,
+          "others": 0,
+          "objects": 12,
+          "trails": 0,
+          "dash": [
+            0,
+            0
+          ]
+        },
+        "radii": {
+          "measured": {
+            "implementer": 15,
+            "you": 49,
+            "reviewer": 15,
+            "indexer": 49,
+            "tracer": 83,
+            "packer": 34,
+            "checker": 18,
+            "explorer": 34
+          },
+          "expected": {
+            "implementer": 15,
+            "you": 49,
+            "reviewer": 15,
+            "indexer": 49,
+            "tracer": 83,
+            "packer": 34,
+            "checker": 18,
+            "explorer": 34
+          },
+          "shared": [
+            [
+              {
+                "id": "you",
+                "kind": "read",
+                "nodeId": 51,
+                "radius": 49
+              },
+              {
+                "id": "implementer",
+                "kind": "write",
+                "nodeId": 51,
+                "radius": 15
+              }
+            ],
+            [
+              {
+                "id": "tracer",
+                "kind": "read",
+                "nodeId": 58,
+                "radius": 83
+              },
+              {
+                "id": "indexer",
+                "kind": "search",
+                "nodeId": 58,
+                "radius": 49
+              },
+              {
+                "id": "reviewer",
+                "kind": "write",
+                "nodeId": 58,
+                "radius": 15
+              }
+            ]
+          ],
+          "rule": "Radius der Art, dann Kennung, dann Mindestabstand 34 Welteinheiten. Unabhaengig aus derselben Regel nachgerechnet, nicht aus der Ansicht gelesen."
+        },
+        "cap": {
+          "actors": 9,
+          "drawn": 8,
+          "capped": 1,
+          "line": {
+            "present": true,
+            "text": "8 of 9 bodies drawn: the layer stops at 8",
+            "capped": 1,
+            "cap": 8,
+            "drawn": 8
+          }
+        },
+        "pulse": {
+          "frames": 10,
+          "perActor": {
+            "you": {
+              "events": 1,
+              "pulseMs": 2600,
+              "amplitude": 0.14,
+              "idle": false,
+              "sizes": [
+                10.143,
+                10.488,
+                11.044,
+                11.378,
+                11.296,
+                10.84,
+                10.286,
+                10.017,
+                10.1,
+                10.525
+              ],
+              "size": {
+                "min": 10.017,
+                "max": 11.378,
+                "ratio": 1.1359,
+                "relative": 0.11962
+              },
+              "scale": {
+                "min": 1.0016,
+                "max": 1.1306,
+                "ratio": 1.1288,
+                "relative": 0.11413
+              }
+            },
+            "implementer": {
+              "events": 9,
+              "pulseMs": 1218,
+              "amplitude": 0.4382,
+              "idle": false,
+              "sizes": [
+                10.282,
+                8.389,
+                9.13,
+                11.027,
+                10.478,
+                8.337,
+                8.703,
+                10.674,
+                10.929,
+                8.916
+              ],
+              "size": {
+                "min": 8.337,
+                "max": 11.027,
+                "ratio": 1.3227,
+                "relative": 0.24395
+              },
+              "scale": {
+                "min": 1.0184,
+                "max": 1.4258,
+                "ratio": 1.4001,
+                "relative": 0.28577
+              }
+            },
+            "explorer": {
+              "events": 0,
+              "pulseMs": 0,
+              "amplitude": 0,
+              "idle": true,
+              "sizes": [
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10,
+                10
+              ],
+              "size": {
+                "min": 10,
+                "max": 10,
+                "ratio": 1,
+                "relative": 0
+              },
+              "scale": {
+                "min": 1,
+                "max": 1,
+                "ratio": 1,
+                "relative": 0
+              }
+            },
+            "packer": {
+              "events": 1,
+              "pulseMs": 2600,
+              "amplitude": 0.14,
+              "idle": false,
+              "sizes": [
+                10.143,
+                10.489,
+                11.044,
+                11.378,
+                11.296,
+                10.84,
+                10.286,
+                10.017,
+                10.1,
+                10.525
+              ],
+              "size": {
+                "min": 10.017,
+                "max": 11.378,
+                "ratio": 1.1359,
+                "relative": 0.11962
+              },
+              "scale": {
+                "min": 1.0016,
+                "max": 1.1306,
+                "ratio": 1.1288,
+                "relative": 0.11413
+              }
+            },
+            "indexer": {
+              "events": 3,
+              "pulseMs": 2255,
+              "amplitude": 0.2145,
+              "idle": false,
+              "sizes": [
+                10.741,
+                10.177,
+                10.1,
+                10.838,
+                11.735,
+                12.132,
+                11.217,
+                10.508,
+                10.055,
+                10.113
+              ],
+              "size": {
+                "min": 10.055,
+                "max": 12.132,
+                "ratio": 1.2066,
+                "relative": 0.1712
+              },
+              "scale": {
+                "min": 1.0023,
+                "max": 1.1885,
+                "ratio": 1.1858,
+                "relative": 0.15671
+              }
+            },
+            "tracer": {
+              "events": 2,
+              "pulseMs": 2427,
+              "amplitude": 0.1773,
+              "idle": false,
+              "sizes": [
+                10.199,
+                10.02,
+                10.323,
+                11.039,
+                11.63,
+                11.713,
+                11.178,
+                10.508,
+                10.055,
+                10.112
+              ],
+              "size": {
+                "min": 10.02,
+                "max": 11.713,
+                "ratio": 1.169,
+                "relative": 0.14454
+              },
+              "scale": {
+                "min": 1.0023,
+                "max": 1.1415,
+                "ratio": 1.1389,
+                "relative": 0.12195
+              }
+            },
+            "checker": {
+              "events": 3,
+              "pulseMs": 2255,
+              "amplitude": 0.2145,
+              "idle": false,
+              "sizes": [
+                10.741,
+                10.177,
+                10.1,
+                10.838,
+                11.735,
+                12.132,
+                11.612,
+                10.749,
+                10.101,
+                10.132
+              ],
+              "size": {
+                "min": 10.1,
+                "max": 12.132,
+                "ratio": 1.2012,
+                "relative": 0.16749
+              },
+              "scale": {
+                "min": 1.002,
+                "max": 1.1885,
+                "ratio": 1.1862,
+                "relative": 0.15697
+              }
+            },
+            "reviewer": {
+              "events": 2,
+              "pulseMs": 2427,
+              "amplitude": 0.1773,
+              "idle": false,
+              "sizes": [
+                8.159,
+                8.016,
+                8.258,
+                8.831,
+                9.304,
+                9.371,
+                8.942,
+                8.406,
+                8.044,
+                8.09
+              ],
+              "size": {
+                "min": 8.016,
+                "max": 9.371,
+                "ratio": 1.169,
+                "relative": 0.1446
+              },
+              "scale": {
+                "min": 1.0023,
+                "max": 1.1415,
+                "ratio": 1.1389,
+                "relative": 0.12193
+              }
+            }
+          },
+          "busiest": "implementer",
+          "quietest": "packer",
+          "idleActor": "explorer",
+          "nodeBox": {
+            "x": 292,
+            "y": 16,
+            "luminance": 188.38
+          },
+          "nodeDistance": 140,
+          "nodeLuminance": [
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758,
+            27.5758
+          ],
+          "nodeSpread": {
+            "min": 27.5758,
+            "max": 27.5758,
+            "ratio": 1,
+            "relative": 0
+          },
+          "method": "Die Groesse des Koerpers kommt aus dem DOM (getBoundingClientRect der Kern-Kugel), das Licht eines Knotens aus den Pixeln eines Kastens von 25 mal 25 Pixeln um den hellsten Punkt des ersten Bildes, der mindestens 140 Pixel von jedem Koerper entfernt liegt. Beide ueber dieselben zehn Bilder. Ein Knoten leuchtet gleichmaessig, ein Agent atmet: die eine Zahl steht still, die andere nicht."
+        },
+        "idle": {
+          "actor": "explorer",
+          "sinceMs": 104411,
+          "angles": [
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868,
+            1.9885714326588868
+          ],
+          "positions": [
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            },
+            {
+              "x": 162.15477131816326,
+              "y": -237.35803664961355,
+              "z": -4.218759536743164
+            }
+          ],
+          "animations": [],
+          "animationsInLayer": [
+            {
+              "state": "running",
+              "actor": "you",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "implementer",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "packer",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "indexer",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "tracer",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "checker",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "reviewer",
+              "className": "atlas-agent-core"
+            },
+            {
+              "state": "running",
+              "actor": "indexer",
+              "className": "atlas-agent-ghost"
+            }
+          ],
+          "busyRows": 7,
+          "row": {
+            "actor": "explorer",
+            "idle": true,
+            "drawn": true,
+            "lines": 1,
+            "name": "explorer",
+            "nameClipped": true,
+            "place": "src (no line range in the index)",
+            "placeClipped": true,
+            "opacity": 0.6,
+            "path": "src < src/routes/orders.ts",
+            "height": 27
+          },
+          "rows": [
+            "you",
+            "implementer",
+            "tracer",
+            "indexer",
+            "reviewer",
+            "packer",
+            "checker",
+            "explorer",
+            "planner"
+          ],
+          "method": "Gemessen an den Elementen des RUHIGEN Akteurs: dort laeuft keine Animation und kein Uebergang, sein Winkel und seine Position aendern sich ueber zehn Proben nicht, und seine Koerpergroesse bleibt gleich. Die Animationen der ganzen Ebene stehen daneben; sie gehoeren zu Akteuren, die arbeiten, und der Puls ist ihre Arbeit."
+        },
+        "performance": {
+          "rates": [
+            61.39,
+            56.53,
+            59.64,
+            57.77,
+            59.52,
+            59.29,
+            58.71,
+            57.2
+          ],
+          "agents": 8,
+          "actors": 9
+        }
+      },
+      "b": {
+        "timeline": {
+          "first": {
+            "present": true,
+            "mode": "live",
+            "tracks": [
+              {
+                "actor": "implementer",
+                "count": 12,
+                "ticks": 12
+              },
+              {
+                "actor": "reviewer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "checker",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "indexer",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "tracer",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "packer",
+                "count": 1,
+                "ticks": 1
+              },
+              {
+                "actor": "explorer",
+                "count": 0,
+                "ticks": 0
+              },
+              {
+                "actor": "planner",
+                "count": 0,
+                "ticks": 0
+              }
+            ],
+            "ticks": 24,
+            "windowMs": 60000,
+            "from": 1788114983754,
+            "to": 1788115043754,
+            "modeLabel": "LIVE",
+            "replayNote": "",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "paused": {
+            "present": true,
+            "mode": "paused",
+            "tracks": [
+              {
+                "actor": "implementer",
+                "count": 12,
+                "ticks": 12
+              },
+              {
+                "actor": "reviewer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "checker",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "indexer",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "tracer",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "packer",
+                "count": 1,
+                "ticks": 1
+              },
+              {
+                "actor": "explorer",
+                "count": 0,
+                "ticks": 0
+              },
+              {
+                "actor": "planner",
+                "count": 0,
+                "ticks": 0
+              }
+            ],
+            "ticks": 23,
+            "windowMs": 60000,
+            "from": 1788114984816,
+            "to": 1788115044816,
+            "modeLabel": "PAUSED",
+            "replayNote": "",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "duringPause": {
+            "present": true,
+            "mode": "paused",
+            "tracks": [
+              {
+                "actor": "checker",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "indexer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "tracer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "implementer",
+                "count": 12,
+                "ticks": 12
+              },
+              {
+                "actor": "reviewer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "packer",
+                "count": 1,
+                "ticks": 1
+              },
+              {
+                "actor": "explorer",
+                "count": 0,
+                "ticks": 0
+              },
+              {
+                "actor": "planner",
+                "count": 0,
+                "ticks": 0
+              }
+            ],
+            "ticks": 26,
+            "windowMs": 60000,
+            "from": 1788114984816,
+            "to": 1788115044816,
+            "modeLabel": "PAUSED",
+            "replayNote": "",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "resumed": {
+            "present": true,
+            "mode": "live",
+            "tracks": [
+              {
+                "actor": "checker",
+                "count": 3,
+                "ticks": 3
+              },
+              {
+                "actor": "indexer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "tracer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "implementer",
+                "count": 11,
+                "ticks": 11
+              },
+              {
+                "actor": "reviewer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "packer",
+                "count": 0,
+                "ticks": 0
+              },
+              {
+                "actor": "explorer",
+                "count": 0,
+                "ticks": 0
+              },
+              {
+                "actor": "planner",
+                "count": 0,
+                "ticks": 0
+              }
+            ],
+            "ticks": 24,
+            "windowMs": 60000,
+            "from": 1788114987753,
+            "to": 1788115047753,
+            "modeLabel": "LIVE",
+            "replayNote": "",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "wide": {
+            "present": true,
+            "mode": "live",
+            "tracks": [
+              {
+                "actor": "checker",
+                "count": 9,
+                "ticks": 9
+              },
+              {
+                "actor": "indexer",
+                "count": 8,
+                "ticks": 8
+              },
+              {
+                "actor": "tracer",
+                "count": 9,
+                "ticks": 9
+              },
+              {
+                "actor": "implementer",
+                "count": 19,
+                "ticks": 19
+              },
+              {
+                "actor": "reviewer",
+                "count": 7,
+                "ticks": 7
+              },
+              {
+                "actor": "packer",
+                "count": 5,
+                "ticks": 5
+              },
+              {
+                "actor": "explorer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "planner",
+                "count": 2,
+                "ticks": 2
+              }
+            ],
+            "ticks": 63,
+            "windowMs": 154392,
+            "from": 1788114894361,
+            "to": 1788115048753,
+            "modeLabel": "LIVE",
+            "replayNote": "",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "keptEvents": 63,
+          "events": {
+            "before": 60,
+            "during": 63,
+            "after": 63
+          }
+        },
+        "scrub": {
+          "state": {
+            "present": true,
+            "mode": "replay",
+            "tracks": [
+              {
+                "actor": "indexer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "implementer",
+                "count": 12,
+                "ticks": 12
+              },
+              {
+                "actor": "tracer",
+                "count": 4,
+                "ticks": 4
+              },
+              {
+                "actor": "checker",
+                "count": 5,
+                "ticks": 5
+              },
+              {
+                "actor": "reviewer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "packer",
+                "count": 2,
+                "ticks": 2
+              },
+              {
+                "actor": "explorer",
+                "count": 1,
+                "ticks": 1
+              },
+              {
+                "actor": "planner",
+                "count": 1,
+                "ticks": 1
+              }
+            ],
+            "ticks": 31,
+            "windowMs": 60000,
+            "from": 1788114949753,
+            "to": 1788115009753,
+            "modeLabel": "REPLAY",
+            "replayNote": "showing the state of 40s ago, not now",
+            "rect": {
+              "x": 0,
+              "y": 891,
+              "width": 1360,
+              "height": 130
+            }
+          },
+          "panelReplay": true,
+          "eventsThen": 53,
+          "eventsNow": 63
+        },
+        "follow": {
+          "goal": {
+            "x": -374.54290771484375,
+            "y": -44.59309387207031,
+            "z": 282.63771057128906
+          },
+          "start": {
+            "at": 1788115053812,
+            "x": 188.0536859706557,
+            "y": -193.48623821780984,
+            "z": 295.1100489301301
+          },
+          "total": 582.1,
+          "overshoot": 0,
+          "overshootFraction": 0,
+          "threshold": 0.02,
+          "maxSpeedChangePerMs": 25.86242,
+          "samples": 90,
+          "movedAlongGoal": 581.97,
+          "method": "Die Kameralage wird 90 Mal im Abstand von etwa 20 ms gelesen und auf die Gerade von der Ausgangslage zum Ziel projiziert. Ueberschwingen ist der groesste Wert JENSEITS des Ziels, als Anteil der Gesamtstrecke. Die Feder ist kritisch gedaempft (Daempfungsgrad 1), kann also rechnerisch nicht ueberschwingen; gemessen wird, ob sie es auch nicht tut."
+        },
+        "followLine": {
+          "seen": {
+            "present": true,
+            "text": "checker testing test/userService.test.ts",
+            "actor": "checker",
+            "kind": "test",
+            "place": "test/userService.test.ts",
+            "lines": ""
+          },
+          "expected": "checker testing test/userService.test.ts"
+        },
+        "wave": {
+          "seam": [
+            {
+              "actor": "implementer",
+              "key": "implementer:a1f2c3d4:20",
+              "nodeId": 51,
+              "events": 5,
+              "from": 1788115037561,
+              "to": 1788115039361
+            },
+            {
+              "actor": "reviewer",
+              "key": "reviewer:d5b1e807:8",
+              "nodeId": 58,
+              "events": 1,
+              "from": 1788115034361,
+              "to": 1788115034361
+            }
+          ],
+          "drawn": [
+            {
+              "actor": "reviewer",
+              "node": 58,
+              "events": 1
+            },
+            {
+              "actor": "implementer",
+              "node": 51,
+              "events": 5
+            }
+          ],
+          "events": 73,
+          "rule": "Fuenf Schreibereignisse auf demselben Knoten, jeweils weniger als 2500 ms auseinander, sind EIN Bruch. Ein Bruch traegt eine Welle, nicht ein Ereignis eine."
+        }
+      },
+      "c": {
+        "ticker": {
+          "shown": [
+            {
+              "actor": "you",
+              "kind": "read",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "you reading createUser, lines 23 to 36"
+            },
+            {
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": "23-36",
+              "text": "implementer writing createUser, lines 23 to 36"
+            }
+          ],
+          "seam": [
+            {
+              "ts": 1788115061497,
+              "actor": "you",
+              "kind": "read",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "you reading createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115059850,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115059400,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115058950,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115058500,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            },
+            {
+              "ts": 1788115058050,
+              "actor": "implementer",
+              "kind": "write",
+              "place": "createUser",
+              "lines": [
+                23,
+                36
+              ],
+              "text": "implementer writing createUser, lines 23 to 36"
+            }
+          ],
+          "honest": true
+        },
+        "escape": {
+          "before": {
+            "at": 1788115073775,
+            "x": -71.46048051002423,
+            "y": -83.32068033490899,
+            "z": -1137.778735777083
+          },
+          "after": {
+            "at": 1788115075391,
+            "x": -71.46048051002424,
+            "y": -83.32068033490934,
+            "z": -1137.778735777067
+          },
+          "drift": 0,
+          "reach": 1143.06,
+          "driftFraction": 0,
+          "threshold": 0.01,
+          "method": "Die Kameralage wird vor und nach Escape gelesen und der Abstand an ihrer Entfernung vom Ursprung gemessen. Der Vollbildmodus aendert die Groesse der Zeichenflaeche, und auf eine neue Groesse passt dieses Panel sonst das Bild ein; genau diese eine Einpassung ist unterdrueckt, weil AC5 sie verbietet."
+        },
+        "effects": {
+          "entries": [
+            {
+              "name": "agentTails",
+              "present": true,
+              "section": "display",
+              "value": "true",
+              "detail": "the short trail right behind a body while it flies from one symbol to the next. One line of twelve points per actor, refilled in every frame of the flight. Off leaves the flight itself untouched.",
+              "hasMeasure": true
+            },
+            {
+              "name": "agentTrails",
+              "present": true,
+              "section": "display",
+              "value": "true",
+              "detail": "the dashed line through the last symbols an actor touched, drawn under the real edges. Up to ten nodes per actor and 120 segments in total; a dashed line needs its own length computation per point. It is the reading that shows whether someone follows a call path or jumps across the repository, so it is the last one to switch off.",
+              "hasMeasure": true
+            },
+            {
+              "name": "agentWaves",
+              "present": true,
+              "section": "display",
+              "value": "true",
+              "detail": "one concentric wave per burst of writes on the same symbol. One per burst, not one per event: a wave per event would be a firework and say nothing.",
+              "hasMeasure": true
+            },
+            {
+              "name": "agentTimeline",
+              "present": true,
+              "section": "display",
+              "value": "true",
+              "detail": "the strip under the graph: one track per actor, one tick per event, redrawn on every tick of the instrument clock. It only appears when the graph area is at least 600 px wide; narrower than that, one tick cannot be told from the next.",
+              "hasMeasure": true
+            }
+          ],
+          "measured": {
+            "verdict": "no-difference",
+            "text": "before 59 frames/s, after 58 frames/s. That is inside the spread this machine shows without any change at all (3.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T18:38:01.774Z"
+          }
+        },
+        "thrifty": {
+          "effects": {
+            "tails": false,
+            "trails": false,
+            "waves": false,
+            "timeline": false
+          },
+          "layerOn": false,
+          "panel": {
+            "fullscreen": true,
+            "replay": false,
+            "x": 0,
+            "y": 0,
+            "width": 1680,
+            "height": 1050,
+            "viewport": {
+              "width": 1680,
+              "height": 1050
+            }
+          },
+          "rates": [
+            12.54,
+            12.43,
+            13.73,
+            12,
+            13.08
+          ],
+          "hudSaysWhy": true
+        }
+      },
+      "d": {
+        "series": [
+          {
+            "index": 1,
+            "file": "frames/step-01.png",
+            "emitted": 5,
+            "remaining": 68,
+            "bodies": 4,
+            "positions": {
+              "tracer": [
+                4.4,
+                -603.3
+              ],
+              "reviewer": [
+                -234.7,
+                154.7
+              ],
+              "implementer": [
+                -251.8,
+                -430.5
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ]
+            }
+          },
+          {
+            "index": 2,
+            "file": "frames/step-02.png",
+            "emitted": 10,
+            "remaining": 63,
+            "bodies": 6,
+            "positions": {
+              "tracer": [
+                4.4,
+                -603.3
+              ],
+              "reviewer": [
+                -234.7,
+                154.7
+              ],
+              "implementer": [
+                -140,
+                -568.5
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -444.3,
+                -349.5
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ]
+            }
+          },
+          {
+            "index": 3,
+            "file": "frames/step-03.png",
+            "emitted": 15,
+            "remaining": 58,
+            "bodies": 7,
+            "positions": {
+              "tracer": [
+                268.1,
+                124.5
+              ],
+              "reviewer": [
+                -213.9,
+                166.3
+              ],
+              "implementer": [
+                -140,
+                -568.5
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -216.3,
+                -387.3
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                -448.8,
+                -78.6
+              ]
+            }
+          },
+          {
+            "index": 4,
+            "file": "frames/step-04.png",
+            "emitted": 20,
+            "remaining": 53,
+            "bodies": 7,
+            "positions": {
+              "tracer": [
+                -416.9,
+                -397.4
+              ],
+              "reviewer": [
+                172.5,
+                -453.4
+              ],
+              "implementer": [
+                -299.3,
+                -337.5
+              ],
+              "explorer": [
+                -406.8,
+                -241.5
+              ],
+              "packer": [
+                -216.3,
+                -387.3
+              ],
+              "indexer": [
+                101.9,
+                -216.9
+              ],
+              "checker": [
+                -448.8,
+                -78.6
+              ]
+            }
+          },
+          {
+            "index": 5,
+            "file": "frames/step-05.png",
+            "emitted": 25,
+            "remaining": 48,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -398.1,
+                326.9
+              ],
+              "reviewer": [
+                5.4,
+                -443.8
+              ],
+              "implementer": [
+                -299.3,
+                -337.5
+              ],
+              "explorer": [
+                -406.8,
+                -241.5
+              ],
+              "packer": [
+                -137.2,
+                -491.1
+              ],
+              "indexer": [
+                101.9,
+                -216.9
+              ],
+              "checker": [
+                -448.8,
+                -78.6
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 6,
+            "file": "frames/step-06.png",
+            "emitted": 30,
+            "remaining": 43,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -432.6,
+                -441.1
+              ],
+              "reviewer": [
+                332.2,
+                164.5
+              ],
+              "implementer": [
+                -123,
+                -588.4
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -137.2,
+                -491.1
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                -310.5,
+                199.1
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 7,
+            "file": "frames/step-07.png",
+            "emitted": 35,
+            "remaining": 38,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -432.6,
+                -441.1
+              ],
+              "reviewer": [
+                332.2,
+                164.5
+              ],
+              "implementer": [
+                291.4,
+                167
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -137.2,
+                -491.1
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                -448.8,
+                -78.6
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 8,
+            "file": "frames/step-08.png",
+            "emitted": 40,
+            "remaining": 33,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -432.6,
+                -441.1
+              ],
+              "reviewer": [
+                332.2,
+                164.5
+              ],
+              "implementer": [
+                -17.1,
+                -446.4
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                31.7,
+                -508.9
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 9,
+            "file": "frames/step-09.png",
+            "emitted": 45,
+            "remaining": 28,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -297.6,
+                129.6
+              ],
+              "reviewer": [
+                -328.8,
+                194.2
+              ],
+              "implementer": [
+                -183.3,
+                -397.4
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                31.7,
+                -508.9
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 10,
+            "file": "frames/step-10.png",
+            "emitted": 49,
+            "remaining": 24,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                93.1,
+                -503.1
+              ],
+              "reviewer": [
+                -328.8,
+                194.2
+              ],
+              "implementer": [
+                54.1,
+                -482
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                75.7,
+                -195.3
+              ],
+              "checker": [
+                -447.6,
+                -101.9
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 11,
+            "file": "frames/step-11.png",
+            "emitted": 53,
+            "remaining": 20,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -232,
+                205.3
+              ],
+              "reviewer": [
+                -315.4,
+                200.9
+              ],
+              "implementer": [
+                -374.1,
+                179.6
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                63.3,
+                -259.1
+              ],
+              "checker": [
+                -436.5,
+                -71.7
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 12,
+            "file": "frames/step-12.png",
+            "emitted": 57,
+            "remaining": 16,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -260.3,
+                161.3
+              ],
+              "reviewer": [
+                -328.8,
+                194.2
+              ],
+              "implementer": [
+                -306.7,
+                -335.3
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                -133.6,
+                -647.5
+              ],
+              "checker": [
+                155.7,
+                -407.7
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 13,
+            "file": "frames/step-13.png",
+            "emitted": 61,
+            "remaining": 12,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -303.1,
+                138.3
+              ],
+              "reviewer": [
+                -359.8,
+                322.8
+              ],
+              "implementer": [
+                -407.2,
+                311
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                -312.9,
+                -457.7
+              ],
+              "indexer": [
+                -84.3,
+                -625.5
+              ],
+              "checker": [
+                199.3,
+                -375.8
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 14,
+            "file": "frames/step-14.png",
+            "emitted": 65,
+            "remaining": 8,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -319,
+                200.9
+              ],
+              "reviewer": [
+                -354.4,
+                326.6
+              ],
+              "implementer": [
+                -316.7,
+                332.3
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                161.5,
+                -496.6
+              ],
+              "indexer": [
+                163.1,
+                -180.2
+              ],
+              "checker": [
+                -448.2,
+                -77.9
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 15,
+            "file": "frames/step-15.png",
+            "emitted": 69,
+            "remaining": 4,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -437,
+                150.2
+              ],
+              "reviewer": [
+                -360.3,
+                163.9
+              ],
+              "implementer": [
+                -228.1,
+                -467.2
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                159.5,
+                -439.5
+              ],
+              "indexer": [
+                -376.1,
+                132.9
+              ],
+              "checker": [
+                -418.9,
+                -80.7
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          },
+          {
+            "index": 16,
+            "file": "frames/step-16.png",
+            "emitted": 73,
+            "remaining": 0,
+            "bodies": 8,
+            "positions": {
+              "tracer": [
+                -317,
+                107.4
+              ],
+              "reviewer": [
+                -374.1,
+                180
+              ],
+              "implementer": [
+                -246.5,
+                -477.7
+              ],
+              "explorer": [
+                130.6,
+                -204.6
+              ],
+              "packer": [
+                110.3,
+                -456.8
+              ],
+              "indexer": [
+                -332.3,
+                219.9
+              ],
+              "checker": [
+                -441,
+                -106.4
+              ],
+              "planner": [
+                -395.4,
+                -396.7
+              ]
+            }
+          }
+        ],
+        "diffs": [
+          {
+            "from": 1,
+            "to": 2,
+            "changed": 17649,
+            "total": 751689,
+            "changedFraction": 0.023479
+          },
+          {
+            "from": 2,
+            "to": 3,
+            "changed": 10800,
+            "total": 751689,
+            "changedFraction": 0.014368
+          },
+          {
+            "from": 3,
+            "to": 4,
+            "changed": 2030,
+            "total": 751689,
+            "changedFraction": 0.002701
+          },
+          {
+            "from": 4,
+            "to": 5,
+            "changed": 1272,
+            "total": 751689,
+            "changedFraction": 0.001692
+          },
+          {
+            "from": 5,
+            "to": 6,
+            "changed": 2248,
+            "total": 751689,
+            "changedFraction": 0.002991
+          },
+          {
+            "from": 6,
+            "to": 7,
+            "changed": 797,
+            "total": 751689,
+            "changedFraction": 0.00106
+          },
+          {
+            "from": 7,
+            "to": 8,
+            "changed": 1197,
+            "total": 751689,
+            "changedFraction": 0.001592
+          },
+          {
+            "from": 8,
+            "to": 9,
+            "changed": 1098,
+            "total": 751689,
+            "changedFraction": 0.001461
+          },
+          {
+            "from": 9,
+            "to": 10,
+            "changed": 4093,
+            "total": 751689,
+            "changedFraction": 0.005445
+          },
+          {
+            "from": 10,
+            "to": 11,
+            "changed": 8158,
+            "total": 751689,
+            "changedFraction": 0.010853
+          },
+          {
+            "from": 11,
+            "to": 12,
+            "changed": 10735,
+            "total": 751689,
+            "changedFraction": 0.014281
+          },
+          {
+            "from": 12,
+            "to": 13,
+            "changed": 8534,
+            "total": 751689,
+            "changedFraction": 0.011353
+          },
+          {
+            "from": 13,
+            "to": 14,
+            "changed": 7868,
+            "total": 751689,
+            "changedFraction": 0.010467
+          },
+          {
+            "from": 14,
+            "to": 15,
+            "changed": 11533,
+            "total": 751689,
+            "changedFraction": 0.015343
+          },
+          {
+            "from": 15,
+            "to": 16,
+            "changed": 10853,
+            "total": 751689,
+            "changedFraction": 0.014438
+          }
+        ],
+        "clip": {
+          "x": 407,
+          "y": 118,
+          "width": 867,
+          "height": 867
+        },
+        "videoBytes": 4529307,
+        "contactSheet": {
+          "code": 0,
+          "out": ""
+        }
+      }
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "ports": {
+      "serverPort": 4520,
+      "uiPort": 4521,
+      "bridgePorts": [
+        4522,
+        4523,
+        4524,
+        4525
+      ]
+    },
+    "leftovers": [
+      {
+        "port": 4520,
+        "listeners": 0
+      },
+      {
+        "port": 4521,
+        "listeners": 0
+      },
+      {
+        "port": 4522,
+        "listeners": 0
+      },
+      {
+        "port": 4523,
+        "listeners": 0
+      },
+      {
+        "port": 4524,
+        "listeners": 0
+      },
+      {
+        "port": 4525,
+        "listeners": 0
+      }
+    ],
+    "leftoverLooks": [
+      {
+        "attempt": 1,
+        "atMs": 155352,
+        "total": 1
+      },
+      {
+        "attempt": 2,
+        "atMs": 156364,
+        "total": 0
+      }
+    ]
+  }
+}

@@ -3,6 +3,7 @@
 // Postinstall script: downloads the platform-appropriate binary from GitHub Releases.
 // Runs automatically via `postinstall` in package.json.
 
+const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -17,19 +18,14 @@ const BIN_DIR = path.join(__dirname, 'bin');
 const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
 const CANDIDATE_TIMEOUT_MS = 15_000;
-const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
-// Release archive resource limits. Keep in sync with the Go wrapper
-// (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper (_cli.py).
-const MAX_RELEASE_ARCHIVE_BYTES = 256 * 1024 * 1024;
+// Entry-count guard for the zip namespace check. Keep in sync with the Go
+// wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper.
 const MAX_ARCHIVE_MEMBERS = 64;
-const MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024;
-const MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024;
-const DEFAULT_ARCHIVE_LIMITS = Object.freeze({
-  compressedBytes: MAX_RELEASE_ARCHIVE_BYTES,
-  members: MAX_ARCHIVE_MEMBERS,
-  memberBytes: MAX_ARCHIVE_MEMBER_BYTES,
-  expandedBytes: MAX_ARCHIVE_EXPANDED_BYTES,
-});
+const DEFAULT_DOWNLOAD_BASE = `https://github.com/${REPO}/releases/download/v${VERSION}`;
+// install.sh's loopback pattern: plain HTTP only to an exact loopback
+// authority, for local smoke tests.
+const LOOPBACK_HTTP_URL = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?#].*)?$/;
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 // Bytes of tar's own diagnostics kept for the failure message.
 const MAX_TAR_STDERR_CHARS = 4096;
 const WINDOWS_BINARY_NAME = 'codebase-memory-mcp.exe';
@@ -83,6 +79,32 @@ function validateUrl(rawUrl) {
   return parsed.href;
 }
 
+// Plain HTTP is accepted only for an exact loopback authority, as in
+// install.sh; such a fetch uses no proxy and follows no redirect.
+function validateLoopbackUrl(rawUrl) {
+  let parsed = null;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_) {
+    // Refused below.
+  }
+  if (!LOOPBACK_HTTP_URL.test(rawUrl) || !parsed || parsed.protocol !== 'http:' ||
+      !LOOPBACK_HOSTNAMES.has(parsed.hostname) || parsed.username || parsed.password) {
+    throw new Error(`Refusing non-loopback HTTP URL: ${rawUrl}`);
+  }
+  return parsed.href;
+}
+
+// CBM_DOWNLOAD_URL replaces the release download base (for testing), with
+// install.sh's policy: HTTPS, or plain HTTP to an exact loopback authority.
+function resolveDownloadBase(env = process.env) {
+  const override = env.CBM_DOWNLOAD_URL;
+  if (!override) return { base: DEFAULT_DOWNLOAD_BASE, loopback: false };
+  if (override.startsWith('https://')) return { base: override, loopback: false };
+  if (LOOPBACK_HTTP_URL.test(override)) return { base: override, loopback: true };
+  throw new Error(`Refusing non-HTTPS download URL (CBM_DOWNLOAD_URL): ${override}`);
+}
+
 function validateExactTarMemberListing(listing, expectedNames) {
   if (listing.includes('\0')) {
     throw new Error('tar member listing contains a NUL byte');
@@ -104,31 +126,16 @@ function validateExactTarMemberListing(listing, expectedNames) {
   }
 }
 
-function validateArchiveLimits(limits) {
-  if (!limits || !(limits.compressedBytes > 0) || !(limits.members > 0) ||
-      !(limits.memberBytes > 0) || !(limits.expandedBytes > 0)) {
-    throw new Error('invalid archive resource safety limits');
-  }
-}
-
-function requireCompressedArchiveWithinLimit(archivePath, limits) {
-  const status = fs.statSync(archivePath);
-  if (!status.isFile()) {
+function requireRegularArchive(archivePath) {
+  if (!fs.statSync(archivePath).isFile()) {
     throw new Error('release archive is not a regular file');
   }
-  if (status.size > limits.compressedBytes) {
-    throw new Error(
-      `release archive exceeds the ${limits.compressedBytes}-byte compressed safety limit`,
-    );
-  }
 }
 
-// Streams one member through `tar -xzOf` into a file this call creates,
-// counting every byte against the per-member limit. The file is removed only
-// when this call created it: a pre-existing target fails untouched.
-function extractTarMemberWithLimit(
-  archivePath, target, memberName, limits, spawnFile = spawn,
-) {
+// Streams one member through `tar -xzOf` into a file this call creates. The
+// file is removed only when this call created it: a pre-existing target
+// fails untouched.
+function extractTarMember(archivePath, target, memberName, spawnFile = spawn) {
   return new Promise((resolve, reject) => {
     let fd;
     try {
@@ -164,12 +171,6 @@ function extractTarMemberWithLimit(
     child.stdout.on('data', (chunk) => {
       if (failure) return;
       written += chunk.length;
-      if (written > limits.memberBytes) {
-        fail(new Error(
-          `archive member ${JSON.stringify(memberName)} exceeds the ${limits.memberBytes}-byte expanded safety limit`,
-        ));
-        return;
-      }
       try {
         let offset = 0;
         while (offset < chunk.length) {
@@ -209,29 +210,24 @@ function extractTarMemberWithLimit(
 
 async function extractExactTarArchive(
   archivePath, destPath, expectedNames, targetName,
-  runFile = execFileSync, limits = DEFAULT_ARCHIVE_LIMITS, spawnFile = spawn,
+  runFile = execFileSync, spawnFile = spawn,
 ) {
-  validateArchiveLimits(limits);
-  requireCompressedArchiveWithinLimit(archivePath, limits);
-  // The exact root namespace is the member bound: its four names lie well
-  // within MAX_ARCHIVE_MEMBERS, which the zip path enforces by count.
-  if (expectedNames.length > limits.members) {
-    throw new Error(`archive namespace exceeds the ${limits.members}-member safety limit`);
-  }
+  requireRegularArchive(archivePath);
+  // The exact root namespace is the member bound: the listing must name
+  // exactly the expected root files.
   const listing = runFile('tar', ['-tzf', archivePath], {
     encoding: 'utf8',
-    maxBuffer: MAX_CHECKSUM_MANIFEST_BYTES,
     windowsHide: true,
   });
   validateExactTarMemberListing(listing, expectedNames);
-  // Only the fixed root executable is ever written, through the counted
-  // writer; the companions are listed but never extracted.
+  // Only the fixed root executable is ever written; the companions are
+  // listed but never extracted.
   const target = path.join(destPath, targetName);
-  await extractTarMemberWithLimit(archivePath, target, targetName, limits, spawnFile);
+  await extractTarMember(archivePath, target, targetName, spawnFile);
   fs.chmodSync(target, 0o755);
 }
 
-function downloadHop(url, dest, maxBytes) {
+function downloadHop(url, dest, loopback) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let response = null;
@@ -245,7 +241,11 @@ function downloadHop(url, dest, maxBytes) {
       else resolve(result);
     }
 
-    const req = https.get(url, (res) => {
+    // A loopback hop gets a fresh agent, so no proxy configuration applies.
+    const get = loopback
+      ? (target, callback) => http.get(target, { agent: false }, callback)
+      : (target, callback) => https.get(target, callback);
+    const req = get(url, (res) => {
       response = res;
       let piped = false;
       // Before the body is piped, a response error ends the hop directly;
@@ -255,6 +255,11 @@ function downloadHop(url, dest, maxBytes) {
       const redirectCodes = new Set([301, 302, 303, 307, 308]);
       if (redirectCodes.has(res.statusCode)) {
         const location = res.headers.location;
+        if (loopback) {
+          res.destroy();
+          finish(new Error(`Refusing redirect from loopback download ${url}`));
+          return;
+        }
         if (!location) {
           res.destroy();
           finish(new Error(`Redirect with no location for ${url}`));
@@ -277,20 +282,7 @@ function downloadHop(url, dest, maxBytes) {
         finish(new Error(`HTTP ${res.statusCode} for ${url}`));
         return;
       }
-      const declared = Number(res.headers['content-length']);
-      if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
-        res.destroy();
-        finish(new Error(`Download exceeds the ${maxBytes}-byte safety limit`));
-        return;
-      }
 
-      let received = 0;
-      res.on('data', (chunk) => {
-        received += chunk.length;
-        if (maxBytes && received > maxBytes) {
-          res.destroy(new Error(`Download exceeds the ${maxBytes}-byte safety limit`));
-        }
-      });
       const file = fs.createWriteStream(dest, { flags: 'w' });
       piped = true;
       pipeline(res, file, (err) => {
@@ -317,10 +309,10 @@ function downloadHop(url, dest, maxBytes) {
   });
 }
 
-async function download(rawUrl, dest, maxBytes = 0) {
-  let url = validateUrl(rawUrl);
+async function download(rawUrl, dest, loopback = false) {
+  let url = loopback ? validateLoopbackUrl(rawUrl) : validateUrl(rawUrl);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    const result = await downloadHop(url, dest, maxBytes);
+    const result = await downloadHop(url, dest, loopback);
     if (!result.redirect) return;
     if (redirects === MAX_REDIRECTS) throw new Error('Too many redirects');
     url = result.redirect;
@@ -605,10 +597,9 @@ function installWindowsBinaryAtomically(sourceDir, destDir, verifier = verifyCan
 
 function extractZipOnWindows(
   archivePath, destPath, requiredNames, extractNames,
-  limits = DEFAULT_ARCHIVE_LIMITS, shell = 'powershell',
+  maxMembers = MAX_ARCHIVE_MEMBERS, shell = 'powershell',
 ) {
-  validateArchiveLimits(limits);
-  requireCompressedArchiveWithinLimit(archivePath, limits);
+  requireRegularArchive(archivePath);
   // -EncodedCommand is a constant program. Paths travel only through the child
   // environment and are consumed with -LiteralPath, so PowerShell never parses
   // user/TEMP path bytes as source code or wildcard syntax.
@@ -616,10 +607,7 @@ function extractZipOnWindows(
     "$ErrorActionPreference = 'Stop'",
     'Add-Type -AssemblyName System.IO.Compression.FileSystem',
     '$maxMembers = [int]$env:CBM_NPM_MAX_MEMBERS',
-    '$maxMemberBytes = [long]$env:CBM_NPM_MAX_MEMBER_BYTES',
-    '$maxExpandedBytes = [long]$env:CBM_NPM_MAX_EXPANDED_BYTES',
     '$memberCount = 0',
-    '$declaredExpanded = [long]0',
     '$zip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
     "$seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)",
     "$requiredNames = @($env:CBM_NPM_REQUIRED_NAMES.Split('|'))",
@@ -629,11 +617,6 @@ function extractZipOnWindows(
       '$memberCount = $memberCount + 1; ' +
       'if ($memberCount -gt $maxMembers) { ' +
       'throw "archive exceeds the $maxMembers-member safety limit" }; ' +
-      'if ($entry.Length -gt $maxMemberBytes) { ' +
-      'throw "archive member $($entry.FullName) exceeds the $maxMemberBytes-byte expanded safety limit" }; ' +
-      'if ($declaredExpanded -gt ($maxExpandedBytes - $entry.Length)) { ' +
-      'throw "archive exceeds the $maxExpandedBytes-byte aggregate expanded safety limit" }; ' +
-      '$declaredExpanded = $declaredExpanded + $entry.Length; ' +
       "$name = $entry.FullName.Replace('\\', '/'); " +
       "$directory = $name.EndsWith('/'); " +
       "$segmentsPath = if ($directory) { $name.TrimEnd('/') } else { $name }; " +
@@ -655,15 +638,13 @@ function extractZipOnWindows(
     'if ($seen.Count -ne $requiredNames.Count) { ' +
       'throw "archive does not match the exact release root-file allowlist" }',
     "$extractNames = @($env:CBM_NPM_EXTRACT_NAMES.Split('|'))",
-    '$actualExpanded = [long]0',
     '$buffer = New-Object byte[] 65536',
     '$extractZip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
-    // Copy by hand with a byte counter: ExtractToFile would write whatever the
-    // compressed stream yields, regardless of the declared size.
+    // Copy by hand so the bytes written can be compared with the declared
+    // size; ExtractToFile would accept whatever the compressed stream yields.
     'try { foreach ($extractName in $extractNames) { ' +
       '$entry = @($extractZip.Entries | Where-Object { $_.FullName -ceq $extractName })[0]; ' +
       '$targetPath = Join-Path $env:CBM_NPM_DEST_PATH $extractName; ' +
-      '$remaining = $maxExpandedBytes - $actualExpanded; ' +
       '$copied = [long]0; ' +
       '$source = $entry.Open(); ' +
       '$target = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write); ' +
@@ -671,18 +652,13 @@ function extractZipOnWindows(
       '$count = $source.Read($buffer, 0, $buffer.Length); ' +
       'if ($count -le 0) { break }; ' +
       '$copied = $copied + $count; ' +
-      'if ($copied -gt $maxMemberBytes) { ' +
-      'throw "archive member $extractName exceeds the $maxMemberBytes-byte actual expanded safety limit" }; ' +
-      'if ($copied -gt $remaining) { ' +
-      'throw "archive exceeds the $maxExpandedBytes-byte aggregate actual expanded safety limit" }; ' +
       '$target.Write($buffer, 0, $count) } ' +
       '} catch { $target.Dispose(); ' +
       'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; throw ' +
       '} finally { $target.Dispose(); $source.Dispose() }; ' +
       'if ($copied -ne $entry.Length) { ' +
       'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; ' +
-      'throw "archive member $extractName actual size $copied does not match declared size $($entry.Length)" }; ' +
-      '$actualExpanded = $actualExpanded + $copied ' +
+      'throw "archive member $extractName actual size $copied does not match declared size $($entry.Length)" } ' +
       '} } finally { $extractZip.Dispose() }',
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
@@ -696,39 +672,30 @@ function extractZipOnWindows(
         CBM_NPM_DEST_PATH: destPath,
         CBM_NPM_REQUIRED_NAMES: requiredNames.join('|'),
         CBM_NPM_EXTRACT_NAMES: extractNames.join('|'),
-        CBM_NPM_MAX_MEMBERS: String(limits.members),
-        CBM_NPM_MAX_MEMBER_BYTES: String(limits.memberBytes),
-        CBM_NPM_MAX_EXPANDED_BYTES: String(limits.expandedBytes),
+        CBM_NPM_MAX_MEMBERS: String(maxMembers),
       },
       encoding: 'utf8',
       stdio: ['ignore', 'inherit', 'pipe'],
       windowsHide: true,
     });
   } catch (err) {
-    // Surface the script's own reason (for example which limit was hit)
+    // Surface the script's own reason (for example which check failed)
     // instead of a bare "Command failed".
     const detail = err && err.stderr ? String(err.stderr).trim() : '';
     throw new Error(detail ? `zip extraction failed: ${detail}` : err.message);
   }
 }
 
-// Fetch checksums.txt and verify the archive hash.
-async function verifyChecksum(archivePath, archiveName) {
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt`;
+// Fetch checksums.txt from the same download base and verify the archive hash.
+async function verifyChecksum(archivePath, archiveName, source) {
+  const url = `${source.base}/checksums.txt`;
   const tmpChecksums = archivePath + '.checksums';
   try {
-    await download(url, tmpChecksums, MAX_CHECKSUM_MANIFEST_BYTES);
-    const manifestSize = fs.statSync(tmpChecksums).size;
-    if (manifestSize > MAX_CHECKSUM_MANIFEST_BYTES) {
-      throw new Error('checksums.txt exceeds the 1 MiB safety limit');
-    }
+    await download(url, tmpChecksums, source.loopback);
     const expected = parseExpectedChecksum(
       fs.readFileSync(tmpChecksums, 'utf-8'), archiveName,
     );
-    const actual = crypto
-      .createHash('sha256')
-      .update(fs.readFileSync(archivePath))
-      .digest('hex');
+    const actual = fileSha256(archivePath);
     if (expected !== actual) {
       throw new Error(
         `Checksum mismatch for ${archiveName}:\n  expected: ${expected}\n  actual:   ${actual}`,
@@ -772,6 +739,7 @@ async function main() {
     }
   }
 
+  const source = resolveDownloadBase();
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
   // Linux ships a fully-static "-portable" build; the standard linux binary
@@ -782,7 +750,7 @@ async function main() {
   // always embedded. The old CBM_VARIANT=ui opt-in pointed at ui-* archives
   // that no longer exist, so honoring it could only 404 (#1538).
   const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
+  const url = `${source.base}/${archive}`;
 
   process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} for ${platform}/${arch}...\n`);
 
@@ -790,8 +758,8 @@ async function main() {
   const tmpArchive = path.join(tmpDir, `cbm.${ext}`);
 
   try {
-    await download(url, tmpArchive, MAX_RELEASE_ARCHIVE_BYTES);
-    await verifyChecksum(tmpArchive, archive);
+    await download(url, tmpArchive, source.loopback);
+    await verifyChecksum(tmpArchive, archive, source);
 
     // Validate the complete archive namespace, then extract only executables.
     if (ext === 'tar.gz') {
@@ -872,7 +840,6 @@ if (require.main === module || module.parent == null) {
 }
 
 module.exports = {
-  DEFAULT_ARCHIVE_LIMITS,
   UNIX_ARCHIVE_NAMES,
   WINDOWS_ARCHIVE_NAMES,
   WINDOWS_BINARY_NAME,
@@ -880,6 +847,7 @@ module.exports = {
   extractExactTarArchive,
   extractZipOnWindows,
   installWindowsBinaryAtomically,
+  resolveDownloadBase,
   validateExactTarMemberListing,
   windowsBinaryReady,
 };

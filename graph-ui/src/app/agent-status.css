@@ -1,0 +1,56 @@
+.atlas-agent-controls {
+    display: inline-flex;
+    align-items: stretch;
+    flex-shrink: 0;
+    border: 1px solid var(--atlas-line);
+    border-radius: 5px;
+}
+
+.atlas-agent-controls .atlas-browser-ai-action {
+    position: relative;
+    justify-content: center;
+    min-width: 36px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 5px 0 0 5px;
+}
+
+.atlas-agent-controls .atlas-browser-ai-action:hover {
+    background: var(--atlas-select);
+    color: var(--atlas-fg);
+}
+
+.atlas-agent-controls .atlas-browser-ai-action > span {
+    position: absolute;
+    top: 4px;
+    right: 5px;
+    width: 7px;
+    height: 7px;
+    box-shadow: 0 0 0 2px var(--atlas-bg);
+}
+
+.atlas-agent-controls .atlas-browser-ai-action[data-state=active] > span {
+    box-shadow: 0 0 0 2px var(--atlas-bg), 0 0 8px var(--atlas-glow);
+}
+
+.atlas-agent-chat-toggle {
+    display: grid;
+    place-items: center;
+    min-width: 36px;
+    padding: 6px 8px;
+    border: 0;
+    border-left: 1px solid var(--atlas-line);
+    border-radius: 0 5px 5px 0;
+    background: transparent;
+    color: var(--atlas-dim);
+    cursor: pointer;
+}
+
+.atlas-agent-chat-toggle:hover, .atlas-agent-chat-toggle[aria-expanded="true"] {
+    background: var(--atlas-select);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-agent-chat-toggle-pane { fill: transparent; }
+.atlas-agent-chat-toggle[aria-expanded="true"] .atlas-agent-chat-toggle-pane { fill: currentColor; opacity: .3; }
+.atlas-agent-controls button:focus-visible { outline: 2px solid var(--atlas-phosphor); outline-offset: 2px; }

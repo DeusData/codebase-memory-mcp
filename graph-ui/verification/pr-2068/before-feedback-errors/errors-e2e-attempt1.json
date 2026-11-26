@@ -1,0 +1,97 @@
+{
+  "startedAt": "2026-09-09T19:29:26.474Z",
+  "origin": "http://127.0.0.1:9749",
+  "fixture": "/tmp/cbm-2068-error-fixture",
+  "project": "pr2068-error-fixture",
+  "syntheticFixture": true,
+  "actions": [
+    {
+      "action": "Created synthetic C fixtures initially readable, including malformed partial.c and excluded.c",
+      "path": "/tmp/cbm-2068-error-fixture"
+    },
+    {
+      "action": "POST /api/index",
+      "project": "pr2068-error-fixture",
+      "root": "/tmp/cbm-2068-error-fixture",
+      "acknowledgement": {
+        "status": "indexing",
+        "slot": 0,
+        "path": "/tmp/cbm-2068-error-fixture"
+      }
+    },
+    {
+      "action": "Index terminal state",
+      "project": "pr2068-error-fixture",
+      "job": {
+        "slot": 0,
+        "status": "done",
+        "path": "/tmp/cbm-2068-error-fixture",
+        "error": ""
+      }
+    }
+  ],
+  "directRequests": [
+    {
+      "at": "2026-09-09T19:29:26.497Z",
+      "method": "POST",
+      "path": "/api/index",
+      "status": 202
+    },
+    {
+      "at": "2026-09-09T19:29:26.499Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:27.000Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:27.502Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:28.005Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:28.506Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:29.006Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:29:29.009Z",
+      "method": "POST",
+      "path": "/rpc",
+      "status": 200
+    }
+  ],
+  "browserRequests": [],
+  "blockedExternalRequests": [],
+  "screenshots": [],
+  "checks": {},
+  "cleanup": [
+    "unreadable.c restored to 0600"
+  ],
+  "indexWithCoverage": {
+    "slot": 0,
+    "status": "done",
+    "path": "/tmp/cbm-2068-error-fixture",
+    "error": ""
+  },
+  "failure": "SyntaxError: Unexpected token 'p', \"project: p\"... is not valid JSON\n    at JSON.parse (<anonymous>)\n    at rpc (file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:38:17)\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)\n    at async main (file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:109:26)\n    at async file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:158:7"
+}

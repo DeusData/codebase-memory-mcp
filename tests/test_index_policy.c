@@ -21,9 +21,15 @@ TEST(index_policy_defaults_are_disabled) {
 
     ASSERT_FALSE(policy.max_files.enabled);
     ASSERT_FALSE(policy.max_source_bytes.enabled);
+    ASSERT_FALSE(policy.max_rss_bytes.enabled);
+    ASSERT_FALSE(policy.max_duration_ms.enabled);
     ASSERT_FALSE(cbm_index_policy_enabled(&policy));
+    ASSERT_FALSE(cbm_index_policy_discovery_enabled(&policy));
+    ASSERT_FALSE(cbm_index_policy_worker_enabled(&policy));
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_FILES), "off");
     ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_SOURCE_MB), "off");
+    ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_RSS_MB), "off");
+    ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_MAX_DURATION_SECONDS), "off");
     PASS();
 }
 
@@ -57,6 +63,38 @@ TEST(index_policy_source_limit_converts_mib_without_overflow) {
     ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "1048576", error,
                                      sizeof(error)));
     ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(1048576) * UINT64_C(1024) * UINT64_C(1024));
+    PASS();
+}
+
+TEST(index_policy_worker_limits_validate_and_convert_units) {
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    char error[256];
+
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "64", error, sizeof(error)));
+    ASSERT_TRUE(cbm_index_policy_enabled(&policy));
+    ASSERT_TRUE(cbm_index_policy_worker_enabled(&policy));
+    ASSERT_FALSE(cbm_index_policy_discovery_enabled(&policy));
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(64) * CBM_INDEX_MIB_BYTES);
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "1048576", error,
+                                     sizeof(error)));
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(1048576) * CBM_INDEX_MIB_BYTES);
+    cbm_index_resource_policy_t before = policy;
+    ASSERT_FALSE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "63", error, sizeof(error)));
+    ASSERT_EQ(memcmp(&policy, &before, sizeof(policy)), 0);
+
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "1", error,
+                                     sizeof(error)));
+    ASSERT_EQ(policy.max_duration_ms.value, 1000);
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "86400", error,
+                                     sizeof(error)));
+    ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(86400000));
+    before = policy;
+    ASSERT_FALSE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "86401",
+                                      error, sizeof(error)));
+    ASSERT_EQ(memcmp(&policy, &before, sizeof(policy)), 0);
     PASS();
 }
 
@@ -95,6 +133,16 @@ TEST(index_policy_format_round_trips_public_values) {
     ASSERT_TRUE(
         cbm_index_policy_format(&policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB, value, sizeof(value)));
     ASSERT_STR_EQ(value, "7");
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "64", error, sizeof(error)));
+    ASSERT_TRUE(
+        cbm_index_policy_format(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, value, sizeof(value)));
+    ASSERT_STR_EQ(value, "64");
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "9", error,
+                                     sizeof(error)));
+    ASSERT_TRUE(cbm_index_policy_format(&policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, value,
+                                        sizeof(value)));
+    ASSERT_STR_EQ(value, "9");
     PASS();
 }
 
@@ -103,10 +151,18 @@ TEST(index_policy_violation_metadata_is_stable) {
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_SOURCE_BYTES), "source_bytes");
     ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_FILES), "files");
     ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_SOURCE_BYTES), "bytes");
+    ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_RSS_BYTES), "rss_bytes");
+    ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_DURATION_MS), "duration_ms");
+    ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_RSS_BYTES), "bytes");
+    ASSERT_STR_EQ(cbm_index_resource_unit(CBM_INDEX_RESOURCE_DURATION_MS), "milliseconds");
     ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_FILES),
                   CBM_INDEX_CONFIG_MAX_FILES);
     ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_SOURCE_BYTES),
                   CBM_INDEX_CONFIG_MAX_SOURCE_MB);
+    ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_RSS_BYTES),
+                  CBM_INDEX_CONFIG_MAX_RSS_MB);
+    ASSERT_STR_EQ(cbm_index_resource_config_key(CBM_INDEX_RESOURCE_DURATION_MS),
+                  CBM_INDEX_CONFIG_MAX_DURATION_SECONDS);
     PASS();
 }
 
@@ -122,9 +178,13 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
     ASSERT_FALSE(cbm_index_policy_enabled(&policy));
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "9"), 0);
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "3"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7"), 0);
     ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
     ASSERT_EQ(policy.max_files.value, 9);
     ASSERT_EQ(policy.max_source_bytes.value, UINT64_C(3) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(64) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(policy.max_duration_ms.value, UINT64_C(7000));
 
     ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_MAX_FILES, "corrupt"), 0);
     ASSERT_FALSE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
@@ -135,16 +195,23 @@ TEST(index_policy_config_loads_defaults_values_and_rejects_corruption) {
     PASS();
 }
 
-TEST(index_policy_cli_lists_both_operator_keys) {
+TEST(index_policy_cli_lists_all_operator_keys) {
     bool files_found = false;
     bool bytes_found = false;
+    bool rss_found = false;
+    bool duration_found = false;
     for (size_t index = 0; index < cbm_cli_config_key_count_for_testing(); index++) {
         const char *key = cbm_cli_config_key_at_for_testing(index);
         files_found = files_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0);
         bytes_found = bytes_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
+        rss_found = rss_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_RSS_MB) == 0);
+        duration_found =
+            duration_found || (key && strcmp(key, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS) == 0);
     }
     ASSERT_TRUE(files_found);
     ASSERT_TRUE(bytes_found);
+    ASSERT_TRUE(rss_found);
+    ASSERT_TRUE(duration_found);
     PASS();
 }
 
@@ -391,11 +458,12 @@ SUITE(index_policy) {
     RUN_TEST(index_policy_defaults_are_disabled);
     RUN_TEST(index_policy_file_limit_accepts_off_and_exact_range);
     RUN_TEST(index_policy_source_limit_converts_mib_without_overflow);
+    RUN_TEST(index_policy_worker_limits_validate_and_convert_units);
     RUN_TEST(index_policy_invalid_value_is_rejected_atomically);
     RUN_TEST(index_policy_format_round_trips_public_values);
     RUN_TEST(index_policy_violation_metadata_is_stable);
     RUN_TEST(index_policy_config_loads_defaults_values_and_rejects_corruption);
-    RUN_TEST(index_policy_cli_lists_both_operator_keys);
+    RUN_TEST(index_policy_cli_lists_all_operator_keys);
     RUN_TEST(index_policy_cli_set_rejects_invalid_value_without_overwrite);
     RUN_TEST(index_policy_cli_set_reports_a_failed_write);
     RUN_TEST(index_policy_worker_rejects_missing_parent_policy);

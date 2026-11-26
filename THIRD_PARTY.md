@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+164 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -45,6 +45,23 @@ contains the upstream `LICENSE` file.
 The **canonical provenance record** — upstream repository, pinned commit, and
 cross-registry verification status for every grammar — is
 [`internal/cbm/vendored/grammars/MANIFEST.md`](internal/cbm/vendored/grammars/MANIFEST.md).
+
+**Local modification** (`internal/cbm/vendored/grammars/jsonnet/scanner.c`,
+upstream [sourcegraph/tree-sitter-jsonnet](https://github.com/sourcegraph/tree-sitter-jsonnet)
+@ `ddd075f1939a`): upstream keeps the external scanner's state (inside a
+string, and which quote) in file-scope globals, so every parser in the process
+shares one copy, and its deserialize ignores the zero-length call that starts a
+parse, so each parse inherits whatever the previous one left. Indexing workers
+parse in parallel, so concurrent jsonnet parses corrupted each other's strings:
+a different set of files came back `parse_partial` on every index, with their
+definitions and edges. A file ending inside an unterminated string also left
+every later `|||` text block in the process unparseable. The CBM patch moves the
+state into a per-parser payload allocated by `..._external_scanner_create()` and
+resets it at the start of every deserialize; lexing logic and the serialized
+state are unchanged. It is recorded with the other scanner patches in
+MANIFEST.md's "Local source patches" table and pinned by
+`scripts/vendored-checksums.txt`. **On re-vendor: re-apply this patch**;
+`make -f Makefile.cbm lint-vendored-scanners` fails while the globals are back.
 
 License summary:
 
@@ -60,10 +77,10 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Nine further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pine`, `qml`, `tsx`) are self-maintained
-  forks that retain their original upstream authors' licenses — see the manifest
-  for per-grammar provenance. `arkts` is a first-party derivative of
+- Fourteen further grammars (`arkts`, `assembly`, `cfml`, `cfscript`, `dotenv`,
+  `haskell`, `javascript`, `pascal`, `pine`, `qml`, `sql`, `tsx`, `vba`, `vbnet`) are
+  self-maintained forks that retain their original upstream authors' licenses —
+  see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
   (MIT, (c) 2017 Max Brunsfeld; on the
   [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
@@ -75,7 +92,60 @@ License summary:
   `tsx` dialect, MIT, (c) 2017 Max Brunsfeld, on the same javascript base) are
   the upstream grammars with one (c) 2026 DeusData patch that lets a lone `&`
   appear in JSX strings and text; their grammar sources live in
-  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`.
+  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`. `pascal`
+  ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
+  MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts non-ASCII letters in identifiers; its grammar
+  source lives in `tools/tree-sitter-pascal/`. `haskell`
+  ([tree-sitter/tree-sitter-haskell](https://github.com/tree-sitter/tree-sitter-haskell),
+  MIT, (c) 2014 Max Brunsfeld) is the upstream grammar with one (c) 2026
+  DeusData patch that stops an escaped char literal at its closing quote; its
+  grammar source lives in `tools/tree-sitter-haskell/`. `sql`
+  ([DerekStride/tree-sitter-sql](https://github.com/DerekStride/tree-sitter-sql),
+  MIT, (c) 2021 Derek Stride) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts the SQLite syntax of real migration files
+  (PRAGMA, AUTOINCREMENT, WITHOUT ROWID, trigger bodies, virtual tables); its
+  grammar source lives in `tools/tree-sitter-sql/`. `vba` and `vbnet` are described
+  in their own sections below.
+
+### tree-sitter-vba
+
+- **Project:** [harumiWeb/tree-sitter-vba](https://github.com/harumiWeb/tree-sitter-vba)
+- **License:** MIT
+- **Copyright:** (c) 2026 harumiWeb
+- **Vendored at:** `internal/cbm/vendored/grammars/vba/`
+- **Pinned commit:** `83c5c3c3c721` (v0.14.5)
+- **Notes:** Visual Basic for Applications and Visual Basic 6 grammar (its
+  `vba` dialect), maintained here as a self-maintained fork without local
+  changes: upstream does not track its generated parser, so its grammar source
+  (`common/define-grammar.js` and `vba/grammar.js`, byte-identical to
+  upstream) and the regeneration recipe live in `tools/tree-sitter-vba/`, and
+  the parser is generated in this repository with tree-sitter-cli 0.25.10.
+  Upstream's `THIRD_PARTY_LICENSE.md` covers only its test fixtures, none of
+  which is carried here. The grammar is vendored ahead of VB6/VBA extraction
+  (#2564); provenance hashes are in
+  `internal/cbm/vendored/grammars/MANIFEST.md`.
+
+### tree-sitter-vbnet (with CodeGraph's real-world VB.NET patch)
+
+- **Project:** [govindbanura/tree-sitter-vbnet](https://github.com/govindbanura/tree-sitter-vbnet)
+- **License:** MIT
+- **Copyright:** (c) 2025 Govind Banura
+- **Patch:** `docs/grammars/tree-sitter-vbnet.patch` from
+  [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
+  (CodeGraph), MIT, (c) 2026 Colby Mchenry. The patch rewrites much of the
+  grammar and adds the external scanner (`scanner.c`), so CodeGraph's license
+  text ships next to the code as `LICENSE-codegraph`.
+- **Vendored at:** `internal/cbm/vendored/grammars/vbnet/`
+- **Pinned commits:** grammar `538b7087bf80` (v0.1-beta); patch `fe7542b6f6a4`
+- **Notes:** Visual Basic .NET grammar, maintained here as a self-maintained
+  fork: the grammar source, the verbatim patch and the regeneration recipe live
+  in `tools/tree-sitter-vbnet/`, and the parser is generated in this repository
+  with tree-sitter-cli 0.25.10 (upstream checks in no generated sources). One
+  local patch of ours, (c) 2026 DeusData, makes the scanner stop at text that
+  cannot be XML (`tools/tree-sitter-vbnet/patches/xml-literal-tag-syntax.patch`).
+  The grammar is vendored ahead of VB.NET extraction (#1179); provenance hashes
+  are in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ### tree-sitter-plsql
 
@@ -98,8 +168,8 @@ License summary:
 - **License:** MIT
 - **Copyright:** (c) 2025 InterSystems Corporation
 - **Vendored at:** `internal/cbm/vendored/grammars/objectscript_udl/`, `internal/cbm/vendored/grammars/objectscript_routine/`
-- **Pinned commit:** `a7ffcdf`
-- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` copied from upstream `common/scanner.h`; two loop counters in that copy are widened from `uint8_t` to `int` as documented in `internal/cbm/vendored/grammars/MANIFEST.md`.
+- **Pinned commit:** `25cf0f67a380` (tag `v1.11.0`; refreshed from `a7ffcdf` on 2026-11-13)
+- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` copied from upstream `common/scanner.h`; two loop counters in that copy are widened from `uint8_t` to `int`, and each `scanner.c` guards its deserialize `memcpy` against an empty state, as documented in `internal/cbm/vendored/grammars/MANIFEST.md`.
 
 ## Vendored C/C++ Libraries
 
@@ -117,10 +187,12 @@ License summary:
 | wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
 
 Local modifications to these libraries are documented next to the
-vendored sources (currently only SQLite: `vendored/sqlite3/PATCHES.md`,
-raising the Unix VFS `MAX_PATHNAME` ceiling from 512 to 4096 to match
-CBM's 4 KiB path support). Patches must be reapplied on every upstream
-refresh and are covered by `scripts/vendored-checksums.txt`.
+vendored sources: `vendored/sqlite3/PATCHES.md` (raising the Unix VFS
+`MAX_PATHNAME` ceiling from 512 to 4096 to match CBM's 4 KiB path support)
+and `vendored/mimalloc/PATCHES.md` (the upstream source pin, mimalloc v3.5.3
+at commit `d4881d33`, plus the macOS decommit-recommit change and one comment
+rewording). Patches must be reapplied on every upstream refresh and are
+covered by `scripts/vendored-checksums.txt`.
 
 The graph-UI HTTP server is a first-party implementation
 (`src/ui/httpd.c` + `src/ui/http_server.c`) — no third-party HTTP library
@@ -137,6 +209,109 @@ Semantic vector search uses static token embeddings derived from the
 
 See `vendored/nomic/NOTICE` for the exact derivation procedure
 (per-token inference + int8 quantization via `scripts/extract_nomic_vectors.py`).
+
+## Embedded Character Data (PDF text layer)
+
+The PDF text-layer extractor (`internal/cbm/pdf/`) carries static tables
+derived from the following sources. No upstream source code is included.
+
+- **Adobe Glyph List** — the glyph-name subset in `internal/cbm/pdf/pdf_tables.c`
+  (the names of the standard Latin encodings and common symbols, mapped to
+  Unicode) follows [adobe-type-tools/agl-aglfn](https://github.com/adobe-type-tools/agl-aglfn)
+  `glyphlist.txt`.
+  - **License:** BSD-3-Clause
+  - **Copyright:** Copyright 2002-2019 Adobe (http://www.adobe.com/).
+- **Adobe core-14 font metrics** — the advance widths of the printable ASCII
+  range of Helvetica and Times-Roman in `pdf_tables.c` (used only for a
+  standard-14 font that omits its `/Widths`) are the values of Adobe's
+  core-14 AFM files. The AFM files themselves are not distributed.
+  - **Copyright:** Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems
+    Incorporated. All Rights Reserved.
+- **Unicode Character Database** — `internal/cbm/pdf/pdf_unicode.c` (NFKC of
+  each code point, canonical compositions, character classes) is generated
+  by `scripts/gen-pdf-unicode.py` from CPython's `unicodedata` (Unicode
+  16.0.0).
+  - **License:** Unicode License v3 (text below)
+  - **Copyright:** Copyright © 1991-2026 Unicode, Inc.
+- The base encodings (Standard, WinAnsi, MacRoman, Symbol) are those of
+  ISO 32000-1, Annex D.
+
+Adobe Glyph List license (BSD-3-Clause):
+
+```
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be
+used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+Unicode License v3:
+
+```
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2026 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+```
 
 ## Hybrid LSP — Reference Language Servers
 

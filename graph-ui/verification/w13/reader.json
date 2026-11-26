@@ -1,0 +1,1350 @@
+{
+  "levels": [
+    {
+      "name": "vibe coder",
+      "level": 0,
+      "mode": "prose",
+      "chars": 733,
+      "sections": 0,
+      "firstLine": "What happens here, and why does it matter to you?",
+      "uniqueElement": "codeatlas-twin-chip",
+      "uniqueElementAsExpected": true,
+      "uniqueElements": [
+        "codeatlas-twin-chip",
+        "codeatlas-twin-prose"
+      ],
+      "marks": 7
+    },
+    {
+      "name": "junior",
+      "level": 1,
+      "mode": "guided",
+      "chars": 1679,
+      "sections": 0,
+      "firstLine": "In what order does it happen, and why?",
+      "uniqueElement": "codeatlas-twin-term",
+      "uniqueElementAsExpected": true,
+      "uniqueElements": [
+        "codeatlas-twin-guided",
+        "codeatlas-twin-steps",
+        "codeatlas-twin-term",
+        "codeatlas-twin-terms"
+      ],
+      "marks": 10
+    },
+    {
+      "name": "medior",
+      "level": 2,
+      "mode": "sections",
+      "chars": 1585,
+      "sections": 8,
+      "firstLine": "What is actually written here?",
+      "uniqueElement": "codeatlas-twin-section-steps",
+      "uniqueElementAsExpected": true,
+      "uniqueElements": [
+        "codeatlas-twin-block-data",
+        "codeatlas-twin-block-effects",
+        "codeatlas-twin-block-errors",
+        "codeatlas-twin-empty-effects",
+        "codeatlas-twin-empty-tests",
+        "codeatlas-twin-note-errors",
+        "codeatlas-twin-note-imports",
+        "codeatlas-twin-section-callers",
+        "codeatlas-twin-section-effects",
+        "codeatlas-twin-section-errors",
+        "codeatlas-twin-section-imports",
+        "codeatlas-twin-section-purpose",
+        "codeatlas-twin-section-state",
+        "codeatlas-twin-section-steps",
+        "codeatlas-twin-section-tests",
+        "codeatlas-twin-state-marker",
+        "codeatlas-twin-text-imports",
+        "codeatlas-twin-text-purpose"
+      ],
+      "marks": 24
+    },
+    {
+      "name": "senior",
+      "level": 3,
+      "mode": "cost",
+      "chars": 1346,
+      "sections": 4,
+      "firstLine": "What does this cost you?",
+      "uniqueElement": "codeatlas-twin-reader-fails",
+      "uniqueElementAsExpected": true,
+      "uniqueElements": [
+        "codeatlas-twin-reader-depends",
+        "codeatlas-twin-reader-fails",
+        "codeatlas-twin-reader-moves",
+        "codeatlas-twin-reader-unchecked"
+      ],
+      "marks": 12
+    },
+    {
+      "name": "architect",
+      "level": 4,
+      "mode": "ground",
+      "chars": 2688,
+      "sections": 4,
+      "firstLine": "What does this sit on, and where does our knowledge end?",
+      "uniqueElement": "codeatlas-twin-limit",
+      "uniqueElementAsExpected": true,
+      "uniqueElements": [
+        "codeatlas-row-confidence",
+        "codeatlas-twin-limit",
+        "codeatlas-twin-limits",
+        "codeatlas-twin-reader-carried-by",
+        "codeatlas-twin-reader-debts",
+        "codeatlas-twin-reader-limits",
+        "codeatlas-twin-reader-sits-on"
+      ],
+      "marks": 15
+    }
+  ],
+  "allLevelsDiffer": true,
+  "measuredWithModelOff": true,
+  "sliderNamesReader": true,
+  "levelNameShown": true,
+  "modelRephrasesOnly": true,
+  "rejectedRewrites": 7,
+  "rejectionShownToReader": true,
+  "provenanceVisible": true,
+  "noRequestsWhileOff": 0,
+  "levelSurvivesReload": true,
+  "levelSurvivesSymbolChange": true,
+  "emptyLevelExplainsItself": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "screenshotsAtRest": true,
+  "port": 4601,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w13",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "symbol": {
+    "name": "createUser",
+    "file": "src/services/userService.ts"
+  },
+  "method": "Die fuenf Stufen werden an EINEM Symbol gemessen, bei ausgeschaltetem Modell. Der Text ist der gerenderte Koerper des Twin (.atlas-twin-body), nicht das Modell dahinter; das eigene Element einer Stufe ist die data-testid, die genau auf ihr vorkommt, und wird aus dem Schnitt der fuenf Markenmengen ausgerechnet statt hier aufgezaehlt. AC3 laeuft durch die ECHTE Pruefung (__atlasTwin.validateRewrite, dieselbe Funktion, die der Knopf ruft): eine treue Umschreibung, die unveraenderte Vorlage und sieben Faelschungen, jede mit einer anderen Abweichung.",
+  "sidecarMethod": "Port 4141 gehoert dem Nutzer. Dieser Lauf startet dort nichts, beendet dort nichts und verbindet sich dorthin nicht: jede Anfrage der Anwendung an diesen Ursprung wird von einem Route-Griff im Browser beantwortet, bevor eine Verbindung entsteht, und steht unter extras.sidecar.requests. Was der Stub zurueckgibt, ist eine deterministische, faktentreue Umschreibung (ein vorangestellter Halbsatz aus kleingeschriebenen Woertern) und keine Modellprosa. Gemessen wird damit die Leitung und der Waechter, nicht die Schreibqualitaet eines Modells.",
+  "timings": {
+    "buildMs": 10789,
+    "totalMs": 86438
+  },
+  "generatedAt": "2026-08-30T18:41:10.144Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "level-0-vibe coder",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 147,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 147,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "level-1-junior",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 156,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "level-2-medior",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 190,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 156,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "level-3-senior",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 159,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 194,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "level-4-architect",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 188,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 145,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "modell an, umformuliert",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 155,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 154,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "modell an, verworfen",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 150,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 150,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "shots": [
+      {
+        "name": "level-vibe-coder.png",
+        "atRest": true,
+        "bytes": 316148,
+        "regions": []
+      },
+      {
+        "name": "level-junior.png",
+        "atRest": true,
+        "bytes": 339752,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 361
+          }
+        ]
+      },
+      {
+        "name": "level-medior.png",
+        "atRest": true,
+        "bytes": 309491,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 672
+          }
+        ]
+      },
+      {
+        "name": "level-senior.png",
+        "atRest": true,
+        "bytes": 335688,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 461
+          }
+        ]
+      },
+      {
+        "name": "level-architect.png",
+        "atRest": true,
+        "bytes": 320955,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 962
+          }
+        ]
+      }
+    ],
+    "levelBodies": [
+      {
+        "level": 0,
+        "name": "vibe coder",
+        "shot": "level-vibe-coder.png",
+        "wants": "codeatlas-twin-chip",
+        "mode": "prose",
+        "levelName": "vibe coder",
+        "text": "What happens here, and why does it matter to you?This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result.The parts it leans on, in the order they come up:validateUserValidationErrorUserEntitylistUsersinsertNobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.1 further part is not listed here; the deeper settings show all of them.Nothing that looks like a test calls this, so no automatic check would notice a change here.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "question": "What happens here, and why does it matter to you?",
+        "sections": 0,
+        "marks": [
+          "codeatlas-twin-chip",
+          "codeatlas-twin-note",
+          "codeatlas-twin-paragraph",
+          "codeatlas-twin-prose",
+          "codeatlas-twin-question",
+          "codeatlas-twin-voice",
+          "codeatlas-twin-voice-note"
+        ],
+        "voiced": 0,
+        "voiceNote": "The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "voiceRefused": false,
+        "voiceButton": false,
+        "emptyBlocks": [],
+        "seam": {
+          "symbol": "createUser",
+          "qualifiedName": "codeatlasweb-w13.src.services.userService.createUser",
+          "fetches": 1,
+          "sectionNames": [],
+          "flowOpen": false,
+          "flowSteps": 0,
+          "flowArrows": 0,
+          "flowParticipants": 0,
+          "flowStep": -1,
+          "view": "facts",
+          "stepLines": [],
+          "pseudocode": {
+            "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+            "leadKind": "unused-imports",
+            "lines": 8,
+            "steps": 6,
+            "stepsWithTarget": 6,
+            "stepsWithoutTarget": 0,
+            "enrichedSteps": 2,
+            "enrichment": {
+              "usable": [
+                {
+                  "kind": "raises",
+                  "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 1
+                },
+                {
+                  "kind": "calls-on",
+                  "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 2
+                }
+              ],
+              "silent": [
+                {
+                  "kind": "reads-env",
+                  "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+                }
+              ],
+              "missing": [
+                {
+                  "kind": "what the callee reads or writes",
+                  "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+                },
+                {
+                  "kind": "the callee's own steps, in order",
+                  "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+                },
+                {
+                  "kind": "whether a raised error escapes through this call",
+                  "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+                },
+                {
+                  "kind": "the callee's signature and return type",
+                  "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+                },
+                {
+                  "kind": "anything at all about an unresolved callee",
+                  "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+                }
+              ]
+            },
+            "imports": 7,
+            "importFindings": 2,
+            "metaVisibleChars": 58,
+            "metaMovedChars": 289
+          },
+          "level": 0,
+          "levelName": "vibe coder",
+          "question": "What happens here, and why does it matter to you?",
+          "mode": "prose",
+          "rewritableSentences": 5,
+          "voiceState": "idle",
+          "voiceMessage": "",
+          "voicedSentences": 0,
+          "subject": [
+            {
+              "id": "p0",
+              "text": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result.",
+              "facts": [
+                "6",
+                "1",
+                "1"
+              ]
+            },
+            {
+              "id": "p1",
+              "text": "The parts it leans on, in the order they come up:",
+              "facts": []
+            },
+            {
+              "id": "n0",
+              "text": "Nobody wrote that description. CodeAtlas put it together from what the index recorded, so it can be wrong about intent and right about counts.",
+              "facts": [
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "n1",
+              "text": "1 further part is not listed here; the deeper settings show all of them.",
+              "facts": [
+                "1"
+              ]
+            },
+            {
+              "id": "n2",
+              "text": "Nothing that looks like a test calls this, so no automatic check would notice a change here.",
+              "facts": []
+            }
+          ]
+        }
+      },
+      {
+        "level": 1,
+        "name": "junior",
+        "shot": "level-junior.png",
+        "wants": "codeatlas-twin-term",
+        "mode": "guided",
+        "levelName": "junior",
+        "text": "In what order does it happen, and why?This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result.These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.1First it hands work to validateUser (validate.ts:19).2Then it hands work to ValidationError (validate.ts:4).3After that it hands work to UserEntity (types.ts:37).4Next it hands work to listUsers (userService.ts:18).5Then it hands work to insert (db.ts:31).6And last it hands work to toUser (userService.ts:9).Words used above, once each:call sitea place in this code where it hands work to another piece of code. The index records where each one is and what it points at.callera piece of code that hands work to this one. If you change what this expects, every caller is where the change lands.raisestopping with an error instead of returning a result. The index records which error types can leave this symbol, not where they are caught.environment reada value this code takes from outside itself, such as a setting or a configuration key, rather than from what it was handed.The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.No test callers found (inferred from callers, not from a test relation): decide if this needs a test.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "question": "In what order does it happen, and why?",
+        "sections": 0,
+        "marks": [
+          "codeatlas-twin-guided",
+          "codeatlas-twin-note",
+          "codeatlas-twin-paragraph",
+          "codeatlas-twin-question",
+          "codeatlas-twin-step",
+          "codeatlas-twin-steps",
+          "codeatlas-twin-term",
+          "codeatlas-twin-terms",
+          "codeatlas-twin-voice",
+          "codeatlas-twin-voice-note"
+        ],
+        "voiced": 0,
+        "voiceNote": "The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "voiceRefused": false,
+        "voiceButton": false,
+        "emptyBlocks": [],
+        "seam": {
+          "symbol": "createUser",
+          "qualifiedName": "codeatlasweb-w13.src.services.userService.createUser",
+          "fetches": 1,
+          "sectionNames": [],
+          "flowOpen": false,
+          "flowSteps": 0,
+          "flowArrows": 0,
+          "flowParticipants": 0,
+          "flowStep": -1,
+          "view": "facts",
+          "stepLines": [],
+          "pseudocode": {
+            "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+            "leadKind": "unused-imports",
+            "lines": 8,
+            "steps": 6,
+            "stepsWithTarget": 6,
+            "stepsWithoutTarget": 0,
+            "enrichedSteps": 2,
+            "enrichment": {
+              "usable": [
+                {
+                  "kind": "raises",
+                  "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 1
+                },
+                {
+                  "kind": "calls-on",
+                  "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 2
+                }
+              ],
+              "silent": [
+                {
+                  "kind": "reads-env",
+                  "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+                }
+              ],
+              "missing": [
+                {
+                  "kind": "what the callee reads or writes",
+                  "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+                },
+                {
+                  "kind": "the callee's own steps, in order",
+                  "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+                },
+                {
+                  "kind": "whether a raised error escapes through this call",
+                  "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+                },
+                {
+                  "kind": "the callee's signature and return type",
+                  "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+                },
+                {
+                  "kind": "anything at all about an unresolved callee",
+                  "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+                }
+              ]
+            },
+            "imports": 7,
+            "importFindings": 2,
+            "metaVisibleChars": 58,
+            "metaMovedChars": 289
+          },
+          "level": 1,
+          "levelName": "junior",
+          "question": "In what order does it happen, and why?",
+          "mode": "guided",
+          "rewritableSentences": 10,
+          "voiceState": "idle",
+          "voiceMessage": "",
+          "voicedSentences": 0,
+          "subject": [
+            {
+              "id": "p0",
+              "text": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result.",
+              "facts": [
+                "6",
+                "1",
+                "1"
+              ]
+            },
+            {
+              "id": "p1",
+              "text": "These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below claims it.",
+              "facts": []
+            },
+            {
+              "id": "s0",
+              "text": "First it hands work to validateUser (validate.ts:19).",
+              "facts": [
+                "validateUser",
+                "validate.ts",
+                "19"
+              ]
+            },
+            {
+              "id": "s1",
+              "text": "Then it hands work to ValidationError (validate.ts:4).",
+              "facts": [
+                "ValidationError",
+                "validate.ts",
+                "4"
+              ]
+            },
+            {
+              "id": "s2",
+              "text": "After that it hands work to UserEntity (types.ts:37).",
+              "facts": [
+                "UserEntity",
+                "types.ts",
+                "37"
+              ]
+            },
+            {
+              "id": "s3",
+              "text": "Next it hands work to listUsers (userService.ts:18).",
+              "facts": [
+                "listUsers",
+                "userService.ts",
+                "18"
+              ]
+            },
+            {
+              "id": "s4",
+              "text": "Then it hands work to insert (db.ts:31).",
+              "facts": [
+                "db.ts",
+                "31"
+              ]
+            },
+            {
+              "id": "s5",
+              "text": "And last it hands work to toUser (userService.ts:9).",
+              "facts": [
+                "toUser",
+                "userService.ts",
+                "9"
+              ]
+            },
+            {
+              "id": "n0",
+              "text": "The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+              "facts": [
+                "2",
+                "UPSTREAM",
+                "ASKS.md"
+              ]
+            },
+            {
+              "id": "n1",
+              "text": "No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+              "facts": []
+            }
+          ]
+        }
+      },
+      {
+        "level": 2,
+        "name": "medior",
+        "shot": "level-medior.png",
+        "wants": "codeatlas-twin-section-steps",
+        "mode": "sections",
+        "levelName": "medior",
+        "text": "What is actually written here?Purposeinferred?Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.Steps?24validateUservalidate.ts:19?27ValidationErrornewvalidate.ts:4?29UserEntitynewtypes.ts:37?29listUsersuserService.ts:18?30insertdb.ts:31?35toUseruserService.ts:9?Called by?registerUserRoutesusers.ts:15?createuserService.ts:41?DATAState and config?Reads from the environmentDB_URL?Uses typesUser?DATAPulls ininferred5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check.insertused here?querynot used here?Rownot used here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Whether a name is used is checked against what the index recorded for this symbol alone, which is why an import can be listed as not used here and still be used by the file.ERRORSError paths?ValidationErrorvalidate.ts:4?Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.Testsinferred?No test callers found (inferred from callers, not from a test relation): decide if this needs a test.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "question": "What is actually written here?",
+        "sections": 8,
+        "marks": [
+          "codeatlas-evidence-btn",
+          "codeatlas-twin-block-data",
+          "codeatlas-twin-block-effects",
+          "codeatlas-twin-block-errors",
+          "codeatlas-twin-empty-effects",
+          "codeatlas-twin-empty-tests",
+          "codeatlas-twin-note-errors",
+          "codeatlas-twin-note-imports",
+          "codeatlas-twin-question",
+          "codeatlas-twin-row",
+          "codeatlas-twin-section-callers",
+          "codeatlas-twin-section-effects",
+          "codeatlas-twin-section-errors",
+          "codeatlas-twin-section-imports",
+          "codeatlas-twin-section-purpose",
+          "codeatlas-twin-section-state",
+          "codeatlas-twin-section-steps",
+          "codeatlas-twin-section-tests",
+          "codeatlas-twin-state-marker",
+          "codeatlas-twin-step",
+          "codeatlas-twin-text-imports",
+          "codeatlas-twin-text-purpose",
+          "codeatlas-twin-voice",
+          "codeatlas-twin-voice-note"
+        ],
+        "voiced": 0,
+        "voiceNote": "The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "voiceRefused": false,
+        "voiceButton": false,
+        "emptyBlocks": [],
+        "seam": {
+          "symbol": "createUser",
+          "qualifiedName": "codeatlasweb-w13.src.services.userService.createUser",
+          "fetches": 1,
+          "sectionNames": [
+            "purpose",
+            "steps",
+            "callers",
+            "state",
+            "imports",
+            "errors",
+            "effects",
+            "tests"
+          ],
+          "flowOpen": false,
+          "flowSteps": 0,
+          "flowArrows": 0,
+          "flowParticipants": 0,
+          "flowStep": -1,
+          "view": "facts",
+          "stepLines": [
+            24,
+            27,
+            29,
+            29,
+            30,
+            35
+          ],
+          "pseudocode": {
+            "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+            "leadKind": "unused-imports",
+            "lines": 8,
+            "steps": 6,
+            "stepsWithTarget": 6,
+            "stepsWithoutTarget": 0,
+            "enrichedSteps": 2,
+            "enrichment": {
+              "usable": [
+                {
+                  "kind": "raises",
+                  "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 1
+                },
+                {
+                  "kind": "calls-on",
+                  "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 2
+                }
+              ],
+              "silent": [
+                {
+                  "kind": "reads-env",
+                  "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+                }
+              ],
+              "missing": [
+                {
+                  "kind": "what the callee reads or writes",
+                  "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+                },
+                {
+                  "kind": "the callee's own steps, in order",
+                  "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+                },
+                {
+                  "kind": "whether a raised error escapes through this call",
+                  "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+                },
+                {
+                  "kind": "the callee's signature and return type",
+                  "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+                },
+                {
+                  "kind": "anything at all about an unresolved callee",
+                  "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+                }
+              ]
+            },
+            "imports": 7,
+            "importFindings": 2,
+            "metaVisibleChars": 58,
+            "metaMovedChars": 289
+          },
+          "level": 2,
+          "levelName": "medior",
+          "question": "What is actually written here?",
+          "mode": "sections",
+          "rewritableSentences": 6,
+          "voiceState": "idle",
+          "voiceMessage": "",
+          "voicedSentences": 0,
+          "subject": [
+            {
+              "id": "section-purpose-text",
+              "text": "Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.",
+              "facts": [
+                "createUser",
+                "userService.ts",
+                "6",
+                "1",
+                "1"
+              ]
+            },
+            {
+              "id": "section-imports-text",
+              "text": "5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check.",
+              "facts": [
+                "5",
+                "2",
+                "0",
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "section-imports-note",
+              "text": "The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Whether a name is used is checked against what the index recorded for this symbol alone, which is why an import can be listed as not used here and still be used by the file.",
+              "facts": [
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "section-errors-note",
+              "text": "Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.",
+              "facts": []
+            },
+            {
+              "id": "section-effects-empty",
+              "text": "The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+              "facts": [
+                "2",
+                "UPSTREAM",
+                "ASKS.md"
+              ]
+            },
+            {
+              "id": "section-tests-empty",
+              "text": "No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+              "facts": []
+            }
+          ]
+        }
+      },
+      {
+        "level": 3,
+        "name": "senior",
+        "shot": "level-senior.png",
+        "wants": "codeatlas-twin-reader-fails",
+        "mode": "cost",
+        "levelName": "senior",
+        "text": "What does this cost you?How it can fail1 place to checkThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.ValidationErrorvalidate.ts:4?What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.Who depends on it2 places to checkEverything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.registerUserRoutesusers.ts:15?createuserService.ts:41?What moves with a change15 places to checkWhat a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.Steps24validateUservalidate.ts:19?27ValidationErrornewvalidate.ts:4?29UserEntitynewtypes.ts:37?29listUsersuserService.ts:18?30insertdb.ts:31?35toUseruserService.ts:9?State and configDB_URL?User?Pulls ininsertused here?querynot used here?Rownot used here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "question": "What does this cost you?",
+        "sections": 4,
+        "marks": [
+          "codeatlas-evidence-btn",
+          "codeatlas-twin-note",
+          "codeatlas-twin-question",
+          "codeatlas-twin-reader-depends",
+          "codeatlas-twin-reader-fails",
+          "codeatlas-twin-reader-lead",
+          "codeatlas-twin-reader-moves",
+          "codeatlas-twin-reader-unchecked",
+          "codeatlas-twin-reader-weight",
+          "codeatlas-twin-row",
+          "codeatlas-twin-voice",
+          "codeatlas-twin-voice-note"
+        ],
+        "voiced": 0,
+        "voiceNote": "The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "voiceRefused": false,
+        "voiceButton": false,
+        "emptyBlocks": [
+          {
+            "name": "unchecked",
+            "text": "What is uncheckedWhat would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between."
+          }
+        ],
+        "seam": {
+          "symbol": "createUser",
+          "qualifiedName": "codeatlasweb-w13.src.services.userService.createUser",
+          "fetches": 1,
+          "sectionNames": [],
+          "flowOpen": false,
+          "flowSteps": 0,
+          "flowArrows": 0,
+          "flowParticipants": 0,
+          "flowStep": -1,
+          "view": "facts",
+          "stepLines": [],
+          "pseudocode": {
+            "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+            "leadKind": "unused-imports",
+            "lines": 8,
+            "steps": 6,
+            "stepsWithTarget": 6,
+            "stepsWithoutTarget": 0,
+            "enrichedSteps": 2,
+            "enrichment": {
+              "usable": [
+                {
+                  "kind": "raises",
+                  "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 1
+                },
+                {
+                  "kind": "calls-on",
+                  "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 2
+                }
+              ],
+              "silent": [
+                {
+                  "kind": "reads-env",
+                  "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+                }
+              ],
+              "missing": [
+                {
+                  "kind": "what the callee reads or writes",
+                  "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+                },
+                {
+                  "kind": "the callee's own steps, in order",
+                  "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+                },
+                {
+                  "kind": "whether a raised error escapes through this call",
+                  "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+                },
+                {
+                  "kind": "the callee's signature and return type",
+                  "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+                },
+                {
+                  "kind": "anything at all about an unresolved callee",
+                  "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+                }
+              ]
+            },
+            "imports": 7,
+            "importFindings": 2,
+            "metaVisibleChars": 58,
+            "metaMovedChars": 289
+          },
+          "level": 3,
+          "levelName": "senior",
+          "question": "What does this cost you?",
+          "mode": "cost",
+          "rewritableSentences": 5,
+          "voiceState": "idle",
+          "voiceMessage": "",
+          "voicedSentences": 0,
+          "subject": [
+            {
+              "id": "block-fails-lead",
+              "text": "The error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.",
+              "facts": []
+            },
+            {
+              "id": "block-unchecked-lead",
+              "text": "What would notice if this broke. This engine records no test relation for TypeScript, so what is listed here is callers that live in test code.",
+              "facts": [
+                "TypeScript"
+              ]
+            },
+            {
+              "id": "block-unchecked-empty",
+              "text": "Nothing that looks like a test calls this. A change here would be caught by a reader or by production, and by nothing in between.",
+              "facts": []
+            },
+            {
+              "id": "block-depends-lead",
+              "text": "Everything the index records as calling this. Change what it expects or what it returns and this is the list you have to walk.",
+              "facts": []
+            },
+            {
+              "id": "block-moves-lead",
+              "text": "What a change here reaches on the way out: the calls it makes, the values it reads and what it touches outside its own process.",
+              "facts": []
+            }
+          ]
+        }
+      },
+      {
+        "level": 4,
+        "name": "architect",
+        "shot": "level-architect.png",
+        "wants": "codeatlas-twin-limit",
+        "mode": "ground",
+        "levelName": "architect",
+        "text": "What does this sit on, and where does our knowledge end?What it sits on11 entriesThe modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.util/validate.tsvalidateUser, ValidationErrorexact2 call sitesvia direct-call?src/types.tsUserEntityexact1 call sitevia construction?services/userService.tslistUsers, toUserexact2 call sitesvia direct-call?repo/db.tsinsertexact1 call sitevia direct-call?Pulls ininsertused here?querynot used here?Rownot used here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?What carries it2 entriesWhat holds this up: the callers, and whether the outside world can reach it directly.registerUserRoutesusers.ts:15exact1 citation?createuserService.ts:41exact1 citation?What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.Where this index stops8 entriesWhat is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "question": "What does this sit on, and where does our knowledge end?",
+        "sections": 4,
+        "marks": [
+          "codeatlas-evidence-btn",
+          "codeatlas-row-confidence",
+          "codeatlas-twin-limit",
+          "codeatlas-twin-limits",
+          "codeatlas-twin-note",
+          "codeatlas-twin-question",
+          "codeatlas-twin-reader-carried-by",
+          "codeatlas-twin-reader-debts",
+          "codeatlas-twin-reader-lead",
+          "codeatlas-twin-reader-limits",
+          "codeatlas-twin-reader-sits-on",
+          "codeatlas-twin-reader-weight",
+          "codeatlas-twin-row",
+          "codeatlas-twin-voice",
+          "codeatlas-twin-voice-note"
+        ],
+        "voiced": 0,
+        "voiceNote": "The local model is off, so these sentences are the ones CodeAtlas assembled. Nothing here waits for it.",
+        "voiceRefused": false,
+        "voiceButton": false,
+        "emptyBlocks": [
+          {
+            "name": "debts",
+            "text": "What it owesWhat is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way."
+          }
+        ],
+        "seam": {
+          "symbol": "createUser",
+          "qualifiedName": "codeatlasweb-w13.src.services.userService.createUser",
+          "fetches": 1,
+          "sectionNames": [],
+          "flowOpen": false,
+          "flowSteps": 0,
+          "flowArrows": 0,
+          "flowParticipants": 0,
+          "flowStep": -1,
+          "view": "facts",
+          "stepLines": [],
+          "pseudocode": {
+            "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+            "leadKind": "unused-imports",
+            "lines": 8,
+            "steps": 6,
+            "stepsWithTarget": 6,
+            "stepsWithoutTarget": 0,
+            "enrichedSteps": 2,
+            "enrichment": {
+              "usable": [
+                {
+                  "kind": "raises",
+                  "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 1
+                },
+                {
+                  "kind": "calls-on",
+                  "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                  "symbols": 2
+                }
+              ],
+              "silent": [
+                {
+                  "kind": "reads-env",
+                  "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+                }
+              ],
+              "missing": [
+                {
+                  "kind": "what the callee reads or writes",
+                  "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+                },
+                {
+                  "kind": "the callee's own steps, in order",
+                  "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+                },
+                {
+                  "kind": "whether a raised error escapes through this call",
+                  "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+                },
+                {
+                  "kind": "the callee's signature and return type",
+                  "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+                },
+                {
+                  "kind": "anything at all about an unresolved callee",
+                  "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+                }
+              ]
+            },
+            "imports": 7,
+            "importFindings": 2,
+            "metaVisibleChars": 58,
+            "metaMovedChars": 289
+          },
+          "level": 4,
+          "levelName": "architect",
+          "question": "What does this sit on, and where does our knowledge end?",
+          "mode": "ground",
+          "rewritableSentences": 13,
+          "voiceState": "idle",
+          "voiceMessage": "",
+          "voicedSentences": 0,
+          "subject": [
+            {
+              "id": "block-sits-on-lead",
+              "text": "The modules underneath this symbol, one line each, with how many call sites reach into them. A module reached from many places is a dependency; a module reached once is a detail.",
+              "facts": []
+            },
+            {
+              "id": "block-carried-by-lead",
+              "text": "What holds this up: the callers, and whether the outside world can reach it directly.",
+              "facts": []
+            },
+            {
+              "id": "block-debts-lead",
+              "text": "What is owed against this symbol, from the rules CodeAtlas applies to the recorded facts. Every line is a rule over facts and not a fact, which is why they all wear the derived marker.",
+              "facts": [
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "block-debts-empty",
+              "text": "No rule fired against this symbol. That is not a clean bill: the rules CodeAtlas can apply are the ones listed under what this index stops at, and the ones it cannot apply stay silent either way.",
+              "facts": [
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "limits-lead",
+              "text": "What is not on this page, and why. This is part of the answer and not a footnote: an architect who cannot see the edge of the index will read a silence as a finding.",
+              "facts": []
+            },
+            {
+              "id": "limit-purpose",
+              "text": "The purpose of this symbol: The purpose of this symbol is derived from indexed callers, not read directly.",
+              "facts": []
+            },
+            {
+              "id": "limit-effects",
+              "text": "What this symbol does outside its own process: What this symbol does outside its own process is unknown because the analyzer does not record this for this language.",
+              "facts": []
+            },
+            {
+              "id": "limit-tests",
+              "text": "The tests covering this symbol: The tests covering this symbol is derived from indexed callers, not read directly.",
+              "facts": []
+            },
+            {
+              "id": "limit-engine-0",
+              "text": "This engine records no test relation for TypeScript at all, so \"what checks it\" is answered by looking at callers that live in test files, and never by the index saying so.",
+              "facts": [
+                "TypeScript"
+              ]
+            },
+            {
+              "id": "limit-engine-1",
+              "text": "Raised error types are recorded; the places they are caught are not. A short error list is therefore not evidence that the failure is contained.",
+              "facts": []
+            },
+            {
+              "id": "limit-engine-2",
+              "text": "Routes for TypeScript are read out of the source text by CodeAtlas, not reported by the engine, so an entry point the engine did not mark can still exist.",
+              "facts": [
+                "TypeScript",
+                "CodeAtlas"
+              ]
+            },
+            {
+              "id": "limit-engine-3",
+              "text": "Two calls to the same target inside one body are recorded once, with the last site. A count of call sites is therefore a count of targets and not of calls.",
+              "facts": []
+            },
+            {
+              "id": "limit-generation",
+              "text": "Everything above was read from index generation 1. An edit after that build is not in it, and this page cannot tell you whether there was one.",
+              "facts": [
+                "1"
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "guard": {
+      "forgeries": [
+        {
+          "label": "renamed",
+          "applied": false,
+          "reason": "sentence 3 says \"validateUsers\" where the built sentence says \"validateUser\"",
+          "why": "ein Name, der um einen Buchstaben abweicht, zeigt auf ein Symbol, das es nicht gibt",
+          "answerHead": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        },
+        {
+          "label": "renumbered",
+          "applied": false,
+          "reason": "sentence 1 says \"7\" where the built sentence says \"6\"",
+          "why": "eine Zahl, die um eins abweicht, ist eine falsche Zeile oder eine falsche Zaehlung",
+          "answerHead": "This is a function. It hands work to 7 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        },
+        {
+          "label": "refiled",
+          "applied": false,
+          "reason": "sentence 3 says \"validate.js\" where the built sentence says \"validate.ts\"",
+          "why": "eine andere Datei ist ein anderer Ort",
+          "answerHead": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        },
+        {
+          "label": "invented",
+          "applied": false,
+          "reason": "sentence 1 added \"saveUserProfile\", which is not in the sentence it was given",
+          "why": "ein dazuerfundener Name ist die teuerste Abweichung: die Zeile sieht danach genauso vertrauenswuerdig aus wie vorher",
+          "answerHead": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        },
+        {
+          "label": "reordered",
+          "applied": false,
+          "reason": "sentence 1 dropped \"6\"",
+          "why": "dieselben Saetze in anderer Reihenfolge sind eine andere Aussage ueber den Ablauf",
+          "answerHead": "These are the calls in the order the body reaches them. The order is read from the code; why they are in that order is not recorded anywhere, so nothing below c"
+        },
+        {
+          "label": "shortened",
+          "applied": false,
+          "reason": "the rewrite has 1 sentences instead of 10",
+          "why": "weniger Saetze als gegeben heisst, dass einer verschwunden ist",
+          "answerHead": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        },
+        {
+          "label": "padded",
+          "applied": false,
+          "reason": "sentence 1 came back 516 characters long, over the ceiling of 388 for a sentence of 174",
+          "why": "jeder Fakt behalten und die Seite gesprengt ist trotzdem keine Umformulierung",
+          "answerHead": "This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of retur"
+        }
+      ],
+      "faithful": {
+        "applied": true,
+        "reason": ""
+      },
+      "unchanged": {
+        "applied": true,
+        "reason": ""
+      }
+    },
+    "sidecar": {
+      "requests": [
+        {
+          "path": "/health",
+          "at": 85373
+        },
+        {
+          "path": "/props",
+          "at": 85384
+        },
+        {
+          "path": "/v1/models",
+          "at": 85386
+        },
+        {
+          "path": "/v1/chat/completions",
+          "at": 85431
+        },
+        {
+          "path": "/v1/chat/completions",
+          "at": 85846
+        }
+      ],
+      "answers": [
+        {
+          "chars": 598
+        },
+        {
+          "chars": 629
+        }
+      ]
+    },
+    "emptyCase": {
+      "symbol": "listUsers",
+      "file": "src/services/userService.ts",
+      "block": "fails",
+      "text": "How it can failThe error types recorded as leaving this symbol. Where they are caught is not in this index, so the list is the cost you can see and not the whole cost.No error path was recorded here, so a change cannot break one you have not seen. What is not recorded is where a raise from further down is caught, and this engine does not read that at all.",
+      "allEmptyBlocks": [
+        "fails"
+      ]
+    },
+    "hold": {
+      "afterReload": {
+        "present": true,
+        "label": "Who is reading",
+        "ariaLabel": "Who is reading",
+        "ariaValueText": "architect",
+        "min": "0",
+        "max": "4",
+        "value": "4",
+        "name": "architect"
+      },
+      "beforeSwitch": {
+        "present": true,
+        "label": "Who is reading",
+        "ariaLabel": "Who is reading",
+        "ariaValueText": "architect",
+        "min": "0",
+        "max": "4",
+        "value": "4",
+        "name": "architect"
+      },
+      "afterSwitch": {
+        "present": true,
+        "label": "Who is reading",
+        "ariaLabel": "Who is reading",
+        "ariaValueText": "architect",
+        "min": "0",
+        "max": "4",
+        "value": "4",
+        "name": "architect"
+      }
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "ports": {
+      "serverPort": 4600,
+      "uiPort": 4601
+    },
+    "slider": {
+      "present": true,
+      "label": "Who is reading",
+      "ariaLabel": "Who is reading",
+      "ariaValueText": "medior",
+      "min": "0",
+      "max": "4",
+      "value": "2",
+      "name": "medior"
+    },
+    "llmOff": {
+      "state": "off",
+      "preferenceOn": false,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "",
+      "chip": "off",
+      "probes": 0
+    },
+    "emptyTried": [
+      {
+        "symbol": "getOrder",
+        "opened": false,
+        "reason": "TimeoutError: page.waitForFunction: Timeout 40000ms exceeded."
+      },
+      {
+        "symbol": "listUsers",
+        "opened": true,
+        "emptyBlocks": [
+          "fails"
+        ]
+      }
+    ],
+    "applied": {
+      "voiced": 5,
+      "note": "The sentences above were reworded by the local model. Every name, number, file and line in them was checked against the built text.",
+      "text": "What happens here, and why does it matter to you?put plainly, This is a function. It hands work to 6 other pieces of code. It reads 1 value from the environment it runs in. It can stop with 1 kind of error instead of returning a result.[~]put plainly, The parts it leans on, in the order they come up:[~]validateUserValidationErrorUserEntitylistUsersinsertput plainly, Nobody wrote that description. ",
+      "sentences": 5
+    },
+    "refused": {
+      "note": "The rewrite was thrown away and the built text is what you see. Reason: sentence 1 added \"saveUserProfile\", which is not in the sentence it was given",
+      "marked": true,
+      "voiced": 0,
+      "seamMessage": "The rewrite was thrown away and the built text is what you see. Reason: sentence 1 added \"saveUserProfile\", which is not in the sentence it was given"
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "leftovers": [
+      {
+        "port": 4600,
+        "listeners": 0
+      },
+      {
+        "port": 4601,
+        "listeners": 0
+      }
+    ],
+    "leftoverLooks": [
+      {
+        "attempt": 1,
+        "atMs": 86437,
+        "total": 0
+      }
+    ]
+  }
+}

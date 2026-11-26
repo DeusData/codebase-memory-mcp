@@ -18,6 +18,7 @@
 /* Use the existing CBMLanguage enum from extraction layer */
 #include "cbm.h"
 #include "foundation/index_policy.h"
+#include "discover/userconfig.h"
 
 /* ── Language detection ──────────────────────────────────────────── */
 
@@ -57,9 +58,16 @@ CBMLanguage cbm_disambiguate_frm(const char *path);
  * CBM_LANG_RESCRIPT. On read failure, defaults to CBM_LANG_RESCRIPT. */
 CBMLanguage cbm_disambiguate_res(const char *path);
 
+/* Disambiguate .d files by reading first 4KB of content.
+ * Returns CBM_LANG_COUNT (not source) for a make-style dependency file written
+ * by rustc/cargo, gcc/clang -MD or CMake ("target ...: prereq ..."), otherwise
+ * CBM_LANG_DLANG. On read failure or any doubt, defaults to CBM_LANG_DLANG. */
+CBMLanguage cbm_disambiguate_d(const char *path);
+
 /* Disambiguate .inc files by reading first 4KB of content.
- * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
- * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.
+ * Returns CBM_LANG_CPP for explicit C-family code, or
+ * CBM_LANG_OBJECTSCRIPT_ROUTINE for ObjectScript markers / a lone #define.
+ * BitBake recipe syntax and unknown content retain CBM_LANG_BITBAKE.
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
 
@@ -82,6 +90,32 @@ CBMLanguage cbm_language_from_shebang(const char *path);
  * leading '<'), otherwise CBM_LANG_CFSCRIPT for script-dialect components.
  * On read failure, defaults to CBM_LANG_CFSCRIPT. */
 CBMLanguage cbm_disambiguate_cfc(const char *path);
+
+/* The language of a file from its base name and, where the name is not enough,
+ * its first bytes: the one rule discovery and the pinned test-impact inventory
+ * share. cbm_language_probe_bytes says how many leading bytes the name needs
+ * (0: the name decides). cbm_language_classify takes those bytes raw, `more`
+ * when the file has bytes beyond them, and `readable` false when they could
+ * not be read (each probe then keeps the name's default, as a failed open
+ * always did). The name lookup consults the installed user language config. */
+size_t cbm_language_probe_bytes(const char *filename);
+CBMLanguage cbm_language_classify(const char *filename, const unsigned char *head, size_t head_len,
+                                  bool more, bool readable);
+
+/* The same with the language config given explicitly (NULL: none) instead of
+ * the installed process-wide one, for a caller that classifies a snapshot
+ * under that snapshot's config while another index may have its own
+ * installed. */
+size_t cbm_language_probe_bytes_with(const cbm_userconfig_t *config, const char *filename);
+CBMLanguage cbm_language_classify_with(const cbm_userconfig_t *config, const char *filename,
+                                       const unsigned char *head, size_t head_len, bool more,
+                                       bool readable);
+
+/* The most leading bytes any name asks cbm_language_probe_bytes for. */
+#define CBM_LANGUAGE_PROBE_MAX 16384
+
+/* cbm_language_classify on the file at `path`, read raw. */
+CBMLanguage cbm_language_for_file(const char *filename, const char *path);
 
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
@@ -128,8 +162,34 @@ typedef enum {
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
- * Only checks the basename, not the full path. */
+ * Only checks the basename, not the full path. Two built-in rules need more
+ * than the name and are not in this list: a directory named env is skipped only
+ * when it is a Python virtual environment, and deploy/ and deployed/ are walked
+ * for their configuration files only (cbm_discover_config_only_dir). */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
+
+/* True for deploy and deployed: walked, but only files whose language passes
+ * cbm_language_is_deployment_config are indexed in them, at any depth; their
+ * program source is not. Not applied below a JVM source root, and lifted by a
+ * .cbmignore negation of the directory, as for the skip list. */
+bool cbm_discover_config_only_dir(const char *dirname);
+
+/* Build and configuration languages (Makefile, CMake, YAML, TOML, JSON, INI,
+ * Dockerfile): no cross-language call semantics. */
+bool cbm_language_is_build_config(CBMLanguage lang);
+
+/* The languages a config-only directory indexes: every build and
+ * configuration language, the other configuration and infrastructure
+ * languages (Properties, XML, JSON5, Jsonnet, Jinja2, Kustomize, Go Template,
+ * HCL, Bicep, Nix, Puppet, Pkl, DotEnv) and the shell family (Bash, Zsh, Fish,
+ * PowerShell). language.c. */
+bool cbm_language_is_deployment_config(CBMLanguage lang);
+
+/* A package manifest by its base name (package.json, go.mod, Cargo.toml,
+ * pyproject.toml, composer.json, pubspec.yaml, pom.xml, build.gradle[.kts],
+ * mix.exs, Package.swift, *.gemspec): what the package map reads. A
+ * config-only directory drops it whatever its language. */
+bool cbm_discover_is_package_manifest(const char *basename);
 
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);

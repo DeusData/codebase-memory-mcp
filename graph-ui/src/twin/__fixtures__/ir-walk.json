@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.repo.db.walk",
+    "name": "walk",
+    "qualifiedName": "codeatlas-atlas-sample.src.repo.db.walk",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+    "range": {
+      "start": {
+        "line": 57,
+        "character": 0
+      },
+      "end": {
+        "line": 65,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "147d8233d7d471099d0090b2cd46635d145698eeed4007929b13e9ba0623a68f",
+  "purpose": {
+    "value": "Function walk in db.ts. Makes 0 calls, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "calls": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "calledBy": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "TreeNode",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.TreeNode",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 10
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 10,
+          "endLine": 10
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [],
+    "state": "inferred",
+    "evidence": []
+  },
+  "missingTests": {
+    "value": true,
+    "state": "inferred",
+    "evidence": []
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [],
+  "checklist": [
+    {
+      "id": "e6da1fddce1b26bb0a9efb3030f2ad400999b02f",
+      "category": "inputs",
+      "label": "Know the shape of TreeNode",
+      "target": {
+        "name": "TreeNode",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.TreeNode",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 9,
+            "character": 0
+          },
+          "end": {
+            "line": 10,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 9,
+            "character": 0
+          },
+          "end": {
+            "line": 9,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "7512d458235451601fb03f7e087b9beeb3854f6a",
+      "category": "tests",
+      "label": "No test callers found (inferred): decide if this needs a test",
+      "target": {
+        "nodeId": "codeatlas-atlas-sample.src.repo.db.walk",
+        "name": "walk",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.walk",
+        "kind": "function",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 57,
+            "character": 0
+          },
+          "end": {
+            "line": 65,
+            "character": 0
+          }
+        },
+        "projectName": "codeatlas-atlas-sample"
+      },
+      "done": false
+    }
+  ]
+}

@@ -11,6 +11,13 @@
 #define CBM_WORKER_POOL_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include "foundation/constants.h" /* CBM_SZ_1K */
+
+/* 8 MB stack per worker — matches main thread default. Required for deep AST
+ * recursion (tree-sitter + walk_defs). Shared here so a test can run an
+ * extraction on a thread of exactly the size the pipeline gives it. */
+#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
 
 /* Worker callback: called once per iteration with index [0..count-1]. */
 typedef void (*cbm_parallel_fn)(int idx, void *ctx);
@@ -28,5 +35,12 @@ typedef struct {
  * If count <= 0, this is a no-op.
  * If count <= 1 or workers <= 1, runs single-threaded. */
 void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for_opts_t opts);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Observe the completed spawn attempt before the caller takes work. Install
+ * only while no dispatch is running; clear after the observed dispatch joins. */
+typedef void (*cbm_parallel_spawn_observer_fn)(int count, int helpers, void *ctx);
+void cbm_parallel_test_set_spawn_observer(cbm_parallel_spawn_observer_fn observer, void *ctx);
+#endif
 
 #endif /* CBM_WORKER_POOL_H */

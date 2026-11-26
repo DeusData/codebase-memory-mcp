@@ -1,0 +1,73 @@
+CODEATLAS
+v0.0.1
+dirty
+Explore
+Galaxy
+Architecture
+Agents
+System
+Daemon
+Chat
+Search
+⌘ / Ctrl K
+Tools
+Brief
+Explained
+sym 10
+edg 9
+Project
+pr2068-error-fixture
+⌄
+! 1 new recorded errors · pr2068-error-fixture
+Last checked 10:14:16 PM
+History (2 retained)
+Acknowledge new events
+All daemon history
+Refresh events
+Inspect index coverage
+
+Index coverage: 1 partially parsed paths · 0 skipped · 1 intentionally excluded.
+
+! ERROR ui 2026-09-09T20:14:15.668Z Event #3988
+EXPLICIT REGRESSION FIXTURE feedback-mtujdz14: project-attributed test error; no production failure asserted
+Full recorded event
+pr2068-error-fixture
+Architecture
+
+Understand the structure. Follow the evidence.
+
+Read by import order
+Refresh
+Overview
+Dependencies
+Entry points
+Routes
+Hotspots
+View saved on this device
+Reset view
+REPOSITORY MAP
+
+Start at an entry point, follow a component boundary, then inspect the symbols behind it.
+
+Evidence legend
+3 indexed files · 0 retained edges · snapshot and limits
+Repository
+Where to start
+
+Entry candidates identified by the index; these are declarations, not a verified execution order.
+
+No entry point was identified. Start with a connected area below and inspect its exported interfaces.
+
+Connected areas
+
+Grouped by source location, ranked by recorded links across areas. Open an area to see its responsibilities through entry symbols, interfaces and connections.
+
+SOURCE AREA · INFERRED BOUNDARY
+(root)
+3 files · 0 entry candidates · 5 exported symbols
+Incoming 0 ← · → Outgoing 0
+fixture_readable · inaccessible · partial.c
+Index summary, layers and communities
+About this view
+server ready
+Connection details

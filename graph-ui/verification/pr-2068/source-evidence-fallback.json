@@ -1,0 +1,18 @@
+{
+  "at": "2026-09-09T21:14:53.414Z",
+  "project": "cbm-pr2068",
+  "origin": "http://127.0.0.1:9749",
+  "method": "Production queryRows/moduleForFile/getCodeSnippet against local daemon, read-only; no architecture snapshot",
+  "path": "tests/test_daemon_application.c",
+  "qualifiedName": "cbm-pr2068.tests.test_daemon_application",
+  "requestedLine": 4185,
+  "query": "MATCH (n:Module) WHERE n.file_path = \"tests/test_daemon_application.c\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1",
+  "returnedRange": [
+    4177,
+    4336
+  ],
+  "nextStartLine": 4337,
+  "sourceTruncated": true,
+  "selectedLine": "TEST(daemon_application_reserved_mutation_delays_worker_start) {",
+  "status": "passed"
+}

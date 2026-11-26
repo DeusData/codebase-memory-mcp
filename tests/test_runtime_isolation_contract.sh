@@ -93,6 +93,7 @@ ENTRY_POINTS=(
     scripts/security-install.sh scripts/security-fuzz.sh scripts/security-fuzz-random.sh
     scripts/security-network.sh tests/test_parent_watchdog.sh tests/test_worker_watchdog.sh
     tests/test_worker_error_response.sh tests/test_hook_conflict_notice.sh
+    tests/test_watcher_disabled.sh
 )
 for entry in "${ENTRY_POINTS[@]}"; do
     grep -q 'test-runtime.sh' "$ROOT/$entry" || fail "$entry does not source the helper"

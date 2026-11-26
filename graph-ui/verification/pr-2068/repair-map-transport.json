@@ -1,0 +1,59 @@
+[
+  {
+    "id": 0,
+    "failures": [],
+    "responses": [
+      {
+        "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068",
+        "status": 200,
+        "headers": {
+          "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+          "content-length": "11070807",
+          "content-type": "application/json",
+          "connection": "close",
+          "access-control-allow-headers": "Content-Type"
+        }
+      }
+    ],
+    "errors": [],
+    "graph": "cbm-pr2068ArchitectureUnderstand the structure. Follow the evidence.Read by import orderRefreshOverviewDependenciesEntry pointsRoutesHotspotsView saved on this deviceReset viewReading project architecture..."
+  },
+  {
+    "id": 1,
+    "failures": [],
+    "responses": [
+      {
+        "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068",
+        "status": 200,
+        "headers": {
+          "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+          "content-length": "11070807",
+          "content-type": "application/json",
+          "connection": "close",
+          "access-control-allow-headers": "Content-Type"
+        }
+      }
+    ],
+    "errors": [],
+    "graph": "cbm-pr2068ArchitectureUnderstand the structure. Follow the evidence.Read by import orderRefreshOverviewDependenciesEntry pointsRoutesHotspotsView saved on this deviceReset viewReading project architecture..."
+  },
+  {
+    "id": 2,
+    "failures": [],
+    "responses": [
+      {
+        "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068",
+        "status": 200,
+        "headers": {
+          "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+          "content-length": "11070807",
+          "content-type": "application/json",
+          "connection": "close",
+          "access-control-allow-headers": "Content-Type"
+        }
+      }
+    ],
+    "errors": [],
+    "graph": "cbm-pr2068ArchitectureUnderstand the structure. Follow the evidence.Read by import orderRefreshOverviewDependenciesEntry pointsRoutesHotspotsView saved on this deviceReset viewReading project architecture..."
+  }
+]

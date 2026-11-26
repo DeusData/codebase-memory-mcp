@@ -1,0 +1,16 @@
+{
+  "command": "npm run test:unit",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 7,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 3975,
+  "maxProcessTreeSize": 12,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [],
+  "generatedAt": "2026-08-29T11:42:34.431Z"
+}

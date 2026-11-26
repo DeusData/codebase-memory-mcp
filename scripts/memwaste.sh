@@ -131,8 +131,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# One explicit memory budget on every venue. Left to the daemon, the budget
+# follows the machine's RAM: 1792 MB on the 7 GB macos-14 runner, about 4 GB on
+# the 16 GB Linux and Windows runners. The event layer itself holds 0.5-1 GB, so
+# on macOS the index stopped with over_memory_budget before it measured anything
+# (dry runs 2026-10-04 and 2026-10-12). A venue's RAM must not decide whether
+# the report exists. 4096 is what the larger runners already derived; the index
+# completes under it on macOS with the runner's 3 workers. CBM_MEM_BUDGET_MB
+# still overrides.
+MEMWASTE_BUDGET_MB="${CBM_MEM_BUDGET_MB:-4096}"
+
 INDEX_RC=0
-CBM_MEMWASTE=1 CBM_MEMWASTE_OUT="$DUMP_ENV" CBM_CACHE_DIR="$CACHE_DIR" CBM_RUNTIME_DIR="$RUNTIME" \
+CBM_MEM_BUDGET_MB="$MEMWASTE_BUDGET_MB" \
+    CBM_MEMWASTE=1 CBM_MEMWASTE_OUT="$DUMP_ENV" CBM_CACHE_DIR="$CACHE_DIR" CBM_RUNTIME_DIR="$RUNTIME" \
     CBM_LOG_LEVEL=error "$RUN_BIN" cli index_repository --repo-path "$REPO" --mode full \
     >"$OUT/index.json" || INDEX_RC=$?
 if [ "$INDEX_RC" -ne 0 ]; then

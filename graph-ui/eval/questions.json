@@ -1,0 +1,357 @@
+[
+  {
+    "id": "who-01-de",
+    "class": "who-calls",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Wer ruft createUser auf?",
+    "expected": ["registerUserRoutes", "create"],
+    "depth": 1
+  },
+  {
+    "id": "who-02-en",
+    "class": "who-calls",
+    "focusQn": "src.services.userService.listUsers",
+    "question": "Who calls listUsers?",
+    "expected": ["registerUserRoutes", "createUser"],
+    "depth": 1
+  },
+  {
+    "id": "who-03-de",
+    "class": "who-calls",
+    "focusQn": "src.util.validate.validateUser",
+    "question": "Wer ruft validateUser?",
+    "expected": ["createUser"],
+    "depth": 1
+  },
+  {
+    "id": "who-04-en",
+    "class": "who-calls",
+    "focusQn": "src.repo.db.insert",
+    "question": "Who calls insert?",
+    "expected": ["createUser"],
+    "depth": 1
+  },
+  {
+    "id": "who-05-de",
+    "class": "who-calls",
+    "focusQn": "src.services.orderService.getOrder",
+    "question": "Wer ruft getOrder?",
+    "expected": ["registerOrderRoutes"],
+    "depth": 1
+  },
+  {
+    "id": "who-06-en",
+    "class": "who-calls",
+    "focusQn": "src.repo.db.query",
+    "question": "Who calls query?",
+    "expected": ["listUsers"],
+    "depth": 1
+  },
+  {
+    "id": "who-07-de",
+    "class": "who-calls",
+    "focusQn": "src.routes.users.registerUserRoutes",
+    "question": "Wer ruft registerUserRoutes?",
+    "expected": ["createApp"],
+    "depth": 1
+  },
+  {
+    "id": "who-08-en",
+    "class": "who-calls",
+    "focusQn": "src.config.loadConfig",
+    "question": "Who calls loadConfig?",
+    "expected": ["main"],
+    "depth": 1
+  },
+  {
+    "id": "what-01-de",
+    "class": "what-is",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Was macht createUser?",
+    "expected": ["validateUser", "insert"],
+    "depth": 1
+  },
+  {
+    "id": "what-02-en",
+    "class": "what-is",
+    "focusQn": "src.services.userService.listUsers",
+    "question": "What does listUsers do?",
+    "expected": ["query"],
+    "depth": 1
+  },
+  {
+    "id": "what-03-de",
+    "class": "what-is",
+    "focusQn": "src.services.orderService.getOrder",
+    "question": "Was macht getOrder?",
+    "expected": ["validateId", "query"],
+    "depth": 1
+  },
+  {
+    "id": "what-04-en",
+    "class": "what-is",
+    "focusQn": "src.repo.db.hotspotScan",
+    "question": "What does hotspotScan do?",
+    "expected": ["query"],
+    "depth": 1
+  },
+  {
+    "id": "what-05-de",
+    "class": "what-is",
+    "focusQn": "src.server.main",
+    "question": "Was macht main?",
+    "expected": ["loadConfig", "createApp"],
+    "depth": 1
+  },
+  {
+    "id": "what-06-en",
+    "class": "what-is",
+    "focusQn": "src.server.createApp",
+    "question": "What does createApp do?",
+    "expected": ["registerUserRoutes"],
+    "depth": 1
+  },
+  {
+    "id": "what-07-de",
+    "class": "what-is",
+    "focusQn": "src.config.loadConfig",
+    "question": "Was macht loadConfig?",
+    "expected": ["loadConfig"],
+    "depth": 0
+  },
+  {
+    "id": "what-08-en",
+    "class": "what-is",
+    "focusQn": "src.util.validate.ValidationError",
+    "question": "What is ValidationError?",
+    "expected": ["validate.ts"],
+    "depth": 0
+  },
+  {
+    "id": "what-09-de",
+    "class": "what-is",
+    "focusQn": "src.services.userService.create",
+    "question": "Was tut `userService.create`?",
+    "expected": ["createUser"],
+    "depth": 1
+  },
+  {
+    "id": "what-10-en",
+    "class": "what-is",
+    "focusQn": "src.routes.orders.registerOrderRoutes",
+    "question": "What does registerOrderRoutes do?",
+    "expected": ["getOrder"],
+    "depth": 1
+  },
+  {
+    "id": "err-01-de",
+    "class": "why-error",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Welche Fehler kann createUser werfen?",
+    "expected": ["ValidationError"],
+    "depth": 1
+  },
+  {
+    "id": "err-02-en",
+    "class": "why-error",
+    "focusQn": "src.util.validate.validateUser",
+    "question": "What errors can validateUser raise?",
+    "expected": ["ValidationError"],
+    "depth": 1
+  },
+  {
+    "id": "err-03-de",
+    "class": "why-error",
+    "focusQn": "src.util.validate.validateId",
+    "question": "Welche Ausnahme wirft validateId?",
+    "expected": ["ValidationError"],
+    "depth": 1
+  },
+  {
+    "id": "err-04-en",
+    "class": "why-error",
+    "focusQn": "src.services.orderService.getOrder",
+    "question": "What errors can getOrder raise?",
+    "expected": ["ValidationError"],
+    "depth": 1
+  },
+  {
+    "id": "err-05-de",
+    "class": "why-error",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Warum schlaegt createUser fehl, wenn DB_URL nicht gesetzt ist?",
+    "expected": ["ValidationError", "DB_URL"],
+    "depth": 1
+  },
+  {
+    "id": "err-06-en",
+    "class": "why-error",
+    "focusQn": "src.repo.db.insert",
+    "question": "What errors can insert raise?",
+    "expected": ["insert"],
+    "forbidden": ["ValidationError"],
+    "depth": 1
+  },
+  {
+    "id": "if-01-de",
+    "class": "what-if",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Was passiert, wenn ich createUser aendere?",
+    "expected": ["registerUserRoutes", "create"],
+    "depth": 1
+  },
+  {
+    "id": "if-02-en",
+    "class": "what-if",
+    "focusQn": "src.services.userService.listUsers",
+    "question": "What happens if I change listUsers?",
+    "expected": ["registerUserRoutes"],
+    "depth": 1
+  },
+  {
+    "id": "if-03-de",
+    "class": "what-if",
+    "focusQn": "src.repo.db.query",
+    "question": "Welche Auswirkung haette eine Aenderung an query?",
+    "expected": ["listUsers"],
+    "depth": 1
+  },
+  {
+    "id": "if-04-en",
+    "class": "what-if",
+    "focusQn": "src.util.validate.validateUser",
+    "question": "What is the blast radius of validateUser?",
+    "expected": ["createUser"],
+    "depth": 1
+  },
+  {
+    "id": "if-05-de",
+    "class": "what-if",
+    "focusQn": "src.repo.db.insert",
+    "question": "Was passiert, wenn ich insert aendere?",
+    "expected": ["createUser"],
+    "depth": 2
+  },
+  {
+    "id": "if-06-en",
+    "class": "what-if",
+    "focusQn": "src.routes.users.registerUserRoutes",
+    "question": "What happens if registerUserRoutes changes?",
+    "expected": ["createApp"],
+    "depth": 1
+  },
+  {
+    "id": "entry-01-de",
+    "class": "where-entry",
+    "focusQn": "src.server.main",
+    "question": "Welche Routen gibt es in diesem Projekt?",
+    "expected": ["/users"],
+    "depth": 1
+  },
+  {
+    "id": "entry-02-en",
+    "class": "where-entry",
+    "focusQn": "src.server.main",
+    "question": "Which HTTP routes does this project expose?",
+    "expected": ["/users", "/orders"],
+    "depth": 1
+  },
+  {
+    "id": "entry-03-de",
+    "class": "where-entry",
+    "focusQn": "src.server.main",
+    "question": "Wo faengt dieses Projekt an?",
+    "expected": ["src/server.ts"],
+    "depth": 1
+  },
+  {
+    "id": "entry-04-en",
+    "class": "where-entry",
+    "focusQn": "src.server.main",
+    "question": "Where do I start reading this project?",
+    "expected": ["src/server.ts"],
+    "depth": 1
+  },
+  {
+    "id": "entry-05-de",
+    "class": "where-entry",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Welche Route fuehrt zu createUser?",
+    "expected": ["/users"],
+    "depth": 1
+  },
+  {
+    "id": "cmp-01-de",
+    "class": "compare",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Was ist der Unterschied zwischen createUser und listUsers?",
+    "expected": ["validateUser", "query"],
+    "depth": 1
+  },
+  {
+    "id": "cmp-02-en",
+    "class": "compare",
+    "focusQn": "src.services.orderService.getOrder",
+    "question": "What is the difference between getOrder and createUser?",
+    "expected": ["validateId", "validateUser"],
+    "depth": 1
+  },
+  {
+    "id": "cmp-03-de",
+    "class": "compare",
+    "focusQn": "src.services.userService.listUsers",
+    "question": "Vergleiche listUsers und createUser.",
+    "expected": ["query", "validateUser"],
+    "depth": 1
+  },
+  {
+    "id": "cmp-04-en",
+    "class": "compare",
+    "focusQn": "src.repo.db.hotspotScan",
+    "question": "What is the difference between hotspotScan and walk?",
+    "expected": ["query"],
+    "depth": 1
+  },
+  {
+    "id": "over-01-de",
+    "class": "overview",
+    "focusQn": "src.server.main",
+    "question": "Gib mir einen Ueberblick ueber dieses Projekt.",
+    "expected": ["TypeScript"],
+    "depth": 1
+  },
+  {
+    "id": "over-02-en",
+    "class": "overview",
+    "focusQn": "src.server.main",
+    "question": "What is this project made of?",
+    "expected": ["TypeScript"],
+    "depth": 1
+  },
+  {
+    "id": "over-03-de",
+    "class": "overview",
+    "focusQn": "src.server.main",
+    "question": "Wie ist die Architektur dieses Projekts aufgebaut?",
+    "expected": ["symbol"],
+    "depth": 1
+  },
+  {
+    "id": "honest-01-de",
+    "class": "other",
+    "focusQn": "src.services.userService.createUser",
+    "question": "Hallo, alles klar bei dir?",
+    "expected": ["no card"],
+    "forbidden": ["createUser"],
+    "depth": 1
+  },
+  {
+    "id": "honest-02-en",
+    "class": "what-is",
+    "focusQn": "src.services.userService.createUser",
+    "question": "What is @notASymbolAnywhereInThisRepo?",
+    "expected": ["no card"],
+    "forbidden": ["createUser"],
+    "depth": 1
+  }
+]

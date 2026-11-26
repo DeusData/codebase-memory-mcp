@@ -1,0 +1,12 @@
+import {chromium} from 'playwright';
+import {writeFile} from 'node:fs/promises';
+const browser=await chromium.launch({headless:true});
+const page=await browser.newPage({viewport:{width:1600,height:1060}});
+const errors=[];page.on('pageerror',e=>errors.push(e.message));
+await page.goto('http://127.0.0.1:9749/?project=cbm-pr2068');
+await page.evaluate(()=>{localStorage.setItem('cbm.workspace.setup','done');localStorage.setItem('cbm.workspace','architecture')});
+await page.reload();await page.waitForTimeout(6000);
+await page.screenshot({path:'verification/pr-2068/after-architecture-first.png',fullPage:true});
+await writeFile('verification/pr-2068/after-dom.txt',await page.locator('body').innerText());
+await writeFile('/tmp/cbm-2068-browser-current.json',JSON.stringify({errors}));
+await browser.close();

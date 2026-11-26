@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.services.orderService.create",
+    "name": "create",
+    "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.create",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/services/orderService.ts",
+    "range": {
+      "start": {
+        "line": 29,
+        "character": 0
+      },
+      "end": {
+        "line": 34,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "f78a4a858d756d8b5e3dbb6ad3d55d3fa2f25500b175f0e81fa92bc38dba40ad",
+  "purpose": {
+    "value": "Function create in orderService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [
+      {
+        "targetName": "insert",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.insert",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 33,
+        "targetLine": 31,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 33,
+          "endLine": 33
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calls": {
+    "value": [
+      {
+        "targetName": "insert",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.insert",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 33,
+        "targetLine": 31,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 33,
+          "endLine": 33
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calledBy": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "Order",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.Order",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "line": 32
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "startLine": 32,
+          "endLine": 32
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [],
+    "state": "inferred",
+    "evidence": []
+  },
+  "missingTests": {
+    "value": true,
+    "state": "inferred",
+    "evidence": []
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [],
+  "checklist": [
+    {
+      "id": "7c6ca5258050d3e74d593b57f99cbd11fd3a475f",
+      "category": "core-logic",
+      "label": "Understand the call to insert",
+      "target": {
+        "name": "insert",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.insert",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 30,
+            "character": 0
+          },
+          "end": {
+            "line": 31,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 30,
+            "character": 0
+          },
+          "end": {
+            "line": 30,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "4e841fd0207e9edaab5341c1391c78456e972734",
+      "category": "inputs",
+      "label": "Know the shape of Order",
+      "target": {
+        "name": "Order",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.Order",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "start": {
+            "line": 31,
+            "character": 0
+          },
+          "end": {
+            "line": 32,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 31,
+            "character": 0
+          },
+          "end": {
+            "line": 31,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "7512d458235451601fb03f7e087b9beeb3854f6a",
+      "category": "tests",
+      "label": "No test callers found (inferred): decide if this needs a test",
+      "target": {
+        "nodeId": "codeatlas-atlas-sample.src.services.orderService.create",
+        "name": "create",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.create",
+        "kind": "function",
+        "uri": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "range": {
+          "start": {
+            "line": 29,
+            "character": 0
+          },
+          "end": {
+            "line": 34,
+            "character": 0
+          }
+        },
+        "projectName": "codeatlas-atlas-sample"
+      },
+      "done": false
+    }
+  ]
+}

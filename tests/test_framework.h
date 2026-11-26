@@ -6,6 +6,7 @@
  *   - Test suite grouping
  *   - Pass/fail counting with summary
  *   - Color output (when isatty)
+ *   - Per-test selection (CBM_TEST_ONLY) and per-test coverage profiles
  *
  * Usage:
  *   TEST(my_test) {
@@ -26,6 +27,7 @@
 #ifndef TEST_FRAMEWORK_H
 #define TEST_FRAMEWORK_H
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +39,32 @@
 extern int tf_pass_count;
 extern int tf_fail_count;
 extern int tf_skip_count;
+extern int tf_deselected_count;
+
+/* ── Per-test selection (defined by the runner) ────────────────── */
+
+/* CBM_TEST_ONLY / CBM_TEST_ONLY_FILE narrow a run to `suite:test` tokens (see
+ * test_main.c). tf_suite_enter decides whether a suite's body executes at all;
+ * inside it tf_test_selected decides each RUN_TEST and counts the tests it
+ * leaves out. Without a selection both are always true. */
+extern const char *tf_current_suite;
+bool tf_suite_enter(const char *suite);
+void tf_suite_leave(const char *suite);
+bool tf_test_selected(const char *test);
+
+/* ── Per-test coverage (CBM_TEST_COVERAGE builds only) ─────────── */
+
+/* A coverage-instrumented runner (make test-runner-cov) writes one profile per
+ * test under CBM_TEST_COVERAGE_DIR. No other build compiles any of it. */
+#ifdef CBM_TEST_COVERAGE
+void tf_coverage_test_begin(const char *test);
+void tf_coverage_test_end(const char *test);
+#define TF_COVERAGE_TEST_BEGIN(test) tf_coverage_test_begin(test)
+#define TF_COVERAGE_TEST_END(test) tf_coverage_test_end(test)
+#else
+#define TF_COVERAGE_TEST_BEGIN(test) ((void)0)
+#define TF_COVERAGE_TEST_END(test) ((void)0)
+#endif
 
 /* ── Color helpers ─────────────────────────────────────────────── */
 
@@ -69,10 +97,10 @@ static inline const char *tf_reset(void) {
 /* Hard failure with a message — for setup/environment failures that must NOT be
  * silently skipped (a test that cannot establish its preconditions has FAILED,
  * not "skipped"). Mirrors the ASSERT failure path (red FAIL + file:line). */
-#define FAIL(reason)                                                                         \
-    do {                                                                                     \
+#define FAIL(reason)                                                                          \
+    do {                                                                                      \
         printf("  %sFAIL%s %s:%d: %s\n", tf_red(), tf_reset(), __FILE__, __LINE__, (reason)); \
-        return 1;                                                                            \
+        return 1;                                                                             \
     } while (0)
 
 /* The ONLY tolerable skip: a test that is inherently platform-specific and does
@@ -224,9 +252,14 @@ static inline const char *tf_reset(void) {
 
 #define RUN_TEST(name)                                    \
     do {                                                  \
+        if (!tf_test_selected(#name)) {                   \
+            break;                                        \
+        }                                                 \
         printf("  %-55s", #name);                         \
         fflush(stdout);                                   \
+        TF_COVERAGE_TEST_BEGIN(#name);                    \
         int _result = test_##name();                      \
+        TF_COVERAGE_TEST_END(#name);                      \
         if (_result == 0) {                               \
             printf("%sPASS%s\n", tf_green(), tf_reset()); \
             tf_pass_count++;                              \
@@ -243,22 +276,28 @@ static inline const char *tf_reset(void) {
 
 #define RUN_SUITE(name)                                            \
     do {                                                           \
+        if (!tf_suite_enter(#name)) {                              \
+            break;                                                 \
+        }                                                          \
         printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
         suite_##name();                                            \
+        tf_suite_leave(#name);                                     \
     } while (0)
 
 /* ── Summary ───────────────────────────────────────────────────── */
 
-#define TEST_SUMMARY()                                                       \
-    do {                                                                     \
-        printf("\n────────────────────────────────────────────\n");          \
-        printf("  %s%d passed%s", tf_green(), tf_pass_count, tf_reset());    \
-        if (tf_fail_count > 0)                                               \
-            printf(", %s%d failed%s", tf_red(), tf_fail_count, tf_reset());  \
-        if (tf_skip_count > 0)                                               \
-            printf(", %s%d skipped%s", tf_dim(), tf_skip_count, tf_reset()); \
-        printf("\n────────────────────────────────────────────\n\n");        \
-        return tf_fail_count > 0 ? 1 : 0;                                    \
+#define TEST_SUMMARY()                                                                \
+    do {                                                                              \
+        printf("\n────────────────────────────────────────────\n");                   \
+        printf("  %s%d passed%s", tf_green(), tf_pass_count, tf_reset());             \
+        if (tf_fail_count > 0)                                                        \
+            printf(", %s%d failed%s", tf_red(), tf_fail_count, tf_reset());           \
+        if (tf_skip_count > 0)                                                        \
+            printf(", %s%d skipped%s", tf_dim(), tf_skip_count, tf_reset());          \
+        if (tf_deselected_count > 0)                                                  \
+            printf(", %s%d deselected%s", tf_dim(), tf_deselected_count, tf_reset()); \
+        printf("\n────────────────────────────────────────────\n\n");                 \
+        return tf_fail_count > 0 ? 1 : 0;                                             \
     } while (0)
 
 #endif /* TEST_FRAMEWORK_H */

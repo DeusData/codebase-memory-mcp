@@ -73,9 +73,9 @@ run_worker() {
 # A worker never reads the resource policy from config or environment: the
 # supervisor resolves it and sends it inside the request, and a request
 # without one is refused ("missing or incomplete trusted worker policy").
-# This script plays the supervisor, so it sends what the supervisor sends --
-# both limits off, the default.
-policy='"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"}'
+# This script plays the supervisor, so it sends the same complete object
+# cbm_test_index_worker_policy_json produces -- every known key, all off.
+policy="$(cbm_test_index_worker_policy_json)"
 
 response="${tmpdir}/scoped.response"
 if ! run_worker "{\"repo_path\":\"${repo}\",\"mode\":\"fast\",${policy}}" "${response}" \

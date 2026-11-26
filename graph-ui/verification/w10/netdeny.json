@@ -1,0 +1,93 @@
+{
+  "command": "node tools/smoke-w10.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 435,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 302489,
+  "maxProcessTreeSize": 10,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4580",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4581",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4582",
+      "seen": 31
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:4583",
+      "seen": 7
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49767",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49796",
+      "seen": 360
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49797",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49811",
+      "seen": 5
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49960",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49961",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49967",
+      "seen": 330
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50008",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50009",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50010",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50011",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50013",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50228",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50238",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:50265",
+      "seen": 3
+    }
+  ],
+  "generatedAt": "2026-08-30T17:35:33.549Z"
+}

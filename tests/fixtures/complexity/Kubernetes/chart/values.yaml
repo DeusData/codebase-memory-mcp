@@ -1,0 +1,12 @@
+common: &common
+  pullPolicy: IfNotPresent
+image:
+  <<: *common
+  registry: ghcr.io
+  repository: acme/cx
+  tag: "1.0"
+sidecars:
+  - name: a
+    image: {repository: ghcr.io/acme/cx-side, tag: "2.0"}
+  - name: b
+    image: {repository: ghcr.io/acme/cx-side, tag: "2.1"}

@@ -1,0 +1,2 @@
+build:
+	./scripts/build.sh

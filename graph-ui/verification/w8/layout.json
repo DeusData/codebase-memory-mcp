@@ -1,0 +1,1593 @@
+{
+  "zonesNeverOverlap": true,
+  "singleExplainTabVisible": true,
+  "explainTabs": [
+    "flow",
+    "walk",
+    "chat",
+    "bug",
+    "change"
+  ],
+  "disabledTabsExplainThemselves": true,
+  "allFourSplittersDrag": true,
+  "splittersKeyboard": true,
+  "splitterDoubleClickResets": true,
+  "layoutPersistsReload": true,
+  "resetLayoutWorks": true,
+  "explainCollapsedOnOpen": true,
+  "explainOpensOnDemand": true,
+  "tabSwitchKeepsState": true,
+  "stateProbes": {
+    "chatLines": 1,
+    "walkStep": 1,
+    "flowStep": 1
+  },
+  "minZoneRespected": true,
+  "chatTabKeepsEscape": true,
+  "chatTabHistorySurvives": true,
+  "chatTabClearStillClears": true,
+  "chatHeightFollowsZone": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "extremeLayouts": [
+    {
+      "name": "explain-max",
+      "explainHeight": 578,
+      "atBound": true,
+      "readerHeight": 267,
+      "zoneOverlaps": 0,
+      "overlapViolations": 0,
+      "clippingViolations": 0,
+      "cutWithoutHint": 0
+    },
+    {
+      "name": "explain-min",
+      "explainHeight": 150,
+      "atBound": true,
+      "readerHeight": 695,
+      "zoneOverlaps": 0,
+      "overlapViolations": 0,
+      "clippingViolations": 0,
+      "cutWithoutHint": 0
+    }
+  ],
+  "screenshotsAtRest": true,
+  "port": 4441,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w8",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "method": "Gemessen wird an den Rechtecken und an den Griffen der Oberflaeche, nicht an Klicks: ein Reiterwechsel gilt als bewiesen, wenn danach genau ein Inhaltskasten im Baum steht und keine zwei Zonen sich schneiden; ein Griff gilt als beweglich, wenn sich nach dem Zug sowohl die Zahl der Oberflaeche als auch das Rechteck der Zone daneben geaendert hat. Die Anschlaege werden gegen die Grenzen geprueft, die die Oberflaeche selbst nennt (aria-valuemin/max, __atlasLayout.bounds), und nicht gegen eine hier abgeschriebene Zahl.",
+  "timings": {
+    "buildMs": 10786,
+    "totalMs": 73435
+  },
+  "generatedAt": "2026-08-30T18:32:51.350Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "default",
+        "scrolledRegions": 0,
+        "overlaps": 0,
+        "clipped": 0,
+        "cutWithoutHint": 0,
+        "top": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "explain-open",
+        "scrolledRegions": 1,
+        "overlaps": 0,
+        "clipped": 0,
+        "cutWithoutHint": 0,
+        "top": {
+          "candidates": 177,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 156,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "custom-layout",
+        "scrolledRegions": 1,
+        "overlaps": 0,
+        "clipped": 0,
+        "cutWithoutHint": 0,
+        "top": {
+          "candidates": 186,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 158,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "explain-max",
+        "scrolledRegions": 3,
+        "overlaps": 0,
+        "clipped": 0,
+        "cutWithoutHint": 0,
+        "top": {
+          "candidates": 205,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 177,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "explain-min",
+        "scrolledRegions": 3,
+        "overlaps": 0,
+        "clipped": 0,
+        "cutWithoutHint": 0,
+        "top": {
+          "candidates": 174,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 151,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "shots": [
+      {
+        "name": "layout-default",
+        "atRest": true,
+        "regions": []
+      },
+      {
+        "name": "layout-custom",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 819
+          }
+        ]
+      },
+      {
+        "name": "layout-explain-large",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-flow-overlay",
+            "top": 0,
+            "left": 0,
+            "hidden": 196
+          },
+          {
+            "name": "atlas-flow-step-list",
+            "top": 0,
+            "left": 0,
+            "hidden": 41
+          },
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 985
+          }
+        ]
+      }
+    ],
+    "zoneRects": {
+      "default": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 960,
+            "height": 813
+          },
+          "explain": {
+            "x": 270,
+            "y": 955,
+            "width": 960,
+            "height": 33
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 604,
+            "width": 439,
+            "height": 384
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 945,
+            "width": 960,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 594,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "leftWidth-max": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 470,
+            "height": 889
+          },
+          "reader": {
+            "x": 480,
+            "y": 132,
+            "width": 750,
+            "height": 385
+          },
+          "explain": {
+            "x": 480,
+            "y": 528,
+            "width": 750,
+            "height": 460
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 604,
+            "width": 439,
+            "height": 384
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 470,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 480,
+            "y": 518,
+            "width": 750,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 594,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "leftWidth-min": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 180,
+            "height": 889
+          },
+          "reader": {
+            "x": 190,
+            "y": 132,
+            "width": 1040,
+            "height": 385
+          },
+          "explain": {
+            "x": 190,
+            "y": 528,
+            "width": 1040,
+            "height": 460
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 604,
+            "width": 439,
+            "height": 384
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 180,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 190,
+            "y": 518,
+            "width": 1040,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 594,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "explainHeight-max": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 960,
+            "height": 267
+          },
+          "explain": {
+            "x": 270,
+            "y": 410,
+            "width": 960,
+            "height": 578
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 604,
+            "width": 439,
+            "height": 384
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 400,
+            "width": 960,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 594,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "explainHeight-min": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 960,
+            "height": 695
+          },
+          "explain": {
+            "x": 270,
+            "y": 838,
+            "width": 960,
+            "height": 150
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 604,
+            "width": 439,
+            "height": 384
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 828,
+            "width": 960,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 594,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "rightWidth-max": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 694,
+            "height": 505
+          },
+          "explain": {
+            "x": 270,
+            "y": 648,
+            "width": 694,
+            "height": 340
+          },
+          "llm": {
+            "x": 975,
+            "y": 99,
+            "width": 705,
+            "height": 119
+          },
+          "twin": {
+            "x": 975,
+            "y": 217,
+            "width": 705,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 975,
+            "y": 587,
+            "width": 705,
+            "height": 400
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 638,
+            "width": 694,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 964,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 975,
+            "y": 577,
+            "width": 705,
+            "height": 10
+          }
+        }
+      },
+      "rightWidth-min": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 1080,
+            "height": 505
+          },
+          "explain": {
+            "x": 270,
+            "y": 648,
+            "width": 1080,
+            "height": 340
+          },
+          "llm": {
+            "x": 1361,
+            "y": 99,
+            "width": 319,
+            "height": 168
+          },
+          "twin": {
+            "x": 1361,
+            "y": 267,
+            "width": 319,
+            "height": 360
+          },
+          "galaxy": {
+            "x": 1361,
+            "y": 637,
+            "width": 319,
+            "height": 351
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 638,
+            "width": 1080,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1350,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1361,
+            "y": 627,
+            "width": 319,
+            "height": 10
+          }
+        }
+      },
+      "twinHeight-max": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 960,
+            "height": 505
+          },
+          "explain": {
+            "x": 270,
+            "y": 648,
+            "width": 960,
+            "height": 340
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 441
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 685,
+            "width": 439,
+            "height": 303
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 638,
+            "width": 960,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 675,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "twinHeight-min": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 260,
+            "height": 889
+          },
+          "reader": {
+            "x": 270,
+            "y": 132,
+            "width": 960,
+            "height": 505
+          },
+          "explain": {
+            "x": 270,
+            "y": 648,
+            "width": 960,
+            "height": 340
+          },
+          "llm": {
+            "x": 1241,
+            "y": 99,
+            "width": 439,
+            "height": 135
+          },
+          "twin": {
+            "x": 1241,
+            "y": 234,
+            "width": 439,
+            "height": 170
+          },
+          "galaxy": {
+            "x": 1241,
+            "y": 414,
+            "width": 439,
+            "height": 574
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 260,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 270,
+            "y": 638,
+            "width": 960,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1230,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1241,
+            "y": 404,
+            "width": 439,
+            "height": 10
+          }
+        }
+      },
+      "custom": {
+        "zones": {
+          "tree": {
+            "x": 0,
+            "y": 99,
+            "width": 388,
+            "height": 889
+          },
+          "reader": {
+            "x": 398,
+            "y": 132,
+            "width": 704,
+            "height": 377
+          },
+          "explain": {
+            "x": 398,
+            "y": 520,
+            "width": 704,
+            "height": 468
+          },
+          "llm": {
+            "x": 1113,
+            "y": 99,
+            "width": 567,
+            "height": 119
+          },
+          "twin": {
+            "x": 1113,
+            "y": 217,
+            "width": 567,
+            "height": 441
+          },
+          "galaxy": {
+            "x": 1113,
+            "y": 668,
+            "width": 567,
+            "height": 319
+          }
+        },
+        "splitters": {
+          "atlas-split-left": {
+            "x": 388,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-explain": {
+            "x": 398,
+            "y": 510,
+            "width": 704,
+            "height": 10
+          },
+          "atlas-split-right": {
+            "x": 1102,
+            "y": 99,
+            "width": 10,
+            "height": 889
+          },
+          "atlas-split-twin": {
+            "x": 1113,
+            "y": 658,
+            "width": 567,
+            "height": 10
+          }
+        }
+      }
+    },
+    "splitters": {
+      "drag": [
+        {
+          "key": "leftWidth",
+          "before": 388,
+          "after": 448,
+          "zoneBefore": {
+            "width": 388,
+            "height": 889
+          },
+          "zoneAfter": {
+            "width": 448,
+            "height": 889
+          },
+          "moved": 60,
+          "zoneMoved": 60
+        },
+        {
+          "key": "explainHeight",
+          "before": 268,
+          "after": 328,
+          "zoneBefore": {
+            "width": 960,
+            "height": 268
+          },
+          "zoneAfter": {
+            "width": 960,
+            "height": 328
+          },
+          "moved": 60,
+          "zoneMoved": 60
+        },
+        {
+          "key": "rightWidth",
+          "before": 568,
+          "after": 628,
+          "zoneBefore": {
+            "width": 568,
+            "height": 889
+          },
+          "zoneAfter": {
+            "width": 628,
+            "height": 889
+          },
+          "moved": 60,
+          "zoneMoved": 60
+        },
+        {
+          "key": "twinHeight",
+          "before": 232,
+          "after": 292,
+          "zoneBefore": {
+            "width": 439,
+            "height": 232
+          },
+          "zoneAfter": {
+            "width": 439,
+            "height": 292
+          },
+          "moved": 60,
+          "zoneMoved": 60
+        }
+      ],
+      "keyboard": [
+        {
+          "key": "leftWidth",
+          "start": 260,
+          "afterOne": 276,
+          "afterBack": 260,
+          "afterBig": 324,
+          "step": 16,
+          "bigStep": 64
+        },
+        {
+          "key": "explainHeight",
+          "start": 340,
+          "afterOne": 324,
+          "afterBack": 340,
+          "afterBig": 276,
+          "step": 16,
+          "bigStep": 64
+        },
+        {
+          "key": "rightWidth",
+          "start": 440,
+          "afterOne": 424,
+          "afterBack": 440,
+          "afterBig": 376,
+          "step": 16,
+          "bigStep": 64
+        },
+        {
+          "key": "twinHeight",
+          "start": 360,
+          "afterOne": 376,
+          "afterBack": 360,
+          "afterBig": 424,
+          "step": 16,
+          "bigStep": 64
+        }
+      ],
+      "reset": [
+        {
+          "key": "leftWidth",
+          "value": 260,
+          "expected": 260,
+          "beforeReset": 448
+        },
+        {
+          "key": "explainHeight",
+          "value": 340,
+          "expected": 340,
+          "beforeReset": 328
+        },
+        {
+          "key": "rightWidth",
+          "value": 440,
+          "expected": 440,
+          "beforeReset": 628
+        },
+        {
+          "key": "twinHeight",
+          "value": 360,
+          "expected": 360,
+          "beforeReset": 292
+        }
+      ],
+      "bounds": [
+        {
+          "key": "leftWidth",
+          "bounds": {
+            "min": 180,
+            "max": 470
+          },
+          "maxValue": 470,
+          "minValue": 180,
+          "zonesAliveAtMax": true,
+          "zonesAliveAtMin": true,
+          "overlapsAtMax": [],
+          "overlapsAtMin": []
+        },
+        {
+          "key": "explainHeight",
+          "bounds": {
+            "min": 150,
+            "max": 578
+          },
+          "maxValue": 578,
+          "minValue": 150,
+          "zonesAliveAtMax": true,
+          "zonesAliveAtMin": true,
+          "overlapsAtMax": [],
+          "overlapsAtMin": []
+        },
+        {
+          "key": "rightWidth",
+          "bounds": {
+            "min": 320,
+            "max": 706
+          },
+          "maxValue": 706,
+          "minValue": 320,
+          "zonesAliveAtMax": true,
+          "zonesAliveAtMin": true,
+          "overlapsAtMax": [],
+          "overlapsAtMin": []
+        },
+        {
+          "key": "twinHeight",
+          "bounds": {
+            "min": 170,
+            "max": 441
+          },
+          "maxValue": 441,
+          "minValue": 170,
+          "zonesAliveAtMax": true,
+          "zonesAliveAtMin": true,
+          "overlapsAtMax": [],
+          "overlapsAtMin": []
+        }
+      ]
+    },
+    "tabCycle": [
+      {
+        "tab": "flow",
+        "panels": 1,
+        "roots": [
+          "flow"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "walk",
+        "panels": 1,
+        "roots": [
+          "walk"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "chat",
+        "panels": 1,
+        "roots": [
+          "chat"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "bug",
+        "panels": 1,
+        "roots": [
+          "bug"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "change",
+        "panels": 1,
+        "roots": [
+          "change"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "flow",
+        "panels": 1,
+        "roots": [
+          "flow"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "chat",
+        "panels": 1,
+        "roots": [
+          "chat"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      },
+      {
+        "tab": "walk",
+        "panels": 1,
+        "roots": [
+          "walk"
+        ],
+        "clashes": 0,
+        "zoneOverlaps": []
+      }
+    ],
+    "openedOnDemand": [
+      {
+        "trigger": "chat question",
+        "tab": "chat",
+        "open": true
+      },
+      {
+        "trigger": "walk",
+        "tab": "walk",
+        "open": true
+      },
+      {
+        "trigger": "flow head",
+        "tab": "flow",
+        "open": true
+      }
+    ],
+    "disabledReasons": [
+      {
+        "tab": "flow",
+        "reason": "No symbol in the twin yet, so there is no sequence to draw. Open a file and put the caret in a function; the twin follows it, and this tab follows the twin.",
+        "roots": [],
+        "panels": 1
+      },
+      {
+        "tab": "walk",
+        "reason": "No walk is running. Start one from the atlas menu (\"why am I here\") and its steps appear here.",
+        "roots": [],
+        "panels": 1
+      },
+      {
+        "tab": "chat",
+        "reason": "Nothing was asked in this session yet. Type a question in the command line and press enter; the answer and the cards it was given show up here.",
+        "roots": [],
+        "panels": 1
+      }
+    ],
+    "persistence": {
+      "custom": {
+        "leftWidth": 388,
+        "explainHeight": 468,
+        "rightWidth": 568,
+        "twinHeight": 441
+      },
+      "reloaded": {
+        "leftWidth": 388,
+        "explainHeight": 468,
+        "rightWidth": 568,
+        "twinHeight": 441
+      },
+      "storageKey": "codeatlas.layout.v1:codeatlasweb-w8"
+    },
+    "reset": {
+      "byCommand": {
+        "isDefault": true,
+        "sizes": {
+          "leftWidth": 260,
+          "explainHeight": 340,
+          "rightWidth": 440,
+          "twinHeight": 360
+        },
+        "lineCleared": true
+      },
+      "beforeMenu": {
+        "isDefault": false,
+        "sizes": {
+          "leftWidth": 452,
+          "explainHeight": 532,
+          "rightWidth": 440,
+          "twinHeight": 360
+        }
+      },
+      "byMenu": {
+        "isDefault": true,
+        "sizes": {
+          "leftWidth": 260,
+          "explainHeight": 340,
+          "rightWidth": 440,
+          "twinHeight": 360
+        }
+      }
+    },
+    "extremes": {
+      "explain-max": {
+        "rects": {
+          "zones": {
+            "tree": {
+              "x": 0,
+              "y": 99,
+              "width": 260,
+              "height": 889
+            },
+            "reader": {
+              "x": 270,
+              "y": 132,
+              "width": 960,
+              "height": 267
+            },
+            "explain": {
+              "x": 270,
+              "y": 410,
+              "width": 960,
+              "height": 578
+            },
+            "llm": {
+              "x": 1241,
+              "y": 99,
+              "width": 439,
+              "height": 135
+            },
+            "twin": {
+              "x": 1241,
+              "y": 234,
+              "width": 439,
+              "height": 360
+            },
+            "galaxy": {
+              "x": 1241,
+              "y": 604,
+              "width": 439,
+              "height": 384
+            }
+          },
+          "splitters": {
+            "atlas-split-left": {
+              "x": 260,
+              "y": 99,
+              "width": 10,
+              "height": 889
+            },
+            "atlas-split-explain": {
+              "x": 270,
+              "y": 400,
+              "width": 960,
+              "height": 10
+            },
+            "atlas-split-right": {
+              "x": 1230,
+              "y": 99,
+              "width": 10,
+              "height": 889
+            },
+            "atlas-split-twin": {
+              "x": 1241,
+              "y": 594,
+              "width": 439,
+              "height": 10
+            }
+          }
+        },
+        "delta": {
+          "overlaps": 0,
+          "clipped": 0,
+          "cut": 0
+        }
+      },
+      "explain-min": {
+        "rects": {
+          "zones": {
+            "tree": {
+              "x": 0,
+              "y": 99,
+              "width": 260,
+              "height": 889
+            },
+            "reader": {
+              "x": 270,
+              "y": 132,
+              "width": 960,
+              "height": 695
+            },
+            "explain": {
+              "x": 270,
+              "y": 838,
+              "width": 960,
+              "height": 150
+            },
+            "llm": {
+              "x": 1241,
+              "y": 99,
+              "width": 439,
+              "height": 135
+            },
+            "twin": {
+              "x": 1241,
+              "y": 234,
+              "width": 439,
+              "height": 360
+            },
+            "galaxy": {
+              "x": 1241,
+              "y": 604,
+              "width": 439,
+              "height": 384
+            }
+          },
+          "splitters": {
+            "atlas-split-left": {
+              "x": 260,
+              "y": 99,
+              "width": 10,
+              "height": 889
+            },
+            "atlas-split-explain": {
+              "x": 270,
+              "y": 828,
+              "width": 960,
+              "height": 10
+            },
+            "atlas-split-right": {
+              "x": 1230,
+              "y": 99,
+              "width": 10,
+              "height": 889
+            },
+            "atlas-split-twin": {
+              "x": 1241,
+              "y": 594,
+              "width": 439,
+              "height": 10
+            }
+          }
+        },
+        "delta": {
+          "overlaps": 0,
+          "clipped": 0,
+          "cut": 0
+        }
+      }
+    },
+    "chat": {
+      "beforeEscape": {
+        "turns": 1,
+        "open": true
+      },
+      "afterEscape": {
+        "turns": 0,
+        "open": false,
+        "note": "1 question in this session",
+        "seamTurns": 1
+      },
+      "afterReopen": {
+        "turns": 1,
+        "open": true
+      },
+      "height": {
+        "before": {
+          "zone": 340,
+          "chat": {
+            "x": 270,
+            "y": 681,
+            "width": 960,
+            "height": 306
+          }
+        },
+        "after": {
+          "zone": 460,
+          "chat": {
+            "x": 270,
+            "y": 561,
+            "width": 960,
+            "height": 426
+          }
+        }
+      },
+      "clear": {
+        "before": 1,
+        "after": 0,
+        "afterEmpty": "Nothing was asked in this session yet. Type a question in the command line and p"
+      }
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4440,
+    "atRest": {
+      "dom": {
+        "present": true,
+        "open": false,
+        "tab": "flow",
+        "panels": 0,
+        "roots": [],
+        "rootBoxes": {
+          "flow": null,
+          "walk": null,
+          "chat": null,
+          "bug": null,
+          "change": null
+        },
+        "note": "no symbol in the twin",
+        "empty": "",
+        "tabs": [
+          {
+            "id": "flow",
+            "enabled": false,
+            "on": true,
+            "label": "flow"
+          },
+          {
+            "id": "walk",
+            "enabled": false,
+            "on": false,
+            "label": "walk"
+          },
+          {
+            "id": "chat",
+            "enabled": false,
+            "on": false,
+            "label": "chat"
+          },
+          {
+            "id": "bug",
+            "enabled": true,
+            "on": false,
+            "label": "bug hunt"
+          },
+          {
+            "id": "change",
+            "enabled": true,
+            "on": false,
+            "label": "change scope"
+          }
+        ],
+        "chatTurns": 0,
+        "chatBox": null,
+        "bodyBox": null,
+        "walkPosition": "",
+        "flowPosition": ""
+      },
+      "seam": {
+        "sizes": {
+          "leftWidth": 260,
+          "explainHeight": 340,
+          "rightWidth": 440,
+          "twinHeight": 360
+        },
+        "requested": {
+          "leftWidth": 260,
+          "explainHeight": 340,
+          "rightWidth": 440,
+          "twinHeight": 360
+        },
+        "bounds": {
+          "leftWidth": {
+            "min": 180,
+            "max": 470
+          },
+          "explainHeight": {
+            "min": 150,
+            "max": 578
+          },
+          "rightWidth": {
+            "min": 320,
+            "max": 706
+          },
+          "twinHeight": {
+            "min": 170,
+            "max": 441
+          }
+        },
+        "defaults": {
+          "leftWidth": 260,
+          "explainHeight": 340,
+          "rightWidth": 440,
+          "twinHeight": 360
+        },
+        "isDefault": true,
+        "frame": {
+          "width": 1680,
+          "height": 1050
+        },
+        "explainOpen": false,
+        "explainTab": "flow",
+        "tabs": [
+          {
+            "id": "flow",
+            "enabled": false,
+            "reason": "No symbol in the twin yet, so there is no sequence to draw. Open a file and put the caret in a function; the twin follows it, and this tab follows the twin.",
+            "note": "no symbol in the twin"
+          },
+          {
+            "id": "walk",
+            "enabled": false,
+            "reason": "No walk is running. Start one from the atlas menu (\"why am I here\") and its steps appear here.",
+            "note": "no walk running"
+          },
+          {
+            "id": "chat",
+            "enabled": false,
+            "reason": "Nothing was asked in this session yet. Type a question in the command line and press enter; the answer and the cards it was given show up here.",
+            "note": "nothing asked yet"
+          },
+          {
+            "id": "bug",
+            "enabled": true,
+            "reason": "No project is open, and this assistant reads a project index. Open one and the expected path against the observed one is drawn here.",
+            "note": "bug hunt"
+          },
+          {
+            "id": "change",
+            "enabled": true,
+            "reason": "No project is open, and this view reads a project index. Open one and the reach of a change is drawn here.",
+            "note": "change scope"
+          }
+        ],
+        "storageKey": "codeatlas.layout.v1:codeatlasweb-w8",
+        "state": {
+          "chatTurns": 0,
+          "walkStep": -1,
+          "walkSteps": 0,
+          "flowStep": -1,
+          "flowSteps": 0
+        }
+      }
+    },
+    "stateBeforeAfter": {
+      "before": {
+        "chatTurns": 1,
+        "walkPosition": "STEP 2/8",
+        "flowPosition": "2 of 11",
+        "seam": {
+          "chatTurns": 1,
+          "walkStep": 1,
+          "walkSteps": 8,
+          "flowStep": 1,
+          "flowSteps": 11
+        }
+      },
+      "after": {
+        "chatTurns": 1,
+        "walkPosition": "STEP 2/8",
+        "flowPosition": "2 of 11",
+        "seam": {
+          "chatTurns": 1,
+          "walkStep": 1,
+          "walkSteps": 8,
+          "flowStep": 1,
+          "flowSteps": 11
+        }
+      }
+    },
+    "afterReload": {
+      "open": false,
+      "roots": [],
+      "tab": "flow"
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14,
+      "/api/trace": 6,
+      "/api/flows": 2,
+      "/api/flow": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 288,
+      "check_index_coverage": 6,
+      "get_architecture": 3,
+      "search_graph": 6,
+      "get_code_snippet": 38,
+      "detect_changes": 2
+    },
+    "leftovers": [
+      {
+        "port": 4440,
+        "listeners": 0
+      },
+      {
+        "port": 4441,
+        "listeners": 0
+      }
+    ]
+  }
+}

@@ -112,7 +112,8 @@ _cbm_test_runtime_daemon() {
 # cbm_mcp_index_policy_add_to_args: every key in cbm_index_policy_key_at, and
 # nothing else.
 cbm_test_index_worker_policy_json() {
-    printf '%s' '"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"}'
+    printf '%s' '"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"'
+    printf '%s' ',"index_max_rss_mb":"off","index_max_duration_seconds":"off"}'
 }
 
 cbm_test_runtime_cleanup() {

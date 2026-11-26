@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cx
+spec:
+  template:
+    spec:
+      containers:
+        - name: main
+          image: "{{ include "cx.image" .Values.image }}"
+        {{- range .Values.sidecars }}
+        - name: {{ .name }}
+          image: "{{ .image.repository }}:{{ .image.tag }}"
+        {{- end }}

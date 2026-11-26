@@ -1,0 +1,143 @@
+.atlas-graph-exploration { display:flex; align-items:center; flex-wrap:wrap; gap:.5rem; padding:.4rem .75rem; border-bottom:1px solid var(--border, #29423b); font-size:.8rem; }
+.atlas-galaxy-search-container { position:relative; flex:1 1 12rem; min-width:9rem; max-width:32rem; }
+.atlas-galaxy-search-container > input { box-sizing:border-box; width:100%; min-height:2rem; padding:.4rem .65rem; border:1px solid #29473a; border-radius:6px; background:rgba(7,17,12,.65); color:var(--atlas-fg,#cbdbd0); font:inherit; }
+.atlas-galaxy-search-container > input:focus { outline:1px solid #6d9a84; border-color:#6d9a84; }
+.atlas-galaxy-search-results { position:absolute; top:calc(100% + .4rem); left:0; z-index:35; width:min(34rem, calc(100vw - 2rem)); padding:.5rem; border:1px solid #355246; border-radius:8px; background:rgb(13,25,19); box-shadow:0 8px 24px #0005; }
+.atlas-graph-exploration label { display:flex; align-items:center; gap:.35rem; color:var(--muted, #a0b6aa); }
+.atlas-graph-exploration select { padding:.2rem .35rem; background:#102019; color:#d4ded8; border:1px solid #29473a; border-radius:5px; }
+.atlas-graph-coverage-filter { cursor:pointer; white-space:nowrap; }
+.atlas-graph-coverage-filter input { accent-color:#80ac96; }
+.atlas-graph-exploration button { appearance:none; padding:.25rem .6rem; font:inherit; line-height:1.4; color:var(--atlas-fg, #cbdbd0); background:rgba(17, 34, 26, .72); border:1px solid var(--atlas-line, #29473a); border-radius:6px; cursor:pointer; }
+.atlas-graph-exploration button:hover:not(:disabled, [aria-disabled=true]) { background:rgba(68, 112, 86, .24); border-color:#517d65; }
+.atlas-graph-exploration button:focus-visible, .atlas-galaxy-selection-details > summary:focus-visible { outline:2px solid #75ac94; outline-offset:2px; }
+/* G3: Expand ist gesperrt statt abgeschaltet (aria-disabled), damit Zeiger und Fokus seinen Grund noch lesen; es sieht gleich aus. */
+.atlas-graph-exploration button:is(:disabled, [aria-disabled=true]) { opacity:.4; cursor:not-allowed; }
+.atlas-graph-scope-name { max-width:14rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.atlas-graph-scope-count { color:#93b2a1; margin-inline-start:auto; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.atlas-graph-scope-groups { white-space:nowrap; }
+/*
+ * Handtest K3: im Ausschnitt eine Zeile, auch bei offenem Chat (rund 1.170 px
+ * bei 1600). Die Zeile bricht nicht um; was schrumpfen darf, sind das Suchfeld
+ * (es waechst beim Tippen wieder), der Name der Wurzel und der Zaehler, jeweils
+ * mit dem vollen Text im Tooltip.
+ */
+.atlas-graph-exploration[data-scoped=true] { flex-wrap:nowrap; gap:.3rem; padding-inline:.6rem; }
+.atlas-graph-exploration[data-scoped=true] > * { flex:none; }
+.atlas-graph-exploration[data-scoped=true] .atlas-galaxy-search-container { flex:0 1 9rem; min-width:5rem; transition:flex-basis .15s ease; }
+.atlas-graph-exploration[data-scoped=true] .atlas-galaxy-search-container:focus-within { flex-basis:18rem; }
+.atlas-graph-exploration[data-scoped=true] .atlas-graph-scope-name { flex:0 1 auto; min-width:3.5rem; max-width:11rem; }
+/* Der Zaehler gibt zuletzt nach: der Name steht auch am Ring in der Szene, die Zahl nur hier. Voll steht er ganz da. */
+.atlas-graph-exploration[data-scoped=true] .atlas-graph-scope-count { flex:none; overflow:hidden; text-overflow:ellipsis; }
+.atlas-graph-exploration[data-scoped=true] .atlas-graph-scope-warning { flex:0 1 auto; width:auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/*
+ * Review zu K3: die Leiste misst ihre Stufe (toolbar-fit.tsx). Ab "compact"
+ * stehen die knappen Beschriftungen, in "tight" wird dazu der Zaehler kuerzer,
+ * "wrap" bricht die knappe Leiste um. Nichts ragt mehr ueber den Rand.
+ */
+.atlas-fit-narrow { display:none; }
+.atlas-fit-narrow::before { content:attr(data-label); }
+.atlas-graph-exploration:is([data-fit=compact], [data-fit=tight], [data-fit=wrap]) .atlas-fit-wide { display:none; }
+.atlas-graph-exploration:is([data-fit=compact], [data-fit=tight], [data-fit=wrap]) .atlas-fit-narrow { display:inline; }
+/*
+ * Suchfeld und Wurzelname geben zuerst nach, der Zaehler zuletzt und nie unter
+ * 8,5rem. Die Rangfolge steckt im Verhaeltnis der Faktoren und nicht in einem
+ * Faktor unter 1: ein solcher nimmt nur seinen Bruchteil des Fehlbetrags auf,
+ * und der Rest ragte wieder hinaus.
+ */
+.atlas-graph-exploration[data-scoped=true][data-fit=tight] :is(.atlas-galaxy-search-container, .atlas-graph-scope-name) { flex-shrink:8; }
+.atlas-graph-exploration[data-scoped=true][data-fit=tight] .atlas-graph-scope-count { flex:0 1 auto; min-width:8.5rem; }
+.atlas-graph-exploration[data-scoped=true][data-fit=wrap] { flex-wrap:wrap; row-gap:.35rem; }
+.atlas-graph-exploration button.atlas-graph-scope-name { position:relative; padding-right:1.2rem; font-weight:600; border-color:transparent; background:transparent; text-align:left; }
+.atlas-graph-exploration button.atlas-graph-scope-name::after { content:'↗'; position:absolute; right:.35rem; color:#7fa592; font-weight:400; }
+.atlas-graph-exploration button.atlas-graph-scope-name:hover { text-decoration:underline; }
+.atlas-graph-more > summary, .atlas-graph-recent > summary { min-width:1.1rem; text-align:center; list-style:none; }
+.atlas-graph-more > summary::-webkit-details-marker, .atlas-graph-recent > summary::-webkit-details-marker { display:none; }
+.atlas-graph-more[data-attention=true] > summary { border-color:#9b7b4a; }
+.atlas-graph-more .atlas-graph-limits-menu small { color:#95a89e; white-space:nowrap; }
+/* Handtest K8: eine Ebene, die am Render-Limit anhielt, und ein Expand, das vermutlich dorthin fuehrt. */
+.atlas-graph-scope-count[data-state=partial] { color:#d8b27a; cursor:help; }
+.atlas-graph-exploration button[data-warning=true] { border-color:#9b7b4a; }
+/* Der Deckel im Scope: dieselbe Bauform wie die Kantenarten (Review-Befund G7). */
+.atlas-graph-limits { position:relative; }
+.atlas-graph-limits > summary { padding:.25rem .5rem; border:1px solid #29473a; border-radius:6px; cursor:pointer; color:#b5c9bc; white-space:nowrap; }
+.atlas-graph-limits-menu { position:absolute; top:calc(100% + .35rem); right:0; z-index:30; display:flex; flex-direction:column; align-items:flex-end; gap:.45rem; padding:.6rem; border:1px solid #355246; border-radius:8px; background:rgb(13,25,19); box-shadow:0 8px 24px #0005; }
+.atlas-graph-scope-warning { width:100%; color:#c6aa82; }
+.atlas-trace-edge-filter { position:relative; }
+.atlas-trace-edge-filter > summary { padding:.25rem .5rem; border:1px solid #29473a; border-radius:6px; cursor:pointer; color:#b5c9bc; }
+.atlas-trace-edge-menu { position:absolute; top:calc(100% + .35rem); left:0; z-index:30; width:min(20rem, calc(100vw - 3rem)); max-height:22rem; overflow:auto; padding:.65rem; border:1px solid #355246; border-radius:8px; background:rgb(13,25,19); box-shadow:0 8px 24px #0005; }
+.atlas-trace-edge-actions { display:flex; gap:.4rem; margin-bottom:.4rem; }
+.atlas-trace-edge-menu small { display:block; color:#95a89e; margin-bottom:.4rem; }
+.atlas-trace-edge-row { display:flex; justify-content:space-between; align-items:center; gap:.5rem; padding:.2rem 0; }
+.atlas-trace-edge-row label { flex:1; cursor:pointer; font-size:.75rem; }
+.atlas-trace-edge-row input { accent-color:#80ac96; }
+.atlas-trace-edge-row i { width:.45rem; height:.45rem; border-radius:50%; flex:none; opacity:.75; }
+.atlas-trace-edge-count { color:#95a89e; font-size:.75rem; font-variant-numeric:tabular-nums; }
+.atlas-trace-edge-row button { padding:.12rem .35rem; font-size:.7rem; opacity:.75; }
+.atlas-galaxy-node-picker ul { max-height:20rem; overflow:auto; list-style:none; padding:0; margin:.5rem 0; }
+.atlas-galaxy-node-picker button { width:100%; display:flex; gap:.5rem; align-items:baseline; text-align:left; }
+.atlas-galaxy-node-picker button span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.75rem; }
+.atlas-galaxy-node-picker .atlas-graph-result-kind { min-width:3rem; color:#91b6a3; }
+
+/* Review zu K29: jede Flaeche ueber der Szene ist deckend; durch .95 schienen der Name des Pfadziels und sein Ring hindurch. */
+.galaxy-selection-evidence.atlas-galaxy-selection-details { top:auto; bottom:12px; right:12px; width:auto; height:auto; max-width:calc(100% - 24px); max-height:55%; padding:0; border-radius:7px; background:rgb(13, 25, 19); }
+.galaxy-selection-evidence.atlas-galaxy-selection-details > summary { padding:.5rem .75rem; color:#b5c9bc; font-size:.8rem; cursor:pointer; }
+.galaxy-selection-evidence.atlas-galaxy-selection-details[open] { width:min(420px, calc(100% - 24px)); max-height:min(24rem, 55%); }
+.atlas-galaxy-selection-details-body { padding:0 .75rem .75rem; }
+@media (max-width:800px) {
+    .galaxy-selection-evidence.atlas-galaxy-selection-details[open] { max-height:38%; }
+}
+
+.atlas-graph-render-progress { position:absolute; z-index:30; top:12px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:.5rem; max-width:calc(100% - 24px); box-sizing:border-box; padding:.45rem .75rem; border:1px solid #6c88764d; border-radius:999px; background:rgb(14,25,20); color:#b9cdc1; box-shadow:0 3px 12px #0003; pointer-events:none; font:12px/1.4 var(--atlas-ui-font,system-ui,sans-serif); }
+.atlas-graph-render-progress > span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.atlas-graph-render-spinner { width:12px; height:12px; box-sizing:border-box; flex:none; border:1.5px solid #99b7a52e; border-top-color:#a8c4b3; border-radius:50%; animation:atlas-graph-render-spin .8s linear infinite; }
+@keyframes atlas-graph-render-spin { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .atlas-graph-render-spinner { animation:none; } }
+
+/* Der Pfad: Auswahl in der Werkzeugleiste, Schrittliste in der Szene, Beschriftung und Ring an den Kanten. */
+.atlas-graph-path-picker { position:relative; }
+.atlas-graph-path-picker > summary { padding:.25rem .5rem; border:1px solid #29473a; border-radius:6px; cursor:pointer; color:#b5c9bc; white-space:nowrap; }
+.atlas-graph-path-menu { position:absolute; top:calc(100% + .35rem); left:0; z-index:30; width:min(22rem, calc(100vw - 3rem)); padding:.55rem; border:1px solid #355246; border-radius:8px; background:rgb(13,25,19); box-shadow:0 8px 24px #0005; }
+.atlas-graph-path-menu input { box-sizing:border-box; width:100%; padding:.35rem .5rem; border:1px solid #29473a; border-radius:5px; background:rgba(7,17,12,.65); color:var(--atlas-fg,#cbdbd0); font:inherit; }
+.atlas-graph-path-menu ul { max-height:18rem; overflow:auto; list-style:none; padding:0; margin:.45rem 0 0; }
+.atlas-graph-path-menu button { width:100%; display:flex; gap:.5rem; align-items:baseline; text-align:left; border:0; background:transparent; }
+.atlas-graph-path-menu button span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.72rem; color:#95a89e; }
+.atlas-graph-path-menu small { display:block; color:#95a89e; margin-top:.4rem; }
+.atlas-graph-exploration button[aria-pressed=true] { border-color:#80ac96; background:rgba(68, 112, 86, .3); }
+.atlas-galaxy-path-panel { position:absolute; z-index:25; top:12px; left:12px; display:flex; flex-direction:column; gap:.35rem; width:min(26rem, calc(100% - 24px)); max-height:min(22rem, 55%); box-sizing:border-box; padding:.55rem .65rem; border:1px solid #355246; border-radius:8px; background:rgb(13, 25, 19); color:#cbdbd0; font-size:.78rem; }
+.atlas-galaxy-path-panel header, .atlas-galaxy-path-panel footer { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+.atlas-galaxy-path-panel p { margin:0; color:#c6aa82; }
+.atlas-galaxy-path-panel ol { flex:1 1 auto; min-height:0; overflow:auto; margin:0; padding:0; list-style:none; }
+.atlas-galaxy-path-panel li button { width:100%; display:flex; gap:.5rem; align-items:baseline; text-align:left; padding:.2rem .35rem; border:1px solid transparent; border-radius:5px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.atlas-galaxy-path-panel li button[data-active=true] { border-color:#80ac96; background:rgba(68, 112, 86, .28); }
+.atlas-galaxy-path-panel code { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:11px var(--atlas-mono, ui-monospace, monospace); }
+.atlas-galaxy-path-hop { flex:none; min-width:3.6rem; color:#91b6a3; font-variant-numeric:tabular-nums; }
+.atlas-galaxy-path-panel header button, .atlas-galaxy-path-panel footer button { padding:.15rem .5rem; border:1px solid #29473a; border-radius:5px; background:rgba(17, 34, 26, .72); color:inherit; font:inherit; cursor:pointer; }
+.atlas-galaxy-path-panel footer button:disabled { opacity:.4; cursor:not-allowed; }
+.atlas-galaxy-path-label { display:block; padding:0 4px; border-radius:3px; background:rgba(13, 15, 18, .78); color:#cfe0d6; font:600 10px/1.4 var(--atlas-mono, ui-monospace, monospace); white-space:nowrap; }
+.atlas-galaxy-path-label[data-active=true] { color:#ffffff; outline:1px solid #80ac96; }
+/* Jeder Knoten des Pfades traegt seinen Namen (K6); der aktuelle Schritt dazu den hellen Ring. */
+.atlas-galaxy-path-node { position:relative; display:block; width:0; height:0; pointer-events:none; }
+.atlas-galaxy-path-node > i { position:absolute; left:-8px; top:-8px; width:16px; height:16px; box-sizing:border-box; border:1px solid rgba(159, 224, 189, .55); border-radius:50%; }
+.atlas-galaxy-path-node[data-active=true] > i { left:-12px; top:-12px; width:24px; height:24px; border:2px solid #9fe0bd; box-shadow:0 0 12px rgba(159, 224, 189, .55); }
+.atlas-galaxy-path-node > b { position:absolute; bottom:15px; left:0; transform:translateX(-50%); padding:1px 6px; border-radius:4px; background:rgba(13, 15, 18, .84); color:#cfeedd; font:600 12px/1.4 var(--atlas-ui-font, system-ui, sans-serif); white-space:nowrap; }
+.atlas-galaxy-path-node:not([data-active=true]) > b { color:#b4cbbf; font-weight:500; }
+
+/* Die Wurzel eines Scopes: ein Ring auf dem Punkt und ihr Name darunter, immer sichtbar. */
+.atlas-galaxy-root-marker { position:relative; display:block; width:0; height:0; pointer-events:none; }
+.atlas-galaxy-root-marker > i { position:absolute; left:-15px; top:-15px; width:30px; height:30px; box-sizing:border-box; border:2px solid #f0cf73; border-radius:50%; box-shadow:0 0 0 4px rgba(240, 207, 115, .16), 0 0 16px rgba(240, 207, 115, .5); }
+.atlas-galaxy-root-marker > b { position:absolute; top:19px; left:0; transform:translateX(-50%); padding:1px 6px; border-radius:4px; background:rgba(13, 15, 18, .84); color:#f5e2a6; font:600 12px/1.4 var(--atlas-ui-font, system-ui, sans-serif); white-space:nowrap; }
+
+/* Zweites Review zu K5: die Ueberschrift des Bandes unter den Spalten und die Notiz, wenn Namen fehlen. */
+.atlas-hierarchy-band-label { display:flex; flex-direction:column; align-items:center; gap:1px; padding:2px 8px; border:1px dashed #6f8f80; border-radius:5px; background:rgba(13, 15, 18, .86); color:#d7e6dd; white-space:nowrap; font:600 11px/1.35 var(--atlas-ui-font, system-ui, sans-serif); }
+.atlas-hierarchy-band-label small { color:#a9bdb2; font-weight:400; font-size:10px; }
+.atlas-hierarchy-key { position:absolute; z-index:20; left:12px; bottom:12px; max-width:min(34rem, calc(100% - 24px)); margin:0; padding:.35rem .6rem; border:1px solid #355246; border-radius:6px; background:rgb(13, 25, 19); color:#cbdbd0; font:12px/1.4 var(--atlas-ui-font, system-ui, sans-serif); pointer-events:none; }
+
+/* Zurueck, Vor und die letzten Wurzeln (Handtest K2): klein, damit die Leiste einzeilig bleibt (K3). */
+.atlas-graph-history { display:flex; align-items:center; gap:.25rem; flex:none; }
+.atlas-graph-history > button { min-width:1.9rem; padding:.25rem .45rem; }
+.atlas-graph-recent { position:relative; }
+.atlas-graph-recent > summary { padding:.25rem .5rem; border:1px solid #29473a; border-radius:6px; cursor:pointer; color:#b5c9bc; white-space:nowrap; }
+.atlas-graph-recent-menu { position:absolute; top:calc(100% + .35rem); left:0; z-index:30; width:min(24rem, calc(100vw - 3rem)); max-height:18rem; overflow:auto; margin:0; padding:.45rem; list-style:none; border:1px solid #355246; border-radius:8px; background:rgb(13,25,19); box-shadow:0 8px 24px #0005; }
+.atlas-graph-recent-menu button { width:100%; display:flex; flex-direction:column; align-items:flex-start; gap:.1rem; text-align:left; border:0; background:transparent; }
+.atlas-graph-recent-menu button span { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.72rem; color:#95a89e; }
+.atlas-graph-recent-menu button[aria-current=true] { opacity:.6; }

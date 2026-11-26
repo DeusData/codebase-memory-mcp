@@ -98,12 +98,16 @@ typedef enum {
 /* Returns a stable, content-free diagnostic name for a failure category. */
 const char *cbm_toml_codex_hook_failure_name(cbm_toml_codex_hook_failure_t failure);
 /* `failure` may be NULL. When non-NULL, it is reset to NONE on entry and remains
- * NONE on success; failure categories never contain configuration content. */
+ * NONE on success; failure categories never contain configuration content.
+ * `pretool_written` may be NULL. When non-NULL it is set to 1 after a successful
+ * upsert that wrote the PreToolUse Bash hook, and to 0 when a foreign inline
+ * hooks.PreToolUse made the upsert keep only the lifecycle pair. */
 int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *begin_marker,
                                             const char *end_marker, const char *command,
                                             const char *command_windows,
                                             cbm_toml_codex_hook_action_t action, int check_only,
-                                            cbm_toml_codex_hook_failure_t *failure);
+                                            cbm_toml_codex_hook_failure_t *failure,
+                                            int *pretool_written);
 int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_marker,
                                    const char *end_marker, const char *command,
                                    const char *command_windows, cbm_toml_codex_hook_action_t action,

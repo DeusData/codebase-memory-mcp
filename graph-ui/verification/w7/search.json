@@ -1,0 +1,942 @@
+{
+  "menuUniform": true,
+  "menuEntryCount": 7,
+  "menuAllButtons": true,
+  "menuClickWorks": true,
+  "menuKeyboardWorks": true,
+  "menuFocusRingVisible": true,
+  "altShortcutsWork": {
+    "a": true,
+    "w": true,
+    "b": true,
+    "c": true,
+    "l": true,
+    "r": true
+  },
+  "keyProbeShown": true,
+  "keyProbeReportsCodeAndAlt": true,
+  "listenerInCapturePhase": true,
+  "firstSuggestionMedianMs": 3,
+  "firstSuggestionSamples": [
+    1.4,
+    3.1,
+    1.1,
+    1.1,
+    9,
+    46.2,
+    20.9,
+    11.6,
+    1.2,
+    3.4,
+    3.5,
+    1.3
+  ],
+  "serverRoundtripMs": 5,
+  "staleAnswerWins": false,
+  "prefixCacheHits": 6,
+  "debounceMs": 90,
+  "localSuggestionsShownFirst": true,
+  "semanticMode": "measured-and-rejected",
+  "semanticBridgesTried": 6,
+  "semanticBridgesFound": 1,
+  "semanticLatencyMs": 2,
+  "semanticRejectionReason": "Nicht dazugeschaltet. Die Latenz war nie das Problem (2 ms gegen 2 ms fuer BM25), der Nutzen ist es: nur 1 von 6 Vokabular-Bruecken standen in den ersten 5 Zeilen. Die Gegenprobe erklaert warum: unter seinem EIGENEN Namen gesucht, steht insert auf Rang 7 von 24, validateUser auf Rang 24 von 24, hotspotScan auf Rang 7 von 24, loadConfig auf Rang 24 von 24. Eine Vektorsuche, die ein Symbol nicht findet, wenn man seinen Namen eintippt, kann keine Bruecke schlagen. Dazu kommt, dass der Modus nie nichts sagt: das Unsinnswort \"zzzzqqqq\" liefert 24 Zeilen mit Werten von 0.02679 bis -0.02086, also den ganzen Graphen in einer Reihenfolge. Dazugeschaltet haette die Suche unter jeder Anfrage Treffer gezeigt und \"no symbol answers\" nie wieder gesagt.",
+  "semanticHitsLabelled": false,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "port": 4381,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w7b",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "menuEntries": [
+    {
+      "menu": "a",
+      "letter": "a"
+    },
+    {
+      "menu": "a-why",
+      "letter": "w"
+    },
+    {
+      "menu": "a-bug",
+      "letter": "b"
+    },
+    {
+      "menu": "a-impact",
+      "letter": "c"
+    },
+    {
+      "menu": "a-layout",
+      "letter": "r"
+    },
+    {
+      "menu": "a-llm",
+      "letter": "l"
+    },
+    {
+      "menu": "?",
+      "letter": "?"
+    }
+  ],
+  "searchSampleWords": [
+    "user",
+    "create",
+    "validate",
+    "insert",
+    "order",
+    "query",
+    "route",
+    "config",
+    "server",
+    "walk",
+    "hotspot",
+    "toUser"
+  ],
+  "semanticBridgeSpec": [
+    {
+      "word": "send",
+      "targets": [
+        "publish",
+        "insert"
+      ]
+    },
+    {
+      "word": "check",
+      "targets": [
+        "validateUser",
+        "validateId"
+      ]
+    },
+    {
+      "word": "start",
+      "targets": [
+        "main",
+        "createApp"
+      ]
+    },
+    {
+      "word": "save",
+      "targets": [
+        "insert"
+      ]
+    },
+    {
+      "word": "fetch",
+      "targets": [
+        "query"
+      ]
+    },
+    {
+      "word": "verify",
+      "targets": [
+        "validateUser"
+      ]
+    }
+  ],
+  "semanticTopN": 5,
+  "readabilityExclusions": [
+    {
+      "selector": ".monaco-editor",
+      "reason": "Der Editor setzt Zeilen, Zeilennummern und Dekorationen selbst, absolut positioniert und in eigenen Ebenen. Gemessen wird seine Flaeche gegen die Nachbarn, nicht sein Innenleben: das waere eine Pruefung einer fremden Bibliothek gegen die Layoutregeln dieses Produkts."
+    }
+  ],
+  "deliberateOverlays": [
+    {
+      "selector": "[data-testid=\"atlas-search-results\"]",
+      "reason": "Das Suchfenster liegt ueber der Kommandozeile."
+    },
+    {
+      "selector": "[data-testid=\"atlas-entry\"]",
+      "reason": "Der Einstiegsdialog liegt ueber der Editorflaeche."
+    },
+    {
+      "selector": "[data-testid=\"atlas-why\"]",
+      "reason": "Die Frage nach dem Warum fuellt die leere Editorflaeche."
+    },
+    {
+      "selector": "[data-testid=\"codeatlas-evidence-popover\"]",
+      "reason": "Ein Beleg klappt ueber die Zeile auf, zu der er gehoert."
+    },
+    {
+      "selector": "[data-testid=\"atlas-help\"]",
+      "reason": "Die Hilfeseite liegt ueber der Editorflaeche."
+    }
+  ],
+  "timings": {
+    "buildMs": 10776,
+    "serverStartMs": 7079,
+    "semanticMs": 35,
+    "totalMs": 69028
+  },
+  "generatedAt": "2026-08-29T15:36:11.376Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health",
+      "http://127.0.0.1:4141/health"
+    ],
+    "consoleErrors": [
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED",
+      "Failed to load resource: net::ERR_FAILED"
+    ],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "menu-row",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 144,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 144,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "help-keyprobe",
+        "scrolledRegions": 2,
+        "top": {
+          "candidates": 184,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-help]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 180,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "search-provisional",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 175,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "div > .atlas-shell > [atlas-command] > [atlas-search-results]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 175,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "search-answered",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 145,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 145,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4380,
+    "semantic": {
+      "mode": "measured-and-rejected",
+      "bridgesTried": 6,
+      "bridgesFound": 1,
+      "topN": 5,
+      "latencyMs": 2,
+      "bm25LatencyMs": 2,
+      "bridges": [
+        {
+          "word": "send",
+          "targets": [
+            "publish",
+            "insert"
+          ],
+          "ranks": [
+            {
+              "target": "publish",
+              "rank": 0
+            },
+            {
+              "target": "insert",
+              "rank": 22
+            }
+          ],
+          "rows": 24,
+          "found": false,
+          "latencyMs": 2,
+          "top": [
+            "registerOrderRoutes",
+            "registerUserRoutes",
+            "createApp",
+            "get",
+            "label"
+          ]
+        },
+        {
+          "word": "check",
+          "targets": [
+            "validateUser",
+            "validateId"
+          ],
+          "ranks": [
+            {
+              "target": "validateUser",
+              "rank": 21
+            },
+            {
+              "target": "validateId",
+              "rank": 17
+            }
+          ],
+          "rows": 24,
+          "found": false,
+          "latencyMs": 2,
+          "top": [
+            "registerUserRoutes",
+            "registerOrderRoutes",
+            "getOrder",
+            "create",
+            "toUser"
+          ]
+        },
+        {
+          "word": "start",
+          "targets": [
+            "main",
+            "createApp"
+          ],
+          "ranks": [
+            {
+              "target": "main",
+              "rank": 22
+            },
+            {
+              "target": "createApp",
+              "rank": 1
+            }
+          ],
+          "rows": 24,
+          "found": true,
+          "latencyMs": 2,
+          "top": [
+            "createApp",
+            "query",
+            "create",
+            "listUsers",
+            "registerOrderRoutes"
+          ]
+        },
+        {
+          "word": "save",
+          "targets": [
+            "insert"
+          ],
+          "ranks": [
+            {
+              "target": "insert",
+              "rank": 10
+            }
+          ],
+          "rows": 24,
+          "found": false,
+          "latencyMs": 2,
+          "top": [
+            "label",
+            "table",
+            "create",
+            "constructor",
+            "isProduction"
+          ]
+        },
+        {
+          "word": "fetch",
+          "targets": [
+            "query"
+          ],
+          "ranks": [
+            {
+              "target": "query",
+              "rank": 18
+            }
+          ],
+          "rows": 24,
+          "found": false,
+          "latencyMs": 1,
+          "top": [
+            "label",
+            "isProduction",
+            "table",
+            "main",
+            "constructor"
+          ]
+        },
+        {
+          "word": "verify",
+          "targets": [
+            "validateUser"
+          ],
+          "ranks": [
+            {
+              "target": "validateUser",
+              "rank": 14
+            }
+          ],
+          "rows": 24,
+          "found": false,
+          "latencyMs": 2,
+          "top": [
+            "loadConfig",
+            "isProduction",
+            "post",
+            "label",
+            "get"
+          ]
+        }
+      ],
+      "identity": [
+        {
+          "name": "insert",
+          "rank": 7,
+          "rows": 24,
+          "topScore": 0.9513,
+          "lastScore": 0.8159
+        },
+        {
+          "name": "validateUser",
+          "rank": 24,
+          "rows": 24,
+          "topScore": 0.01493,
+          "lastScore": -0.01793
+        },
+        {
+          "name": "hotspotScan",
+          "rank": 7,
+          "rows": 24,
+          "topScore": -0.002969,
+          "lastScore": -0.03884
+        },
+        {
+          "name": "loadConfig",
+          "rank": 24,
+          "rows": 24,
+          "topScore": 0.08065,
+          "lastScore": 0
+        }
+      ],
+      "nonsense": {
+        "word": "zzzzqqqq",
+        "rows": 24,
+        "topScore": 0.02679,
+        "lastScore": -0.02086
+      },
+      "rejectionReason": "Nicht dazugeschaltet. Die Latenz war nie das Problem (2 ms gegen 2 ms fuer BM25), der Nutzen ist es: nur 1 von 6 Vokabular-Bruecken standen in den ersten 5 Zeilen. Die Gegenprobe erklaert warum: unter seinem EIGENEN Namen gesucht, steht insert auf Rang 7 von 24, validateUser auf Rang 24 von 24, hotspotScan auf Rang 7 von 24, loadConfig auf Rang 24 von 24. Eine Vektorsuche, die ein Symbol nicht findet, wenn man seinen Namen eintippt, kann keine Bruecke schlagen. Dazu kommt, dass der Modus nie nichts sagt: das Unsinnswort \"zzzzqqqq\" liefert 24 Zeilen mit Werten von 0.02679 bis -0.02086, also den ganzen Graphen in einer Reihenfolge. Dazugeschaltet haette die Suche unter jeder Anfrage Treffer gezeigt und \"no symbol answers\" nie wieder gesagt."
+    },
+    "menu": {
+      "entries": [
+        {
+          "menu": "a",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[a]tlas",
+          "bracket": "[a]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(31, 127, 76)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 72,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "a-why",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[w]hy am I here",
+          "bracket": "[w]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 139,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "a-bug",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[b]ug hunt",
+          "bracket": "[b]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 98,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "a-impact",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[c]hange scope",
+          "bracket": "[c]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 131,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "a-layout",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[r]eset layout",
+          "bracket": "[r]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 131,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "a-llm",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[l]ocal llm off",
+          "bracket": "[l]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 139,
+          "height": 25,
+          "disabled": false
+        },
+        {
+          "menu": "?",
+          "tag": "BUTTON",
+          "className": "atlas-menu-item",
+          "label": "[?]help",
+          "bracket": "[?]",
+          "bracketColor": "rgb(51, 255, 153)",
+          "fontSize": "13px",
+          "padding": "1px 6px 1px 6px",
+          "border": "1px solid",
+          "borderColor": "rgb(29, 41, 38)",
+          "borderBottom": "1px solid",
+          "tabIndex": 0,
+          "width": 72,
+          "height": 25,
+          "disabled": false
+        }
+      ],
+      "legend": "alt + letter"
+    },
+    "activatedByClick": [
+      "a",
+      "w",
+      "b",
+      "c",
+      "r",
+      "l",
+      "?"
+    ],
+    "menuKeyboard": [
+      {
+        "menu": "a",
+        "reached": true,
+        "tabs": 1,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "a-why",
+        "reached": true,
+        "tabs": 2,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "a-bug",
+        "reached": true,
+        "tabs": 3,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "a-impact",
+        "reached": true,
+        "tabs": 4,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "a-layout",
+        "reached": true,
+        "tabs": 5,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "a-llm",
+        "reached": true,
+        "tabs": 6,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      },
+      {
+        "menu": "?",
+        "reached": true,
+        "tabs": 7,
+        "outlineStyle": "solid",
+        "outlineWidth": 2,
+        "activated": true
+      }
+    ],
+    "altShortcuts": {
+      "a": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "false",
+        "activatedMenus": [
+          "a"
+        ]
+      },
+      "w": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "true",
+        "activatedMenus": [
+          "w"
+        ]
+      },
+      "b": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "true",
+        "activatedMenus": [
+          "b"
+        ]
+      },
+      "c": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "true",
+        "activatedMenus": [
+          "c"
+        ]
+      },
+      "l": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "true",
+        "activatedMenus": [
+          "l"
+        ]
+      },
+      "r": {
+        "activated": true,
+        "lineStayedEmpty": true,
+        "galaxyBefore": "true",
+        "galaxyAfter": "true",
+        "activatedMenus": [
+          "r"
+        ]
+      }
+    },
+    "altShortcutVisibleEffect": true,
+    "capturePhase": {
+      "seen": 1,
+      "defaultPrevented": true,
+      "handled": "w",
+      "declared": true
+    },
+    "keyProbe": {
+      "idle": {
+        "present": true,
+        "pressed": false,
+        "fields": {
+          "code": "-",
+          "key": "-",
+          "modifiers": "-",
+          "defaultPrevented": "-",
+          "consumedBy": "-",
+          "target": "-",
+          "shortcut": "-"
+        }
+      },
+      "pressed": {
+        "present": true,
+        "pressed": true,
+        "fields": {
+          "code": "KeyA",
+          "key": "a",
+          "modifiers": "alt (option)",
+          "defaultPrevented": "true",
+          "consumedBy": "this window: its own shortcut handler took it",
+          "target": "DIV",
+          "shortcut": "yes: the menu key for [a]"
+        }
+      }
+    },
+    "searchSamples": [
+      {
+        "word": "user",
+        "ms": 1.4,
+        "source": "loaded",
+        "rows": 10
+      },
+      {
+        "word": "create",
+        "ms": 3.1,
+        "source": "loaded",
+        "rows": 4
+      },
+      {
+        "word": "validate",
+        "ms": 1.1,
+        "source": "loaded",
+        "rows": 6
+      },
+      {
+        "word": "insert",
+        "ms": 1.1,
+        "source": "loaded",
+        "rows": 4
+      },
+      {
+        "word": "order",
+        "ms": 9,
+        "source": "loaded",
+        "rows": 10
+      },
+      {
+        "word": "query",
+        "ms": 46.2,
+        "source": "loaded",
+        "rows": 2
+      },
+      {
+        "word": "route",
+        "ms": 20.9,
+        "source": "loaded",
+        "rows": 10
+      },
+      {
+        "word": "config",
+        "ms": 11.6,
+        "source": "loaded",
+        "rows": 7
+      },
+      {
+        "word": "server",
+        "ms": 1.2,
+        "source": "loaded",
+        "rows": 10
+      },
+      {
+        "word": "walk",
+        "ms": 3.4,
+        "source": "loaded",
+        "rows": 1
+      },
+      {
+        "word": "hotspot",
+        "ms": 3.5,
+        "source": "loaded",
+        "rows": 2
+      },
+      {
+        "word": "toUser",
+        "ms": 1.3,
+        "source": "loaded",
+        "rows": 3
+      }
+    ],
+    "prefixCache": {
+      "before": 0,
+      "after": 6,
+      "shownQuery": "validate"
+    },
+    "roundtrips": [
+      6,
+      5
+    ],
+    "staleRace": {
+      "shownQuery": "validate",
+      "shownSource": "index",
+      "aborted": 1,
+      "dropped": 0,
+      "firstRow": {
+        "present": true,
+        "name": "validateId",
+        "source": "index",
+        "top": 719.61,
+        "headline": "5 hits for \"validate\"",
+        "rows": 5,
+        "provisionalMarks": 0
+      }
+    },
+    "provisionalShot": {
+      "present": true,
+      "name": "ValidationError",
+      "source": "loaded",
+      "top": 719.61,
+      "headline": "6 suggestions for \"validat\" from what is already loaded, the index is answering ...",
+      "rows": 6,
+      "provisionalMarks": 6
+    },
+    "noJump": {
+      "before": {
+        "present": true,
+        "name": "ValidationError",
+        "source": "loaded",
+        "top": 719.61,
+        "headline": "6 suggestions for \"validat\" from what is already loaded, the index is answering ...",
+        "rows": 6,
+        "provisionalMarks": 6
+      },
+      "after": {
+        "present": true,
+        "name": "validateId",
+        "source": "index",
+        "top": 719.61,
+        "headline": "5 hits for \"validate\"",
+        "rows": 5,
+        "provisionalMarks": 0
+      },
+      "movedPx": 0
+    },
+    "apiRoutes": {
+      "/api/layout": 18,
+      "/api/tree": 126
+    },
+    "rpcTools": {
+      "index_status": 36,
+      "query_graph": 78,
+      "check_index_coverage": 18,
+      "detect_changes": 3,
+      "get_architecture": 3,
+      "get_code_snippet": 27,
+      "search_graph": 4
+    },
+    "finalSeam": {
+      "debounceMs": 90,
+      "minQuery": 2,
+      "currentQuery": "",
+      "shownQuery": "",
+      "shownSource": "index",
+      "shownRows": 0,
+      "localFirst": 80,
+      "prefixCacheHits": 6,
+      "serverRequests": 5,
+      "serverRoundtripMs": 706,
+      "roundtrips": [
+        6,
+        5,
+        707,
+        706
+      ],
+      "abortedRequests": 1,
+      "staleDropped": 0,
+      "staleAnswerWins": false,
+      "localCandidates": 87,
+      "activatedMenus": [],
+      "keyListenerCapture": true
+    },
+    "consoleErrorsCancelled": 16,
+    "consoleErrorsOther": [],
+    "blockedSidecarProbes": 16,
+    "blockedOther": []
+  }
+}

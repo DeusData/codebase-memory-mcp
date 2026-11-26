@@ -1,0 +1,1113 @@
+{
+  "layoutEdgeTypes": {
+    "DEFINES": 52,
+    "USAGE": 37,
+    "IMPORTS": 26,
+    "CALLS": 25,
+    "CONTAINS_FILE": 11,
+    "CONFIGURES": 6,
+    "CONTAINS_FOLDER": 6,
+    "DEFINES_METHOD": 6,
+    "IMPLEMENTS": 4,
+    "RAISES": 3,
+    "CALL_REFERENCE": 1,
+    "HAS_BRANCH": 1
+  },
+  "distinctColorsRendered": 9,
+  "renderedColors": [
+    {
+      "type": "USAGE",
+      "color": "#99ff3d",
+      "tableColor": "#a3e635",
+      "pixels": 3301,
+      "distanceToTable": 27.81
+    },
+    {
+      "type": "DEFINES",
+      "color": "#7e38ff",
+      "tableColor": "#a855f7",
+      "pixels": 2110,
+      "distanceToTable": 57.09
+    },
+    {
+      "type": "CALLS",
+      "color": "#1affc1",
+      "tableColor": "#1DA27E",
+      "pixels": 1317,
+      "distanceToTable": 20.36
+    },
+    {
+      "type": "IMPORTS",
+      "color": "#2369ff",
+      "tableColor": "#3b82f6",
+      "pixels": 960,
+      "distanceToTable": 39.62
+    },
+    {
+      "type": "CONTAINS_FILE",
+      "color": "#17ff67",
+      "tableColor": "#22c55e",
+      "pixels": 753,
+      "distanceToTable": 28.11
+    },
+    {
+      "type": "CONFIGURES",
+      "color": "#ffdb2e",
+      "tableColor": "#fde047",
+      "pixels": 344,
+      "distanceToTable": 26.44
+    },
+    {
+      "type": "RAISES",
+      "color": "#ff2e55",
+      "tableColor": "#ff4d4d",
+      "pixels": 247,
+      "distanceToTable": 32.02
+    },
+    {
+      "type": "IMPLEMENTS",
+      "color": "#ff5f16",
+      "tableColor": "#f97316",
+      "pixels": 184,
+      "distanceToTable": 22.78
+    },
+    {
+      "type": "HAS_BRANCH",
+      "color": "#a7d9ff",
+      "tableColor": "#94a3b8",
+      "pixels": 12,
+      "distanceToTable": 39.13
+    }
+  ],
+  "colorDistanceThreshold": 40,
+  "colorMatchThreshold": 25,
+  "legendShowsCounts": true,
+  "legendMatchesLayout": true,
+  "legendListsAbsentTypes": false,
+  "legendSortedByCount": true,
+  "filterHidesType": true,
+  "filterKeepsRowVisible": true,
+  "filterRowDimmed": true,
+  "filterHeaderText": "12 edge kinds, 1 of 12 hidden",
+  "filterSurvivesViewSwitch": true,
+  "hierarchyWalkEdges": 8,
+  "hierarchyExtraEdges": 3,
+  "hierarchyHeaderExplainsCounts": true,
+  "hierarchyExtraEdgesFilterable": true,
+  "hierarchyDeterminismUnchanged": true,
+  "hierarchyColumnsFromCallsOnly": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "screenshotsAtRest": true,
+  "port": 4461,
+  "leftoverProcesses": 0,
+  "sceneDriftMeanAbs": 0,
+  "sceneDriftPixels": 0,
+  "project": "codeatlasweb-w9",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "walkTarget": "createUser",
+  "method": "Gemessen wird am gerenderten Bild: eine Aufnahme der Zeichenflaeche, dann je Kantenart dieselbe Aufnahme mit dieser Art abgeschaltet. Die Differenz ist das Licht, das genau diese Art beigetragen hat; ihre Richtung im Farbraum (auf den gleichen Maximalkanal gebracht) ist die Farbe, in der sie gezeichnet wurde. Zwei Farben gelten ab einem Abstand von 40 als verschieden, ein Pixel zeigt eine Art ab einem Abstand unter 25.",
+  "timings": {
+    "buildMs": 10740,
+    "totalMs": 50293
+  },
+  "generatedAt": "2026-08-30T17:30:30.811Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "galaxy mit ausgeblendeter Art USAGE",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 163,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 150,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "galaxy mit offener Legende",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 163,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 150,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "hierarchie mit den zusaetzlichen Kanten",
+        "scrolledRegions": 2,
+        "top": {
+          "candidates": 185,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 158,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "measurements": [
+      {
+        "type": "DEFINES",
+        "count": 52,
+        "tableColor": "#a855f7",
+        "renderedColor": "#7e38ff",
+        "pixels": 2110,
+        "addedPixels": 0,
+        "matchBefore": 294,
+        "matchAfter": 27,
+        "litPixels": 11943,
+        "meanDiff": [
+          29.64,
+          13.25,
+          60.06
+        ],
+        "distanceToTable": 57.09,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "USAGE",
+        "count": 37,
+        "tableColor": "#a3e635",
+        "renderedColor": "#99ff3d",
+        "pixels": 3301,
+        "addedPixels": 0,
+        "matchBefore": 715,
+        "matchAfter": 0,
+        "litPixels": 11943,
+        "meanDiff": [
+          28.91,
+          48.17,
+          11.46
+        ],
+        "distanceToTable": 27.81,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "IMPORTS",
+        "count": 26,
+        "tableColor": "#3b82f6",
+        "renderedColor": "#2369ff",
+        "pixels": 960,
+        "addedPixels": 0,
+        "matchBefore": 507,
+        "matchAfter": 0,
+        "litPixels": 11943,
+        "meanDiff": [
+          17.16,
+          50.92,
+          123.78
+        ],
+        "distanceToTable": 39.62,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "CALLS",
+        "count": 25,
+        "tableColor": "#1DA27E",
+        "renderedColor": "#1affc1",
+        "pixels": 1317,
+        "addedPixels": 0,
+        "matchBefore": 445,
+        "matchAfter": 0,
+        "litPixels": 11943,
+        "meanDiff": [
+          5.17,
+          51.09,
+          38.71
+        ],
+        "distanceToTable": 20.36,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "CONTAINS_FILE",
+        "count": 11,
+        "tableColor": "#22c55e",
+        "renderedColor": "#17ff67",
+        "pixels": 753,
+        "addedPixels": 0,
+        "matchBefore": 540,
+        "matchAfter": 158,
+        "litPixels": 11943,
+        "meanDiff": [
+          8.61,
+          96.42,
+          39.07
+        ],
+        "distanceToTable": 28.11,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "CONFIGURES",
+        "count": 6,
+        "tableColor": "#fde047",
+        "renderedColor": "#ffdb2e",
+        "pixels": 344,
+        "addedPixels": 0,
+        "matchBefore": 487,
+        "matchAfter": 380,
+        "litPixels": 11943,
+        "meanDiff": [
+          46.98,
+          40.41,
+          8.42
+        ],
+        "distanceToTable": 26.44,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "CONTAINS_FOLDER",
+        "count": 6,
+        "tableColor": "#22c55e",
+        "renderedColor": "#16ff61",
+        "pixels": 468,
+        "addedPixels": 0,
+        "matchBefore": 540,
+        "matchAfter": 384,
+        "litPixels": 11943,
+        "meanDiff": [
+          7.75,
+          91.49,
+          34.69
+        ],
+        "distanceToTable": 33.07,
+        "distinct": false,
+        "sameColorAs": "CONTAINS_FILE"
+      },
+      {
+        "type": "DEFINES_METHOD",
+        "count": 6,
+        "tableColor": "#a855f7",
+        "renderedColor": "#9c36ff",
+        "pixels": 61,
+        "addedPixels": 0,
+        "matchBefore": 294,
+        "matchAfter": 277,
+        "litPixels": 11943,
+        "meanDiff": [
+          79.46,
+          27.2,
+          129.57
+        ],
+        "distanceToTable": 37.99,
+        "distinct": false,
+        "sameColorAs": "DEFINES"
+      },
+      {
+        "type": "IMPLEMENTS",
+        "count": 4,
+        "tableColor": "#f97316",
+        "renderedColor": "#ff5f16",
+        "pixels": 184,
+        "addedPixels": 0,
+        "matchBefore": 479,
+        "matchAfter": 449,
+        "litPixels": 11943,
+        "meanDiff": [
+          64.05,
+          23.94,
+          5.55
+        ],
+        "distanceToTable": 22.78,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "RAISES",
+        "count": 3,
+        "tableColor": "#ff4d4d",
+        "renderedColor": "#ff2e55",
+        "pixels": 247,
+        "addedPixels": 0,
+        "matchBefore": 85,
+        "matchAfter": 84,
+        "litPixels": 11943,
+        "meanDiff": [
+          27.74,
+          4.99,
+          9.29
+        ],
+        "distanceToTable": 32.02,
+        "distinct": true,
+        "sameColorAs": null
+      },
+      {
+        "type": "CALL_REFERENCE",
+        "count": 1,
+        "tableColor": "#7dd3fc",
+        "renderedColor": "",
+        "pixels": 0,
+        "addedPixels": 0,
+        "matchBefore": 20,
+        "matchAfter": 20,
+        "litPixels": 11943,
+        "meanDiff": null,
+        "distanceToTable": null,
+        "distinct": false
+      },
+      {
+        "type": "HAS_BRANCH",
+        "count": 1,
+        "tableColor": "#94a3b8",
+        "renderedColor": "#a7d9ff",
+        "pixels": 12,
+        "addedPixels": 0,
+        "matchBefore": 27,
+        "matchAfter": 17,
+        "litPixels": 11943,
+        "meanDiff": [
+          81.92,
+          106.42,
+          125.17
+        ],
+        "distanceToTable": 39.13,
+        "distinct": true,
+        "sameColorAs": null
+      }
+    ],
+    "shots": [
+      {
+        "name": "galaxy-edges.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-galaxy-legend",
+            "top": 0,
+            "left": 0,
+            "hidden": 405,
+            "hint": "bottom"
+          }
+        ]
+      },
+      {
+        "name": "legend-filter.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-galaxy-legend",
+            "top": 0,
+            "left": 0,
+            "hidden": 405,
+            "hint": "bottom"
+          }
+        ]
+      },
+      {
+        "name": "hierarchy-edges.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 904,
+            "hint": "bottom"
+          },
+          {
+            "name": "atlas-galaxy-legend",
+            "top": 0,
+            "left": 0,
+            "hidden": 405,
+            "hint": "bottom"
+          }
+        ]
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4460,
+    "layout": {
+      "url": "/api/layout?project=codeatlasweb-w9&max_nodes=5000",
+      "nodes": 76,
+      "edges": 178
+    },
+    "legendRows": [
+      {
+        "type": "DEFINES",
+        "count": 52,
+        "color": "#a855f7",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "DEFINES 52",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1335.859375,
+          "y": 689.265625,
+          "width": 77.234375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "USAGE",
+        "count": 37,
+        "color": "#a3e635",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "USAGE 37",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1423.09375,
+          "y": 689.265625,
+          "width": 63.984375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "IMPORTS",
+        "count": 26,
+        "color": "#3b82f6",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "IMPORTS 26",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1497.078125,
+          "y": 689.265625,
+          "width": 77.234375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "CALLS",
+        "count": 25,
+        "color": "#1DA27E",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "CALLS 25",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1584.3125,
+          "y": 689.265625,
+          "width": 63.984375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "CONTAINS_FILE",
+        "count": 11,
+        "color": "#22c55e",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "CONTAINS_FILE 11",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1255,
+          "y": 704.65625,
+          "width": 116.96875,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "CONFIGURES",
+        "count": 6,
+        "color": "#fde047",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "CONFIGURES 6",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1381.96875,
+          "y": 704.65625,
+          "width": 90.484375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "CONTAINS_FOLDER",
+        "count": 6,
+        "color": "#22c55e",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "CONTAINS_FOLDER 6",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1482.453125,
+          "y": 704.65625,
+          "width": 123.59375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "DEFINES_METHOD",
+        "count": 6,
+        "color": "#a855f7",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "DEFINES_METHOD 6",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1255,
+          "y": 720.046875,
+          "width": 116.96875,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "IMPLEMENTS",
+        "count": 4,
+        "color": "#f97316",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "IMPLEMENTS 4",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1381.96875,
+          "y": 720.046875,
+          "width": 90.484375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "RAISES",
+        "count": 3,
+        "color": "#ff4d4d",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "RAISES 3",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1482.453125,
+          "y": 720.046875,
+          "width": 63.984375,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "CALL_REFERENCE",
+        "count": 1,
+        "color": "#7dd3fc",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "CALL_REFERENCE 1",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1255,
+          "y": 735.4375,
+          "width": 116.96875,
+          "height": 15.390625
+        }
+      },
+      {
+        "type": "HAS_BRANCH",
+        "count": 1,
+        "color": "#94a3b8",
+        "hidden": false,
+        "pressed": "true",
+        "tag": "BUTTON",
+        "title": "",
+        "text": "HAS_BRANCH 1",
+        "opacity": 1,
+        "struckThrough": false,
+        "visible": true,
+        "rect": {
+          "x": 1381.96875,
+          "y": 735.4375,
+          "width": 90.484375,
+          "height": 15.390625
+        }
+      }
+    ],
+    "galaxyAtCapture": {
+      "nodes": 76,
+      "drawnEdges": 178,
+      "highlightedCount": 0,
+      "mode": "galaxy"
+    },
+    "sceneRect": {
+      "x": 1241,
+      "y": 761,
+      "width": 439,
+      "height": 198
+    },
+    "captureSize": {
+      "width": 439,
+      "height": 198
+    },
+    "filterType": "USAGE",
+    "filterHeadline": {
+      "headline": {
+        "present": true,
+        "text": "76 nodes, 178 edges from /api/layout",
+        "title": "",
+        "clipped": false,
+        "lines": 1
+      },
+      "edges": {
+        "present": true,
+        "text": "12 edge kinds, 1 of 12 hidden",
+        "title": "",
+        "clipped": false,
+        "lines": 1
+      },
+      "text": "76 nodes, 178 edges from /api/layout 12 edge kinds, 1 of 12 hidden"
+    },
+    "filterRow": {
+      "type": "USAGE",
+      "count": 37,
+      "color": "#a3e635",
+      "hidden": true,
+      "pressed": "false",
+      "tag": "BUTTON",
+      "title": "",
+      "text": "USAGE 37",
+      "opacity": 0.42,
+      "struckThrough": true,
+      "visible": true,
+      "rect": {
+        "x": 1423.09375,
+        "y": 689.265625,
+        "width": 63.984375,
+        "height": 15.390625
+      }
+    },
+    "colorDistances": [
+      {
+        "a": "USAGE",
+        "b": "DEFINES",
+        "distance": 279.22
+      },
+      {
+        "a": "USAGE",
+        "b": "CALLS",
+        "distance": 183.17
+      },
+      {
+        "a": "USAGE",
+        "b": "IMPORTS",
+        "distance": 272.14
+      },
+      {
+        "a": "USAGE",
+        "b": "CONTAINS_FILE",
+        "distance": 136.62
+      },
+      {
+        "a": "USAGE",
+        "b": "CONFIGURES",
+        "distance": 109.2
+      },
+      {
+        "a": "USAGE",
+        "b": "RAISES",
+        "distance": 233.8
+      },
+      {
+        "a": "USAGE",
+        "b": "IMPLEMENTS",
+        "distance": 193.71
+      },
+      {
+        "a": "USAGE",
+        "b": "HAS_BRANCH",
+        "distance": 198.18
+      },
+      {
+        "a": "DEFINES",
+        "b": "CALLS",
+        "distance": 231.18
+      },
+      {
+        "a": "DEFINES",
+        "b": "IMPORTS",
+        "distance": 103.35
+      },
+      {
+        "a": "DEFINES",
+        "b": "CONTAINS_FILE",
+        "distance": 270.77
+      },
+      {
+        "a": "DEFINES",
+        "b": "CONFIGURES",
+        "distance": 294.77
+      },
+      {
+        "a": "DEFINES",
+        "b": "RAISES",
+        "distance": 213.64
+      },
+      {
+        "a": "DEFINES",
+        "b": "IMPLEMENTS",
+        "distance": 269.17
+      },
+      {
+        "a": "DEFINES",
+        "b": "HAS_BRANCH",
+        "distance": 166.14
+      },
+      {
+        "a": "CALLS",
+        "b": "IMPORTS",
+        "distance": 162.56
+      },
+      {
+        "a": "CALLS",
+        "b": "CONTAINS_FILE",
+        "distance": 90.05
+      },
+      {
+        "a": "CALLS",
+        "b": "CONFIGURES",
+        "distance": 274.49
+      },
+      {
+        "a": "CALLS",
+        "b": "RAISES",
+        "distance": 328.31
+      },
+      {
+        "a": "CALLS",
+        "b": "IMPLEMENTS",
+        "distance": 327.54
+      },
+      {
+        "a": "CALLS",
+        "b": "HAS_BRANCH",
+        "distance": 158.65
+      },
+      {
+        "a": "IMPORTS",
+        "b": "CONTAINS_FILE",
+        "distance": 213.89
+      },
+      {
+        "a": "IMPORTS",
+        "b": "CONFIGURES",
+        "distance": 324.16
+      },
+      {
+        "a": "IMPORTS",
+        "b": "RAISES",
+        "distance": 284.22
+      },
+      {
+        "a": "IMPORTS",
+        "b": "IMPLEMENTS",
+        "distance": 320.61
+      },
+      {
+        "a": "IMPORTS",
+        "b": "HAS_BRANCH",
+        "distance": 173.11
+      },
+      {
+        "a": "CONTAINS_FILE",
+        "b": "CONFIGURES",
+        "distance": 241.6
+      },
+      {
+        "a": "CONTAINS_FILE",
+        "b": "RAISES",
+        "distance": 312.78
+      },
+      {
+        "a": "CONTAINS_FILE",
+        "b": "IMPLEMENTS",
+        "distance": 293.23
+      },
+      {
+        "a": "CONTAINS_FILE",
+        "b": "HAS_BRANCH",
+        "distance": 212.8
+      },
+      {
+        "a": "CONFIGURES",
+        "b": "RAISES",
+        "distance": 177.34
+      },
+      {
+        "a": "CONFIGURES",
+        "b": "IMPLEMENTS",
+        "distance": 126.3
+      },
+      {
+        "a": "CONFIGURES",
+        "b": "HAS_BRANCH",
+        "distance": 226.78
+      },
+      {
+        "a": "RAISES",
+        "b": "IMPLEMENTS",
+        "distance": 79.81
+      },
+      {
+        "a": "RAISES",
+        "b": "HAS_BRANCH",
+        "distance": 256.68
+      },
+      {
+        "a": "IMPLEMENTS",
+        "b": "HAS_BRANCH",
+        "distance": 277.34
+      }
+    ],
+    "hiddenAcrossSwitch": {
+      "beforeSwitch": [
+        "USAGE"
+      ],
+      "afterSwitch": [
+        "USAGE"
+      ]
+    },
+    "hierarchy": {
+      "root": "createUser",
+      "symbols": 8,
+      "depth": 3,
+      "walkEdges": 8,
+      "extraEdges": 3,
+      "extras": [
+        {
+          "type": "RAISES",
+          "from": "codeatlasweb-w9.src.services.userService.createUser",
+          "to": "codeatlasweb-w9.src.util.validate.ValidationError",
+          "offset": 9
+        },
+        {
+          "type": "CALL_REFERENCE",
+          "from": "codeatlasweb-w9.src.services.userService.listUsers",
+          "to": "codeatlasweb-w9.src.services.userService.toUser",
+          "offset": 0
+        },
+        {
+          "type": "RAISES",
+          "from": "codeatlasweb-w9.src.util.validate.validateUser",
+          "to": "codeatlasweb-w9.src.util.validate.ValidationError",
+          "offset": 9
+        }
+      ],
+      "headline": "hierarchy of createUser: 8 symbols, depth 3",
+      "edgeKinds": [
+        {
+          "type": "CALLS",
+          "count": 8,
+          "color": "#1DA27E",
+          "hidden": false
+        },
+        {
+          "type": "RAISES",
+          "count": 2,
+          "color": "#ff4d4d",
+          "hidden": false
+        },
+        {
+          "type": "CALL_REFERENCE",
+          "count": 1,
+          "color": "#7dd3fc",
+          "hidden": false
+        }
+      ]
+    },
+    "hierarchyHead": {
+      "headline": {
+        "present": true,
+        "text": "hierarchy of createUser: 8 symbols, depth 3",
+        "title": "",
+        "clipped": false,
+        "lines": 1
+      },
+      "edges": {
+        "present": true,
+        "text": "8 calls from the walk, 3 links from the index; 3 edge kinds",
+        "title": "",
+        "clipped": false,
+        "lines": 1
+      },
+      "text": "hierarchy of createUser: 8 symbols, depth 3 8 calls from the walk, 3 links from the index; 3 edge kinds"
+    },
+    "hierarchyFilter": {
+      "hiddenKinds": [
+        {
+          "type": "RAISES",
+          "count": 2
+        },
+        {
+          "type": "CALL_REFERENCE",
+          "count": 1
+        }
+      ],
+      "drawnBefore": 11,
+      "drawnAfter": 8,
+      "walkEdges": 8,
+      "headAfter": {
+        "headline": {
+          "present": true,
+          "text": "hierarchy of createUser: 8 symbols, depth 3",
+          "title": "",
+          "clipped": false,
+          "lines": 1
+        },
+        "edges": {
+          "present": true,
+          "text": "8 calls from the walk, 3 links from the index; 3 edge kinds, 2 of 3 hidden",
+          "title": "",
+          "clipped": false,
+          "lines": 2
+        },
+        "text": "hierarchy of createUser: 8 symbols, depth 3 8 calls from the walk, 3 links from the index; 3 edge kinds, 2 of 3 hidden"
+      }
+    },
+    "columns": {
+      "columnWidth": 120,
+      "columnsOk": true,
+      "sortedOk": true,
+      "reachedByWalk": true,
+      "placements": [
+        {
+          "key": "codeatlasweb-w9.src.services.userService.createUser",
+          "name": "createUser",
+          "file": "src/services/userService.ts",
+          "hop": 0,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "key": "codeatlasweb-w9.src.types.UserEntity",
+          "name": "UserEntity",
+          "file": "src/types.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 180
+        },
+        {
+          "key": "codeatlasweb-w9.src.util.validate.ValidationError",
+          "name": "ValidationError",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 108
+        },
+        {
+          "key": "codeatlasweb-w9.src.repo.db.insert",
+          "name": "insert",
+          "file": "src/repo/db.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 36
+        },
+        {
+          "key": "codeatlasweb-w9.src.services.userService.listUsers",
+          "name": "listUsers",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -36
+        },
+        {
+          "key": "codeatlasweb-w9.src.services.userService.toUser",
+          "name": "toUser",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -108
+        },
+        {
+          "key": "codeatlasweb-w9.src.util.validate.validateUser",
+          "name": "validateUser",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -180
+        },
+        {
+          "key": "codeatlasweb-w9.src.repo.db.query",
+          "name": "query",
+          "file": "src/repo/db.ts",
+          "hop": 2,
+          "x": 240,
+          "y": 0
+        }
+      ]
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 57,
+      "check_index_coverage": 2,
+      "get_architecture": 1,
+      "search_graph": 2,
+      "get_code_snippet": 2
+    },
+    "leftovers": [
+      {
+        "port": 4460,
+        "listeners": 0
+      },
+      {
+        "port": 4461,
+        "listeners": 0
+      }
+    ]
+  }
+}

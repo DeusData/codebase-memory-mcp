@@ -6,6 +6,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
+#include "discover/discover_policy_internal.h"
 #include "foundation/platform.h"
 
 typedef struct {
@@ -151,6 +153,12 @@ TEST(skip_fast_3rdparty) {
 }
 TEST(skip_fast_e2e) {
     ASSERT_TRUE(cbm_should_skip_dir("e2e", CBM_MODE_FAST));
+    PASS();
+}
+TEST(no_skip_fast_external) {
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_FAST));
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_MODERATE));
+    ASSERT_FALSE(cbm_should_skip_dir("shop-external-api", CBM_MODE_FAST));
     PASS();
 }
 
@@ -891,6 +899,76 @@ TEST(discover_gitignore_dir_excluded_issue234) {
     PASS();
 }
 
+static int disc_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=master %s",
+             dir, args);
+    return system(cmd);
+}
+
+static bool disc_has(const cbm_file_info_t *files, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A .gitignore never hides a file git tracks: git applies ignore rules to
+ * untracked paths only. cluster-api's nested `.gitignore` line `manager`,
+ * meant for a built binary, hid its tracked config/manager/ kustomization.
+ * Untracked ignored files stay out, also inside a directory that is entered
+ * only for its tracked content. */
+TEST(discover_gitignore_never_hides_tracked_files) {
+    char *base = th_mktempdir("cbm_disc_tracked");
+    ASSERT(base != NULL);
+    if (disc_git(base, "init -q") != 0) {
+        th_cleanup(base);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(base, ".gitignore"), "manager\n*.gen.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n\nfunc main() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/manager.go"), "package manager\n\nfunc Run() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/scratch.go"), "package manager\n\nfunc S() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/sub/deep.go"), "package sub\n\nfunc Deep() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/tmp/build.go"), "package tmp\n\nfunc B() {}\n");
+    th_write_file(TH_PATH(base, "api/types.gen.go"), "package api\n\nfunc Gen() {}\n");
+    th_write_file(TH_PATH(base, "api/other.gen.go"), "package api\n\nfunc Other() {}\n");
+    int add_rc = disc_git(base, "add .gitignore main.go");
+    int force_rc = disc_git(base, "add -f config/manager/manager.go config/manager/sub/deep.go "
+                                  "api/types.gen.go");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool main_found = rc == 0 && disc_has(files, count, "main.go");
+    bool manager_found = rc == 0 && disc_has(files, count, "config/manager/manager.go");
+    bool deep_found = rc == 0 && disc_has(files, count, "config/manager/sub/deep.go");
+    bool gen_found = rc == 0 && disc_has(files, count, "api/types.gen.go");
+    bool scratch_found = rc == 0 && disc_has(files, count, "config/manager/scratch.go");
+    bool build_found = rc == 0 && disc_has(files, count, "config/manager/tmp/build.go");
+    bool other_found = rc == 0 && disc_has(files, count, "api/other.gen.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(force_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(main_found);
+    /* Tracked: kept although .gitignore matches them or a directory above. */
+    ASSERT_TRUE(manager_found);
+    ASSERT_TRUE(deep_found);
+    ASSERT_TRUE(gen_found);
+    /* Untracked and ignored: still out, also below the entered directory. */
+    ASSERT_FALSE(scratch_found);
+    ASSERT_FALSE(build_found);
+    ASSERT_FALSE(other_found);
+    PASS();
+}
+
 TEST(discover_max_file_size) {
     char *base = th_mktempdir("cbm_disc_size");
     ASSERT(base != NULL);
@@ -1195,6 +1273,292 @@ TEST(discover_deploy_excluded_full_mode) {
     PASS();
 }
 
+typedef struct {
+    const char *path;
+    const char *content;
+    CBMLanguage language; /* the language discovery gives it; CBM_LANG_COUNT: not discovered */
+} discover_case_t;
+
+/* The language discovery gave rel_path, or CBM_LANG_COUNT when it is absent. */
+static CBMLanguage discover_language_of(const cbm_file_info_t *files, int count,
+                                        const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return files[i].language;
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* Writes the cases under base, discovers in full mode and checks each case's
+ * language (CBM_LANG_COUNT: not discovered). Returns the number of mismatches,
+ * each printed, or -1 when discovery fails. */
+static int discover_check_cases(const char *base, const discover_case_t *cases, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        th_write_file(TH_PATH(base, cases[i].path), cases[i].content);
+    }
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    if (cbm_discover(base, &opts, &files, &count) != 0) {
+        return -1;
+    }
+    int mismatches = 0;
+    for (size_t i = 0; i < n; i++) {
+        CBMLanguage got = discover_language_of(files, count, cases[i].path);
+        if (got != cases[i].language) {
+            fprintf(stderr, "  %s: language %d, expected %d\n", cases[i].path, (int)got,
+                    (int)cases[i].language);
+            mismatches++;
+        }
+    }
+    cbm_discover_free(files, count);
+    return mismatches;
+}
+
+/* Inside deploy/ and deployed/ discovery indexes deployment and configuration
+ * files, one of each family here, and keeps skipping program source: build
+ * copies of source there (discover_deploy_excluded_full_mode) still make no
+ * duplicate classes. A file is admitted by its language, never by its
+ * folder: a .py beside a chart stays out. Below a JVM source root `deploy` is
+ * a package like any other and is indexed in full, as before. */
+TEST(discover_deploy_indexes_config_files_only) {
+    static const discover_case_t cases[] = {
+        {"deploy/k8s/deployment.yaml", "apiVersion: apps/v1\nkind: Deployment\n", CBM_LANG_YAML},
+        {"deploy/k8s/service.json", "{\"apiVersion\": \"v1\", \"kind\": \"Service\"}\n",
+         CBM_LANG_JSON},
+        {"deploy/overlays/prod/kustomization.yaml", "resources:\n  - ../../k8s\n",
+         CBM_LANG_KUSTOMIZE},
+        {"deploy/chart/Chart.yaml", "apiVersion: v2\nname: web\nversion: 0.1.0\n", CBM_LANG_YAML},
+        {"deploy/chart/templates/deployment.yaml", "kind: Deployment\n", CBM_LANG_YAML},
+        {"deploy/chart/templates/_helpers.tpl", "{{- define \"web.name\" -}}web{{- end }}\n",
+         CBM_LANG_GOTEMPLATE},
+        {"deploy/terraform/main.tf", "resource \"null_resource\" \"x\" {}\n", CBM_LANG_HCL},
+        {"deploy/packer/image.pkr.hcl", "source \"null\" \"x\" {}\n", CBM_LANG_HCL},
+        {"deploy/Dockerfile", "FROM alpine:3.20\n", CBM_LANG_DOCKERFILE},
+        {"deploy/docker-compose.yml", "services:\n  web:\n    image: alpine\n", CBM_LANG_YAML},
+        {"deploy/install.sh", "kubectl apply -f k8s\n", CBM_LANG_BASH},
+        {"deploy/bootstrap", "#!/bin/bash\necho up\n", CBM_LANG_BASH},
+        {"deploy/prod.env", "MODE=prod\n", CBM_LANG_DOTENV},
+        {"deployed/stack/main.tf", "variable \"x\" {}\n", CBM_LANG_HCL},
+        {"deployed/.env.production", "MODE=prod\n", CBM_LANG_DOTENV},
+        /* the registry's build and configuration languages */
+        {"deploy/Makefile", "deploy:\n\tkubectl apply -f k8s\n", CBM_LANG_MAKEFILE},
+        {"deploy/cmake/CMakeLists.txt", "project(web)\n", CBM_LANG_CMAKE},
+        {"deploy/config.toml", "[server]\nport = 8080\n", CBM_LANG_TOML},
+        {"deploy/app.ini", "[app]\nmode = prod\n", CBM_LANG_INI},
+        {"deploy/nginx/nginx.conf", "worker_processes = 2\n", CBM_LANG_INI},
+        /* the other configuration and infrastructure languages */
+        {"deploy/app.properties", "server.port=8080\n", CBM_LANG_PROPERTIES},
+        {"deploy/web.xml", "<web-app></web-app>\n", CBM_LANG_XML},
+        {"deploy/settings.json5", "{port: 8080}\n", CBM_LANG_JSON5},
+        {"deploy/stack.jsonnet", "{ port: 8080 }\n", CBM_LANG_JSONNET},
+        {"deploy/templates/app.conf.j2", "port = {{ port }}\n", CBM_LANG_JINJA2},
+        {"deploy/main.bicep", "param location string\n", CBM_LANG_BICEP},
+        {"deploy/shell.nix", "{ pkgs }: pkgs.mkShell {}\n", CBM_LANG_NIX},
+        {"deploy/site.pp", "node default {}\n", CBM_LANG_PUPPET},
+        {"deploy/config.pkl", "port = 8080\n", CBM_LANG_PKL},
+        /* the rest of the shell family */
+        {"deploy/run.ps1", "Write-Host up\n", CBM_LANG_POWERSHELL},
+        {"deploy/setup.fish", "echo up\n", CBM_LANG_FISH},
+        /* dropped: SQL, Groovy, and the dependency manifests the package-map
+         * walk skips there (by name, whatever their language) */
+        {"deploy/schema.sql", "CREATE TABLE users (id int);\n", CBM_LANG_COUNT},
+        {"deploy/pipeline.groovy", "def run() {}\n", CBM_LANG_COUNT},
+        {"deploy/requirements.txt", "ansible==9.0\n", CBM_LANG_COUNT},
+        {"deploy/tool/go.mod", "module example.com/tool\n", CBM_LANG_COUNT},
+        {"deploy/tool/Cargo.toml", "[package]\nname = \"tool\"\n", CBM_LANG_COUNT},
+        {"deploy/tool/pyproject.toml", "[project]\nname = \"tool\"\n", CBM_LANG_COUNT},
+        {"deploy/tool/pom.xml", "<project></project>\n", CBM_LANG_COUNT},
+        {"deploy/tool/pubspec.yaml", "name: tool\n", CBM_LANG_COUNT},
+        /* the same names outside: indexed, so the rule is what drops them */
+        {"ops/schema.sql", "CREATE TABLE users (id int);\n", CBM_LANG_SQL},
+        {"ops/Cargo.toml", "[package]\nname = \"ops\"\n", CBM_LANG_TOML},
+        {"ops/pom.xml", "<project></project>\n", CBM_LANG_XML},
+        /* program source stays out, wherever it sits below the directory; each
+         * has a configuration file beside it, so its directory is walked */
+        {"deploy/main.go", "package deploy\n", CBM_LANG_COUNT},
+        {"deploy/chart/plugin.py", "def hook():\n    pass\n", CBM_LANG_COUNT},
+        {"deploy/lib/App.java", "class App {}\n", CBM_LANG_COUNT},
+        {"deploy/lib/replicas.json", "{\"replicas\": 2}\n", CBM_LANG_JSON},
+        {"deploy/run", "#!/usr/bin/env python3\nprint(1)\n", CBM_LANG_COUNT},
+        {"deployed/web/index.ts", "export class Web {}\n", CBM_LANG_COUNT},
+        {"deployed/web/Dockerfile", "FROM nginx:1.27\n", CBM_LANG_DOCKERFILE},
+        /* the same program files outside: indexed, so the rule is what drops them */
+        {"src/main.go", "package main\n", CBM_LANG_GO},
+        {"src/plugin.py", "def hook():\n    pass\n", CBM_LANG_PYTHON},
+        {"src/App.java", "class App {}\n", CBM_LANG_JAVA},
+        {"src/run", "#!/usr/bin/env python3\nprint(1)\n", CBM_LANG_PYTHON},
+        {"web/index.ts", "export class Web {}\n", CBM_LANG_TYPESCRIPT},
+        {"src/main/java/com/acme/deploy/Tool.java", "package com.acme.deploy;\nclass Tool {}\n",
+         CBM_LANG_JAVA},
+    };
+    char *base = th_mktempdir("cbm_disc_deploy_cfg");
+    ASSERT(base != NULL);
+    int mismatches = discover_check_cases(base, cases, sizeof(cases) / sizeof(cases[0]));
+    /* The walk reached each dropped file and recorded why (#963), as it
+     * records every built-in skip-list drop. */
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    cbm_ignored_file_t *ignored = NULL;
+    int ignored_count = 0;
+    int ignored_total = 0;
+    int rc = cbm_discover_ex2(base, &opts, &files, &count, &excluded, &excluded_count, &ignored,
+                              &ignored_count, &ignored_total);
+    static const char *const dropped[] = {"deploy/main.go",
+                                          "deploy/chart/plugin.py",
+                                          "deploy/lib/App.java",
+                                          "deploy/run",
+                                          "deployed/web/index.ts",
+                                          "deploy/schema.sql",
+                                          "deploy/pipeline.groovy",
+                                          "deploy/requirements.txt",
+                                          "deploy/tool/go.mod",
+                                          "deploy/tool/Cargo.toml",
+                                          "deploy/tool/pyproject.toml",
+                                          "deploy/tool/pom.xml",
+                                          "deploy/tool/pubspec.yaml"};
+    int recorded = 0;
+    for (size_t d = 0; d < sizeof(dropped) / sizeof(dropped[0]); d++) {
+        for (int i = 0; i < ignored_count; i++) {
+            recorded += strcmp(ignored[i].rel_path, dropped[d]) == 0 &&
+                        strcmp(ignored[i].reason, "skip-list") == 0;
+        }
+    }
+    int deploy_excluded = 0;
+    for (int i = 0; i < excluded_count; i++) {
+        deploy_excluded += strncmp(excluded[i], "deploy", strlen("deploy")) == 0;
+    }
+    cbm_discover_free(files, count);
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free_ignored(ignored, ignored_count);
+    th_cleanup(base);
+    ASSERT_EQ(mismatches, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(recorded, (int)(sizeof(dropped) / sizeof(dropped[0])));
+    ASSERT_EQ(deploy_excluded, 0); /* no deploy or deployed subtree is excluded any more */
+    PASS();
+}
+
+/* A directory named env is skipped only when it is a Python virtual
+ * environment: python -m venv writes pyvenv.cfg, virtualenv an activate
+ * script in bin/ (POSIX) or Scripts/ (Windows). Any other env directory, a Go
+ * package or a folder of settings, is walked like any other. */
+TEST(discover_env_skipped_only_as_virtualenv) {
+    static const discover_case_t cases[] = {
+        {"a/env/pyvenv.cfg", "home = /usr/bin\n", CBM_LANG_COUNT},
+        {"a/env/lib/tool.py", "def tool():\n    pass\n", CBM_LANG_COUNT},
+        {"b/env/bin/activate", "# This file must be used with source\n", CBM_LANG_COUNT},
+        {"b/env/bin/tool.py", "def tool():\n    pass\n", CBM_LANG_COUNT},
+        {"c/env/Scripts/activate", "# This file must be used with source\n", CBM_LANG_COUNT},
+        {"c/env/Scripts/tool.py", "def tool():\n    pass\n", CBM_LANG_COUNT},
+        /* conda writes conda-meta/history into every environment, and no
+         * pyvenv.cfg or activate script into a named one */
+        {"d/env/conda-meta/history", "==> 2026-11-18 <==\n", CBM_LANG_COUNT},
+        {"d/env/lib/python3.12/os.py", "def getenv(key):\n    pass\n", CBM_LANG_COUNT},
+        /* beside each virtual environment: walked */
+        {"a/tool.py", "def tool():\n    pass\n", CBM_LANG_PYTHON},
+        {"b/tool.py", "def tool():\n    pass\n", CBM_LANG_PYTHON},
+        {"c/tool.py", "def tool():\n    pass\n", CBM_LANG_PYTHON},
+        {"d/tool.py", "def tool():\n    pass\n", CBM_LANG_PYTHON},
+        /* a marker is its exact stored name: one that differs in letter case
+         * makes no virtual environment, on any platform */
+        {"e/env/PYVENV.CFG", "home = /usr/bin\n", CBM_LANG_COUNT},
+        {"e/env/e.py", "x = 1\n", CBM_LANG_PYTHON},
+        {"f/env/scripts/activate", "# activate\n", CBM_LANG_COUNT},
+        {"f/env/f.py", "x = 1\n", CBM_LANG_PYTHON},
+        {"g/env/bin/Activate", "# activate\n", CBM_LANG_COUNT},
+        {"g/env/g.py", "x = 1\n", CBM_LANG_PYTHON},
+        {"h/env/Bin/activate", "# activate\n", CBM_LANG_COUNT},
+        {"h/env/h.py", "x = 1\n", CBM_LANG_PYTHON},
+        {"pkg/util/env/env.go", "package env\n", CBM_LANG_GO},
+        {"config/env/app.yaml", "mode: prod\n", CBM_LANG_YAML},
+        {"env/settings.py", "DEBUG = False\n", CBM_LANG_PYTHON},
+        /* a marker name in a directory that is not env proves nothing */
+        {"tools/bin/activate.py", "def activate():\n    pass\n", CBM_LANG_PYTHON},
+    };
+    char *base = th_mktempdir("cbm_disc_env_venv");
+    ASSERT(base != NULL);
+    int mismatches = discover_check_cases(base, cases, sizeof(cases) / sizeof(cases[0]));
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    int venvs_reported = 0;
+    int env_excluded = 0;
+    for (int i = 0; i < excluded_count; i++) {
+        venvs_reported += strcmp(excluded[i], "a/env") == 0 || strcmp(excluded[i], "b/env") == 0 ||
+                          strcmp(excluded[i], "c/env") == 0 || strcmp(excluded[i], "d/env") == 0;
+        size_t len = strlen(excluded[i]);
+        env_excluded +=
+            len >= strlen("/env") && strcmp(excluded[i] + len - strlen("/env"), "/env") == 0;
+    }
+    cbm_discover_free(files, count);
+    cbm_discover_free_excluded(excluded, excluded_count);
+    th_cleanup(base);
+    ASSERT_EQ(mismatches, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(venvs_reported, 4); /* each virtual environment is an excluded subtree */
+    ASSERT_EQ(env_excluded, 4);   /* and no other env directory is */
+    PASS();
+}
+
+/* The virtual-environment test only looks at entries inside the repository:
+ * a marker reached through a symlink, or a marker that is itself a symlink,
+ * proves nothing, as discovery never follows either. */
+TEST(discover_env_venv_marker_through_symlink_not_followed) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    /* th_mktempdir returns one static buffer: keep the first path. */
+    char outside[256];
+    const char *made = th_mktempdir("cbm_disc_env_outside");
+    ASSERT(made != NULL);
+    snprintf(outside, sizeof(outside), "%s", made);
+    th_write_file(TH_PATH(outside, "bin/activate"), "# activate\n");
+    th_write_file(TH_PATH(outside, "pyvenv.cfg"), "home = /usr/bin\n");
+    char *base = th_mktempdir("cbm_disc_env_link");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "d/env/env.go"), "package env\n");
+    th_write_file(TH_PATH(base, "e/env/env.go"), "package env\n");
+    /* the same layout with the marker inside the repository is a venv */
+    th_write_file(TH_PATH(base, "f/env/bin/activate"), "# activate\n");
+    th_write_file(TH_PATH(base, "f/env/env.go"), "package env\n");
+    char target[512];
+    char link[512];
+    snprintf(target, sizeof(target), "%s/bin", outside);
+    snprintf(link, sizeof(link), "%s/d/env/bin", base);
+    int linked_dir = symlink(target, link);
+    snprintf(target, sizeof(target), "%s/pyvenv.cfg", outside);
+    snprintf(link, sizeof(link), "%s/e/env/pyvenv.cfg", base);
+    int linked_file = symlink(target, link);
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool has_d = rc == 0 && discover_has_rel_path(files, count, "d/env/env.go");
+    bool has_e = rc == 0 && discover_has_rel_path(files, count, "e/env/env.go");
+    bool has_f = rc == 0 && discover_has_rel_path(files, count, "f/env/env.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    th_cleanup(outside);
+
+    ASSERT_EQ(linked_dir, 0);
+    ASSERT_EQ(linked_file, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(has_d);
+    ASSERT_TRUE(has_e);
+    ASSERT_FALSE(has_f);
+    PASS();
+#endif
+}
+
 TEST(discover_cbmignore_no_git) {
     char *base = th_mktempdir("cbm_disc_nogit");
     ASSERT(base != NULL);
@@ -1253,6 +1617,73 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "obj"));
 
     cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* ── JVM packages named like build output (issue #2661) ─────────── */
+
+/* Below src/<set>/{java,kotlin,scala,groovy}/ every directory is a package, so
+ * "target", "tmp", "vendor" there are package names, not build output. */
+TEST(jvm_package_path_predicate_issue2661) {
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("src/main/java/com/acme/target"));
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("app/src/test/kotlin/x/tmp"));
+    ASSERT_TRUE(cbm_discover_path_in_jvm_package("src/main/scala/vendor"));
+    /* The language root itself and its siblings are not packages. */
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/main/java"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/main/target"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("target"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("module/target/classes"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package("src/java/main/tmp"));
+    ASSERT_FALSE(cbm_discover_path_in_jvm_package(NULL));
+    PASS();
+}
+
+TEST(discover_keeps_jvm_packages_named_like_build_dirs_issue2661) {
+    char *base = th_mktempdir("cbm_disc_jvm_pkg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main/java/com/acme/target/Foo.java"),
+                  "package com.acme.target;\nclass Foo {}\n");
+    th_write_file(TH_PATH(base, "src/test/java/com/acme/tmp/T.java"),
+                  "package com.acme.tmp;\nclass T {}\n");
+    th_write_file(TH_PATH(base, "src/main/kotlin/com/acme/vendor/V.kt"),
+                  "package com.acme.vendor\nclass V\n");
+    /* Real build output stays skipped. */
+    th_write_file(TH_PATH(base, "target/classes/Gen.java"), "class Gen {}\n");
+    th_write_file(TH_PATH(base, "src/main/target/Out.java"), "class Out {}\n");
+    /* The safety core is never un-skipped, even below a package root. */
+    th_write_file(TH_PATH(base, "src/main/java/com/.git/H.java"), "class H {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/java/com/acme/target/Foo.java"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/test/java/com/acme/tmp/T.java"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/kotlin/com/acme/vendor/V.kt"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "target/classes/Gen.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/target/Out.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "src/main/java/com/.git/H.java"));
+    ASSERT_EQ(count, 3);
+    cbm_discover_free(files, count);
+
+    /* Moderate/fast mode: a package named like a fast-mode skip dir is kept
+     * below a JVM source root, while the same name at the top stays skipped. */
+    th_write_file(TH_PATH(base, "src/main/java/com/acme/integration/I.java"),
+                  "package com.acme.integration;\nclass I {}\n");
+    th_write_file(TH_PATH(base, "integration/Top.java"), "class Top {}\n");
+
+    cbm_discover_opts_t mod_opts = {.mode = CBM_MODE_MODERATE};
+    files = NULL;
+    count = 0;
+    rc = cbm_discover(base, &mod_opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "src/main/java/com/acme/integration/I.java"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "integration/Top.java"));
+
     cbm_discover_free(files, count);
     th_cleanup(base);
     PASS();
@@ -2052,6 +2483,34 @@ static CBMLanguage discover_lang_of(const cbm_file_info_t *files, int count, con
     return CBM_LANG_COUNT;
 }
 
+/* #1803: a symlink is skipped by policy on every walk. A bounded count must
+ * skip it too, not abort: aborting made auto-index admission refuse every
+ * repository containing any symlink ("unsafe_or_unavailable_path"), while
+ * an explicit index of the same tree succeeded. */
+TEST(discover_count_bounded_survives_a_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_link");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/helper.go"), "package sub\n");
+    ASSERT_EQ(symlink("sub", TH_PATH(base, "linkdir")), 0);
+
+    cbm_discover_opts_t opts = {0};
+    int count = -1;
+    /* deadline 0 = no deadline: only the symlink can decide this count. */
+    cbm_discover_status_t status = cbm_discover_count_bounded(base, &opts, 50000, 0, &count);
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 2);
+
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
 /* Write raw bytes (may contain embedded NUL) to base/rel. Parent must exist. */
 static int write_bytes_file(const char *path, const void *data, size_t n) {
     FILE *f = cbm_fopen(path, "wb");
@@ -2272,6 +2731,49 @@ TEST(shebang_oversized_first_line_unindexed) {
     PASS();
 }
 
+/* ── .d: D source vs make/cargo dep-info ───────────────────────── */
+
+/* rustc/cargo dep-info (and gcc -MD, CMake .o.d) files share .d with D source
+ * but are Makefile rules the D grammar parses slowly into nothing useful, so
+ * they must not be indexed as D. */
+static const char CARGO_DEP_INFO[] = "/home/u/proj/t/debug/deps/foo-abc123.d: src/lib.rs src/a.rs\n"
+                                     "\n"
+                                     "src/lib.rs:\n"
+                                     "src/a.rs:\n";
+
+TEST(discover_d_dep_info_not_indexed_as_dlang) {
+    CBMLanguage dep;
+    CBMLanguage src;
+    ASSERT(shebang_probe("cbm_disc_dotd", "t/debug/deps/foo-abc123.d", CARGO_DEP_INFO, &dep));
+    ASSERT(shebang_probe("cbm_disc_dotd", "app.d", "module app;\nimport std.stdio : writeln;\n",
+                         &src));
+    ASSERT_EQ(dep, CBM_LANG_COUNT);
+    ASSERT_EQ(src, CBM_LANG_DLANG);
+    PASS();
+}
+
+/* The probe runs only while .d maps to D, so a user override to another
+ * language wins. */
+TEST(discover_d_user_override_skips_dep_info_probe) {
+    char *cfg_dir = th_mktempdir("cbm_disc_dotd_uc");
+    ASSERT(cfg_dir != NULL);
+    ASSERT_EQ(th_write_file(TH_PATH(cfg_dir, ".codebase-memory.json"),
+                            "{\"extra_extensions\":{\".d\":\"makefile\"}}"),
+              0);
+    cbm_userconfig_t *cfg = cbm_userconfig_load(cfg_dir);
+    th_cleanup(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_set_user_lang_config(cfg);
+    CBMLanguage lang;
+    bool ok = shebang_probe("cbm_disc_dotd_uc", "foo-abc123.d", CARGO_DEP_INFO, &lang);
+    cbm_set_user_lang_config(NULL);
+    cbm_userconfig_free(cfg);
+    ASSERT(ok);
+    ASSERT_EQ(lang, CBM_LANG_MAKEFILE);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -2283,6 +2785,8 @@ SUITE(discover) {
     RUN_TEST(skip_venv);
     RUN_TEST(skip_dist);
     RUN_TEST(skip_target);
+    RUN_TEST(jvm_package_path_predicate_issue2661);
+    RUN_TEST(discover_keeps_jvm_packages_named_like_build_dirs_issue2661);
     RUN_TEST(skip_vendor);
     RUN_TEST(skip_vendored);
     RUN_TEST(skip_terraform);
@@ -2306,6 +2810,7 @@ SUITE(discover) {
     RUN_TEST(skip_fast_assets);
     RUN_TEST(skip_fast_3rdparty);
     RUN_TEST(skip_fast_e2e);
+    RUN_TEST(no_skip_fast_external);
 
     /* Suffix filters */
     RUN_TEST(suffix_pyc);
@@ -2364,6 +2869,10 @@ SUITE(discover) {
     RUN_TEST(shebang_embedded_nul_unindexed);
     RUN_TEST(shebang_oversized_first_line_unindexed);
 
+    /* .d: D source vs make/cargo dep-info */
+    RUN_TEST(discover_d_dep_info_not_indexed_as_dlang);
+    RUN_TEST(discover_d_user_override_skips_dep_info_probe);
+
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
@@ -2382,6 +2891,7 @@ SUITE(discover) {
     RUN_TEST(discover_missing_global_excludes_is_noop);
     RUN_TEST(discover_cbmignore_negates_global_ignore);
     RUN_TEST(discover_gitignore_dir_excluded_issue234);
+    RUN_TEST(discover_gitignore_never_hides_tracked_files);
     RUN_TEST(discover_max_file_size);
     RUN_TEST(discover_null_path);
     RUN_TEST(discover_nonexistent_path);
@@ -2397,6 +2907,9 @@ SUITE(discover) {
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
     RUN_TEST(discover_deploy_excluded_full_mode);
+    RUN_TEST(discover_deploy_indexes_config_files_only);
+    RUN_TEST(discover_env_skipped_only_as_virtualenv);
+    RUN_TEST(discover_env_venv_marker_through_symlink_not_followed);
     RUN_TEST(discover_cbmignore_no_git);
 
     /* .cbmignore negation vs built-in skip dirs (issue #500) */
@@ -2436,4 +2949,7 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
     RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
     RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
+
+    /* A symlink must not abort a bounded count (auto-index admission, #1803) */
+    RUN_TEST(discover_count_bounded_survives_a_symlink);
 }

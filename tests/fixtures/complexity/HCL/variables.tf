@@ -1,0 +1,3 @@
+variable "prefix" {
+  default = "cx"
+}
