@@ -1322,6 +1322,15 @@ typedef struct {
     int line;
 } k8s_kchart_t;
 
+/* A file a kustomization reads (extract_k8s.c FILE fact): input to its
+ * build, no member of it. */
+typedef struct {
+    char *kust;      /* the kustomization file */
+    char *path;      /* the file, from the repository root */
+    const char *via; /* static: configMapGenerator, secretGenerator, configurations */
+    int line;
+} k8s_kfile_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1350,6 +1359,9 @@ typedef struct {
     k8s_kchart_t *kcharts;
     int kchart_n;
     int kchart_cap;
+    k8s_kfile_t *kfiles;
+    int kfile_n;
+    int kfile_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1407,6 +1419,11 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, c->values);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, f->kcharts);
+    for (int i = 0; i < f->kfile_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles[i].kust);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles[i].path);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles);
     cbm_free(CBM_MEM_CLASS_OTHER, f->envs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
@@ -5270,21 +5287,59 @@ static void k8s_kchart_keep(k8s_facts_t *f, const char *kust, const CBMK8sFact *
                                                .line = x->line};
 }
 
-/* Keep a kustomization's facts: its patches (PATCH) and the charts it
- * inflates (DEPLOY via "kustomize"), each file as a repository path -- a
- * patch file outside the repository (or a URL) names no file of it, a values
- * file there is left out. */
+/* The static name of a FILE fact's `via`; NULL: not one of ours. */
+static const char *k8s_kfile_via(const char *via) {
+    static const char *const names[] = {"configMapGenerator", "secretGenerator", "configurations"};
+    for (size_t i = 0; via && i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(via, names[i]) == 0) {
+            return names[i];
+        }
+    }
+    return NULL;
+}
+
+/* A file kustomization `kust` reads, at repository path `path`. */
+static void k8s_kfile_keep(k8s_facts_t *f, const char *kust, const CBMK8sFact *x,
+                           const char *path) {
+    const char *via = k8s_kfile_via(x->via);
+    if (!via || !k8s_grow((void **)&f->kfiles, &f->kfile_cap, f->kfile_n, sizeof(*f->kfiles))) {
+        return;
+    }
+    char *kust_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, kust);
+    char *path_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path);
+    if (!kust_copy || !path_copy) {
+        cbm_free(CBM_MEM_CLASS_OTHER, kust_copy);
+        cbm_free(CBM_MEM_CLASS_OTHER, path_copy);
+        return;
+    }
+    f->kfiles[f->kfile_n++] =
+        (k8s_kfile_t){.kust = kust_copy, .path = path_copy, .via = via, .line = x->line};
+}
+
+/* Keep a kustomization's facts: its patches (PATCH), the charts it inflates
+ * (DEPLOY via "kustomize") and the files it reads (FILE), each file as a
+ * repository path -- a patch file outside the repository (or a URL) names no
+ * file of it, a values file or a read file there is left out. */
 static void k8s_kustomize_keep(k8s_facts_t *f, const char *kust, const CBMFileResult *res) {
     char dir[CBM_SZ_1K];
     k8s_dirname(kust, dir, sizeof(dir));
     for (int i = 0; res && i < res->k8s_facts.count; i++) {
         const CBMK8sFact *x = &res->k8s_facts.items[i];
         bool chart = x->fact == CBM_K8S_FACT_DEPLOY && x->via && strcmp(x->via, "kustomize") == 0;
-        if (x->fact != CBM_K8S_FACT_PATCH && !chart) {
+        bool file = x->fact == CBM_K8S_FACT_FILE;
+        if (x->fact != CBM_K8S_FACT_PATCH && !chart && !file) {
             continue;
         }
         char path[CBM_SZ_1K];
         bool in_repo = x->path && k8s_repo_path(dir, x->path, path, sizeof(path));
+        if (file) {
+            /* An absolute path names a file of the machine, not of the
+             * repository: k8s_repo_path would read it from the directory. */
+            if (in_repo && x->path[0] != '/') {
+                k8s_kfile_keep(f, kust, x, path);
+            }
+            continue;
+        }
         if (chart) {
             k8s_kchart_keep(f, kust, x, in_repo ? path : NULL);
             continue;
@@ -5544,6 +5599,59 @@ static void k8s_patch_builds(const k8s_kusts_t *ks, const k8s_ints_t *inc, int k
         if (k8s_grow((void **)&out->items, &out->cap, out->count, sizeof(int))) {
             out->items[out->count++] = inc[k].items[i];
         }
+    }
+}
+
+static int k8s_cmp_kfile(const void *a, const void *b) {
+    const k8s_kfile_t *x = a;
+    const k8s_kfile_t *y = b;
+    int c = strcmp(x->kust, y->kust);
+    if (c == 0) {
+        c = (x->line > y->line) - (x->line < y->line);
+    }
+    return c ? c : strcmp(x->path, y->path);
+}
+
+/* The files kustomizations read -> REFERENCES_FILE {via: configMapGenerator |
+ * secretGenerator | configurations, line}, the kustomization's File to the
+ * file's File: once per kustomization and file, at the first line naming it.
+ * A file the index does not hold (a generated kubeconfig, a secret kept out
+ * of the repository) is none. Never an IMPORTS: that would make the file a
+ * member of the build (k8s_kusts_wire). */
+static void k8s_link_kfiles(cbm_pipeline_ctx_t *ctx, k8s_facts_t *f) {
+    if (f->kfile_n == 0) {
+        return;
+    }
+    k8s_qsort(f->kfiles, (size_t)f->kfile_n, sizeof(*f->kfiles), k8s_cmp_kfile);
+    CBMArena keys;
+    cbm_arena_init_lazy(&keys, CBM_SZ_4K);
+    CBMHashTable *seen = cbm_ht_create((uint32_t)f->kfile_n);
+    int edges = 0;
+    for (int i = 0; seen && i < f->kfile_n; i++) {
+        const k8s_kfile_t *x = &f->kfiles[i];
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, x->path);
+        int64_t src = k8s_file_of(ctx, x->kust);
+        /* a File's QN folds `/` and `.` alike: the path itself must be the file's */
+        if (src <= 0 || !tgt || !tgt->file_path || strcmp(tgt->file_path, x->path) != 0 ||
+            tgt->id == src) {
+            continue;
+        }
+        const char *key = cbm_arena_sprintf(&keys, "%s\x01%s", x->kust, x->path);
+        if (!key || cbm_ht_get(seen, key)) {
+            continue;
+        }
+        cbm_ht_set(seen, key, (void *)key);
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"line\":%d}", x->via, x->line);
+        cbm_gbuf_insert_edge(ctx->gbuf, src, tgt->id, "REFERENCES_FILE", props);
+        edges++;
+    }
+    if (seen) {
+        cbm_ht_free(seen);
+    }
+    cbm_arena_destroy(&keys);
+    if (edges > 0) {
+        cbm_log_info("pass.k8s.kustomize_files", "edges", itoa_k8s(edges));
     }
 }
 
@@ -6013,6 +6121,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_helm_collect(ctx, &facts, &helm);
     k8s_link_envs(ctx, &facts);
     k8s_link_patches(ctx, &kusts, &facts);
+    k8s_link_kfiles(ctx, &facts);
     k8s_link_renames(ctx, &kusts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);
