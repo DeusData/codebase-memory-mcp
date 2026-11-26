@@ -10749,9 +10749,9 @@ TEST(extract_scala_companion_owners_are_distinct) {
     ASSERT_FALSE(r->has_error);
 
     ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational"));
-    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational.reciprocal"));
-    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$.apply"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational#object.apply"));
     /* Class-body vals keep their module-level QN like every other language;
      * parent_class tells the two owners apart. */
     ASSERT_TRUE(has_def_qn(r, "t.Rational.isWhole"));
@@ -10777,12 +10777,12 @@ TEST(extract_scala_trait_companion_and_standalone_object) {
 
     /* Trait companions collide just like class companions. */
     ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec"));
-    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec.encode"));
-    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$.utf8"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec#object.utf8"));
     /* A standalone object has nothing to collide with and keeps its plain QN. */
     ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry"));
-    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry.lookup"));
 
     cbm_free_result(r);
@@ -10819,35 +10819,73 @@ TEST(extract_scala_companion_detection_is_scoped) {
     ASSERT_FALSE(r->has_error);
 
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Node"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node$"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node$.leaf"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node#object.leaf"));
     /* Inside `Tree` there is no class Node, so its `object Node` is standalone,
      * while `Leaf` has a class sibling there. */
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node"));
-    ASSERT_FALSE(has_def_qn(r, "t.Ast.Tree.Node$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Tree.Node#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node.root"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf$"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf$.make"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf#object.make"));
     /* `Ops` holds objects only; nothing there is a companion, whatever the
      * neighbouring scopes declare. */
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node"));
-    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Node$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Node#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Leaf"));
-    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Leaf$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Leaf#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node.count"));
     /* Sealed hierarchy in one scope: companions of a case class and of the
-     * sealed trait get `$`, a case object without a class sibling does not. */
+     * sealed trait get `#object`, a case object without a class sibling does not. */
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Add"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Sub"));
-    ASSERT_FALSE(has_def_qn(r, "t.Ast.Sub$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Sub#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Neg"));
-    ASSERT_FALSE(has_def_qn(r, "t.Ast.Neg$"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Neg#object"));
     ASSERT_TRUE(has_def_qn(r, "t.Ast.Op"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op$"));
-    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op$.all"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op#object.all"));
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2154: an object beside a same-named class is its companion and gets the
+ * Owner#object fence (CBM_SCALA_OBJECT_QN_SUFFIX): `name` stays Owner, the
+ * label is the object's own, and its members live under the fence. An object
+ * with no such type beside it keeps its plain QN, and no QN carries `$`. */
+TEST(extract_scala_object_beside_class_gets_object_fence) {
+    CBMFileResult *r = extract("class Rational(n: Int, d: Int)\n"
+                               "object Rational {\n"
+                               "  def make(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Rational] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *cls = pyn_def(r, "t.Rational.Rational");
+    ASSERT_NOT_NULL(cls);
+    const CBMDefinition *obj = pyn_def(r, "t.Rational.Rational" CBM_SCALA_OBJECT_QN_SUFFIX);
+    ASSERT_NOT_NULL(obj);
+    ASSERT_STR_EQ(obj->name, "Rational");
+    ASSERT_STR_EQ(obj->label, "Class");
+    const CBMDefinition *make = pyn_def(r, "t.Rational.Rational#object.make");
+    ASSERT_NOT_NULL(make);
+    ASSERT_STR_EQ(make->parent_class, "t.Rational.Rational#object");
+
+    /* Control: no type named Registry, so the object keeps its plain QN. */
+    ASSERT_NOT_NULL(pyn_def(r, "t.Rational.Registry"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.Rational.Registry.lookup"));
+    ASSERT_FALSE(has_def_qn(r, "t.Rational.Registry#object"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        ASSERT(!qn || !strchr(qn, '$'));
+    }
     cbm_free_result(r);
     PASS();
 }
@@ -16504,6 +16542,7 @@ SUITE(extraction) {
     RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_trait_companion_and_standalone_object);
     RUN_TEST(extract_scala_companion_detection_is_scoped);
+    RUN_TEST(extract_scala_object_beside_class_gets_object_fence);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_scala_chained_package_clauses);

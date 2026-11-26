@@ -173,118 +173,277 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
-/* --- Scala companion cache (CBMScalaCompanionCache) --- */
+/* --- Scala companion objects ---
+ *
+ * The answer for every Scala object_definition whose scope has been read: is
+ * there a class, trait or enum of the same name beside it. The table is keyed
+ * by node id (open addressing, power-of-two capacity) and holds one more key
+ * per read scope, so no scope is read twice. Reading a scope walks its children
+ * with a cursor: indexed child access and ts_node_parent both re-walk from the
+ * start, which made a wide scope quadratic. The table lives in `scratch` (or
+ * `arena`) for one file and records the source it was built for: a copy of the
+ * context with another source (extract_defs.c's spliced-source audit) builds a
+ * table of its own instead of answering from another tree's node ids. */
+enum { SCC_EMPTY = 0, SCC_PLAIN = 1, SCC_COMPANION = 2, SCC_SCOPE = 3 };
+enum { SCC_MIN_CAP = 64 };
 
-static uint64_t scc_hash(const void *scope, const char *bytes, uint32_t len) {
-    uint64_t h = 1469598103934665603ULL;
-    const unsigned char *p = (const unsigned char *)&scope;
-    for (size_t i = 0; i < sizeof(scope); i++) {
-        h = (h ^ p[i]) * 1099511628211ULL;
-    }
+typedef struct {
+    const void *id;
+    uint8_t kind; /* SCC_*; SCC_EMPTY marks a free slot */
+} scc_slot_t;
+
+typedef struct {
+    const char *source;
+    scc_slot_t *slots;
+    uint32_t cap;
+    uint32_t count;
+    bool root_read;
+} scc_table_t;
+
+/* The class/trait/enum names of one scope while it is read: byte ranges into
+ * the source, len 0 = free slot. */
+typedef struct {
+    uint32_t off;
+    uint32_t len;
+} scc_name_t;
+
+static uint32_t scc_id_hash(const void *id) {
+    uint64_t x = (uint64_t)(uintptr_t)id;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static uint32_t scc_bytes_hash(const char *p, uint32_t len) {
+    uint32_t h = 2166136261U;
     for (uint32_t i = 0; i < len; i++) {
-        h = (h ^ (unsigned char)bytes[i]) * 1099511628211ULL;
+        h = (h ^ (unsigned char)p[i]) * 16777619U;
     }
     return h;
 }
 
-/* Slot holding (scope, name), or the empty slot where it would go. */
-static CBMScalaScopeName *scc_find(const CBMScalaCompanionCache *c, const char *source,
-                                   const void *scope, uint32_t off, uint32_t len) {
-    uint32_t mask = c->cap - 1;
-    uint32_t i = (uint32_t)scc_hash(scope, source + off, len) & mask;
-    for (;;) {
-        CBMScalaScopeName *s = &c->slots[i];
-        if (!s->scope) {
+/* The slot holding `id` (an object answer, or with `scope` the read mark), or
+ * the free slot where it would go. */
+static scc_slot_t *scc_find(const scc_table_t *t, const void *id, bool scope) {
+    uint32_t mask = t->cap - 1;
+    for (uint32_t i = scc_id_hash(id) & mask;; i = (i + 1) & mask) {
+        scc_slot_t *s = &t->slots[i];
+        if (s->kind == SCC_EMPTY || (s->id == id && (s->kind == SCC_SCOPE) == scope)) {
             return s;
         }
-        if (s->scope == scope && s->len == len &&
-            (len == 0 || memcmp(source + s->off, source + off, len) == 0)) {
-            return s;
-        }
-        i = (i + 1) & mask;
     }
 }
 
-static bool scc_insert(CBMScalaCompanionCache *c, CBMArena *a, const char *source,
-                       const void *scope, uint32_t off, uint32_t len) {
-    if ((c->count + 1) * 2 > c->cap) {
-        uint32_t new_cap = c->cap ? c->cap * 2 : 64;
-        CBMScalaScopeName *old = c->slots;
-        uint32_t old_cap = c->cap;
-        c->slots = cbm_arena_calloc(a, (size_t)new_cap * sizeof(*c->slots));
-        if (!c->slots) {
-            c->slots = old;
-            return false;
-        }
-        c->cap = new_cap;
-        for (uint32_t i = 0; i < old_cap; i++) {
-            if (old[i].scope) {
-                *scc_find(c, source, old[i].scope, old[i].off, old[i].len) = old[i];
-            }
-        }
+/* Room for `more` new keys at half load; false on OOM (the table is kept). */
+static bool scc_reserve(scc_table_t *t, CBMArena *a, uint32_t more) {
+    if (t->count > UINT32_MAX / 4 || more > UINT32_MAX / 4 - t->count) {
+        return false;
     }
-    CBMScalaScopeName *s = scc_find(c, source, scope, off, len);
-    if (!s->scope) {
-        s->scope = scope;
-        s->off = off;
-        s->len = len;
-        c->count++;
-    }
-    return true;
-}
-
-/* First query in a scope: record its class/trait/enum names, plus the
- * (scope, "") marker that says the scope has been scanned. */
-static bool scc_scan_scope(CBMScalaCompanionCache *c, CBMArena *a, const char *source,
-                           TSNode scope) {
-    const void *id = scope.id;
-    if (c->cap && scc_find(c, source, id, 0, 0)->scope) {
+    uint32_t need = (t->count + more) * 2;
+    if (need <= t->cap) {
         return true;
     }
-    if (!scc_insert(c, a, source, id, 0, 0)) {
+    uint32_t cap = t->cap ? t->cap : SCC_MIN_CAP;
+    while (cap < need) {
+        cap *= 2;
+    }
+    scc_slot_t *slots = cbm_arena_calloc(a, (size_t)cap * sizeof(*slots));
+    if (!slots) {
         return false;
     }
-    uint32_t count = ts_node_named_child_count(scope);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode sibling = ts_node_named_child(scope, i);
-        const char *kind = ts_node_type(sibling);
-        if (strcmp(kind, "class_definition") != 0 && strcmp(kind, "trait_definition") != 0 &&
-            strcmp(kind, "enum_definition") != 0) {
-            continue;
-        }
-        TSNode name = ts_node_child_by_field_name(sibling, TS_FIELD("name"));
-        if (ts_node_is_null(name)) {
-            continue;
-        }
-        uint32_t off = ts_node_start_byte(name);
-        uint32_t len = ts_node_end_byte(name) - off;
-        if (len && !scc_insert(c, a, source, id, off, len)) {
-            return false;
+    scc_table_t grown = {.source = t->source, .slots = slots, .cap = cap};
+    for (uint32_t i = 0; i < t->cap; i++) {
+        if (t->slots[i].kind != SCC_EMPTY) {
+            *scc_find(&grown, t->slots[i].id, t->slots[i].kind == SCC_SCOPE) = t->slots[i];
         }
     }
+    t->slots = slots;
+    t->cap = cap;
     return true;
 }
 
-bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node) {
-    if (!ctx || !ctx->source || strcmp(ts_node_type(node), "object_definition") != 0) {
+static void scc_put(scc_table_t *t, const void *id, uint8_t kind) {
+    scc_slot_t *s = scc_find(t, id, kind == SCC_SCOPE);
+    if (s->kind == SCC_EMPTY) {
+        t->count++;
+    }
+    s->id = id;
+    s->kind = kind;
+}
+
+static bool scc_is_type_kind(const char *kind) {
+    return strcmp(kind, "class_definition") == 0 || strcmp(kind, "trait_definition") == 0 ||
+           strcmp(kind, "enum_definition") == 0;
+}
+
+/* The name of a definition as a byte range of the source; false when it has
+ * none (or it lies outside the source). */
+static bool scc_name_range(const CBMExtractCtx *ctx, TSNode def, uint32_t *off, uint32_t *len) {
+    TSNode name = ts_node_child_by_field_name(def, TS_FIELD("name"));
+    if (ts_node_is_null(name)) {
         return false;
     }
-    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(name_node) || ts_node_is_null(parent)) {
+    uint32_t start = ts_node_start_byte(name);
+    uint32_t end = ts_node_end_byte(name);
+    if (end <= start || ctx->source_len < 0 || end > (uint32_t)ctx->source_len) {
         return false;
     }
-    uint32_t off = ts_node_start_byte(name_node);
-    uint32_t len = ts_node_end_byte(name_node) - off;
-    if (len == 0 || ts_node_end_byte(name_node) > (uint32_t)ctx->source_len) {
-        return false;
+    *off = start;
+    *len = end - start;
+    return true;
+}
+
+static scc_name_t *scc_name_find(scc_name_t *names, uint32_t mask, const char *source, uint32_t off,
+                                 uint32_t len) {
+    for (uint32_t i = scc_bytes_hash(source + off, len) & mask;; i = (i + 1) & mask) {
+        scc_name_t *n = &names[i];
+        if (n->len == 0 || (n->len == len && memcmp(source + n->off, source + off, len) == 0)) {
+            return n;
+        }
     }
+}
+
+/* Read `scope` once: answer each of its object_definition children and mark
+ * the scope read. Three linear cursor passes over the children, the last two
+ * only for a scope that holds an object: count, collect the type names, answer
+ * the objects (a companion may come before or after its type). */
+static void scc_read_scope(CBMExtractCtx *ctx, scc_table_t *t, CBMArena *a, TSNode scope) {
+    if (ts_node_is_null(scope) || (t->cap && scc_find(t, scope.id, true)->kind != SCC_EMPTY)) {
+        return;
+    }
+    uint32_t types = 0;
+    uint32_t objects = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(scope);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            const char *kind = ts_node_type(ts_tree_cursor_current_node(&cur));
+            if (strcmp(kind, "object_definition") == 0) {
+                objects++;
+            } else if (scc_is_type_kind(kind)) {
+                types++;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    if (!scc_reserve(t, a, objects + 1)) {
+        ts_tree_cursor_delete(&cur);
+        return;
+    }
+    scc_name_t *names = NULL;
+    uint32_t mask = 0;
+    if (objects && types && types <= UINT32_MAX / 4) {
+        uint32_t cap = SCC_MIN_CAP;
+        while (cap < types * 2) {
+            cap *= 2;
+        }
+        names = cbm_arena_calloc(a, (size_t)cap * sizeof(*names));
+        mask = cap - 1;
+    }
+    if (names) {
+        ts_tree_cursor_reset(&cur, scope);
+        if (ts_tree_cursor_goto_first_child(&cur)) {
+            do {
+                TSNode kid = ts_tree_cursor_current_node(&cur);
+                uint32_t off = 0;
+                uint32_t len = 0;
+                if (scc_is_type_kind(ts_node_type(kid)) && scc_name_range(ctx, kid, &off, &len)) {
+                    scc_name_t *n = scc_name_find(names, mask, ctx->source, off, len);
+                    n->off = off;
+                    n->len = len;
+                }
+            } while (ts_tree_cursor_goto_next_sibling(&cur));
+        }
+    }
+    if (objects) {
+        ts_tree_cursor_reset(&cur, scope);
+        if (ts_tree_cursor_goto_first_child(&cur)) {
+            do {
+                TSNode kid = ts_tree_cursor_current_node(&cur);
+                if (strcmp(ts_node_type(kid), "object_definition") != 0) {
+                    continue;
+                }
+                uint32_t off = 0;
+                uint32_t len = 0;
+                bool companion = names && scc_name_range(ctx, kid, &off, &len) &&
+                                 scc_name_find(names, mask, ctx->source, off, len)->len != 0;
+                scc_put(t, kid.id, companion ? SCC_COMPANION : SCC_PLAIN);
+            } while (ts_tree_cursor_goto_next_sibling(&cur));
+        }
+    }
+    ts_tree_cursor_delete(&cur);
+    scc_put(t, scope.id, SCC_SCOPE);
+}
+
+/* This context's table, built for its own source; NULL without an arena. */
+static scc_table_t *scc_table(CBMExtractCtx *ctx, CBMArena **arena) {
     CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
-    CBMScalaCompanionCache *c = &ctx->scala_companions;
-    if (!a || !scc_scan_scope(c, a, ctx->source, parent)) {
+    if (!a || !ctx->source) {
+        return NULL;
+    }
+    *arena = a;
+    scc_table_t *t = (scc_table_t *)ctx->scala_companions;
+    if (t && t->source == ctx->source) {
+        return t;
+    }
+    t = cbm_arena_calloc(a, sizeof(*t));
+    if (!t) {
+        return NULL;
+    }
+    t->source = ctx->source;
+    ctx->scala_companions = t;
+    return t;
+}
+
+void cbm_scala_prime_scope(CBMExtractCtx *ctx, TSNode scope) {
+    CBMArena *a = NULL;
+    scc_table_t *t = ctx && ctx->language == CBM_LANG_SCALA ? scc_table(ctx, &a) : NULL;
+    if (t) {
+        scc_read_scope(ctx, t, a, scope);
+    }
+}
+
+/* The answer recorded for `node`: SCC_EMPTY until its scope has been read. */
+static uint8_t scc_answer(const scc_table_t *t, TSNode node) {
+    return t->cap ? scc_find(t, node.id, false)->kind : SCC_EMPTY;
+}
+
+bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node, TSNode scope) {
+    if (!ctx || ctx->language != CBM_LANG_SCALA || ts_node_is_null(node) ||
+        strcmp(ts_node_type(node), "object_definition") != 0) {
         return false;
     }
-    return scc_find(c, ctx->source, parent.id, off, len)->scope != NULL;
+    CBMArena *a = NULL;
+    scc_table_t *t = scc_table(ctx, &a);
+    if (!t) {
+        return false;
+    }
+    uint8_t kind = scc_answer(t, node);
+    if (kind == SCC_EMPTY && !t->root_read) {
+        t->root_read = true;
+        scc_read_scope(ctx, t, a, ctx->root);
+        kind = scc_answer(t, node);
+    }
+    if (kind == SCC_EMPTY && !ts_node_is_null(scope)) {
+        scc_read_scope(ctx, t, a, scope);
+        kind = scc_answer(t, node);
+    }
+    if (kind == SCC_EMPTY) {
+        /* An object in a scope nobody read ahead (a block, a package body):
+         * one parent step, and that whole scope is answered with it. */
+        scc_read_scope(ctx, t, a, ts_node_parent(node));
+        kind = scc_answer(t, node);
+    }
+    return kind == SCC_COMPANION;
+}
+
+const char *cbm_scala_object_qn(CBMExtractCtx *ctx, TSNode node, TSNode scope,
+                                const char *plain_qn) {
+    if (!ctx || ctx->language != CBM_LANG_SCALA || !plain_qn ||
+        !cbm_scala_is_companion_object(ctx, node, scope)) {
+        return plain_qn;
+    }
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s" CBM_SCALA_OBJECT_QN_SUFFIX, plain_qn);
+    return qn ? qn : plain_qn;
 }
 
 // True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
@@ -1680,7 +1839,8 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn,
-                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans) {
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans,
+                                  CBMExtractCtx *scala_ctx) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
@@ -1715,8 +1875,9 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         // to the innermost. Walk parents collecting class names innermost-first,
         // then prepend each as we ascend so the result reads Outer.Inner.
         const char *class_chain = NULL;
-        for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
-             cur = ts_node_parent(cur)) {
+        TSNode next = {0};
+        for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur); cur = next) {
+            next = ts_node_parent(cur);
             if (!cbm_kind_in_set(cur, spec->class_node_types) &&
                 !cbm_is_namespace_scope_kind(lang, ts_node_type(cur))) {
                 continue;
@@ -1725,9 +1886,14 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
             if (ts_node_is_null(class_name)) {
                 continue;
             }
-            char *cname = cbm_node_text(a, class_name, source);
+            const char *cname = cbm_node_text(a, class_name, source);
             if (!cname || !cname[0]) {
                 continue;
+            }
+            /* Scala: a companion object is Owner#object in the def walk, and
+             * `next` is its scope. */
+            if (scala_ctx) {
+                cname = cbm_scala_object_qn(scala_ctx, cur, next, cname);
             }
             class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
         }
@@ -1769,7 +1935,8 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     // Cache miss: compute via parent walk
     const char *qn = cbm_enclosing_func_qn(
         ctx->arena, node, ctx->language, ctx->source, ctx->project, ctx->rel_path, ctx->module_qn,
-        cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), ctx->pp_test_spans);
+        cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), ctx->pp_test_spans,
+        ctx);
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);

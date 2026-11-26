@@ -2741,39 +2741,40 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     PASS();
 }
 
-/* Scala companion objects carry a `$` suffix on their QN. A call written on
- * the class name (`Rational.make`) must reach the companion member through
- * every strategy that compares owner segments: import_map, same_module and
- * the qualified-tail disambiguator. Non-`$` QNs are matched exactly as before. */
+/* A Scala companion object is Owner#object (CBM_SCALA_OBJECT_QN_SUFFIX). A
+ * call written on the class name (`Rational.make`) must reach the companion
+ * member through every strategy that compares owner segments: import_map,
+ * same_module and the qualified-tail disambiguator. Unfenced QNs are matched
+ * exactly as before. */
 TEST(resolve_scala_companion_owner_matches_class_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add_lang(r, "Rational", "proj.num.Rational.Rational", "Class", CBM_LANG_SCALA,
                           false);
-    cbm_registry_add_lang(r, "Rational", "proj.num.Rational.Rational$", "Class", CBM_LANG_SCALA,
-                          false);
-    cbm_registry_add_lang(r, "make", "proj.num.Rational.Rational$.make", "Method", CBM_LANG_SCALA,
-                          false);
+    cbm_registry_add_lang(r, "Rational", "proj.num.Rational.Rational#object", "Class",
+                          CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "make", "proj.num.Rational.Rational#object.make", "Method",
+                          CBM_LANG_SCALA, false);
     cbm_registry_add_lang(r, "make", "proj.other.Builder.Builder.make", "Method", CBM_LANG_SCALA,
                           false);
 
-    /* import_map: the import binds the class; the method lives in Rational$ */
+    /* import_map: the import binds the class; the method lives in Rational#object */
     const char *keys[] = {"Rational"};
     const char *vals[] = {"proj.num.Rational.Rational"};
     cbm_resolution_t res = cbm_registry_resolve(r, "Rational.make", "proj.app.Main", keys, vals, 1);
-    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
     ASSERT_STR_EQ(res.strategy, "import_map");
 
     /* same_module: called from the declaring file */
     res = cbm_registry_resolve(r, "Rational.make", "proj.num.Rational", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
     ASSERT_STR_EQ(res.strategy, "same_module");
 
-    /* qualified_suffix: two `make` candidates, the owner segment picks Rational$ */
+    /* qualified_suffix: two `make` candidates, the owner segment picks the object */
     res = cbm_registry_resolve(r, "Rational.make", "proj.elsewhere.X", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
     ASSERT_STR_EQ(res.strategy, "qualified_suffix");
 
-    /* A plain owner does not match a `$`-less candidate any more loosely. */
+    /* A plain owner does not match an unfenced candidate any more loosely. */
     res = cbm_registry_resolve(r, "Builder.make", "proj.elsewhere.X", NULL, NULL, 0);
     ASSERT_STR_EQ(res.qualified_name, "proj.other.Builder.Builder.make");
     ASSERT_STR_EQ(res.strategy, "qualified_suffix");
@@ -2783,34 +2784,14 @@ TEST(resolve_scala_companion_owner_matches_class_name) {
     PASS();
 }
 
-/* The companion rules are keyed on the registry's own record of Scala
- * companions, not on the `$` character: the language-less cbm_registry_add
- * records nothing, and neither does a registration from a non-Scala file. */
-TEST(resolve_dollar_owner_is_companion_only_when_registered_from_scala) {
-    cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Rational", "proj.num.Rational.Rational", "Class", false);
-    cbm_registry_add(r, "Rational", "proj.num.Rational.Rational$", "Class", false);
-    cbm_registry_add(r, "make", "proj.num.Rational.Rational$.make", "Method", false);
-    cbm_registry_add(r, "make", "proj.other.Builder.Builder.make", "Method", false);
-    const char *keys[] = {"Rational"};
-    const char *vals[] = {"proj.num.Rational.Rational"};
-    cbm_resolution_t res = cbm_registry_resolve(r, "Rational.make", "proj.app.Main", keys, vals, 1);
-    ASSERT(res.strategy == NULL || strcmp(res.strategy, "import_map") != 0);
-    res = cbm_registry_resolve(r, "Rational.make", "proj.num.Rational", NULL, NULL, 0);
-    ASSERT(res.strategy == NULL || strcmp(res.strategy, "same_module") != 0);
-    res = cbm_registry_resolve(r, "Rational.make", "proj.elsewhere.X", NULL, NULL, 0);
-    ASSERT(res.strategy == NULL || strcmp(res.strategy, "qualified_suffix") != 0);
-    cbm_registry_free(r);
-    PASS();
-}
-
-/* `$` is a legal identifier character in Java and JS/TS (`user$` streams,
- * `Foo$` helper classes), so a class `Foo$` next to `Foo` is an ordinary
- * sibling there. With both registered from a Java or a TypeScript file,
- * `Foo.m` resolves exactly as it does on a registry without any companion
- * rule (the expectations below were taken from that registry): import_map,
- * same_module and the qualified tail never reach the `$` owner's member, and
- * the receiver chain does not admit it as a unique-name hit. */
+/* `$` is not special: it is a legal identifier character in Java and JS/TS
+ * (`user$` streams, `Foo$` helper classes), so a class `Foo$` next to `Foo` is
+ * an ordinary sibling there, and only the Scala object fence (`#object`)
+ * makes `Foo.m` read as a companion member. With both registered from a Java
+ * or a TypeScript file, `Foo.m` resolves exactly as it does on a registry
+ * without any companion rule: import_map, same_module and the qualified tail
+ * never reach the `$` owner's member, and the receiver chain does not admit it
+ * as a unique-name hit. */
 TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged) {
     const CBMLanguage langs[] = {CBM_LANG_JAVA, CBM_LANG_TYPESCRIPT};
     for (size_t li = 0; li < sizeof(langs) / sizeof(langs[0]); li++) {
@@ -3790,7 +3771,6 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_scala_companion_owner_matches_class_name);
-    RUN_TEST(resolve_dollar_owner_is_companion_only_when_registered_from_scala);
     RUN_TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged);
     RUN_TEST(swift_receiver_resolution_is_independent_of_registration_order);
     RUN_TEST(swift_manifest_root_targets_respect_nested_package_boundaries);

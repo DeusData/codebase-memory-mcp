@@ -398,6 +398,16 @@ typedef struct {
  * definition is the target, and the macro only when no definition is visible. */
 #define CBM_MACRO_QN_SUFFIX "#macro"
 
+/* The qualified name of a Scala companion object -- an `object` with a
+ * same-named class, trait or enum in the same scope -- is `<Owner QN>#object`,
+ * and its members are `<Owner QN>#object.<member>`. The class and its companion
+ * share one source name; the fence gives the object an identity of its own, and
+ * the plain `<Owner QN>` always belongs to the type. An object without such a
+ * type beside it keeps its plain QN. `name` stays Owner. A plain Scala
+ * identifier never ends in `#object` (operator characters such as '#' do not
+ * mix with letters outside backquotes), so no other definition spells it. */
+#define CBM_SCALA_OBJECT_QN_SUFFIX "#object"
+
 /* Byte offsets are meaningful only within the source buffer that produced
  * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
  * buffers can contain unrelated occurrences at the same numeric span. */
@@ -1203,24 +1213,6 @@ typedef struct {
     int count;
 } CBMReturnTypeTable;
 
-// --- Scala companion cache ---
-// The class/trait/enum names of every scope an object_definition has asked
-// about, keyed by (scope node, name bytes). A scope is scanned once, on its
-// first query; names are byte ranges into the source, never copied. One extra
-// key per scanned scope (len == 0) records the scan itself, so a scope without
-// any class is not rescanned either. Open addressing, power-of-two capacity.
-typedef struct {
-    const void *scope; // ts_node id of the scope (parent) node; NULL = empty slot
-    uint32_t off;
-    uint32_t len;
-} CBMScalaScopeName;
-
-typedef struct {
-    CBMScalaScopeName *slots;
-    uint32_t cap; // 0 until the first query
-    uint32_t count;
-} CBMScalaCompanionCache;
-
 typedef struct {
     CBMArena *arena;
     /* Scratch for AST traversal, owned by the cbm_extract_file_ex call that
@@ -1293,6 +1285,11 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    /* Scala: the companion-object answers (helpers.c cbm_scala_is_companion_object),
+     * NULL until the first object asks; allocated in `scratch` (or `arena`) and
+     * tied to the `source` it was built for, so a copy of this context with
+     * another source builds its own. Nothing in a CBMFileResult points at it. */
+    void *scala_companions;
     /* C++/CUDA raw view: the GoogleTest definitions the def walk named
      * (CBMTestSpan, in `scratch`), in walk order. */
     CBMTestSpan *test_spans;
@@ -1301,9 +1298,6 @@ typedef struct {
     /* The preprocessed second view only: the raw view's test definitions and
      * the line map (cbm_test_span_owner_qn). NULL in every raw view. */
     const CBMTestSpanMap *pp_test_spans;
-    /* Scala only; lives in `scratch` (or `arena` without one). Nothing in a
-     * CBMFileResult points at it. */
-    CBMScalaCompanionCache scala_companions;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1639,11 +1633,6 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 void cbm_diagram_arrows_push(CBMDiagramArrowArray *arr, CBMArena *a, CBMDiagramArrow da);
-
-/* True for a Scala object_definition with a same-named class/trait/enum
- * sibling. O(1) per query after the first one in a scope, which scans the
- * scope's named children once into ctx->scala_companions. */
-bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node);
 
 // --- Sub-extractor entry points ---
 

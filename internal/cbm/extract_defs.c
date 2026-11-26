@@ -227,6 +227,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                            const char *kind, char *name);
+static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang);
 static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused);
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
@@ -9745,11 +9746,15 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     } else {
         class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     }
-    /* A Scala class and its companion object are distinct owners despite sharing
-     * the source-level name. Use Scala's conventional singleton-class suffix so
-     * neither container nor their methods overwrite each other in the graph. */
-    if (ctx->language == CBM_LANG_SCALA && cbm_scala_is_companion_object(ctx, node)) {
-        class_qn = cbm_arena_sprintf(a, "%s$", class_qn);
+    /* Scala: a companion object shares its class's source name; it is
+     * Owner#object (CBM_SCALA_OBJECT_QN_SUFFIX), so neither owner nor its
+     * members overwrite the other's. Members, fields and nested types follow
+     * from class_qn; `name` stays Owner. The body is read ahead here, before
+     * the walk reaches its nested objects, so each of them is answered in O(1). */
+    if (ctx->language == CBM_LANG_SCALA) {
+        TSNode no_scope = {0};
+        class_qn = cbm_scala_object_qn(ctx, node, no_scope, class_qn);
+        cbm_scala_prime_scope(ctx, find_class_member_body(node, ctx->language));
     }
     const char *label = class_label_for_kind(kind);
 
@@ -14171,19 +14176,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
+            TSNode no_scope = {0}; /* Scala: a companion is Owner#object (emit_class_def) */
             if (saved_enclosing) {
-                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
-                return ctx->language == CBM_LANG_SCALA && cbm_scala_is_companion_object(ctx, node)
-                           ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
-                           : qn;
+                return cbm_scala_object_qn(
+                    ctx, node, no_scope,
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname));
             }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
-            const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
-                                                         cname, ctx->language);
-            return ctx->language == CBM_LANG_SCALA && cbm_scala_is_companion_object(ctx, node)
-                       ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
-                       : qn;
+            return cbm_scala_object_qn(ctx, node, no_scope,
+                                       cbm_fqn_compute_source_lang(ctx->arena, ctx->project,
+                                                                   ctx->rel_path, cname,
+                                                                   ctx->language));
         }
     }
     return saved_enclosing;

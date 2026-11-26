@@ -1813,8 +1813,12 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: a Scala object with a same-named class, trait or enum beside it is
+ *      <Owner>#object and its members <Owner>#object.<m> (extract_defs.c,
+ *      helpers.c cbm_scala_object_qn). An index built before holds one merged
+ *      node for the type and its companion, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

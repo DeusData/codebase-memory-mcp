@@ -15367,16 +15367,19 @@ static void write_scala_companion_fixture(const char *tmp) {
 }
 
 static bool scala_companion_edges_are_exact(cbm_store_t *s, const char *project) {
-    return cross_file_call_to_owner_has_strategy(s, project, "half", "make", "Rational$.make",
-                                                 "import_map") &&
-           cross_file_call_to_owner_has_strategy(s, project, "two", "fromInt", "Rational$.fromInt",
-                                                 "import_map");
+    return cross_file_call_to_owner_has_strategy(s, project, "half", "make",
+                                                 "Rational#object.make", "import_map") &&
+           cross_file_call_to_owner_has_strategy(s, project, "two", "fromInt",
+                                                 "Rational#object.fromInt", "import_map") &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromInt", "make",
+                                                 "Rational#object.make", "");
 }
 
 /* A class with a companion object is one importable name. `import pkg.Foo`
  * must not fail closed as ambiguous now that class and companion have
- * distinct QNs, `Foo.factory()` must bind into the companion (`Foo$`), and
- * `import pkg.Foo.member` must bind the companion member. */
+ * distinct QNs, `Foo.factory()` must bind into the companion (`Foo#object`),
+ * `import pkg.Foo.member` must bind the companion member, and a bare call
+ * between two members of the object stays inside it. */
 TEST(pipeline_scala_companion_import_and_factory_call) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_XXXXXX");

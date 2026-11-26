@@ -2938,13 +2938,18 @@ static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_
         }
         /* `import pkg.Owner.member`: the member must exist under the owner's
          * QN. Binding the owner instead would mislabel the edge. Only object
-         * members are importable, so when Owner has a companion the `Owner$`
-         * scope is tried before the class. */
-        static const char *const scopes[] = {"$", ""};
+         * members are importable, so when Owner has a companion object its
+         * scope (Owner#object, CBM_SCALA_OBJECT_QN_SUFFIX) is tried before the
+         * class's. A name too long for the fenced probe still gets the plain one. */
+        static const char *const scopes[] = {CBM_SCALA_OBJECT_QN_SUFFIX, ""};
         for (size_t si = 0; si < sizeof(scopes) / sizeof(scopes[0]); si++) {
             char member_qn[CBM_SZ_512];
-            if (snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name, scopes[si],
-                         remainder + top_len + 1) >= (int)sizeof(member_qn)) {
+            int n = snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name,
+                             scopes[si], remainder + top_len + 1);
+            if (n < 0 || n >= (int)sizeof(member_qn)) {
+                if (scopes[si][0]) {
+                    continue;
+                }
                 return NULL;
             }
             const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
