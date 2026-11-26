@@ -654,6 +654,40 @@ static const jts_file_t JTS_FILES[] = {
      "public class User {\n"
      "    String viaPort(Port p) { return p.open(); }\n"
      "}\n"},
+    /* Positive partners of external_import and jdk_receiver: the same calls
+     * on project receivers bind the project methods (javac 21:
+     * invokevirtual other/Service.run, decoy/Decoys.isEmpty, decoy/Decoys.put). */
+    {"src/main/java/user/Partners.java",
+     "package user;\n\n"
+     "import decoy.Decoys;\n"
+     "import other.Service;\n\n"
+     "public class Partners {\n"
+     "    String projectService(Service s) { return s.run(); }\n"
+     "    boolean decoyReceiver(Decoys d) { return d.isEmpty(); }\n"
+     "    String decoyPut(Decoys d) { return d.put(\"k\", \"v\"); }\n"
+     "}\n"},
+    /* 34: a supertype whose QN two source trees define (p34.Base34 in
+     * src/main and src/test): it gets no identity, so a closure repair of
+     * Sub34's file does not bring its rows, while the run's index holds it.
+     * javac (the main tree): Help34 is q34.Help34, ping34 runs. */
+    {"src/main/java/p34/Base34.java",
+     "package p34;\n\n"
+     "public class Base34 {\n"
+     "}\n"},
+    {"src/test/java/p34/Base34.java",
+     "package p34;\n\n"
+     "public class Base34 {\n"
+     "}\n"},
+    {"src/main/java/q34/Help34.java",
+     "package q34;\n\n"
+     "public class Help34 {\n"
+     "    public String ping34() { return \"q34.Help34.ping34\"; }\n"
+     "}\n"},
+    {"src/main/java/q34/Sub34.java",
+     "package q34;\n\n"
+     "public class Sub34 extends p34.Base34 {\n"
+     "    String m34() { Help34 h = new Help34(); return h.ping34(); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -849,6 +883,8 @@ static int jts_check_single_import(jts_index_t *ix) {
 static int jts_check_external_import(jts_index_t *ix) {
     int ok = jts_expect_none_to(ix, "externalImport", "run", "other.Service");
     ok &= jts_expect_none_to(ix, "externalImport", "run", "Decoys");
+    /* Partner: the project's other.Service imported binds its run. */
+    ok &= jts_expect_engine(ix, "projectService", "run", "other.Service.run");
     return ok;
 }
 
@@ -904,6 +940,9 @@ static int jts_check_inherited_field(jts_index_t *ix) {
 static int jts_check_jdk_receiver(jts_index_t *ix) {
     int ok = jts_expect_none_to(ix, "jdkReceiver", "isEmpty", "Decoys");
     ok &= jts_expect_none_to(ix, "mixedReceivers", "put", "Decoys");
+    /* Partner: the project's Decoys receiver binds its isEmpty and put. */
+    ok &= jts_expect_engine(ix, "decoyReceiver", "isEmpty", "decoy.Decoys.isEmpty");
+    ok &= jts_expect_engine(ix, "decoyPut", "put", "decoy.Decoys.put");
     return ok;
 }
 
@@ -1208,9 +1247,12 @@ TEST(java_type_scope_incremental_import_edit) {
  * incremental route: the repaired graph's engine edges are a fresh full
  * index's of the edited tree, and the inherited project member types still
  * answer (javac: Right24 / Right25). */
-static bool jts_incremental_append(const char *rel, const char *append, jts_check_fn check) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_jtsa_XXXXXX");
+/* The fixture indexed, `append` added at the end of `rel`, then the edited
+ * tree indexed again on the same store (it must take the closure repair) and
+ * fresh into another: both opened in *inc and *full; tmp is the work dir. */
+static bool jts_incremental_pair(const char *rel, const char *append, char *tmp, size_t tmp_len,
+                                 jts_index_t *inc, jts_index_t *full) {
+    snprintf(tmp, tmp_len, "/tmp/cbm_jtsa_XXXXXX");
     if (!cbm_mkdtemp(tmp)) {
         return false;
     }
@@ -1235,23 +1277,60 @@ static bool jts_incremental_append(const char *rel, const char *append, jts_chec
     free(text);
     cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
     ok = ok && jts_pipeline(repo, inc_db, &route) && jts_pipeline(repo, full_db, NULL);
-    printf("\n  %s: incremental route %d\n", rel, (int)route);
-    jts_index_t inc;
-    jts_index_t full;
-    bool opened = jts_open(&inc, inc_db) && jts_open(&full, full_db);
-    char *a = opened ? jts_engine_edges(&inc) : NULL;
-    char *b = opened ? jts_engine_edges(&full) : NULL;
+    if (route != CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR) {
+        printf("\n  %s: the edit did not take the closure repair (route %d)\n", rel, (int)route);
+        ok = false;
+    }
+    bool opened = jts_open(inc, inc_db) && jts_open(full, full_db);
+    return ok && opened;
+}
+
+static void jts_incremental_close(char *tmp, jts_index_t *inc, jts_index_t *full) {
+    if (inc->db) {
+        sqlite3_close(inc->db);
+    }
+    if (full->db) {
+        sqlite3_close(full->db);
+    }
+    th_cleanup(tmp);
+}
+
+/* A one-file edit through the closure repair: its engine edges are a fresh
+ * full index's of the edited tree, and `check` holds on it. */
+static bool jts_incremental_append(const char *rel, const char *append, jts_check_fn check) {
+    char tmp[256];
+    jts_index_t inc = {0};
+    jts_index_t full = {0};
+    bool ok = jts_incremental_pair(rel, append, tmp, sizeof(tmp), &inc, &full);
+    char *a = ok ? jts_engine_edges(&inc) : NULL;
+    char *b = ok ? jts_engine_edges(&full) : NULL;
     bool same = a && b && strcmp(a, b) == 0;
     if (!same) {
         printf("\n  incremental:\n%s\n  full:\n%s\n", a ? a : "(none)", b ? b : "(none)");
     }
-    ok = ok && same && opened && check(&inc);
+    ok = ok && same && check(&inc);
     free(a);
     free(b);
-    sqlite3_close(inc.db);
-    sqlite3_close(full.db);
-    th_cleanup(tmp);
+    jts_incremental_close(tmp, &inc, &full);
     return ok;
+}
+
+/* 34: the closure repair lacks a supertype the run's index holds (its QN two
+ * source trees define, so it has no identity): rule (i)'s closure arm gives
+ * no engine answer there (counted: java.unseen closure) and the name chain
+ * draws, where a full index walks the registered type and answers. A defect
+ * of the closure, shown, not hidden. */
+TEST(java_type_scope_incremental_closure_lacks_supertype) {
+    char tmp[256];
+    jts_index_t inc = {0};
+    jts_index_t full = {0};
+    bool ok = jts_incremental_pair("src/main/java/q34/Sub34.java", "\n", tmp, sizeof(tmp), &inc,
+                                   &full);
+    ok = ok && jts_expect_engine(&full, "m34", "ping34", "q34.Help34.ping34");
+    ok = ok && jts_expect_no_engine(&inc, "m34", "ping34");
+    jts_incremental_close(tmp, &inc, &full);
+    ASSERT_TRUE(ok);
+    PASS();
 }
 
 /* The review's edit: a newline appended to the subclass's file. */
@@ -1914,6 +1993,7 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_incremental_inherited_member);
     RUN_TEST(java_type_scope_incremental_supertype_edit);
     RUN_TEST(java_type_scope_incremental_library_split_package);
+    RUN_TEST(java_type_scope_incremental_closure_lacks_supertype);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(java_type_scope_growth_package_table);
     RUN_TEST(java_type_scope_growth_many_imports);
