@@ -390,6 +390,8 @@ typedef struct {
     char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
     char *source_rel;   /* heap: the manifest file that yielded this entry; NULL if hand-built */
     int source_seq;     /* position among that manifest's entries, in the parser's order */
+    /* A registry dependency a package.json declares, named by pkg_name; entry_rel is NULL. */
+    bool npm_dependency;
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
