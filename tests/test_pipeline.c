@@ -5396,6 +5396,82 @@ TEST(incremental_docker_copy_reference_follows_edits) {
     PASS();
 }
 
+/* A compose service's REFERENCES_FILE edge to a file it mounts follows the
+ * files, with the compose file untouched: editing the target keeps the edge,
+ * deleting the target removes it, bringing the target back draws it again.
+ * Editing the compose file redraws its services' edges from the new text. */
+TEST(incremental_compose_file_reference_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cmpref_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "compose.yaml", "services:\n"
+                                         "  web:\n"
+                                         "    image: nginx:1.27\n"
+                                         "    volumes:\n"
+                                         "      - ./nginx.conf:/etc/nginx/nginx.conf:ro\n");
+    write_temp_file(tmp, "nginx.conf", "worker_processes 1;\n");
+    write_temp_file(tmp, "extra.conf", "gzip on;\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cmpref.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='volume'";
+    static const char to_nginx[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='nginx.conf'";
+    static const char to_extra[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='extra.conf'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "nginx.conf", "worker_processes 2;\n");
+    int rc_edit = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t edit_route = cbm_pipeline_incremental_test_last_route();
+    int refs_edit = k8s_inc_count(db_path, refs);
+    int nginx_edit = k8s_inc_count(db_path, to_nginx);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/nginx.conf", tmp);
+    (void)remove(path);
+    int rc_gone = k8s_inc_index(tmp, db_path);
+    int refs_gone = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "nginx.conf", "worker_processes 3;\n");
+    int rc_back = k8s_inc_index(tmp, db_path);
+    int refs_back = k8s_inc_count(db_path, refs);
+    int nginx_back = k8s_inc_count(db_path, to_nginx);
+
+    write_temp_file(tmp, "compose.yaml", "services:\n"
+                                         "  web:\n"
+                                         "    image: nginx:1.27\n"
+                                         "    volumes:\n"
+                                         "      - ./extra.conf:/etc/nginx/extra.conf:ro\n");
+    int rc_swap = k8s_inc_index(tmp, db_path);
+    int refs_swap = k8s_inc_count(db_path, refs);
+    int nginx_swap = k8s_inc_count(db_path, to_nginx);
+    int extra_swap = k8s_inc_count(db_path, to_extra);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1);
+    ASSERT_EQ(rc_edit, 0);
+    ASSERT_EQ(refs_edit, 1);
+    ASSERT_EQ(nginx_edit, 1);
+    ASSERT_EQ(edit_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gone, 0);
+    ASSERT_EQ(refs_gone, 0);
+    ASSERT_EQ(rc_back, 0);
+    ASSERT_EQ(refs_back, 1);
+    ASSERT_EQ(nginx_back, 1);
+    ASSERT_EQ(rc_swap, 0);
+    ASSERT_EQ(refs_swap, 1);
+    ASSERT_EQ(nginx_swap, 0);
+    ASSERT_EQ(extra_swap, 1);
+    PASS();
+}
+
 /* One referring file `ref_path` (text `ref_text`) names one target file that
  * does not exist yet. With the referring file untouched: the target appears
  * (the edge is drawn), is edited (the edge stays), is deleted (the edge is
@@ -5445,6 +5521,25 @@ TEST(incremental_docker_copy_reference_follows_its_file) {
                                               "FROM alpine:3.20\n"
                                               "COPY late.properties /late.properties\n",
                                               NULL, NULL, "late.properties", "copy", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A compose bind mount whose host file appears after the compose file was
+ * indexed. */
+TEST(incremental_compose_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("compose.yaml",
+                                              "services:\n"
+                                              "  web:\n"
+                                              "    image: nginx:1.27\n"
+                                              "    volumes:\n"
+                                              "      - ./late.properties:/etc/late.properties\n",
+                                              NULL, NULL, "late.properties", "volume", counts);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(counts[0], 0);
     ASSERT_EQ(counts[1], 1);
@@ -36990,7 +37085,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_docker_context_pair_deleted_takes_the_full_route);
     RUN_TEST(incremental_docker_context_directory_deleted_takes_the_full_route);
     RUN_TEST(incremental_docker_copy_reference_follows_edits);
+    RUN_TEST(incremental_compose_file_reference_follows_edits);
     RUN_TEST(incremental_docker_copy_reference_follows_its_file);
+    RUN_TEST(incremental_compose_file_reference_follows_its_file);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

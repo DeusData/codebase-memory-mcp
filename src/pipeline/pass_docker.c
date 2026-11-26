@@ -47,6 +47,13 @@
  * once per file, at the first instruction naming it. Which context a build
  * reads is in the build command, not in the Dockerfile, so a source that is a
  * file under both is no edge; a directory is no edge (it names no one file).
+ *
+ * PHASE 4 P4.7: the repository files a compose service names -- a bind
+ * mount's host side, an env_file, a listed config's or secret's file
+ * (pass_ci.c reads them). Compose states these paths relative to the compose
+ * file's directory, so each that is an indexed file is a file the service
+ * REFERENCES_FILE {via: volume | env_file | config | secret, line}: service
+ * to File, once per file, at the first line naming it.
  * Run at the end of the K8s pass.
  */
 #include "foundation/constants.h"
@@ -2027,7 +2034,8 @@ typedef struct {
     const char *file;
     const char *base; /* the compose file's module QN */
     int64_t file_node;
-    int pass; /* 0: make the service nodes, 1: their edges */
+    CBMHashTable *files; /* the repository's File nodes by path; NULL: none */
+    int pass;            /* 0: make the service nodes, 1: their edges */
     int edges;
 } dk_compose_t;
 
@@ -2102,6 +2110,46 @@ static void dk_compose_image(dk_compose_t *c, const cbm_compose_service_t *s, in
     }
 }
 
+static int dk_compose_file_cmp(const void *x, const void *y) {
+    const cbm_compose_file_t *a = x;
+    const cbm_compose_file_t *b = y;
+    if (a->line != b->line) {
+        return a->line < b->line ? -1 : SKIP_ONE;
+    }
+    int c = strcmp(a->path, b->path);
+    return c ? c : strcmp(a->via, b->via);
+}
+
+/* P4.7: REFERENCES_FILE {via: volume | env_file | config | secret, line} from
+ * service `self` to each indexed file it names (a bind mount's host side, an
+ * env_file, a listed config's or secret's file), once per file at the first
+ * line naming it. A directory, a file the index does not hold and the compose
+ * file itself are none: the paths are stated relative to the compose file's
+ * directory, so nothing is guessed. */
+static void dk_compose_files(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self) {
+    if (!c->files || s->nfiles <= 0) {
+        return;
+    }
+    cbm_compose_file_t *v = cbm_arena_alloc(c->a, (size_t)s->nfiles * sizeof(*v));
+    CBMHashTable *seen = v ? cbm_ht_create((uint32_t)s->nfiles) : NULL;
+    if (!seen) {
+        return;
+    }
+    memcpy(v, s->files, (size_t)s->nfiles * sizeof(*v));
+    qsort(v, (size_t)s->nfiles, sizeof(*v), dk_compose_file_cmp);
+    for (int i = 0; i < s->nfiles; i++) {
+        const cbm_gbuf_node_t *f = cbm_ht_get(c->files, v[i].path);
+        if (!f || f->id == c->file_node || cbm_ht_get(seen, v[i].path)) {
+            continue;
+        }
+        cbm_ht_set(seen, v[i].path, (void *)f);
+        dk_compose_edge(
+            c, self, f->id, "REFERENCES_FILE",
+            cbm_arena_sprintf(c->a, "{\"via\":\"%s\",\"line\":%d}", v[i].via, v[i].line));
+    }
+    cbm_ht_free(seen);
+}
+
 static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     dk_compose_t *c = ud;
     const char *qn = dk_compose_qn(c, s->name);
@@ -2148,6 +2196,7 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
                             "{\"via\":\"build\",\"tool\":\"compose\"}");
         }
     }
+    dk_compose_files(c, s, self->id);
 }
 
 /* The .env of the directory of `rel` under the repository, NULL when none. */
@@ -2173,6 +2222,7 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
         return 0;
     }
     dk_builds_t b = {.ctx = ctx, .a = a};
+    CBMHashTable *by_path = NULL; /* built at the first build configuration */
     for (int i = 0; i < n; i++) {
         const char *rel = files[i]->file_path;
         if (!rel || !cbm_build_path(rel)) {
@@ -2185,6 +2235,14 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
         if (!src) {
             continue;
         }
+        if (!by_path) {
+            by_path = cbm_ht_create((uint32_t)n);
+            for (int k = 0; by_path && k < n; k++) {
+                if (files[k]->file_path) {
+                    cbm_ht_set(by_path, files[k]->file_path, (void *)files[k]);
+                }
+            }
+        }
         char *dotenv = dk_read_dotenv(ctx, rel);
         b.file = rel;
         cbm_build_sites(a, rel, src, len, dotenv, dk_build_site, &b);
@@ -2192,7 +2250,8 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
                            .a = a,
                            .file = rel,
                            .base = cbm_fqn_compute(a, ctx->project_name, rel, NULL),
-                           .file_node = files[i]->id};
+                           .file_node = files[i]->id,
+                           .files = by_path};
         for (cs.pass = 0; cs.base && cs.pass < PAIR_LEN; cs.pass++) {
             cbm_compose_services(a, rel, src, len, dotenv, dk_compose_service, &cs);
         }
@@ -2201,6 +2260,9 @@ static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
             cbm_free(CBM_MEM_CLASS_OTHER, dotenv);
         }
         cbm_free(CBM_MEM_CLASS_OTHER, src);
+    }
+    if (by_path) {
+        cbm_ht_free(by_path);
     }
     return b.edges;
 }
