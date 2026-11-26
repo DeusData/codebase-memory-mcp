@@ -1684,6 +1684,125 @@ TEST(java_type_scope_growth_step0) {
     PASS();
 }
 
+/* One file: `class O extends A0` (an ancestry of d classes) holds n nested
+ * classes, each followed by a method declaring a `Help` local. Every nested
+ * class is a push and a pop of the enclosing classes, so step 0 runs again
+ * after each; the walk of O's ancestry is kept per (class, name), once. The
+ * per-file engine's counted work. The local has no initializer call: a
+ * method lookup in the per-file registry scans its functions (main's), which
+ * would add work growing with n times the file's methods. */
+static uint64_t jts_epoch_work(int n, int d) {
+    size_t cap = (size_t)(n + d) * 96 + 1024;
+    char *src = malloc(cap);
+    if (!src) {
+        return 0;
+    }
+    size_t at = 0;
+    at += (size_t)snprintf(src + at, cap - at, "package g;\n\nclass Help {\n}\n");
+    for (int i = 0; i < d; i++) {
+        if (i + 1 < d) {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d extends A%d {\n}\n", i, i + 1);
+        } else {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d {\n}\n", i);
+        }
+    }
+    at += (size_t)snprintf(src + at, cap - at, "class O extends A0 {\n");
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at,
+                               " class N%d {\n }\n void m%d() { Help h = null; }\n", i, i);
+    }
+    at += (size_t)snprintf(src + at, cap - at, "}\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)at, CBM_LANG_JAVA, "g", "src/g/Main.java", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return work;
+}
+
+/* n nested classes in a class with an ancestry of depth d, both at 1x, 4x,
+ * 16x: the counted work grows linearly (one ancestry walk per class and
+ * name, not one per class body segment). */
+TEST(java_type_scope_growth_nested_epochs) {
+    uint64_t w1 = jts_epoch_work(50, 10);
+    uint64_t w4 = jts_epoch_work(200, 40);
+    uint64_t w16 = jts_epoch_work(800, 160);
+    printf("\n  nested classes n/d 50/10, 200/40, 800/160: work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
+/* The shared registrar over n methods `Help mI(Help h)` of `g.O extends
+ * g.A0` (an ancestry of d classes): every parameter and return type is a
+ * member lookup on O's ancestry, kept per (owner, name), once. Its counted
+ * work. */
+static uint64_t jts_registrar_work(int n, int d) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int total = d + 2 + n;
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(&arena, (size_t)total * sizeof(*defs));
+    if (!defs) {
+        cbm_arena_destroy(&arena);
+        return 0;
+    }
+    memset(defs, 0, (size_t)total * sizeof(*defs));
+    int k = 0;
+    for (int i = 0; i < d; i++, k++) {
+        defs[k].qualified_name = cbm_arena_sprintf(&arena, "g.A%d", i);
+        defs[k].short_name = cbm_arena_sprintf(&arena, "A%d", i);
+        defs[k].embedded_types = i + 1 < d ? cbm_arena_sprintf(&arena, "g.A%d", i + 1) : NULL;
+    }
+    defs[k].qualified_name = "g.O";
+    defs[k].short_name = "O";
+    defs[k++].embedded_types = "g.A0";
+    defs[k].qualified_name = "g.Help";
+    defs[k++].short_name = "Help";
+    for (int i = 0; i < d + 2; i++) {
+        defs[i].label = "Class";
+        defs[i].lang = CBM_LANG_JAVA;
+        defs[i].namespace_name = "g";
+        defs[i].type_scope = "Help=g.Help";
+    }
+    static const char *const params[] = {"Help"};
+    for (int i = 0; i < n; i++, k++) {
+        defs[k].qualified_name = cbm_arena_sprintf(&arena, "g.O.m%d", i);
+        defs[k].short_name = cbm_arena_sprintf(&arena, "m%d", i);
+        defs[k].label = "Method";
+        defs[k].lang = CBM_LANG_JAVA;
+        defs[k].namespace_name = "g";
+        defs[k].receiver_type = "g.O";
+        defs[k].return_types = "Help";
+        defs[k].signature_param_types = (const char **)params;
+        defs[k].signature_param_count = 1;
+        defs[k].type_scope = "Help=g.Help";
+    }
+    (void)cbm_lsp_work_take();
+    CBMTypeRegistry *reg = cbm_java_build_cross_registry(&arena, defs, total);
+    uint64_t work = cbm_lsp_work_take();
+    cbm_arena_destroy(&arena);
+    return reg ? work : 0;
+}
+
+/* n signatures of a class with an ancestry of depth d, both at 1x, 4x, 16x:
+ * the registrar's counted work grows linearly. */
+TEST(java_type_scope_growth_registrar_walks) {
+    uint64_t w1 = jts_registrar_work(50, 10);
+    uint64_t w4 = jts_registrar_work(200, 40);
+    uint64_t w16 = jts_registrar_work(800, 160);
+    printf("\n  registrar signatures n/d 50/10, 200/40, 800/160: work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
 TEST(java_type_scope_growth_supertype_chain) {
     bool f1 = false;
     bool f4 = false;
@@ -1802,5 +1921,7 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_package_spread);
     RUN_TEST(java_type_scope_growth_supertype_chain);
     RUN_TEST(java_type_scope_growth_step0);
+    RUN_TEST(java_type_scope_growth_nested_epochs);
+    RUN_TEST(java_type_scope_growth_registrar_walks);
 #endif
 }

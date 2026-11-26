@@ -97,6 +97,10 @@ typedef struct {
     int step0_memo_types;
     unsigned class_epoch; /* changes with every push and pop of the enclosing classes */
     bool step0_ready;
+    /* java_inherited_member per (class, simple name), for this file only
+     * (java_inherited_member_ctx): made and dropped as step0_memo. */
+    void *walk_memo;
+    int walk_memo_types;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
