@@ -688,6 +688,61 @@ static const jts_file_t JTS_FILES[] = {
      "public class Sub34 extends p34.Base34 {\n"
      "    String m34() { Help34 h = new Help34(); return h.ping34(); }\n"
      "}\n"},
+    /* 35: the inherited rule and overloads (javac 21, javap and run):
+     * c.f35(o) with A35.f35(Object) and B35.f35(String) binds A35.f35 (the
+     * most specific method applicable to an Object); c.m35(o) with
+     * A35.m35(Object) and B35.m35(String, int) binds A35.m35; c.h35(1, 2)
+     * binds B35.h35(int, int), the only method taking two arguments;
+     * c.k35("x") binds B35.k35, which overrides A35.k35; i.g35("x") binds
+     * H35.g35(String), which overrides G35<T>.g35(T) with T = String;
+     * c.v35("x", 1, 2) binds the varargs B35.v35(String, Object...). */
+    {"src/main/java/p35/A35.java",
+     "package p35;\n\n"
+     "public class A35 {\n"
+     "    public String f35(Object o) { return \"p35.A35.f35\"; }\n"
+     "    public String h35(Object o) { return \"p35.A35.h35\"; }\n"
+     "    public String k35(String s) { return \"p35.A35.k35\"; }\n"
+     "    public String m35(Object o) { return \"p35.A35.m35\"; }\n"
+     "}\n"},
+    {"src/main/java/p35/B35.java",
+     "package p35;\n\n"
+     "public class B35 extends A35 {\n"
+     "    public String f35(String s) { return \"p35.B35.f35\"; }\n"
+     "    public String h35(int a, int b) { return \"p35.B35.h35\"; }\n"
+     "    @Override\n"
+     "    public String k35(String s) { return \"p35.B35.k35\"; }\n"
+     "    public String m35(String s, int i) { return \"p35.B35.m35\"; }\n"
+     "    public String v35(String f, Object... a) { return \"p35.B35.v35\"; }\n"
+     "}\n"},
+    {"src/main/java/p35/C35.java",
+     "package p35;\n\n"
+     "public class C35 extends B35 {\n"
+     "}\n"},
+    {"src/main/java/p35/G35.java",
+     "package p35;\n\n"
+     "public class G35<T> {\n"
+     "    public String g35(T t) { return \"p35.G35.g35\"; }\n"
+     "}\n"},
+    {"src/main/java/p35/H35.java",
+     "package p35;\n\n"
+     "public class H35 extends G35<String> {\n"
+     "    @Override\n"
+     "    public String g35(String s) { return \"p35.H35.g35\"; }\n"
+     "}\n"},
+    {"src/main/java/p35/I35.java",
+     "package p35;\n\n"
+     "public class I35 extends H35 {\n"
+     "}\n"},
+    {"src/main/java/p35/Use35.java",
+     "package p35;\n\n"
+     "public class Use35 {\n"
+     "    String viaObject35(C35 c, Object o) { return c.f35(o); }\n"
+     "    String viaArity35(C35 c, Object o) { return c.m35(o); }\n"
+     "    String viaPair35(C35 c) { return c.h35(1, 2); }\n"
+     "    String viaOverride35(C35 c) { return c.k35(\"x\"); }\n"
+     "    String viaGeneric35(I35 i) { return i.g35(\"x\"); }\n"
+     "    String viaVarargs35(C35 c) { return c.v35(\"x\", 1, 2); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -821,6 +876,20 @@ static int jts_expect_none_to(jts_index_t *ix, const char *caller, const char *l
         return 1;
     }
     printf("\n  %s -> %s: an edge reaches %s:\n%s", caller, leaf, bad, got);
+    return 0;
+}
+
+/* The one CALLS edge for (caller, leaf) reaches `want`, whatever drew it. */
+static int jts_expect_edge_to(jts_index_t *ix, const char *caller, const char *leaf,
+                              const char *want) {
+    char got[4096];
+    int n = jts_targets(ix, caller, leaf, got, sizeof(got));
+    char line[1024];
+    snprintf(line, sizeof(line), "%s|", want);
+    if (n == 1 && strncmp(got, line, strlen(line)) == 0) {
+        return 1;
+    }
+    printf("\n  %s -> %s: want one edge to %s, have %d:\n%s", caller, leaf, want, n, got);
     return 0;
 }
 
@@ -1084,6 +1153,25 @@ static int jts_check_interface_call(jts_index_t *ix) {
     int ok = jts_expect_engine(ix, "viaIface", "run", "ia.Svc.run");
     ok &= jts_expect_no_engine_to(ix, "viaLibIface", "get", "ia.Caller.Sup.get");
     ok &= jts_expect_engine(ix, "viaPort", "open", "ib.Port.open");
+    return ok;
+}
+
+/* 35: the engine chooses by name and argument count; where a farther
+ * overload of that count exists, or the nearest class's method does not take
+ * it, the argument types choose, and the inherited rule gives no answer. The
+ * edge drawn at the site afterwards never reaches the nearer method. Where
+ * the count leaves one method (h35), or the nearer one overrides (k35; g35,
+ * whose farther parameter is a type variable and proves nothing), the rule
+ * answers. A varargs method called with more arguments (v35): the shared
+ * registrar's signature does not mark varargs, so the count does not fit and
+ * the rule gives no answer; the edge drawn there reaches the method. */
+static int jts_check_inherited_overload(jts_index_t *ix) {
+    int ok = jts_expect_none_to(ix, "viaObject35", "f35", "p35.B35.f35");
+    ok &= jts_expect_none_to(ix, "viaArity35", "m35", "p35.B35.m35");
+    ok &= jts_expect_engine(ix, "viaPair35", "h35", "p35.B35.h35");
+    ok &= jts_expect_engine(ix, "viaOverride35", "k35", "p35.B35.k35");
+    ok &= jts_expect_engine(ix, "viaGeneric35", "g35", "p35.H35.g35");
+    ok &= jts_expect_edge_to(ix, "viaVarargs35", "v35", "p35.B35.v35");
     return ok;
 }
 
@@ -1882,6 +1970,93 @@ TEST(java_type_scope_growth_registrar_walks) {
     PASS();
 }
 
+/* A chain of d classes g.A0 extends g.A1 ... each declaring f(Object) (an
+ * override at every level), g.C extends g.A0, and one method making n calls
+ * c.f(o): the inherited rule's farther walk is kept per (declaring class,
+ * name, argument count), so it runs once. The cross engine's counted work,
+ * and how many calls it answers (each by A0.f). */
+static uint64_t jts_inherit_work(int n, int d, int *answered) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int total = 2 * d + 1;
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(&arena, (size_t)total * sizeof(*defs));
+    size_t cap = (size_t)n * 16 + 256;
+    char *src = malloc(cap);
+    if (!defs || !src) {
+        free(src);
+        cbm_arena_destroy(&arena);
+        return 0;
+    }
+    memset(defs, 0, (size_t)total * sizeof(*defs));
+    static const char *const params[] = {"java.lang.Object"};
+    int k = 0;
+    for (int i = 0; i < d; i++) {
+        defs[k].qualified_name = cbm_arena_sprintf(&arena, "g.A%d", i);
+        defs[k].short_name = cbm_arena_sprintf(&arena, "A%d", i);
+        defs[k].label = "Class";
+        defs[k].lang = CBM_LANG_JAVA;
+        defs[k].def_module_qn = "g";
+        defs[k].embedded_types = i + 1 < d ? cbm_arena_sprintf(&arena, "g.A%d", i + 1) : NULL;
+        k++;
+        defs[k].qualified_name = cbm_arena_sprintf(&arena, "g.A%d.f", i);
+        defs[k].short_name = "f";
+        defs[k].label = "Method";
+        defs[k].lang = CBM_LANG_JAVA;
+        defs[k].def_module_qn = "g";
+        defs[k].receiver_type = cbm_arena_sprintf(&arena, "g.A%d", i);
+        defs[k].signature_param_types = (const char **)params;
+        defs[k].signature_param_count = 1;
+        k++;
+    }
+    defs[k].qualified_name = "g.C";
+    defs[k].short_name = "C";
+    defs[k].label = "Class";
+    defs[k].lang = CBM_LANG_JAVA;
+    defs[k].def_module_qn = "g";
+    defs[k++].embedded_types = "g.A0";
+    size_t at = (size_t)snprintf(src, cap, "package g;\npublic class Use {\n void use(g.C c, Object o) {\n");
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "  c.f(o);\n");
+    }
+    at += (size_t)snprintf(src + at, cap - at, " }\n}\n");
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    (void)cbm_lsp_work_take();
+    cbm_run_java_lsp_cross(&arena, src, (int)at, "g", defs, k, NULL, NULL, 0, NULL, &out);
+    uint64_t work = cbm_lsp_work_take();
+    *answered = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].confidence >= 0.5f && out.items[i].callee_qn &&
+            strcmp(out.items[i].callee_qn, "g.A0.f") == 0) {
+            (*answered)++;
+        }
+    }
+    free(src);
+    cbm_arena_destroy(&arena);
+    return work;
+}
+
+/* n calls through a chain of depth d whose every level redeclares the
+ * method, both at 1x, 4x, 16x: every call is answered (an override is the
+ * same method), and the counted work grows linearly. */
+TEST(java_type_scope_growth_inherited_rule) {
+    int a1 = 0;
+    int a4 = 0;
+    int a16 = 0;
+    uint64_t w1 = jts_inherit_work(50, 10, &a1);
+    uint64_t w4 = jts_inherit_work(200, 40, &a4);
+    uint64_t w16 = jts_inherit_work(800, 160, &a16);
+    printf("\n  inherited rule n/d 50/10, 200/40, 800/160: work %llu / %llu / %llu, answered %d / %d / %d\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16, a1, a4, a16);
+    ASSERT_EQ(a1, 50);
+    ASSERT_EQ(a4, 200);
+    ASSERT_EQ(a16, 800);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
 TEST(java_type_scope_growth_supertype_chain) {
     bool f1 = false;
     bool f4 = false;
@@ -1939,6 +2114,7 @@ JTS_ROUTES(library_supertype, jts_check_library_supertype)
 JTS_ROUTES(owner_spelled_supertype, jts_check_owner_spelled_supertype)
 JTS_ROUTES(library_split_package, jts_check_library_split_package)
 JTS_ROUTES(interface_call, jts_check_interface_call)
+JTS_ROUTES(inherited_overload, jts_check_inherited_overload)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1987,6 +2163,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_library_split_package_parallel);
     RUN_TEST(java_type_scope_interface_call_sequential);
     RUN_TEST(java_type_scope_interface_call_parallel);
+    RUN_TEST(java_type_scope_inherited_overload_sequential);
+    RUN_TEST(java_type_scope_inherited_overload_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);
@@ -2003,5 +2181,6 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_step0);
     RUN_TEST(java_type_scope_growth_nested_epochs);
     RUN_TEST(java_type_scope_growth_registrar_walks);
+    RUN_TEST(java_type_scope_growth_inherited_rule);
 #endif
 }

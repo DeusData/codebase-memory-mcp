@@ -944,6 +944,8 @@ static void java_lsp_ctx_done(JavaLSPContext *ctx) {
     ctx->step0_memo = NULL;
     cbm_ht_free(ctx->walk_memo); /* NULL-safe; its entries live in the arena */
     ctx->walk_memo = NULL;
+    cbm_ht_free(ctx->inherit_memo); /* NULL-safe; its keys live in the arena */
+    ctx->inherit_memo = NULL;
 }
 
 static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
@@ -2660,6 +2662,223 @@ static void java_emit_unresolved_reference_at(JavaLSPContext *ctx, const char *e
     java_stamp_resolved_site(ctx, first, site);
 }
 
+/* Whether `f` takes `arity` arguments: its parameter count, or the range a
+ * registered minimum opens; a last parameter that is an array (`T...` or
+ * `T[]`) takes any count from one less on, as varargs do. A signature the
+ * registry does not model takes any count. */
+static bool java_func_takes(const CBMRegisteredFunc *f, int arity) {
+    const CBMType *sig = f ? f->signature : NULL;
+    if (!sig || sig->kind != CBM_TYPE_FUNC) {
+        return true;
+    }
+    int pc = 0;
+    while (sig->data.func.param_types && sig->data.func.param_types[pc]) {
+        pc++;
+    }
+    const CBMType *last = pc > 0 ? sig->data.func.param_types[pc - 1] : NULL;
+    const char *last_name =
+        last && last->kind == CBM_TYPE_NAMED ? last->data.named.qualified_name : NULL;
+    if (last && (last->kind == CBM_TYPE_SLICE || (last_name && strstr(last_name, "...")) ||
+                 (last_name && strstr(last_name, "[]")))) {
+        return arity >= pc - 1;
+    }
+    int min = f->min_params >= 0 ? f->min_params : pc;
+    return arity >= min && arity <= pc;
+}
+
+/* A parameter type's erased name, when the position can prove two methods
+ * distinct: a type the registry resolves, a primitive, or a written qualified
+ * name (*resolved tells which); NULL for a type variable, an unknown type or a
+ * simple name the registry does not hold (it may be a type variable). *dims
+ * counts the array dimensions. */
+static const char *java_param_name(JavaLSPContext *ctx, const CBMType *t, int *dims,
+                                   bool *resolved) {
+    *dims = 0;
+    *resolved = false;
+    while (t && t->kind == CBM_TYPE_SLICE) {
+        (*dims)++;
+        t = t->data.slice.elem;
+    }
+    if (!t) {
+        return NULL;
+    }
+    if (t->kind == CBM_TYPE_BUILTIN) {
+        *resolved = true;
+        return t->data.builtin.name;
+    }
+    const char *name = t->kind == CBM_TYPE_NAMED      ? t->data.named.qualified_name
+                       : t->kind == CBM_TYPE_TEMPLATE ? t->data.template_type.template_name
+                                                      : NULL;
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    *resolved = cbm_registry_lookup_type(ctx->registry, name) != NULL;
+    return *resolved || strchr(name, '.') ? name : NULL;
+}
+
+/* Two methods of one name are provably distinct (overloads, not one method
+ * and its override, nor one method registered twice) when at some position
+ * both declared parameter types are concrete and differ: both resolved by the
+ * registry, or both written qualified names, and not equal. A type variable,
+ * an unknown type, or a position where only one side resolves proves
+ * nothing. No overload is ever chosen by an argument's type. */
+static bool java_funcs_distinct(JavaLSPContext *ctx, const CBMRegisteredFunc *a,
+                                const CBMRegisteredFunc *b) {
+    const CBMType *sa = a->signature;
+    const CBMType *sb = b->signature;
+    if (a == b || !sa || !sb || sa->kind != CBM_TYPE_FUNC || sb->kind != CBM_TYPE_FUNC ||
+        !sa->data.func.param_types || !sb->data.func.param_types) {
+        return false;
+    }
+    const CBMType **pa = sa->data.func.param_types;
+    const CBMType **pb = sb->data.func.param_types;
+    for (int i = 0; pa[i] && pb[i]; i++) {
+        int da = 0;
+        int db = 0;
+        bool ra = false;
+        bool rb = false;
+        const char *na = java_param_name(ctx, pa[i], &da, &ra);
+        const char *nb = java_param_name(ctx, pb[i], &db, &rb);
+        if (!na || !nb || ra != rb) {
+            continue; /* this position proves nothing */
+        }
+        if (da != db || strcmp(na, nb) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The methods named `mname` that the class `cls` declares and that take
+ * `arity` arguments, each once; *one is set to one of them. Only methods
+ * provably distinct from `like` (and from each other) are counted: one that
+ * overrides `like` is `like`. */
+static int java_level_taking(JavaLSPContext *ctx, const char *cls, const char *mname, int arity,
+                             const CBMRegisteredFunc *like, const CBMRegisteredFunc **one) {
+    const CBMRegisteredFunc *seen[2] = {0};
+    int count = 0;
+    CBMMethodIter it;
+    cbm_registry_methods_chain(ctx->registry, cls, mname, &it);
+    for (int index; (index = cbm_method_iter_next(&it)) >= 0;) {
+        CBM_LSP_WORK(1);
+        const CBMRegisteredFunc *g = &it.reg->funcs[index];
+        if (!java_func_takes(g, arity) || (like && !java_funcs_distinct(ctx, g, like))) {
+            continue;
+        }
+        bool again = false;
+        for (int k = 0; k < count && k < 2; k++) {
+            again = again || !java_funcs_distinct(ctx, g, seen[k]);
+        }
+        if (again) {
+            continue;
+        }
+        if (count < 2) {
+            seen[count] = g;
+        }
+        count++;
+        if (count > 1) {
+            break; /* two: no single one */
+        }
+    }
+    if (one) {
+        *one = count == 1 ? seen[0] : NULL;
+    }
+    return count;
+}
+
+/* The inherited rule (lsp_inherited_dispatch) names the method `f` of the
+ * nearest supertype that declares `mname`. javac binds the most specific
+ * method applicable to the arguments' types, which can be another overload,
+ * nearer or farther; the engine chooses by name and argument count only.
+ * So the rule answers only where that count leaves one method: the nearest
+ * declaring class has exactly one method of the name that takes the call's
+ * argument count, and no farther supertype declares another one that does
+ * and is provably distinct from it (java_funcs_distinct: an override is the
+ * same method). Returns that method, or NULL for no answer. A JDK seed class
+ * keeps its answer: its parameters are not modelled. */
+static const CBMRegisteredFunc *java_inherited_unique_compute(JavaLSPContext *ctx,
+                                                              const CBMRegisteredFunc *f,
+                                                              const char *mname, int arity) {
+    const CBMRegisteredType *lt =
+        f->receiver_type ? cbm_registry_lookup_type(ctx->registry, f->receiver_type) : NULL;
+    if (!java_is_project_type(lt)) {
+        return f;
+    }
+    const CBMRegisteredFunc *m = NULL;
+    if (java_level_taking(ctx, f->receiver_type, mname, arity, NULL, &m) != 1 || !m) {
+        return NULL;
+    }
+    const char *cur = lt->embedded_types ? lt->embedded_types[0] : NULL;
+    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
+        CBM_LSP_WORK(1);
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
+        if (!rt) {
+            break;
+        }
+        if (java_level_taking(ctx, cur, mname, arity, m, NULL) > 0) {
+            return NULL; /* a farther overload: the argument types choose */
+        }
+        cur = rt->embedded_types ? rt->embedded_types[0] : NULL;
+    }
+    return m;
+}
+
+/* java_inherited_unique_compute once per (declaring class, method name,
+ * argument count) in a file, made once the registry is complete and dropped
+ * when it grows (the answer is a function of the registry and the key). */
+static const CBMRegisteredFunc *java_inherited_unique(JavaLSPContext *ctx,
+                                                      const CBMRegisteredFunc *f,
+                                                      const char *mname, int arity) {
+    static const char no_answer; /* the memo's value for "no answer" */
+    char key[JAVA_LSP_BUF];
+    int n = -1;
+    if (ctx->step0_ready && f->receiver_type) {
+        n = snprintf(key, sizeof(key), "%s\x1f%s\x1f%d", f->receiver_type, mname, arity);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(key)) {
+        return java_inherited_unique_compute(ctx, f, mname, arity);
+    }
+    int size = ctx->registry->type_count + ctx->registry->func_count;
+    if (ctx->inherit_memo && ctx->inherit_memo_types != size) {
+        cbm_ht_free(ctx->inherit_memo);
+        ctx->inherit_memo = NULL;
+    }
+    if (!ctx->inherit_memo) {
+        ctx->inherit_memo = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 64);
+        ctx->inherit_memo_types = size;
+    }
+    CBM_LSP_WORK(1);
+    const void *hit = ctx->inherit_memo ? cbm_ht_get(ctx->inherit_memo, key) : NULL;
+    if (hit) {
+        return hit == (const void *)&no_answer ? NULL : (const CBMRegisteredFunc *)hit;
+    }
+    const CBMRegisteredFunc *m = java_inherited_unique_compute(ctx, f, mname, arity);
+    const char *k = cbm_arena_strdup(ctx->arena, key);
+    if (k && ctx->inherit_memo) {
+        cbm_ht_set(ctx->inherit_memo, k, m ? (void *)m : (void *)&no_answer);
+    }
+    return m;
+}
+
+/* The answer for a method `f` found on the class `cls` (the receiver's or
+ * the enclosing class): type dispatch on its own method, the inherited rule
+ * on a supertype's, or no answer where the inherited rule leaves the choice
+ * to the argument types. */
+static void java_emit_found_method(JavaLSPContext *ctx, const char *cls,
+                                   const CBMRegisteredFunc *f, const char *mname, int arity) {
+    if (!f->receiver_type || strcmp(f->receiver_type, cls) == 0) {
+        java_emit_resolved(ctx, f->qualified_name, "lsp_type_dispatch", 0.95f);
+        return;
+    }
+    const CBMRegisteredFunc *m = java_inherited_unique(ctx, f, mname, arity);
+    if (!m) {
+        java_emit_unresolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mname),
+                             "inherited_overload_by_types");
+        return;
+    }
+    java_emit_resolved(ctx, m->qualified_name, "lsp_inherited_dispatch", 0.95f);
+}
+
 static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
     TSNode obj = ts_node_child_by_field_name(call, "object", 6);
     TSNode name_node = ts_node_child_by_field_name(call, "name", 4);
@@ -2676,11 +2895,7 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             const CBMRegisteredFunc *f =
                 java_lookup_method(ctx, ctx->enclosing_class_qn, mname, arity);
             if (f) {
-                const char *strategy = "lsp_type_dispatch";
-                if (f->receiver_type && strcmp(f->receiver_type, ctx->enclosing_class_qn) != 0) {
-                    strategy = "lsp_inherited_dispatch";
-                }
-                java_emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+                java_emit_found_method(ctx, ctx->enclosing_class_qn, f, mname, arity);
                 return;
             }
         }
@@ -2802,11 +3017,7 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
              * default) method, as javac's invokeinterface names it, whatever
              * implements it: never the one implementer a file declares. A
              * library interface's method has no node, so no edge follows. */
-            const char *strategy = "lsp_type_dispatch";
-            if (f->receiver_type && strcmp(f->receiver_type, recv_qn) != 0) {
-                strategy = "lsp_inherited_dispatch";
-            }
-            java_emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+            java_emit_found_method(ctx, recv_qn, f, mname, arity);
             return;
         }
         /* An interface whose registered types do not declare the method

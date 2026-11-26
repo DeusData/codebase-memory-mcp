@@ -781,6 +781,54 @@ TEST(repro_lsp_cs_ctor_synthetic) {
                                "cs_ctor_synthetic");
 }
 
+/* Known red (whitelisted on this board): overload choice on the receiver's
+ * own class. javac 21 binds the most specific method applicable to the
+ * arguments' types, and tries non-varargs methods first: `b.f(o)` with
+ * Over1A.f(Object) and Over1B.f(String) binds Over1A.f; `s.log("x")` with
+ * Over2Base.log(String) and Over2Sub.log(String, Object...) binds
+ * Over2Base.log. The engine chooses by name and argument count on the
+ * receiver's class (the registry's lookup by arguments, shared), so it names
+ * Over1B.f and Over2Sub.log (lsp_type_dispatch), as main does. Tried in round
+ * 8 of B1: the inherited rule now gives no answer where a farther overload or
+ * the argument count leaves the choice to the types (test_java_type_scope.c
+ * shape 35); the receiver's own class keeps main's answer by ruling, since the
+ * fix is overload resolution by argument types, which the shared member walk
+ * does not have. Each case asserts javac's answer: no edge to the nearer
+ * method. */
+static const char kJavaOverloadByTypes[] =
+    "class Over1A {\n"
+    "    void f(Object o) { }\n"
+    "}\n"
+    "class Over1B extends Over1A {\n"
+    "    void f(String s) { }\n"
+    "    void ctl1() { }\n"
+    "}\n"
+    "public class Client {\n"
+    "    void use(Over1B b, Object o) { b.f(o); }\n"
+    "    void control(Over1B b) { b.ctl1(); }\n"
+    "}\n";
+
+static const char kJavaOverloadVarargs[] =
+    "class Over2Base {\n"
+    "    void log(String m) { }\n"
+    "}\n"
+    "class Over2Sub extends Over2Base {\n"
+    "    void log(String f, Object... a) { }\n"
+    "    void ctl2() { }\n"
+    "}\n"
+    "public class Client {\n"
+    "    void use(Over2Sub s) { s.log(\"x\"); }\n"
+    "    void control(Over2Sub s) { s.ctl2(); }\n"
+    "}\n";
+
+TEST(repro_lsp_java_overload_by_types) {
+    return assert_no_resolvable_edge("Client.java", kJavaOverloadByTypes, "Over1B.f");
+}
+
+TEST(repro_lsp_java_overload_varargs) {
+    return assert_no_resolvable_edge("Client.java", kJavaOverloadVarargs, "Over2Sub.log");
+}
+
 /* ── Suite ───────────────────────────────────────────────────────────────── */
 
 SUITE(repro_lsp_java_cs) {
@@ -801,6 +849,8 @@ SUITE(repro_lsp_java_cs) {
     RUN_TEST(repro_lsp_java_constructor);
     RUN_TEST(repro_lsp_java_constructor_synth);
     RUN_TEST(repro_lsp_java_unresolved);
+    RUN_TEST(repro_lsp_java_overload_by_types); /* known red, see the note at the case */
+    RUN_TEST(repro_lsp_java_overload_varargs);  /* known red, see the note at the case */
 
     /* C# passes. */
     RUN_TEST(repro_lsp_cs_static_typed);

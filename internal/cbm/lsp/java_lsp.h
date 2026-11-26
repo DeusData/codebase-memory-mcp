@@ -101,6 +101,10 @@ typedef struct {
      * (java_inherited_member_ctx): made and dropped as step0_memo. */
     void *walk_memo;
     int walk_memo_types;
+    /* The inherited rule's answer per (declaring class, method name, argument
+     * count) (java_inherited_unique): made and dropped as walk_memo. */
+    void *inherit_memo;
+    int inherit_memo_types;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
