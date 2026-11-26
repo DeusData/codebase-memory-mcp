@@ -5548,6 +5548,23 @@ TEST(incremental_compose_file_reference_follows_its_file) {
     PASS();
 }
 
+/* A Terraform file function whose file appears after the module was indexed. */
+TEST(incremental_terraform_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps(
+        "infra/main.tf",
+        "locals {\n"
+        "  settings = file(\"${path.module}/late.properties\")\n"
+        "}\n",
+        NULL, NULL, "infra/late.properties", "file", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -37088,6 +37105,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_compose_file_reference_follows_edits);
     RUN_TEST(incremental_docker_copy_reference_follows_its_file);
     RUN_TEST(incremental_compose_file_reference_follows_its_file);
+    RUN_TEST(incremental_terraform_file_reference_follows_its_file);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

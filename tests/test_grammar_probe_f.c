@@ -3185,6 +3185,78 @@ TEST(probe_terraform_refs_resolve_in_their_module) {
     PASS();
 }
 
+/* Every REFERENCES_FILE edge a Terraform block draws for a file function, as
+ * "<file> <block> -> <target file> (fn:line)", sorted, one per line. */
+static char *gpf_tf_file_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' ' || s.name || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND s.file_path LIKE '%.tf' "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A file function whose path begins at ${path.module} reads a file of the
+ * repository: the block holding the call references that file, once, at its
+ * first call. A path without ${path.module} is relative to the directory
+ * Terraform runs in and draws nothing; neither does path.root, a path with
+ * another interpolation, a variable, a directory read by fileset, or a file
+ * the index does not hold. */
+TEST(probe_terraform_file_functions_reference_their_files) {
+    static const GpfFile files[] = {
+        {"infra/main.tf", "variable \"name\" {}\n"
+                          "locals {\n"
+                          "  policy = file(\"${path.module}/policies/read.json\")\n"
+                          "  again  = file(\"${path.module}/policies/read.json\")\n"
+                          "  plain  = file(\"policies/read.json\")\n"
+                          "  rooted = file(\"${path.root}/policies/read.json\")\n"
+                          "  named  = file(\"${path.module}/policies/${var.name}.json\")\n"
+                          "  byvar  = file(var.name)\n"
+                          "  set    = fileset(\"${path.module}/policies\", \"*.json\")\n"
+                          "  gone   = file(\"${path.module}/policies/missing.json\")\n"
+                          "}\n"
+                          "resource \"aws_instance\" \"web\" {\n"
+                          "  user_data = templatefile(\"${path.module}/templates/init.sh\", {\n"
+                          "    name = var.name\n"
+                          "  })\n"
+                          "  hash = filemd5(\"${path.module}/../shared/common.yaml\")\n"
+                          "}\n"},
+        {"infra/policies/read.json", "{\"Version\": \"2012-10-17\"}\n"},
+        {"infra/templates/init.sh", "#!/bin/sh\necho ${name}\n"},
+        {"shared/common.yaml", "name: common\n"},
+        {"policies/read.json", "{\"Version\": \"2012-10-17\"}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_file_refs(files, n);
+    static const char want[] =
+        "infra/main.tf locals -> infra/policies/read.json (file:3)\n"
+        "infra/main.tf resource.aws_instance.web -> infra/templates/init.sh (templatefile:13)\n"
+        "infra/main.tf resource.aws_instance.web -> shared/common.yaml (filemd5:16)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform file refs got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform file refs");
+    }
+    free(got);
+    PASS();
+}
+
 /* A Terraform / OpenTofu module file (.tf, .tofu) extracts its blocks but no
  * generic calls or usages -- its references are the module resolver's -- while
  * any other HCL file (Packer, Nomad, Terragrunt .hcl) keeps them. */
@@ -7336,6 +7408,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_patches_override_their_base);
     RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
     RUN_TEST(probe_terraform_refs_resolve_in_their_module);
+    RUN_TEST(probe_terraform_file_functions_reference_their_files);
     RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
     RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
