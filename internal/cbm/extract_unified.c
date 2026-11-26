@@ -1139,6 +1139,14 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (configured_qn) {
         return configured_qn;
     }
+    /* The preprocessed view of a C/C++ file: a body whose lines are a raw
+     * GoogleTest definition's is that test, whatever its expanded head reads. */
+    if (ctx->pp_test_spans && strcmp(ts_node_type(node), "function_definition") == 0) {
+        const char *raw_test = cbm_test_span_owner_qn(ctx->pp_test_spans, node);
+        if (raw_test) {
+            return raw_test;
+        }
+    }
 
     /* C# local functions nested in a member have no graph node. Attribute calls
      * in them to the enclosing function, whose definition span contains the
@@ -1305,6 +1313,17 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
     if (!name || !name[0]) {
         return NULL;
+    }
+
+    /* GoogleTest `TEST(Suite, Case) {...}` and its four siblings: the def
+     * extractor names the definition TEST_Suite_Case (#1266). Name the call
+     * scope through the same helper, or every call in the body names a
+     * definition that was never minted and is sourced at the File node. */
+    char *test_name = cbm_cpp_test_macro_name(
+        ctx->arena, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), name, node,
+        ctx->source);
+    if (test_name) {
+        name = test_name;
     }
 
     /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor

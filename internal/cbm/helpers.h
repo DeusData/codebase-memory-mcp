@@ -48,9 +48,14 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 // Returns a null node if none found.
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
-// Get the QN of an enclosing function, or module_qn if none.
+// Get the QN of an enclosing function, or module_qn if none. test_macro_names:
+// a GoogleTest macro head is named as the def walk names it
+// (cbm_cpp_test_macro_name; cbm_cpp_test_macro_names_on gives the value).
+// pp_test_spans: the preprocessed view's map to the raw tests
+// (cbm_test_span_owner_qn), NULL in a raw view.
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path, const char *module_qn);
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
@@ -209,6 +214,12 @@ bool cbm_csharp_is_extension_block(TSNode node, TSNode class_node, const char *s
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// ObjectScript `Do obj.M()` / `Job obj.M()`: grammar v1.9.15+ hides the old
+// `method_call` wrapper, so its receiver and `oref_method` sit directly under
+// `do_parameter` / `job_argument`. True for `method_call` itself or for one of
+// those parents carrying a direct `oref_method` child.
+bool cbm_objectscript_is_instance_call(TSNode node);
+
 // Find every child node matching `kind` (unlike cbm_find_child_by_kind,
 // which stops at the first match). Writes up to `max` nodes into `out`;
 // returns how many were found. Repeated sibling nodes of the same kind are
@@ -248,6 +259,11 @@ bool cbm_chialisp_is_def_head(const char *t);
 
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
+
+// cbm_kind_in_set over a language's call_node_types, plus the ObjectScript UDL
+// `Do obj.M()` sites that no longer have a dedicated node kind (see
+// cbm_objectscript_is_instance_call).
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types);
 
 /* Namespace/module declarations that extend a qualified-name scope without
  * turning their children into class methods. Shared by definition and unified

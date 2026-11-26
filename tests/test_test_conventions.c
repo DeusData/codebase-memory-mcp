@@ -388,6 +388,60 @@ TEST(conventions_presets_and_languages_are_isolated) {
     PASS();
 }
 
+static int tc_calls_from(const CBMFileResult *result, const char *callee, const char *scope) {
+    int n = 0;
+    for (int i = 0; result && i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        n += tc_text(call->callee_name, callee) && tc_text(call->enclosing_func_qn, scope);
+    }
+    return n;
+}
+
+static int tc_resolved_from(const CBMFileResult *result, const char *caller, const char *callee) {
+    int n = 0;
+    for (int i = 0; result && i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        n += tc_text(rc->caller_qn, caller) && tc_text(rc->callee_qn, callee);
+    }
+    return n;
+}
+
+/* The caller of a call in a gtest body follows the definition's name in both
+ * preset states, on the text path and in the C/C++ engine: on, the test's own
+ * TEST_Group_Alpha; off, the bare TEST the def walk then mints. A caller name
+ * without a definition sources the call at the file. */
+TEST(conventions_gtest_preset_names_body_callers) {
+    ASSERT_EQ(tc_init_status, 0);
+    const char *source = "void helper() {}\nTEST(Group, Alpha) { helper(); }\n";
+    cbm_test_declarations_t *disabled = tc_config(NULL, "\"gtest\":false");
+    cbm_test_declarations_t *enabled = tc_config(NULL, "\"gtest\":true");
+    bool parsed = disabled && enabled;
+    CBMFileResult *off = disabled ? tc_extract(source, CBM_LANG_CPP, "src/body.cpp", disabled) : NULL;
+    CBMFileResult *on = enabled ? tc_extract(source, CBM_LANG_CPP, "src/body.cpp", enabled) : NULL;
+    cbm_test_declarations_free(disabled);
+    cbm_test_declarations_free(enabled);
+    bool states[2] = {false, false};
+    const char *names[2] = {"TEST", "TEST_Group_Alpha"};
+    CBMFileResult *results[2] = {off, on};
+    for (int i = 0; i < 2; i++) {
+        const CBMDefinition *def = tc_def(results[i], names[i]);
+        const CBMDefinition *helper = tc_def(results[i], "helper");
+        states[i] = tc_ok(results[i]) && def && helper && def->qualified_name &&
+                    tc_calls_from(results[i], "helper", def->qualified_name) == 1 &&
+                    tc_resolved_from(results[i], def->qualified_name, helper->qualified_name) == 1;
+        if (!states[i]) fprintf(stderr, "gtest preset %s: caller does not follow %s\n",
+                                i ? "on" : "off", names[i]);
+    }
+    bool off_has_no_test_name = off && !tc_def(off, "TEST_Group_Alpha");
+    cbm_free_result(off);
+    cbm_free_result(on);
+    ASSERT_TRUE(parsed);
+    ASSERT_TRUE(off_has_no_test_name);
+    ASSERT_TRUE(states[0]);
+    ASSERT_TRUE(states[1]); /* RED on 08a7a586: the call says TEST, the def TEST_Group_Alpha */
+    PASS();
+}
+
 TEST(conventions_snapshot_and_result_strings_are_independently_owned) {
     ASSERT_EQ(tc_init_status, 0);
     char json_a[] = "{\"test_impact\":{\"version\":1,\"tests\":{\"conventions\":[" TC_CASE0 "]}}}";
@@ -585,9 +639,11 @@ static bool tc_owner_cross(tc_owner_fixture_t *f, CBMArena *arena,
                            bool cpp, CBMSourceOrigin origin, TSTree *tree) {
     if (registry)
         return cbm_run_c_lsp_cross_with_registry_with_test_owners(arena, source, length,
-            module, cpp, registry, NULL, NULL, 0, tree, out, origin, f->owners);
+            module, cpp, registry, NULL, NULL, 0, tree, out, origin, f->owners,
+            f->owners && f->owners->cpp_test_macro_names);
     return cbm_run_c_lsp_cross_with_test_owners(arena, source, length, module, cpp,
-        &f->foo, 1, NULL, NULL, 0, tree, out, origin, f->owners);
+        &f->foo, 1, NULL, NULL, 0, tree, out, origin, f->owners,
+        f->owners && f->owners->cpp_test_macro_names);
 }
 
 TEST(conventions_cached_body_tree_cannot_drop_calls) {
@@ -791,6 +847,7 @@ SUITE(test_conventions) {
     RUN_TEST(conventions_invalid_invocations_have_exact_typed_locations);
     RUN_TEST(conventions_unsupported_consumed_descriptors_fail_preflight);
     RUN_TEST(conventions_presets_and_languages_are_isolated);
+    RUN_TEST(conventions_gtest_preset_names_body_callers);
     RUN_TEST(conventions_snapshot_and_result_strings_are_independently_owned);
     RUN_TEST(conventions_roles_and_errors_survive_compaction_and_spill);
     RUN_TEST(conventions_only_raw_invocations_receive_configured_roles);

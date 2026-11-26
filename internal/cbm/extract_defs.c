@@ -102,9 +102,10 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
  * contract; the pending stack is not — BT_STACK is only the on-stack first
  * chunk and spills to the heap, because a full fixed stack dropped a wide
  * body's FIRST children and sampled a mid-body window instead.
+ * Subtrees ending at or before from_byte are skipped (0 = whole body).
  * Returns arena-allocated string, or NULL when there are no identifiers or the
  * stack could not be grown (logged; no truncated sample is ever returned). */
-static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+static char *extract_ident_tokens_from(CBMExtractCtx *ctx, TSNode body, uint32_t from_byte) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
     TSNode bt_inline[BT_STACK];
     TSNode *bt_stack = bt_inline;
@@ -119,6 +120,9 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
 
     while (bt_top > 0 && bt_count < BT_MAX_IDENTS) {
         TSNode nd = bt_stack[--bt_top];
+        if (ts_node_end_byte(nd) <= from_byte) {
+            continue;
+        }
         uint32_t nc = ts_node_child_count(nd);
         if (nc == 0) {
             const char *k = ts_node_type(nd);
@@ -154,6 +158,10 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
         return cbm_arena_strdup(ctx->arena, bt_buf);
     }
     return NULL;
+}
+
+static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+    return extract_ident_tokens_from(ctx, body, 0);
 }
 
 /* Compute MinHash fingerprint for a function body node and store in def.
@@ -6482,30 +6490,82 @@ static bool is_cpp_test_macro(const char *name) {
  * Returns an arena-allocated string, or NULL when the parameters cannot be
  * resolved (caller keeps the original name in that case). */
 static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
-                                         const char *source) {
+                                         const char *source);
+
+char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNode func_node,
+                              const char *source) {
+    if (!enabled || !name || !source || ts_node_is_null(func_node) || !is_cpp_test_macro(name)) {
+        return NULL;
+    }
+    return resolve_cpp_test_macro_name(a, name, func_node, source);
+}
+
+/* An argument's text without comments and without the blanks around it, in
+ * place: `Suite /\* c *\/` reads `Suite`, as the compiler (and the second,
+ * preprocessed view) sees it. */
+static char *cpp_test_arg_text(char *text) {
+    if (!text) {
+        return NULL;
+    }
+    char *w = text;
+    for (const char *r = text; *r;) {
+        if (r[0] == '/' && r[1] == '*') {
+            const char *close = strstr(r + 2, "*/");
+            r = close ? close + 2 : r + strlen(r);
+            *w++ = ' ';
+        } else if (r[0] == '/' && r[1] == '/') {
+            while (*r && *r != '\n') {
+                r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+    while (w > text && (w[-1] == ' ' || w[-1] == '\t' || w[-1] == '\n' || w[-1] == '\r')) {
+        *--w = '\0';
+    }
+    char *start = text;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
+        start++;
+    }
+    return start;
+}
+
+/* The first two arguments of a GoogleTest-style head `MACRO(a, b) {`: the text
+ * of each named parameter, its type node where the grammar gives one (`Suite`
+ * parses as a parameter whose type is that name). A comment in the head is an
+ * extra of the grammar, not an argument. Returns how many it found, at most
+ * two. */
+static int cpp_test_macro_args(CBMArena *a, TSNode node, const char *source, const char *args[2]) {
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
         params = find_c_params(node);
     }
     if (ts_node_is_null(params)) {
-        return NULL;
+        return 0;
     }
-
-    const char *args[2] = {NULL, NULL};
     int count = 0;
     uint32_t nc = ts_node_named_child_count(params);
     for (uint32_t i = 0; i < nc && count < 2; i++) {
         TSNode child = ts_node_named_child(params, i);
-        if (ts_node_is_null(child)) {
+        if (ts_node_is_null(child) || strcmp(ts_node_type(child), "comment") == 0) {
             continue;
         }
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        char *text = cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source);
+        char *text = cpp_test_arg_text(
+            cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source));
         if (text && text[0]) {
             args[count++] = text;
         }
     }
+    return count;
+}
 
+static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
+                                         const char *source) {
+    const char *args[2] = {NULL, NULL};
+    int count = cpp_test_macro_args(a, node, source, args);
     if (count == 2) {
         return cbm_arena_sprintf(a, "%s_%s_%s", macro, args[0], args[1]);
     }
@@ -6513,6 +6573,192 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
         return cbm_arena_sprintf(a, "%s_%s", macro, args[0]);
     }
     return NULL;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_test_span_work = 0;
+void cbm_test_span_test_reset(void) {
+    atomic_store_explicit(&g_test_span_work, 0, memory_order_relaxed);
+}
+uint64_t cbm_test_span_test_work(void) {
+    return atomic_load_explicit(&g_test_span_work, memory_order_relaxed);
+}
+void cbm_test_span_test_count(uint64_t work) {
+    atomic_fetch_add_explicit(&g_test_span_work, work, memory_order_relaxed);
+}
+#define TEST_SPAN_WORK(n) cbm_test_span_test_count(n)
+#else
+#define TEST_SPAN_WORK(n) ((void)0)
+#endif
+
+static int test_span_cmp(const CBMTestSpan *s, uint32_t start, uint32_t end) {
+    if (s->start_line != start) {
+        return s->start_line < start ? -1 : 1;
+    }
+    return s->end_line == end ? 0 : (s->end_line < end ? -1 : 1);
+}
+
+/* The raw test span (start, end): its index, or -1 when none or two raw tests
+ * share it. Binary search. */
+static int test_span_at(const CBMTestSpanMap *map, uint32_t start, uint32_t end) {
+    int lo = 0;
+    int hi = map->count;
+    while (lo < hi) { /* the first span not below (start, end) */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (test_span_cmp(&map->spans[mid], start, end) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->count || test_span_cmp(&map->spans[lo], start, end) != 0 ||
+        (lo + 1 < map->count && test_span_cmp(&map->spans[lo + 1], start, end) == 0)) {
+        return -1; /* none, or two raw tests on one span */
+    }
+    return lo;
+}
+
+/* The raw test span a preprocessed-view definition's first and last lines map
+ * onto, or -1. */
+static int test_span_of(const CBMTestSpanMap *map, TSNode function) {
+    uint32_t first = ts_node_start_point(function).row + 1;
+    uint32_t last = ts_node_end_point(function).row + 1;
+    if (last < first || last > (uint32_t)map->line_count || !map->in_main_file[first] ||
+        !map->in_main_file[last]) {
+        return -1;
+    }
+    uint32_t start = map->raw_line_by_line[first];
+    uint32_t end = map->raw_line_by_line[last];
+    return start && end ? test_span_at(map, start, end) : -1;
+}
+
+/* Nodes whose children are still top level: namespace, extern-block and
+ * template bodies and the branches of conditionals. */
+static bool test_view_container(const char *kind) {
+    return strcmp(kind, "namespace_definition") == 0 || strcmp(kind, "declaration_list") == 0 ||
+           strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "template_declaration") == 0 || strncmp(kind, "preproc_", 8) == 0;
+}
+
+void cbm_test_span_index_view(CBMTestSpanMap *map, CBMArena *a, TSNode root) {
+    if (!map) {
+        return;
+    }
+    map->view_defs = NULL;
+    map->view_def_count = 0;
+    if (map->count <= 0 || !map->raw_line_by_line || !map->in_main_file || !a ||
+        ts_node_is_null(root)) {
+        return;
+    }
+    CBMTestViewDef *defs = NULL;
+    int count = 0;
+    int cap = 0;
+    bool failed = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    int depth = 1;
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    while (more && !failed) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TEST_SPAN_WORK(1);
+        if (strcmp(kind, "function_definition") == 0) {
+            int span = test_span_of(map, node);
+            if (span >= 0 && count == cap) {
+                int grown_cap = cap ? cap * 2 : 16;
+                CBMTestViewDef *grown =
+                    cbm_arena_alloc(a, (size_t)grown_cap * sizeof(CBMTestViewDef));
+                if (!grown) {
+                    failed = true;
+                    break;
+                }
+                if (count) {
+                    memcpy(grown, defs, (size_t)count * sizeof(CBMTestViewDef));
+                }
+                defs = grown;
+                cap = grown_cap;
+            }
+            if (span >= 0) {
+                defs[count++] =
+                    (CBMTestViewDef){ts_node_start_byte(node), ts_node_end_byte(node), span};
+            }
+        } else if (test_view_container(kind) && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!(more = ts_tree_cursor_goto_next_sibling(&cursor)) && depth > 1) {
+            ts_tree_cursor_goto_parent(&cursor);
+            depth--;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    int *per_span =
+        failed || count == 0 ? NULL : cbm_arena_alloc(a, (size_t)map->count * sizeof(int));
+    if (!per_span) {
+        return; /* nothing maps, or out of memory: no body is named from a span */
+    }
+    memset(per_span, 0, (size_t)map->count * sizeof(int));
+    for (int i = 0; i < count; i++) {
+        per_span[defs[i].span]++;
+    }
+    for (int i = 0; i < count; i++) {
+        if (per_span[defs[i].span] != 1) {
+            defs[i].span = -1; /* two definitions of this view on one span: neither */
+        }
+    }
+    map->view_defs = defs;
+    map->view_def_count = count;
+}
+
+/* The raw test span of an indexed top-level definition of the preprocessed
+ * view, or -1: not indexed (not top level, or mapping onto no single raw
+ * test), or sharing its span with another such definition. */
+static int test_view_def_span(const CBMTestSpanMap *map, TSNode function) {
+    if (!map || map->view_def_count <= 0 || ts_node_is_null(function)) {
+        return -1;
+    }
+    uint32_t start = ts_node_start_byte(function);
+    int lo = 0;
+    int hi = map->view_def_count;
+    while (lo < hi) { /* the first indexed definition not before `function` */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (map->view_defs[mid].start_byte < start) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->view_def_count || map->view_defs[lo].start_byte != start ||
+        map->view_defs[lo].end_byte != ts_node_end_byte(function)) {
+        return -1; /* not an indexed top-level definition of the view */
+    }
+    return map->view_defs[lo].span; /* -1 on a shared span */
+}
+
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
+    int span = test_view_def_span(map, function);
+    return span >= 0 ? map->spans[span].qualified_name : NULL;
+}
+
+/* Record a raw test definition's span for the preprocessed view (in scratch;
+ * amortised constant work per test). */
+static void record_test_span(CBMExtractCtx *ctx, const CBMDefinition *def) {
+    if (ctx->test_span_count == ctx->test_span_cap) {
+        int cap = ctx->test_span_cap ? ctx->test_span_cap * 2 : 16;
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        CBMTestSpan *grown = cbm_arena_alloc(scratch, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return; /* the second view then names this body from its own head */
+        }
+        if (ctx->test_span_count) {
+            memcpy(grown, ctx->test_spans, (size_t)ctx->test_span_count * sizeof(*grown));
+        }
+        ctx->test_spans = grown;
+        ctx->test_span_cap = cap;
+    }
+    ctx->test_spans[ctx->test_span_count++] =
+        (CBMTestSpan){def->start_line, def->end_line, def->qualified_name};
 }
 
 /* Configured macro definitions are interpreted only in their raw source.
@@ -6637,11 +6883,21 @@ bool cbm_test_declarations_validate(CBMFileResult *result,
     return result->test_declarations_status == CBM_TEST_EXTRACT_OK;
 }
 
-static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
-    if (!ctx->test_declarations)
+static bool tdx_preset_of(const cbm_test_declarations_t *declarations, cbm_test_preset_t preset) {
+    if (!declarations)
         return preset != CBM_TEST_PRESET_C_CBM;
     bool enabled = false;
-    return cbm_test_declarations_preset(ctx->test_declarations, preset, &enabled) && enabled;
+    return cbm_test_declarations_preset(declarations, preset, &enabled) && enabled;
+}
+
+static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
+    return tdx_preset_of(ctx->test_declarations, preset);
+}
+
+bool cbm_cpp_test_macro_names_on(CBMLanguage language,
+                                 const cbm_test_declarations_t *declarations) {
+    return (language == CBM_LANG_CPP || language == CBM_LANG_CUDA) &&
+           tdx_preset_of(declarations, CBM_TEST_PRESET_GTEST);
 }
 
 static bool tdx_equal(const char *name, const char *text, size_t size) {
@@ -8071,7 +8327,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     /* C++/CUDA: GoogleTest macros (TEST, TEST_F, TEST_P, ...) parse as
      * function definitions whose name resolves to the bare macro identifier.
      * Multiple test cases per file collide on qualified name; derive a unique
-     * name from the macro arguments so each gets its own graph node (#1266). */
+     * name from the macro arguments so each gets its own graph node (#1266).
+     * The callers of calls in the body are named by the same helper. */
     bool is_gtest = false;
     const char *configured_name = NULL;
     TDXRule configured_rule;
@@ -8081,14 +8338,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
         name = (char *)configured_name;
     }
-    if (!configured && tdx_preset(ctx, CBM_TEST_PRESET_GTEST) &&
-        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        is_cpp_test_macro(name)) {
-        char *gtest_name = resolve_cpp_test_macro_name(a, name, node, ctx->source);
-        if (gtest_name) {
-            name = gtest_name;
-            is_gtest = true;
-        }
+    char *gtest_name =
+        configured ? NULL
+                   : cbm_cpp_test_macro_name(
+                         a, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations),
+                         name, node, ctx->source);
+    if (gtest_name) {
+        name = gtest_name;
+        is_gtest = true;
     }
 
     /* Nix `"${foo}" = x: …`: an interpolated attrpath segment has no statically
@@ -8377,6 +8634,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (is_gtest && ctx->test_declarations_raw_source && def.qualified_name) {
+        record_test_span(ctx, &def);
+    }
     if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
         push_make_rule_targets(ctx, node, &def);
     }
@@ -13653,6 +13913,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
                         if (strcmp(member_label, "Storage") == 0) {
                             TSNode sbody = cbm_find_child_by_kind(child, "storage_body");
+                            if (ts_node_is_null(sbody)) {
+                                sbody =
+                                    cbm_find_child_by_kind(child, "external_method_body_content");
+                            }
                             if (!ts_node_is_null(sbody)) {
                                 char *xml = cbm_node_text(a, sbody, ctx->source);
                                 if (xml) {
@@ -13754,13 +14018,27 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                         }
 
                         if (strcmp(member_label, "Trigger") == 0) {
+                            /* Grammar v1.9.15+ hides the core_trigger /
+                             * external_trigger wrapper; the body is then
+                             * everything after trigger_name. */
                             TSNode tbody = cbm_find_child_by_kind(child, "core_trigger");
                             if (ts_node_is_null(tbody)) {
                                 tbody = cbm_find_child_by_kind(child, "external_trigger");
                             }
+                            uint32_t body_from = 0;
+                            if (ts_node_is_null(tbody)) {
+                                tbody = child;
+                                body_from = ts_node_end_byte(nname);
+                            }
                             if (!ts_node_is_null(tbody)) {
-                                mdef.body_tokens = extract_body_ident_tokens(ctx, tbody);
+                                mdef.body_tokens = extract_ident_tokens_from(ctx, tbody, body_from);
                                 char *raw = cbm_node_text(a, tbody, ctx->source);
+                                if (raw && body_from > ts_node_start_byte(tbody)) {
+                                    raw += body_from - ts_node_start_byte(tbody);
+                                    while (*raw == ' ' || *raw == '\t') {
+                                        raw++;
+                                    }
+                                }
                                 if (raw && raw[0]) {
                                     char esc[CBM_SZ_512];
                                     int ei = 0;
