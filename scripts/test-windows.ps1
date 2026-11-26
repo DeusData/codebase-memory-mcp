@@ -160,6 +160,7 @@ try {
 # UI (build target cbm-with-ui); against a non-UI binary it reports a precondition
 # (exit 2) and is skipped rather than failed.
 $guards = @(
+    "tests\windows\test_worker_trace.py",
     "tests\windows\test_non_ascii_path.py",
     "tests\windows\test_non_ascii_cache_dump.py",
     "tests\windows\test_daemon_lifecycle.py",
