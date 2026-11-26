@@ -11,7 +11,7 @@ int tf_deselected_count = 0;
 
 #include "test_framework.h"
 #include "test_helpers.h"
-#include "test_daemon_runtime_contract.h"
+#include "test_image_probe.h"
 #include "foundation/compat.h"         /* cbm_setenv — #845 supervisor kill switch */
 #include "foundation/compat_fs.h"      /* cbm_fopen — worker response file */
 #include "foundation/constants.h"      /* CBM_SZ_4K — forced stderr buffer */
@@ -44,11 +44,10 @@ int tf_deselected_count = 0;
 #include <windows.h>
 #include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
+#include <fcntl.h>    /* open: the process-tree probe's handshake FIFOs */
+#include <limits.h>   /* INT_MAX: a handed-down descriptor */
+#include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
-#ifdef __APPLE__
-#include <fcntl.h>
-#include <sys/mman.h>
-#endif
 #ifdef CBM_TEST_COVERAGE
 #include <dlfcn.h>    /* the libc functions behind the profile-keeping ones */
 #include <fcntl.h>    /* the marker of a forked child */
@@ -211,14 +210,12 @@ static void tf_cleanup_cache_sentinel(void) {
     }
 }
 
-/* Client home overrides the CLI honours BEFORE $HOME, so redirecting HOME alone
- * does not isolate them: cbm_codex_config_dir() and its siblings return the
- * ambient path and the suite resolves against the developer's real config —
- * reading its state and writing to it. Same inventory the shell fixtures are
- * already required to neutralize (tests/test_smoke_fixture_contract.sh), kept
- * in one place so a new client cannot be isolated in the smoke scripts and
- * forgotten here. A test that exercises one of these sets it after setup. */
+/* These paths take precedence over HOME and can escape the private fixture.
+ * A test that exercises an override sets it after setup. */
 static const char *const tf_client_home_overrides[] = {
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "KIRO_HOME",
@@ -454,10 +451,12 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         FILE *ready = marker ? cbm_fopen(marker, "wb") : NULL;
         if (ready) {
             (void)fprintf(
-                ready, "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\n",
+                ready,
+                "single=%s\nmarker=%s\nquarantine=%s\nbudget=%zu\ndescendant=%ld\nfence=%s\n",
                 getenv("CBM_INDEX_SINGLE_THREAD") ? getenv("CBM_INDEX_SINGLE_THREAD") : "", marker,
                 getenv("CBM_INDEX_QUARANTINE_FILE") ? getenv("CBM_INDEX_QUARANTINE_FILE") : "",
-                cbm_mem_budget(), descendant);
+                cbm_mem_budget(), descendant,
+                cbm_index_worker_publish_fence() ? cbm_index_worker_publish_fence() : "");
             (void)fclose(ready);
         }
         (void)fprintf(stderr, "async worker hang-tree probe\n");
@@ -508,6 +507,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
+    cbm_index_set_worker_publish_fence(invocation.publish_fence_file);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
@@ -651,129 +651,12 @@ static int tf_maybe_run_version_cohort_crash_holder(int argc, char **argv) {
 #endif
 }
 
-static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
-#ifdef _WIN32
-    if (argc != 3 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
-        return -1;
-    }
-    HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[2]);
-    bool announced = ready && SetEvent(ready) != 0;
-    if (ready) {
-        (void)CloseHandle(ready);
-    }
-    if (!announced) {
-        return 24;
-    }
-    Sleep(INFINITE);
-    return 25;
-#else
-    /* POSIX copied-image holder: block reading stdin until the parent closes
-     * the release pipe, exactly like the cat(1) donor this replaced. A system
-     * utility cannot serve as the copied image — a multi-call coreutils
-     * binary (uutils cat) refuses to execute under the copied name. */
-    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
-        return -1;
-    }
-    char release[16];
-    ssize_t count;
-    do {
-        count = read(STDIN_FILENO, release, sizeof(release));
-    } while (count > 0 || (count < 0 && errno == EINTR));
-    return count == 0 ? 0 : 25;
-#endif
-}
-
-/* Real copied-image HELLO probe used by daemon_runtime. Keeping this in the
- * test runner avoids any production-only test hook: the daemon authenticates
- * and fingerprints an ordinary, separately executed process image. */
-static int tf_maybe_run_runtime_hello_client(int argc, char **argv) {
-    if (argc != 6 || strcmp(argv[1], "__cbm_runtime_hello_client") != 0) {
-        return -1;
-    }
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_ipc_endpoint_new(argv[3], argv[2]);
-    cbm_daemon_build_identity_t identity = {
-        .semantic_version = argv[4],
-        .build_fingerprint = argv[5],
-    };
-    cbm_daemon_runtime_connect_result_t result;
-    memset(&result, 0, sizeof(result));
-    cbm_daemon_runtime_client_t *client =
-        endpoint ? cbm_daemon_runtime_client_connect(endpoint, &identity,
-                                                     TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result)
-                 : NULL;
-    bool accepted = client && result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
-                    result.hello_status == CBM_DAEMON_HELLO_COMPATIBLE;
-    bool closed =
-        !client || cbm_daemon_runtime_client_close(client, TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS);
-    cbm_daemon_ipc_endpoint_free(endpoint);
-    if (!accepted) {
-        return 26;
-    }
-    return closed ? 0 : 27;
-}
-
-/* Real copied-image activation probe. The request identity is supplied by the
- * executing copy so the daemon must authenticate that peer image rather than
- * require the active generation's build fingerprint. */
-static int tf_maybe_run_runtime_activation_client(int argc, char **argv) {
-    if (argc != 7 || strcmp(argv[1], "__cbm_runtime_activation_client") != 0) {
-        return -1;
-    }
-    char *action_end = NULL;
-    unsigned long action_value = strtoul(argv[6], &action_end, 10);
-    bool action_valid = action_end != argv[6] && *action_end == '\0' &&
-                        action_value >= (unsigned long)CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL &&
-                        action_value <= (unsigned long)CBM_DAEMON_RUNTIME_ACTIVATION_UNINSTALL;
-    cbm_daemon_ipc_endpoint_t *endpoint =
-        action_valid ? cbm_daemon_ipc_endpoint_new(argv[3], argv[2]) : NULL;
-    cbm_daemon_build_identity_t identity = {
-        .semantic_version = argv[4],
-        .build_fingerprint = argv[5],
-    };
-    cbm_daemon_runtime_activation_result_t result;
-    memset(&result, 0, sizeof(result));
-    bool exchanged =
-        endpoint && cbm_daemon_runtime_request_activation_shutdown(
-                        endpoint, &identity, (cbm_daemon_runtime_activation_action_t)action_value,
-                        TF_RUNTIME_IMAGE_EXCHANGE_TIMEOUT_MS, &result);
-    cbm_daemon_ipc_endpoint_free(endpoint);
-    return exchanged && result.accepted ? 0 : 29;
-}
-
-/* macOS adversarial HELLO probe: execute this mode from a foreign process
- * image while mapping the genuine runner RX. The daemon must authenticate the
- * main image, not merely find its own vnode in an arbitrary executable map. */
-static int tf_maybe_run_runtime_mapped_hello_client(int argc, char **argv) {
-#ifdef __APPLE__
-    if (argc != 7 || strcmp(argv[1], "__cbm_runtime_mapped_hello_client") != 0) {
-        return -1;
-    }
-    int image_fd = open(argv[2], O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    void *mapping =
-        image_fd >= 0 ? mmap(NULL, 1, PROT_READ | PROT_EXEC, MAP_PRIVATE, image_fd, 0) : MAP_FAILED;
-    bool mapped = mapping != MAP_FAILED;
-    if (image_fd >= 0 && close(image_fd) != 0) {
-        mapped = false;
-    }
-    if (!mapped) {
-        if (mapping != MAP_FAILED) {
-            (void)munmap(mapping, 1);
-        }
-        return 28;
-    }
-
-    char *hello_argv[] = {argv[0], "__cbm_runtime_hello_client", argv[3], argv[4], argv[5],
-                          argv[6]};
-    int result = tf_maybe_run_runtime_hello_client(6, hello_argv);
-    if (munmap(mapping, 1) != 0) {
-        return 28;
-    }
-    return result >= 0 ? result : 28;
-#else
-    (void)argc;
-    (void)argv;
-    return -1;
-#endif
+/* The image probe's roles (tests/image_probe_roles.c, tests/test_image_probe.h).
+ * The runner itself dispatches only the image holder through here; tf_roles
+ * names the probe's other literals under TF_PHASE_PROBE so the test-impact
+ * engine still maps a change those roles reach to the tests that start them. */
+static int tf_role_image_probe(int argc, char **argv) {
+    return tf_image_probe_dispatch(argc, argv);
 }
 
 static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
@@ -1791,6 +1674,10 @@ extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
+extern void suite_site_bind(void);
+extern void suite_scope_facts(void);
+extern void suite_include_path(void);
+extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
 extern void suite_zstd(void);
@@ -1812,6 +1699,7 @@ extern void suite_py_lsp_scale(void);
 extern void suite_ts_lsp(void);
 extern void suite_java_lsp(void);
 extern void suite_java_lsp_coverage(void);
+extern void suite_java_typed_calls(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_kotlin_typed_calls(void);
 extern void suite_rust_lsp(void);
@@ -1852,6 +1740,7 @@ extern void suite_activation_transaction(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
+extern void suite_type_scope(void);
 extern void suite_call_reference_language_complex_contract(void);
 extern void suite_repro_call_scope_usages(void);
 extern void suite_repro_call_argument_usages(void);
@@ -1969,6 +1858,240 @@ static int tf_role_env_isolation(int argc, char **argv) {
     return 0;
 }
 
+/* Process-tree memory probe coverage (test_subprocess.c). The test creates
+ * two pipes, "up" (tree -> test) and "down" (test -> tree), and starts the
+ * root with their names. The root connects both FIRST -- the test is blocked
+ * until it has -- then starts ONE descendant that inherits the connected ends
+ * and drops its own copies, so the descendant alone holds the tree's side.
+ * The descendant and the test then move in lock step, each blocked in a pipe
+ * read until the other side writes:
+ *
+ *   descendant: 'I' up    started, nothing allocated   (test: idle sample)
+ *   test:       'L' down  allocate the load
+ *   descendant: 'R' up    every page of the load is touched (test: loaded sample)
+ *   test:       closes    the descendant frees the load and exits, then the root
+ *
+ * A read whose writer died returns end-of-file, so a failed descendant ends
+ * the wait on the other side instead of leaving it blocked. */
+#ifdef _WIN32
+typedef HANDLE tf_rss_pipe_t;
+#define TF_RSS_NO_PIPE INVALID_HANDLE_VALUE
+#else
+typedef int tf_rss_pipe_t;
+#define TF_RSS_NO_PIPE (-1)
+#endif
+
+static bool tf_rss_tree_say(tf_rss_pipe_t channel, char byte) {
+#ifdef _WIN32
+    DWORD written = 0;
+    return WriteFile(channel, &byte, 1, &written, NULL) && written == 1;
+#else
+    ssize_t count;
+    do {
+        count = write(channel, &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    return count == 1;
+#endif
+}
+
+/* Blocks until the test writes; false once it closed its end. */
+static bool tf_rss_tree_hear(tf_rss_pipe_t channel, char *byte) {
+#ifdef _WIN32
+    DWORD got = 0;
+    return ReadFile(channel, byte, 1, &got, NULL) && got == 1;
+#else
+    ssize_t count;
+    do {
+        count = read(channel, byte, 1);
+    } while (count < 0 && errno == EINTR);
+    return count == 1;
+#endif
+}
+
+static int tf_rss_tree_hold(tf_rss_pipe_t up, tf_rss_pipe_t down, const char *mib_text) {
+    char *end = NULL;
+    long mib = strtol(mib_text, &end, 10);
+    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
+        return 81;
+    }
+    if (!tf_rss_tree_say(up, 'I')) {
+        return 83;
+    }
+    char heard = 0;
+    if (!tf_rss_tree_hear(down, &heard)) {
+        return 0; /* released before the load */
+    }
+    if (heard != 'L') {
+        return 84;
+    }
+    size_t bytes = (size_t)mib * 1024U * 1024U;
+    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
+    if (bytes > 0 && !block) {
+        return 82;
+    }
+    /* One store per 4 KiB reaches every page at every page size in use (4 KiB,
+     * 16 KiB on Apple silicon). volatile keeps the compiler from dropping
+     * stores to memory nothing reads back. */
+    volatile unsigned char *page = block;
+    for (size_t offset = 0; offset < bytes; offset += 4096U) {
+        page[offset] = 0xA5;
+    }
+    int code = tf_rss_tree_say(up, 'R') ? 0 : 83;
+    if (code == 0) {
+        (void)tf_rss_tree_hear(down, &heard); /* hold the load until released */
+    }
+    free(block);
+    return code;
+}
+
+static bool tf_rss_tree_parse_pipe(const char *text, tf_rss_pipe_t *channel) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (!text[0] || !end || *end != '\0' || errno != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    *channel = (HANDLE)(uintptr_t)value;
+#else
+    if (value > (unsigned long long)INT_MAX) {
+        return false;
+    }
+    *channel = (int)value;
+#endif
+    return true;
+}
+
+/* The descendant as its own image (Windows): argv names the inherited ends. */
+static int tf_role_rss_tree_hold(int argc, char **argv) {
+    if (argc != 5) {
+        return -1;
+    }
+    tf_rss_pipe_t up = TF_RSS_NO_PIPE;
+    tf_rss_pipe_t down = TF_RSS_NO_PIPE;
+    if (!tf_rss_tree_parse_pipe(argv[2], &up) || !tf_rss_tree_parse_pipe(argv[3], &down)) {
+        return 80;
+    }
+    return tf_rss_tree_hold(up, down, argv[4]);
+}
+
+static tf_rss_pipe_t tf_rss_tree_connect(const char *name, bool writer) {
+#ifdef _WIN32
+    /* Inheritable: the descendant receives this end through the handle list. */
+    SECURITY_ATTRIBUTES inheritable;
+    ZeroMemory(&inheritable, sizeof(inheritable));
+    inheritable.nLength = sizeof(inheritable);
+    inheritable.bInheritHandle = TRUE;
+    wchar_t *wide = cbm_utf8_to_wide(name);
+    HANDLE channel = wide ? CreateFileW(wide, writer ? GENERIC_WRITE : GENERIC_READ, 0,
+                                        &inheritable, OPEN_EXISTING, 0, NULL)
+                          : INVALID_HANDLE_VALUE;
+    free(wide);
+    return channel;
+#else
+    int channel;
+    do {
+        channel = open(name, writer ? O_WRONLY : O_RDONLY);
+    } while (channel < 0 && errno == EINTR);
+    return channel;
+#endif
+}
+
+static void tf_rss_tree_drop(tf_rss_pipe_t channel) {
+    if (channel == TF_RSS_NO_PIPE) {
+        return;
+    }
+#ifdef _WIN32
+    (void)CloseHandle(channel);
+#else
+    (void)close(channel);
+#endif
+}
+
+#ifdef _WIN32
+/* Start the descendant with exactly the two pipe ends inherited. The child
+ * joins this process's Job Object by default, which is the tree the probe
+ * under test enumerates. */
+static bool tf_rss_tree_start_descendant(HANDLE up, HANDLE down, const char *mib_text,
+                                         PROCESS_INFORMATION *child) {
+    char up_text[32];
+    char down_text[32];
+    (void)snprintf(up_text, sizeof(up_text), "%llu", (unsigned long long)(uintptr_t)up);
+    (void)snprintf(down_text, sizeof(down_text), "%llu", (unsigned long long)(uintptr_t)down);
+    char *self = cbm_module_path_utf8();
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", up_text, down_text, mib_text, NULL};
+    char command_line[8192];
+    bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
+    wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
+    wchar_t *wide_command = built ? cbm_utf8_to_wide(command_line) : NULL;
+    HANDLE inherit[2] = {up, down};
+    SIZE_T attrs_size = 0;
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrs_size);
+    bool attrs_init = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
+    bool attrs_ready =
+        attrs_init && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                inherit, sizeof(inherit), NULL, NULL);
+    STARTUPINFOEXW startup;
+    ZeroMemory(&startup, sizeof(startup));
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = attrs;
+    ZeroMemory(child, sizeof(*child));
+    BOOL started =
+        wide_self && wide_command && attrs_ready &&
+        CreateProcessW(wide_self, wide_command, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+                       NULL, NULL, &startup.StartupInfo, child);
+    if (attrs_init) {
+        DeleteProcThreadAttributeList(attrs);
+    }
+    free(attrs);
+    free(wide_self);
+    free(wide_command);
+    free(self);
+    return started != FALSE;
+}
+#endif
+
+static int tf_role_rss_tree_root(int argc, char **argv) {
+    if (argc != 5) {
+        return -1;
+    }
+    /* Connect before anything else: the test's first blocking step waits for
+     * these two ends, in this order. */
+    tf_rss_pipe_t up = tf_rss_tree_connect(argv[2], true);
+    tf_rss_pipe_t down =
+        up != TF_RSS_NO_PIPE ? tf_rss_tree_connect(argv[3], false) : TF_RSS_NO_PIPE;
+    bool connected = up != TF_RSS_NO_PIPE && down != TF_RSS_NO_PIPE;
+#ifdef _WIN32
+    PROCESS_INFORMATION child;
+    bool started = connected && tf_rss_tree_start_descendant(up, down, argv[4], &child);
+    /* From here the descendant holds the tree's only copies of both ends. */
+    tf_rss_tree_drop(up);
+    tf_rss_tree_drop(down);
+    if (!started) {
+        return 85;
+    }
+    CloseHandle(child.hThread);
+    (void)WaitForSingleObject(child.hProcess, INFINITE);
+    CloseHandle(child.hProcess);
+#else
+    pid_t child = connected ? fork() : -1;
+    if (child == 0) {
+        _exit(tf_rss_tree_hold(up, down, argv[4]));
+    }
+    /* From here the descendant holds the tree's only copies of both ends. */
+    tf_rss_tree_drop(up);
+    tf_rss_tree_drop(down);
+    if (child < 0) {
+        return 85;
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+#endif
+    return 86; /* the descendant ended: end the tree */
+}
+
 /* Installation tests use this executable as a structurally real candidate.
  * Mirror the production binary's minimal verification contract. */
 static int tf_role_version(int argc, char **argv) {
@@ -2047,6 +2170,7 @@ typedef enum {
     TF_PHASE_SEAMED,    /* after the spill and build-fingerprint pins */
     TF_PHASE_WORKER,    /* after the fingerprint capture; the literal anywhere in argv */
     TF_PHASE_SPAWNER,   /* never dispatched: one more literal a spawner names */
+    TF_PHASE_PROBE,     /* never dispatched here: the image probe runs the role */
 } tf_phase_t;
 
 typedef struct {
@@ -2061,6 +2185,8 @@ typedef struct {
 static const tf_role_t tf_roles[] = {
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_values", tf_role_env_values),
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_isolation", tf_role_env_isolation),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_root", tf_role_rss_tree_root),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_hold", tf_role_rss_tree_hold),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdin_probe", tf_role_subprocess_stdin_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdout_probe", tf_role_subprocess_stdout_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_git_facts_diff_probe", tf_role_git_facts_diff_probe),
@@ -2070,10 +2196,11 @@ static const tf_role_t tf_roles[] = {
     TF_ROLE(TF_PHASE_INSTALL, "--build-config", tf_role_build_config),
     TF_ROLE(TF_PHASE_SEAMED, "--userns-secure-probe", tf_role_userns_secure_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_mcp_idxfailclosed_probe", tf_maybe_run_mcp_idxfailclosed_probe),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_image_holder", tf_maybe_run_runtime_image_holder),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_hello_client", tf_maybe_run_runtime_hello_client),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_activation_client", tf_maybe_run_runtime_activation_client),
-    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_mapped_hello_client", tf_maybe_run_runtime_mapped_hello_client),
+    TF_ROLE(TF_PHASE_SEAMED, "__cbm_runtime_image_holder", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_serve", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_hello_client", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_activation_client", tf_role_image_probe),
+    TF_ROLE(TF_PHASE_PROBE, "__cbm_runtime_mapped_hello_client", tf_role_image_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_version_cohort_crash_holder", tf_maybe_run_version_cohort_crash_holder),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_daemon_ipc_lock_probe", tf_maybe_run_daemon_ipc_lock_probe),
     TF_ROLE(TF_PHASE_SEAMED, "__cbm_deleted_self_probe", tf_maybe_run_deleted_self_probe),
@@ -2123,7 +2250,49 @@ static int tf_role_dispatch(tf_phase_t phase, int argc, char **argv) {
 
 const char *cbm_test_program_path;
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define TF_MSAN_MIMALLOC_OUTPUT 1
+#endif
+#endif
+
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+#include <mimalloc.h>
+#include <sanitizer/msan_interface.h>
+
+/* MSan lane only. mimalloc is deliberately left uninstrumented there
+ * (build/msan/mimalloc.o is compiled without -fsanitize=memory), so MSan never
+ * sees it write its own stack. Its text output is the one place those stack
+ * bytes reach an MSan interceptor: a message formatted in a mimalloc stack
+ * buffer arrives at fputs still carrying the shadow an earlier instrumented
+ * frame left there, and MSan reports initialized bytes as uninitialized.
+ * mimalloc 3.5.3 prints an arena-alignment fallback warning on the x86-64 MSan
+ * lane, which tripped this in the mem suite. Routing mimalloc's output through
+ * this handler marks the finished text initialized before it reaches fputs. */
+static bool tf_msan_mi_output_live;
+
+static void tf_msan_mi_output(const char *msg, void *arg) {
+    (void)arg;
+    /* Registering replays mimalloc's delayed-output buffer into the handler.
+     * Its constructor already wrote all of that to stderr before main, so the
+     * replay would only repeat it behind a stray newline: skip it. */
+    if (!tf_msan_mi_output_live || !msg) {
+        return;
+    }
+    /* Mark the text initialized before reading even its first byte. */
+    __msan_unpoison_string(msg);
+    if (!msg[0]) {
+        return;
+    }
+    (void)fputs(msg, stderr);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+    mi_register_output(tf_msan_mi_output, NULL);
+    tf_msan_mi_output_live = true;
+#endif
     cbm_test_program_path = tf_runner_image(argc, argv);
     int role_rc = tf_role_dispatch(TF_PHASE_RAW, argc, argv);
     if (role_rc >= 0) {
@@ -2373,8 +2542,12 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
     RUN_SELECTED_SUITE(path_alias);
+    RUN_SELECTED_SUITE(site_bind);
+    RUN_SELECTED_SUITE(scope_facts);
+    RUN_SELECTED_SUITE(include_path);
 
     /* Watcher (M10) */
+    RUN_SELECTED_SUITE(svn_state);
     RUN_SELECTED_SUITE(watcher);
 
     /* LZ4 + zstd + SQLite writer */
@@ -2405,6 +2578,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(ts_lsp);
     RUN_SELECTED_SUITE(java_lsp);
     RUN_SELECTED_SUITE(java_lsp_coverage);
+    RUN_SELECTED_SUITE(java_typed_calls);
 
     /* Architecture + ADR + Louvain */
     RUN_SELECTED_SUITE(store_arch);
@@ -2459,6 +2633,9 @@ int main(int argc, char **argv) {
 
     /* Parallel pipeline */
     RUN_SELECTED_SUITE(parallel);
+
+    /* Declared types resolved in the scope that wrote them */
+    RUN_SELECTED_SUITE(type_scope);
 
     /* Promoted lexical-resolution regression contracts. */
     RUN_SELECTED_SUITE(repro_lexical_binding_precision);

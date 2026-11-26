@@ -1103,8 +1103,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     watcher_windows_image_identity_t expected_git;
     ASSERT_TRUE(watcher_windows_capture_image_identity(fake_git, &expected_git));
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? cbm_strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? cbm_strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -1238,8 +1238,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_TRUE(watcher_test_self_image(self));
     ASSERT_EQ(symlink(self, fake_git), 0);
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -2253,6 +2253,127 @@ TEST(watcher_sustained_failure_logs_once_issue2015) {
     ASSERT_EQ(cbm_watcher_index_failure_count(w, "sust-repo"), 14);
     /* Exactly one, not four (11..14) and not zero. */
     ASSERT_EQ(sustained_log_hits, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── Success cooldown (#2835) ─────────────────────────────────────── */
+
+TEST(success_delay_fast_index_keeps_interval) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 0), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1666), 5000); /* 3x < interval */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 20000), 60000);
+    PASS();
+}
+
+TEST(success_delay_slow_index_scales_by_factor) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1667), 5001);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 10000), 30000);
+    /* 90 s rebuild → next poll 4.5 min after it finishes. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 90000), 270000);
+    PASS();
+}
+
+TEST(success_delay_clamped_and_degenerate) {
+    /* Capped at 5 min (INDEX_FAIL_CEILING_MS) from 100 s of indexing up. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 100001), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 300000), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MAX), 300000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, -1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MIN), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(-1, 0), 0);
+    /* Never below the caller's own cadence, even above the ceiling. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(INT_MAX, INT64_MAX), INT_MAX);
+    PASS();
+}
+
+TEST(success_delay_is_monotonic) {
+    int previous = cbm_watcher_success_delay_ms(5000, 0);
+    for (int64_t e = 0; e <= 2000000; e += 997) {
+        int delay = cbm_watcher_success_delay_ms(5000, e);
+        ASSERT_TRUE(delay >= previous);
+        ASSERT_TRUE(delay >= 5000 && delay <= 300000);
+        previous = delay;
+    }
+    PASS();
+}
+
+/* Wire-up: the cooldown must be measured around the real index_fn call and
+ * counted from when the index finished. The watcher's clock is frozen via a
+ * test seam and the callback advances it, so an index "takes" a chosen time
+ * with no sleep and the scheduled poll time can be asserted exactly. */
+#define COOL_NS_PER_MS 1000000LL
+static int64_t cool_clock_ns = 0;
+static int64_t cool_index_ms = 0;
+static int cool_index_calls = 0;
+static int cool_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    cool_index_calls++;
+    cool_clock_ns += cool_index_ms * COOL_NS_PER_MS;
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
+    return 0;
+}
+
+/* Re-index once (touch + poll until the callback runs; a transient git probe
+ * failure makes a poll a no-op, see the sustained-failure test) and return
+ * the scheduled next poll relative to when the index finished, in ms. */
+static int64_t cool_reindex_delay_ms(cbm_watcher_t *w, const char *file, const char *line,
+                                     int64_t index_ms) {
+    cool_index_ms = index_ms;
+    th_append_file(file, line);
+    int target = cool_index_calls + 1;
+    while (cool_index_calls < target) {
+        cbm_watcher_touch(w, "cool-repo");
+        cbm_watcher_poll_once(w);
+    }
+    return (cbm_watcher_test_next_poll_ns(w, "cool-repo") - cool_clock_ns) / COOL_NS_PER_MS;
+}
+
+TEST(watcher_success_cooldown_measures_index_issue2835) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cool_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    char p[300];
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cool_clock_ns = 1000LL * 1000 * COOL_NS_PER_MS; /* any nonzero start */
+    cbm_watcher_test_set_clock_ns(cool_clock_ns);
+    cool_index_calls = 0;
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, cool_index_callback, NULL);
+    cbm_watcher_watch(w, "cool-repo", tmpdir);
+    cbm_watcher_poll_once(w); /* baseline */
+
+    wt_path(p, sizeof(p), tmpdir, "file.txt");
+    /* Instant index: plain cadence. */
+    int64_t fast = cool_reindex_delay_ms(w, p, "a\n", 0);
+    /* 60 s index → 3 x 60 s, counted from the END of the index (anchoring at
+     * the start would give 120 s here). */
+    int64_t slow = cool_reindex_delay_ms(w, p, "b\n", 60000);
+    /* 200 s index → 600 s, capped at 5 min. */
+    int64_t capped = cool_reindex_delay_ms(w, p, "c\n", 200000);
+
+    /* Restore the real clock before any assert can return early. */
+    cbm_watcher_test_set_clock_ns(0);
+
+    ASSERT_EQ(fast, cbm_watcher_poll_interval_ms(1));
+    ASSERT_EQ(slow, 180000);
+    ASSERT_EQ(capped, 300000);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -3995,7 +4116,41 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+TEST(watcher_unicode_root_is_not_pruned_as_missing) {
+    char *parent = th_mktempdir("cbm_watch_utf8");
+    ASSERT_NOT_NULL(parent);
+    char root[CBM_SZ_4K];
+    snprintf(root, sizeof(root), "%s/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", parent);
+    ASSERT_EQ(th_mkdir_p(root), 0);
+    const char *saved = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_store_upsert_project(store, "unicode-root", root);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    cbm_watcher_watch(watcher, "unicode-root", root);
+    for (int i = 0; i < 8; i++) {
+        cbm_watcher_poll_once(watcher);
+    }
+    cbm_project_t info = {0};
+    bool kept = cbm_watcher_watch_count(watcher) == 1 &&
+                cbm_store_get_project(store, "unicode-root", &info) == CBM_STORE_OK;
+    cbm_project_free_fields(&info);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    if (saved_copy) {
+        cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WATCHER_PRUNE_GRACE_S");
+    }
+    free(saved_copy);
+    ASSERT_EQ(th_rmtree(parent), 0);
+    ASSERT_TRUE(kept);
+    PASS();
+}
+
 SUITE(watcher) {
+    RUN_TEST(watcher_unicode_root_is_not_pruned_as_missing);
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
     RUN_TEST(poll_interval_scaling);
@@ -4009,6 +4164,11 @@ SUITE(watcher) {
     RUN_TEST(index_backoff_never_schedules_sooner_than_the_interval);
     RUN_TEST(watcher_index_failure_streak_increments_and_resets_issue2015);
     RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
+    RUN_TEST(success_delay_fast_index_keeps_interval);
+    RUN_TEST(success_delay_slow_index_scales_by_factor);
+    RUN_TEST(success_delay_clamped_and_degenerate);
+    RUN_TEST(success_delay_is_monotonic);
+    RUN_TEST(watcher_success_cooldown_measures_index_issue2835);
     RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
     RUN_TEST(watcher_index_failure_count_unknown_project);
     RUN_TEST(watcher_project_info_publishes_scan_issue2167);

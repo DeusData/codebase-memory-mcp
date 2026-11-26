@@ -58,9 +58,16 @@ CBMLanguage cbm_disambiguate_frm(const char *path);
  * CBM_LANG_RESCRIPT. On read failure, defaults to CBM_LANG_RESCRIPT. */
 CBMLanguage cbm_disambiguate_res(const char *path);
 
+/* Disambiguate .d files by reading first 4KB of content.
+ * Returns CBM_LANG_COUNT (not source) for a make-style dependency file written
+ * by rustc/cargo, gcc/clang -MD or CMake ("target ...: prereq ..."), otherwise
+ * CBM_LANG_DLANG. On read failure or any doubt, defaults to CBM_LANG_DLANG. */
+CBMLanguage cbm_disambiguate_d(const char *path);
+
 /* Disambiguate .inc files by reading first 4KB of content.
- * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
- * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.
+ * Returns CBM_LANG_CPP for explicit C-family code, or
+ * CBM_LANG_OBJECTSCRIPT_ROUTINE for ObjectScript markers / a lone #define.
+ * BitBake recipe syntax and unknown content retain CBM_LANG_BITBAKE.
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
 
@@ -155,8 +162,34 @@ typedef enum {
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
- * Only checks the basename, not the full path. */
+ * Only checks the basename, not the full path. Two built-in rules need more
+ * than the name and are not in this list: a directory named env is skipped only
+ * when it is a Python virtual environment, and deploy/ and deployed/ are walked
+ * for their configuration files only (cbm_discover_config_only_dir). */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
+
+/* True for deploy and deployed: walked, but only files whose language passes
+ * cbm_language_is_deployment_config are indexed in them, at any depth; their
+ * program source is not. Not applied below a JVM source root, and lifted by a
+ * .cbmignore negation of the directory, as for the skip list. */
+bool cbm_discover_config_only_dir(const char *dirname);
+
+/* Build and configuration languages (Makefile, CMake, YAML, TOML, JSON, INI,
+ * Dockerfile): no cross-language call semantics. */
+bool cbm_language_is_build_config(CBMLanguage lang);
+
+/* The languages a config-only directory indexes: every build and
+ * configuration language, the other configuration and infrastructure
+ * languages (Properties, XML, JSON5, Jsonnet, Jinja2, Kustomize, Go Template,
+ * HCL, Bicep, Nix, Puppet, Pkl, DotEnv) and the shell family (Bash, Zsh, Fish,
+ * PowerShell). language.c. */
+bool cbm_language_is_deployment_config(CBMLanguage lang);
+
+/* A package manifest by its base name (package.json, go.mod, Cargo.toml,
+ * pyproject.toml, composer.json, pubspec.yaml, pom.xml, build.gradle[.kts],
+ * mix.exs, Package.swift, *.gemspec): what the package map reads. A
+ * config-only directory drops it whatever its language. */
+bool cbm_discover_is_package_manifest(const char *basename);
 
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);

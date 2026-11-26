@@ -3379,7 +3379,8 @@ static int toml_codex_inline_is_owned(const char *data, size_t start, size_t end
     toml_string_t type = {0};
     toml_string_t command = {0};
     toml_string_t windows = {0};
-    const char *expected_matcher = event == 0 ? "startup|resume|clear|compact" : "*";
+    const char *expected_matcher =
+        event == 0 ? "startup|resume|clear|compact" : (event == 1 ? "*" : "Bash");
     int result = 0;
     if (toml_codex_take(data, end, &pos, "[") != TOML_EDIT_OK ||
         toml_codex_take(data, end, &pos, "{") != TOML_EDIT_OK)
@@ -3432,11 +3433,15 @@ done:
     toml_string_dispose(&windows);
     return result;
 }
+/* include_pretool renders the current block: the lifecycle pair plus a PreToolUse
+ * Bash hook, so Codex shell searches get graph context in flow. Without it the
+ * function renders the previous block (lifecycle pair only), which installs up to
+ * v0.12 wrote and which upgrades and uninstalls must still recognize as owned. */
 static int toml_codex_build_block(const char *command, const char *command_windows,
-                                  toml_buffer_t *block) {
+                                  int include_pretool, toml_buffer_t *block) {
     char escaped[8192];
     char escaped_windows[8192];
-    char rendered[24576];
+    char rendered[32768];
     if (cbm_toml_escape_basic_string(command, escaped, sizeof(escaped)) != TOML_EDIT_OK ||
         cbm_toml_escape_basic_string(command_windows, escaped_windows, sizeof(escaped_windows)) !=
             TOML_EDIT_OK ||
@@ -3455,6 +3460,16 @@ static int toml_codex_build_block(const char *command, const char *command_windo
                            "type = \"command\"\ncommand = \"%s\"\n"
                            "command_windows = \"%s\"\ntimeout = 5\n",
                            escaped, escaped_windows, escaped, escaped_windows);
+    if (written > 0 && (size_t)written < sizeof(rendered) && include_pretool) {
+        int more = snprintf(rendered + written, sizeof(rendered) - (size_t)written,
+                            "\n[[hooks.PreToolUse]]\nmatcher = \"Bash\"\n\n"
+                            "[[hooks.PreToolUse.hooks]]\n"
+                            "type = \"command\"\ncommand = \"%s\"\n"
+                            "command_windows = \"%s\"\ntimeout = 5\n",
+                            escaped, escaped_windows);
+        written =
+            more > 0 && (size_t)more < sizeof(rendered) - (size_t)written ? written + more : -1;
+    }
     return written > 0 && (size_t)written < sizeof(rendered)
                ? toml_buffer_append(block, rendered, (size_t)written)
                : TOML_EDIT_ERR;
@@ -3485,19 +3500,24 @@ static size_t toml_codex_owned_span(const char *data, size_t len, const char *be
         }
         toml_assignment_dispose(&assignment);
     }
-    toml_buffer_t block = {0};
-    toml_buffer_t expected = {0};
-    if (toml_codex_current_command_is_owned(values[0].data, values[0].len) &&
-        toml_codex_current_command_is_owned(values[1].data, values[1].len) &&
-        toml_codex_build_block(values[0].data, values[1].data, &block) == TOML_EDIT_OK &&
-        (marked ? toml_append_managed(&expected, begin_marker, end_marker, block.data, newline)
-                : toml_append_normalized_text(&expected, block.data, block.len, newline)) ==
-            TOML_EDIT_OK &&
-        expected.len <= len && memcmp(expected.data, data, expected.len) == 0) {
-        result = expected.len;
+    /* Either generation is ours: the current block with PreToolUse first, then the
+     * previous lifecycle-only block, so upgrade and uninstall never strand it. */
+    for (int include_pretool = 1; include_pretool >= 0 && result == 0U; --include_pretool) {
+        toml_buffer_t block = {0};
+        toml_buffer_t expected = {0};
+        if (toml_codex_current_command_is_owned(values[0].data, values[0].len) &&
+            toml_codex_current_command_is_owned(values[1].data, values[1].len) &&
+            toml_codex_build_block(values[0].data, values[1].data, include_pretool, &block) ==
+                TOML_EDIT_OK &&
+            (marked ? toml_append_managed(&expected, begin_marker, end_marker, block.data, newline)
+                    : toml_append_normalized_text(&expected, block.data, block.len, newline)) ==
+                TOML_EDIT_OK &&
+            expected.len <= len && memcmp(expected.data, data, expected.len) == 0) {
+            result = expected.len;
+        }
+        toml_buffer_dispose(&expected);
+        toml_buffer_dispose(&block);
     }
-    toml_buffer_dispose(&expected);
-    toml_buffer_dispose(&block);
 done:
     toml_string_dispose(&values[0]);
     toml_string_dispose(&values[1]);
@@ -3509,14 +3529,21 @@ static int toml_codex_add_edit(toml_codex_edit_t *edits, size_t *count, size_t s
     edits[(*count)++] = (toml_codex_edit_t){.start = start, .end = end};
     return TOML_EDIT_OK;
 }
+/* Inline forms Codex may normalize our hooks to (#1432). SessionStart and
+ * SubagentStart must be ours or the edit is refused. A foreign inline PreToolUse
+ * is the user's own hook: it is kept, and *foreign_pretool tells the caller to
+ * leave PreToolUse out of the block, because TOML cannot hold an inline array and
+ * array-of-tables entries for the same key. */
 static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_t *edits,
-                                  size_t *edit_count, int found[2],
+                                  size_t *edit_count, int found[3], int *foreign_pretool,
                                   cbm_toml_codex_hook_failure_t *failure) {
-    toml_key_path_t wanted[2] = {{0}};
+    toml_key_path_t wanted[3] = {{0}};
     toml_key_path_t scope = {0};
     if (toml_parse_key_path("hooks.SessionStart", 0U, strlen("hooks.SessionStart"), &wanted[0]) !=
             TOML_EDIT_OK ||
         toml_parse_key_path("hooks.SubagentStart", 0U, strlen("hooks.SubagentStart"), &wanted[1]) !=
+            TOML_EDIT_OK ||
+        toml_parse_key_path("hooks.PreToolUse", 0U, strlen("hooks.PreToolUse"), &wanted[2]) !=
             TOML_EDIT_OK) {
         toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
         goto error;
@@ -3554,9 +3581,12 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
                     toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_EDIT_BUILD);
                     goto error;
                 }
-                int event = toml_key_path_equal(&full_key, &wanted[0])
-                                ? 0
-                                : (toml_key_path_equal(&full_key, &wanted[1]) ? 1 : -1);
+                int event = -1;
+                for (int candidate = 0; candidate < 3 && event < 0; ++candidate) {
+                    if (toml_key_path_equal(&full_key, &wanted[candidate])) {
+                        event = candidate;
+                    }
+                }
                 toml_key_path_dispose(&full_key);
                 if (event >= 0) {
                     size_t tail = assignment.value_end;
@@ -3564,12 +3594,14 @@ static int toml_codex_scan_inline(const char *data, size_t len, toml_codex_edit_
                     size_t payload_start = toml_codex_payload_start(data, len);
                     size_t edit_start = line.start == 0U ? payload_start : line.start;
                     cbm_toml_codex_hook_failure_t event_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
-                    ++found[event];
-                    if (found[event] > 1) {
+                    int owned = !assignment.multiline_value && tail == line.content_end &&
+                                toml_codex_inline_is_owned(data, assignment.value_start,
+                                                           assignment.value_end, event);
+                    if (event == 2 && !owned) {
+                        *foreign_pretool = 1;
+                    } else if (++found[event] > 1) {
                         event_failure = CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS;
-                    } else if (assignment.multiline_value || tail != line.content_end ||
-                               !toml_codex_inline_is_owned(data, assignment.value_start,
-                                                           assignment.value_end, event)) {
+                    } else if (!owned) {
                         event_failure = CBM_TOML_CODEX_HOOK_FAILURE_AMBIGUOUS_OWNERSHIP;
                     } else if (toml_codex_add_edit(edits, edit_count, edit_start, line.full_end) !=
                                TOML_EDIT_OK) {
@@ -3600,14 +3632,19 @@ done:
     toml_key_path_dispose(&scope);
     toml_key_path_dispose(&wanted[0]);
     toml_key_path_dispose(&wanted[1]);
+    toml_key_path_dispose(&wanted[2]);
     return result;
 }
 int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *begin_marker,
                                             const char *end_marker, const char *command,
                                             const char *command_windows,
                                             cbm_toml_codex_hook_action_t action, int check_only,
-                                            cbm_toml_codex_hook_failure_t *failure) {
+                                            cbm_toml_codex_hook_failure_t *failure,
+                                            int *pretool_written) {
     toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_NONE);
+    if (pretool_written) {
+        *pretool_written = 0;
+    }
     if (!toml_valid_path(file_path) || !toml_valid_marker(begin_marker) ||
         !toml_valid_marker(end_marker) || strcmp(begin_marker, end_marker) == 0 || !command ||
         !command_windows ||
@@ -3616,7 +3653,7 @@ int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *b
         return TOML_EDIT_ERR;
     }
     toml_buffer_t block = {0};
-    if (toml_codex_build_block(command, command_windows, &block) != TOML_EDIT_OK) {
+    if (toml_codex_build_block(command, command_windows, 1, &block) != TOML_EDIT_OK) {
         toml_buffer_dispose(&block);
         toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_COMMAND_RENDER);
         return TOML_EDIT_ERR;
@@ -3687,14 +3724,22 @@ int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *b
             pos += owned_len - 1U;
         }
     }
-    int inline_found[2] = {0};
-    if (toml_codex_scan_inline(existing, existing_len, edits, &edit_count, inline_found, failure) !=
-        TOML_EDIT_OK) {
+    int inline_found[3] = {0};
+    int foreign_pretool = 0;
+    if (toml_codex_scan_inline(existing, existing_len, edits, &edit_count, inline_found,
+                               &foreign_pretool, failure) != TOML_EDIT_OK) {
         goto error;
     }
-    if (markerless_count && (has_pair || inline_found[0] || inline_found[1])) {
+    if (markerless_count && (has_pair || inline_found[0] || inline_found[1] || inline_found[2])) {
         toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFLICTING_HOOKS);
         goto error;
+    }
+    if (foreign_pretool) {
+        toml_buffer_dispose(&block);
+        if (toml_codex_build_block(command, command_windows, 0, &block) != TOML_EDIT_OK) {
+            toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_COMMAND_RENDER);
+            goto error;
+        }
     }
     for (size_t i = 0U; i < edit_count; ++i) {
         for (size_t j = i + 1U; j < edit_count; ++j) {
@@ -3737,6 +3782,8 @@ int cbm_toml_reconcile_codex_hooks_detailed(const char *file_path, const char *b
                                             output.len, &snapshot);
     if (result != TOML_EDIT_OK) {
         toml_codex_set_failure(failure, CBM_TOML_CODEX_HOOK_FAILURE_CONFIG_WRITE);
+    } else if (pretool_written) {
+        *pretool_written = action == CBM_TOML_CODEX_HOOK_UPSERT && !foreign_pretool;
     }
 error:
     toml_buffer_dispose(&output);
@@ -3749,5 +3796,5 @@ int cbm_toml_reconcile_codex_hooks(const char *file_path, const char *begin_mark
                                    const char *command_windows, cbm_toml_codex_hook_action_t action,
                                    int check_only) {
     return cbm_toml_reconcile_codex_hooks_detailed(file_path, begin_marker, end_marker, command,
-                                                   command_windows, action, check_only, NULL);
+                                                   command_windows, action, check_only, NULL, NULL);
 }

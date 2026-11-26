@@ -18,8 +18,24 @@
 # that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
 # ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
 # leaving CC/CXX unchanged there.
-override CC := $(CC) $(ARCHFLAGS)
-override CXX := $(CXX) $(ARCHFLAGS)
+#
+# Minimum macOS version (Apple targets only). Without one, clang takes the
+# minimum from the SDK it compiles against (LC_BUILD_VERSION minos), so a
+# release built on a macos-15 runner would refuse to start on macOS 14. 14.0
+# keeps every macOS that could run a release built on the macos-14 runner
+# (retired 2026-11-02). A flag folded into the drivers like ARCHFLAGS, not an
+# exported MACOSX_DEPLOYMENT_TARGET: it reaches every compile AND link on every
+# build path (build.sh, test.sh, direct make) and is part of each command line.
+# Detected from the compiler's target, not the host, so a cross compiler run
+# on a Mac is left untouched.
+MACOS_MIN_VERSION := 14.0
+IS_APPLE_TARGET := $(shell echo | $(CC) $(ARCHFLAGS) -dM -E - 2>/dev/null | grep -q '__APPLE__' && echo yes || echo no)
+MACOS_MIN_FLAGS :=
+ifeq ($(IS_APPLE_TARGET),yes)
+MACOS_MIN_FLAGS := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+endif
+override CC := $(CC) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
+override CXX := $(CXX) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
 
 # ── Common flags ─────────────────────────────────────────────────
 
@@ -45,8 +61,9 @@ endif
 
 # -Wdate-time: with -Werror, any use of __DATE__/__TIME__/__TIMESTAMP__ fails the
 # build. Build-time entropy is how one identical source tree produced a new hash
-# on every compile (see the local patch in vendored/mimalloc/src/options.c) —
-# once removed, it must not creep back through a new call site.
+# on every compile (mimalloc's version banner, patched locally until upstream
+# dropped the clock in v3.4.5; see vendored/mimalloc/PATCHES.md) — once
+# removed, it must not creep back through a new call site.
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
@@ -105,7 +122,8 @@ EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
 	-DCBM_CONFIG_EDIT_PATH_ENABLE_TEST_API=1 \
-	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1 \
+	-DCBM_SVN_STATE_ENABLE_TEST_API=1
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
 # clang's feature-check spelling and every non-ASan sanitizer, so the
@@ -120,9 +138,10 @@ KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
 CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
+MEM_CORE_TEST_DEFINE = -DCBM_MEM_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
 	-g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS) \
 	$(CXX_STDLIB_FLAGS)
@@ -142,7 +161,7 @@ TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 # macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	$(COVERAGE_MARKER_TEST_DEFINE) \
+	$(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) \
 	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
@@ -182,8 +201,9 @@ endif
 ifeq ($(IS_MINGW),yes)
 # --no-insert-timestamp: the PE header otherwise carries the link wall clock, so
 # two Windows builds of identical source are never byte-identical and every
-# release is a brand-new file to a reputation system. Same motivation as the
-# mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
+# release is a brand-new file to a reputation system. Same motivation as
+# dropping mimalloc's __DATE__ banner; ELF and Mach-O have no equivalent field
+# to clear.
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
@@ -397,7 +417,9 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/diagram.c \
     $(CBM_DIR)/route_path.c \
     $(CBM_DIR)/openapi.c \
+    $(CBM_DIR)/extract_nextjs.c \
     $(CBM_DIR)/sql_values.c \
+    $(CBM_DIR)/php_inline_html.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/cpp_branch_views.c \
     $(CBM_DIR)/result_compact.c \
@@ -406,7 +428,9 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c \
-    $(CBM_DIR)/spawn_patterns.c
+    $(CBM_DIR)/spawn_patterns.c \
+    $(CBM_DIR)/resolve_stats.c \
+    $(CBM_DIR)/extract_scope.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -509,6 +533,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_calls.c \
     src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
+    src/pipeline/type_scope.c \
     src/pipeline/pass_usages.c \
     src/pipeline/pass_semantic.c \
     src/pipeline/pass_tests.c \
@@ -552,7 +577,9 @@ PIPELINE_SRCS = \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
     src/pipeline/pass_ensemble_routing.c \
-    src/pipeline/pass_pkgmap.c
+    src/pipeline/pass_pkgmap.c \
+    src/pipeline/site_bind.c \
+    src/pipeline/include_path.c
 
 # SimHash / MinHash module
 SIMHASH_SRCS = src/simhash/minhash.c
@@ -567,7 +594,7 @@ UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 TRACES_SRCS = src/traces/traces.c
 
 # Watcher module (new)
-WATCHER_SRCS = src/watcher/watcher.c
+WATCHER_SRCS = src/watcher/watcher.c src/watcher/svn_state.c
 
 # Git context module (new)
 GIT_SRCS = src/git/git_context.c
@@ -644,6 +671,18 @@ ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
+# MI_MINGW_UCRT64: since 3.5.3, mimalloc treats a MinGW build as having a
+# process-attach hook only when this is defined (src/prim/windows/prim.c);
+# upstream's CMake sets it, this Makefile must too. Without it src/prim/prim.c
+# also compiles its constructor, so _mi_auto_process_init runs twice (that
+# constructor plus the CRT TLS callback) and the second options flush writes a
+# stray newline to stderr before main: a blank first line on every run, which
+# failed smoke-win's one-line --version check. Every MinGW toolchain we build
+# with (MSYS2 CLANG64/CLANGARM64) is UCRT. 3.3.2 had no such condition.
+MIMALLOC_WIN_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_DEFINE := -DMI_MINGW_UCRT64=1
+endif
 # MI_DEBUG=0: the production allocator is mimalloc's RELEASE build. Its header
 # defaults to MI_DEBUG=2 unless NDEBUG is defined, and nothing here defined it,
 # so every shipped binary up to v0.11.0 ran mimalloc's debug build: internal
@@ -653,15 +692,39 @@ endif
 # work inside the allocator (2026-09-17). Committed-bytes accounting, which the
 # memory budget reads, is kept in every build (subproc stats, not MI_STAT).
 # The TEST build below keeps mimalloc's debug checks.
+# MI_PROFILE=0: mimalloc 3.5.2+ compiles its allocation-sampling profiler in by
+# default, which puts a sample countdown on the allocation path. The product
+# never uses it, so the production allocator leaves it out (the contract in
+# tests/test_prod_allocator_contract.sh checks the banner has no profiling line).
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
-                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 \
-                  $(MIMALLOC_OVERRIDE_DEFINE)
+                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 -DMI_PROFILE=0 \
+                  $(MIMALLOC_OVERRIDE_DEFINE) $(MIMALLOC_WIN_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
+                       -DMI_OVERRIDE=0 $(MIMALLOC_WIN_DEFINE)
+# MI_WIN_INIT_USE_FLS (MinGW TEST build only) is an EXPERIMENT (R32) for the
+# Windows test leg's nondeterministic crash: 1-3 suites die in their first
+# test with 0xC0000005 and no sanitizer report, seen only on trees with
+# mimalloc 3.5.3. 3.5.3 is the first version whose loader hooks are live on
+# MinGW: TLS callbacks in .CRT$XLB/.CRT$XLY run _mi_auto_process_init under the
+# loader lock and _mi_thread_done on every thread detach. With FLS,
+# src/prim/windows/prim.c compiles none of those hooks; process init runs once,
+# from the constructor in src/prim/prim.c (no double init), and thread-done
+# goes through a fiber-local destructor. MI_DEBUG=1 is what FLS needs to run at
+# all: the first thread init (src/init.c) associates the main theap before the
+# FLS key exists, which trips an internal assertion in prim.c and aborts every
+# MI_DEBUG=2 process at startup. Level 1 keeps the fill patterns, padding and
+# double-free checks and drops only the internal assertions. The production
+# allocator (MIMALLOC_CFLAGS) is unchanged. Drop or promote this when the
+# experiment ends.
+MIMALLOC_WIN_TEST_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_TEST_DEFINE := -DMI_WIN_INIT_USE_FLS=1 -DMI_DEBUG=1
+MIMALLOC_CFLAGS_TEST += $(MIMALLOC_WIN_TEST_DEFINE)
+endif
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
@@ -789,7 +852,8 @@ TEST_DAEMON_SRCS = \
     tests/test_daemon_application.c \
     tests/test_daemon_frontend.c \
     tests/test_daemon_bootstrap.c \
-    tests/test_daemon_ipc.c
+    tests/test_daemon_ipc.c \
+    tests/image_probe_roles.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -811,9 +875,9 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_type_scope.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c tests/test_site_bind.c tests/test_scope_facts.c tests/test_include_path.c
 
-TEST_WATCHER_SRCS = tests/test_watcher.c
+TEST_WATCHER_SRCS = tests/test_watcher.c tests/test_svn_state.c
 
 TEST_LZ4_SRCS = tests/test_lz4.c
 TEST_ZSTD_SRCS = tests/test_zstd.c
@@ -847,7 +911,8 @@ TEST_PY_LSP_STRESS_SRCS = tests/test_py_lsp_stress.c
 TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
-TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
+TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c \
+	tests/test_java_typed_calls.c
 TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
@@ -1054,10 +1119,12 @@ MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
 MIMALLOC_OBJ_TSAN = $(BUILD_DIR)/tsan_mimalloc.o
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
 
-$(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                         $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                              $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
 # static.c is an AMALGAMATION: it #includes options.c and friends, none of which
@@ -1153,7 +1220,34 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+# ── Image probe (tests/test_image_probe.h) ──────────────────────
+# The small executable that copied-image and install tests run or publish
+# instead of a copy of the runner: the daemon runtime, foundation and the probe
+# roles, ~5 MB against ~800 MB for the sanitized runner, every full SHA-256 of
+# which costs 70-95 s on some hosted x86 CPUs. One beside each runner flavour,
+# built with that flavour's flags and found by the runner's own name
+# (<runner>-image-probe), so every venue that builds a runner builds its probe:
+# each runner rule lists its probe as an order-only prerequisite. Coverage
+# instrumentation stays out: the probe's profile must never land in the
+# per-test profile of the runner that started it.
+# workspace.c (needs mcp.c's path check) and slab_alloc.c (needs the tree-sitter
+# runtime) serve the indexer, not the daemon runtime, so the probe leaves them out.
+IMAGE_PROBE_FOUNDATION_SRCS = $(filter-out src/foundation/workspace.c src/foundation/slab_alloc.c,$(FOUNDATION_SRCS))
+IMAGE_PROBE_SRCS = tests/image_probe_main.c tests/image_probe_roles.c \
+                   src/daemon/daemon.c src/daemon/ipc.c src/daemon/runtime.c \
+                   src/daemon/service.c $(IMAGE_PROBE_FOUNDATION_SRCS)
+CFLAGS_IMAGE_PROBE = $(filter-out $(TEST_COVERAGE_FLAGS) $(TEST_COVERAGE_DEFINE),$(CFLAGS_TEST))
+
+# TRE_OBJ_* is empty except on Windows, where compat_regex.c is backed by TRE.
+$(BUILD_DIR)/test-runner-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TEST) $(TRE_OBJ_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_IMAGE_PROBE) -Itests -o $@ $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TEST) \
+		$(TRE_OBJ_TEST) $(LDFLAGS_TEST)
+
+$(BUILD_DIR)/test-runner-tsan-image-probe: $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(TRE_OBJ_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TSAN) -Itests -o $@ $(IMAGE_PROBE_SRCS) $(MIMALLOC_OBJ_TSAN) $(TRE_OBJ_TSAN) \
+		$(LDFLAGS_TSAN)
+
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR) $(BUILD_DIR)/test-runner-image-probe
 	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -1241,7 +1335,7 @@ TSAN_OPTIONS ?= halt_on_error=1:report_thread_leaks=0
 # Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
 # invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
-$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR) $(BUILD_DIR)/test-runner-tsan-image-probe
 	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -1387,6 +1481,7 @@ LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
 CPPCHECK ?= cppcheck
+CPPCHECK_JOBS ?= 2
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
 SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
@@ -1411,10 +1506,16 @@ lint-tidy:
 lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). A build directory
+# retains whole-program analysis with parallel workers; each run owns its state.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
-	@$(CPPCHECK) --enable=warning,style,performance,portability \
+	@set -e; \
+		cppcheck_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/cbm-cppcheck.XXXXXX"); \
+		trap 'status=$$?; rm -rf "$$cppcheck_dir" || :; exit "$$status"' EXIT; \
+		trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+		$(CPPCHECK) -j$(CPPCHECK_JOBS) --cppcheck-build-dir="$$cppcheck_dir" \
+		--enable=warning,style,performance,portability \
 		--std=c11 --language=c \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
@@ -1467,8 +1568,17 @@ lint-memory-core:
 	@echo "=== memory-core linter ==="
 	@python3 scripts/lint-memory-core.py
 
+# Vendored tree-sitter scanners keep their state in the payload their create()
+# returns, one per parser. A file-scope variable is one object shared by every
+# parser in the process, and the indexer runs one per worker thread: properties
+# and jsonnet both made the graph differ run to run that way. Exceptions, each
+# argued, are in scripts/lint-vendored-scanners-whitelist.txt.
+lint-vendored-scanners:
+	@echo "=== vendored scanner state ==="
+	@python3 scripts/lint-vendored-scanners.py
+
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core
+lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core lint-vendored-scanners
 	@echo "=== CI linters passed ==="
 
 # ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag

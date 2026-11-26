@@ -268,6 +268,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_list(c, &d->return_types);
     cr_str(c, &d->route_path);
     cr_str(c, &d->route_method);
+    cr_str(c, &d->client_route_path);
     cr_blob(c, (const void **)&d->fingerprint,
             d->fingerprint_k > 0 ? (size_t)d->fingerprint_k * sizeof(uint32_t) : 0);
     cr_str(c, &d->structural_profile);
@@ -276,9 +277,22 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->http_client);
     cr_str(c, &d->http_base_url);
     cr_str(c, &d->variants);
+    cr_str(c, &d->call_selector);
     cr_list(c, &d->extra_props);
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
+    cr_str(c, &d->alias_target);
+    cr_str(c, &d->mixin_refs);
+    /* The type-facts record: one record, then its strings. */
+    cr_array(c, (void **)&d->type_facts, d->type_facts ? 1 : 0, sizeof(CBMDefTypeFacts));
+    CBMDefTypeFacts *facts = (CBMDefTypeFacts *)d->type_facts;
+    if (facts) {
+        cr_str(c, &facts->type_params);
+        cr_str(c, &facts->value_type);
+        cr_str(c, &facts->go_embedded);
+        cr_str(c, &facts->class_bindings);
+        cr_str(c, &facts->global_names);
+    }
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -302,6 +316,12 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         call->args = NULL;
         call->arg_count = 0;
     }
+    /* Swift trailing-closure labels are a bounded counted string list. */
+    int labels = call->trailing_closure_count;
+    if (labels > CBM_MAX_TRAILING_CLOSURES) {
+        labels = CBM_MAX_TRAILING_CLOSURES;
+    }
+    cr_counted_list(c, &call->trailing_closure_labels, labels);
 }
 
 /* Facts have counted lists, not sentinel arrays. Bail before touching a failed
@@ -366,6 +386,11 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->imports.items[i].local_name);
         cr_str(c, &r->imports.items[i].module_path);
         cr_str(c, &r->imports.items[i].member);
+    }
+    cr_array(c, (void **)&r->scope.items, r->scope.count, sizeof(CBMScopeEvent));
+    for (int i = 0; i < r->scope.count && r->scope.items; i++) {
+        cr_str(c, &r->scope.items[i].name);
+        cr_str(c, &r->scope.items[i].qual);
     }
     cr_array(c, (void **)&r->usages.items, r->usages.count, sizeof(CBMUsage));
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {
@@ -452,6 +477,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->constants);
     cr_list(c, &r->global_vars);
     cr_list(c, &r->macros);
+    cr_list(c, &r->included_files);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
     cr_str(c, &r->module_doc);
@@ -614,6 +640,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
     tmp.field_types.cap = tmp.field_types.count;
     tmp.doc_links.cap = tmp.doc_links.count;
+    tmp.scope.cap = tmp.scope.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */

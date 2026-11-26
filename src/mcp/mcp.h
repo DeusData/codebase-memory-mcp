@@ -275,6 +275,7 @@ char *cbm_mcp_index_worker_no_response_failure(const char *args,
 typedef enum {
     CBM_MCP_SUPERVISED_RESULT_FALLBACK = 0,
     CBM_MCP_SUPERVISED_RESULT_SUCCESS,
+    CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE,
     CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE,
     CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL,
 } cbm_mcp_supervised_result_disposition_t;

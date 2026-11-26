@@ -1837,16 +1837,62 @@ TEST(lrp_tsx_usage_import_type_with_decoy) {
     PASS();
 }
 
-/* Python: constructor syntax is an exact call to the materialized Class node. */
+/* Python: ClassName() with a user __init__ is an exact CALLS edge to that
+ * method. The Class node no longer receives the instantiation edge. */
 TEST(lrp_python_usage_instantiation) {
     static const LRP_File f[] = {
         {"model.py", "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py", "from .model import User\n\n\ndef create(name):\n    return User(name)\n"}};
     LRP_Proj lp;
     cbm_store_t *store = lrp_index(&lp, f, 2);
-    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
+    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "__init__") : -1;
+    int class_edge = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
     lrp_cleanup(&lp, store);
     ASSERT_EQ(exact, 1);
+    ASSERT_EQ(class_edge, 0);
+    PASS();
+}
+
+/* Python same-file subclasses in the graph: ClassName() binds only to an
+ * __init__ the class declares itself. B(A) declares none, so make_b keeps
+ * its CALLS edge on the class B and the inherited A.__init__ gets none.
+ * C(A) declares its own __init__, so make_c calls C.__init__, not C and not
+ * the inherited A.__init__. */
+TEST(lrp_python_subclass_constructor_own_init_only) {
+    static const LRP_File f[] = {{"main.py", "class A:\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = True\n"
+                                             "\n"
+                                             "class B(A):\n"
+                                             "    def go(self):\n"
+                                             "        return 1\n"
+                                             "\n"
+                                             "class C(A):\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = False\n"
+                                             "\n"
+                                             "def make_b():\n"
+                                             "    return B()\n"
+                                             "\n"
+                                             "def make_c():\n"
+                                             "    return C()\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 1);
+    const char *p = store ? lp.project : NULL;
+    int b_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.B");
+    int b_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.A.__init__");
+    int c_own_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C.__init__");
+    int c_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C");
+    int c_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.A.__init__");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(b_class, 1);
+    ASSERT_EQ(b_base_init, 0);
+    ASSERT_EQ(c_own_init, 1);
+    ASSERT_EQ(c_class, 0);
+    ASSERT_EQ(c_base_init, 0);
     PASS();
 }
 
@@ -1897,6 +1943,47 @@ TEST(lrp_ruby_cross_file_zeitwerk) {
     ASSERT_TRUE(assist >= 1);
     ASSERT_TRUE(extra >= 1);
     ASSERT_TRUE(typed >= 2);
+    PASS();
+}
+
+/* ── Ruby: singleton side and cross-file mixins, through real extraction ──
+ * The hand-built-def rows pass the singleton flag and mixin macros in
+ * themselves; this one has the extractor produce them. `Child.run` is a
+ * `def self.run`, `Child.new.run` is Base's instance `run`, and `Widget`
+ * includes a module that overrides Base#greet, all from a caller in a fifth
+ * file. */
+TEST(lrp_ruby_cross_file_singleton_and_mixin) {
+    const LRP_File files[] = {
+        {"app/base.rb", "class Base\n  def run\n    1\n  end\n  def greet\n    2\n  end\nend\n"},
+        {"app/overrides.rb", "module Overrides\n  def greet\n    3\n  end\nend\n"},
+        {"app/child.rb", "class Child < Base\n  def self.run\n    4\n  end\nend\n"},
+        {"app/widget.rb", "class Widget < Base\n  include Overrides\nend\n"},
+        {"app/caller.rb", "class Caller\n"
+                          "  def go\n"
+                          "    Child.new.run\n"
+                          "    Child.run\n"
+                          "    Widget.new.greet\n"
+                          "  end\n"
+                          "end\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 5);
+    const char *p = store ? lp.project : NULL;
+    int inst = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.run");
+    int klass =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "child.Child.run");
+    int mixin = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go",
+                                            "overrides.Overrides.greet");
+    int base_greet =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.greet");
+    if (inst != 1 || klass != 1 || mixin != 1 || base_greet != 0)
+        fprintf(stderr, "  [LRP] ruby singleton/mixin FAIL instance=%d class=%d mixin=%d base=%d\n",
+                inst, klass, mixin, base_greet);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(inst, 1);
+    ASSERT_EQ(klass, 1);
+    ASSERT_EQ(mixin, 1);
+    ASSERT_EQ(base_greet, 0);
     PASS();
 }
 
@@ -2017,7 +2104,9 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_usage_import_type_with_decoy);
     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
+    RUN_TEST(lrp_python_subclass_constructor_own_init_only);
 
     /* ── Ruby (project registry built once) ── */
     RUN_TEST(lrp_ruby_cross_file_zeitwerk);
+    RUN_TEST(lrp_ruby_cross_file_singleton_and_mixin);
 }

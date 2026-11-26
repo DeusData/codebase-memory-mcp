@@ -109,6 +109,8 @@ SURFACES=(
     "pkg/chocolatey/tools/chocolateyInstall.ps1|release"
     "pkg/scoop/codebase-memory-mcp.json|release"
     "pkg/homebrew/Formula/codebase-memory-mcp.rb|release"
+    "plugin/.claude-plugin/plugin.json|release"
+    "plugin/.mcp.json|release"
     "pkg/aur/PKGBUILD|pin:0.8.1"
     "pkg/aur/.SRCINFO|pin:0.8.1"
 )
@@ -163,6 +165,12 @@ versions_in() {
         # cannot see it, because the version keyword is in the function NAME.
         grep -oE 'return "[0-9]+\.[0-9]+\.[0-9]+"' "$path" |
             grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+        # npm package-spec form: the Claude Code plugin launches the server as
+        # `npx -y codebase-memory-mcp@X.Y.Z`, and that pin is the version every
+        # plugin user actually runs. No declaration keyword sits next to it, so
+        # without this form plugin/.mcp.json reads as a surface with no claim.
+        grep -oE 'codebase-memory-mcp@[0-9]+\.[0-9]+\.[0-9]+' "$path" |
+            grep -oE '[0-9]+\.[0-9]+\.[0-9]+$'
     } | sort -u
 }
 
@@ -280,7 +288,9 @@ fi
 # this contract exists to prevent, and every check above would still pass. The
 # sweep pattern is deliberately BROADER than the extractors in section 3: if the
 # two shared a regex, a claim form the extractors cannot see would be invisible
-# to the sweep as well.
+# to the sweep as well. The Claude Code plugin tree (plugin/, .claude-plugin/) is
+# swept too: a later plugin file that pins `codebase-memory-mcp@X.Y.Z` (a hook
+# command, say) must be registered here, or it would go stale unchecked.
 while IFS= read -r path; do
     [[ -z "$path" ]] && continue
     for entry in "${SURFACES[@]}"; do
@@ -293,8 +303,8 @@ while IFS= read -r path; do
         "SURFACES so it stays in step with the release, or to EXEMPT with a" \
         "note saying what its number actually is."
 done < <(
-    git grep -IlE '(version|pkgver|releases/(download|tag)/v)[^0-9]{0,16}[0-9]+\.[0-9]+\.[0-9]+|return "[0-9]+\.[0-9]+\.[0-9]+"' \
-        -- server.json pkg tests/test_version_metadata_contract.sh 2>/dev/null || true
+    git grep -IlE '(version|pkgver|releases/(download|tag)/v)[^0-9]{0,16}[0-9]+\.[0-9]+\.[0-9]+|return "[0-9]+\.[0-9]+\.[0-9]+"|codebase-memory-mcp@[0-9]+\.[0-9]+\.[0-9]+' \
+        -- server.json pkg plugin .claude-plugin tests/test_version_metadata_contract.sh 2>/dev/null || true
 )
 
 if ((failures > 0)); then

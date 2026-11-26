@@ -16,9 +16,15 @@ enum {
     GD_ALLOW_INTEGER = 1 << GD_INTEGER,
     GD_ALLOW_TEXT = 1 << GD_TEXT,
     GD_ALLOW_BLOB = 1 << GD_BLOB,
-    GD_TABLE_COUNT = 9,
-    GD_MAX_COLUMNS = 9,
+    GD_TABLE_COUNT = 10,
+    GD_MAX_COLUMNS = 10,
+    GD_LSP_SURFACE = 5,
+    GD_COVERAGE_META = 7,
     GD_STORE_META = 8,
+    GD_UNRESOLVED_CANDIDATES = 9,
+    GD_SCHEMA_DECLARED_TYPE = 2,
+    GD_SCHEMA_PRIMARY_KEY = 5,
+    GD_SCHEMA_HIDDEN = 6,
     GD_CHUNK_BYTES = 65536
 };
 
@@ -73,8 +79,9 @@ static const gd_column_t gd_project_summaries[] = {{"project", GD_T, 0, 1},
                                                    {"created_at", GD_T, 0, 0},
                                                    {"updated_at", GD_T, 0, 0}};
 static const gd_column_t gd_lsp_surface[] = {
-    {"project", GD_T, 0, 1},   {"rel_path", GD_T, 0, 2},         {"surface_sha", GD_T, 0, 0},
-    {"defs_json", GD_T, 0, 0}, {"ref_bloom", GD_B | GD_N, 0, 0}, {"config_ctx", GD_T, 0, 0}};
+    {"project", GD_T, 0, 1},       {"rel_path", GD_T, 0, 2},         {"surface_sha", GD_T, 0, 0},
+    {"defs_json", GD_T, 0, 0},     {"ref_bloom", GD_B | GD_N, 0, 0}, {"config_ctx", GD_T, 0, 0},
+    {"included_files", GD_T, 0, 0}};
 static const gd_column_t gd_index_coverage[] = {{"project", GD_T, 0, 1},
                                                 {"rel_path", GD_T, 0, 2},
                                                 {"kind", GD_T, 0, 3},
@@ -87,8 +94,14 @@ static const gd_column_t gd_index_coverage_meta[] = {{"project", GD_T, 0, 1},
                                                      {"ignored_files_stored", GD_I, 0, 0},
                                                      {"ignored_files_total", GD_I, 0, 0},
                                                      {"coverage_version", GD_I, 0, 0},
-                                                     {"hash_records_complete", GD_I, 0, 0}};
+                                                     {"hash_records_complete", GD_I, 0, 0},
+                                                     {"unresolved_calls_complete", GD_I, 0, 0}};
 static const gd_column_t gd_store_meta[] = {{"k", GD_T, 0, 1}, {"v", GD_T, 0, 0}};
+
+static const gd_column_t gd_unresolved_candidates[] = {{"project", GD_T, 0, 1},
+                                                       {"candidate", GD_T, 0, 2},
+                                                       {"rel_path", GD_T, 0, 3},
+                                                       {"kind", GD_T, 0, 0}};
 
 /* These descriptors and SQL strings are immutable; all other state is local. */
 static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
@@ -108,7 +121,7 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "PRAGMA main.table_xinfo('project_summaries');",
      "SELECT project,summary,source_hash,created_at,updated_at FROM main.project_summaries "
      "ORDER BY CAST(project AS BLOB) ASC;"},
-    {"lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface),
+    {"lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface) - 1,
      "PRAGMA main.table_xinfo('lsp_surface');",
      "SELECT project,rel_path,surface_sha,defs_json,ref_bloom,config_ctx FROM main.lsp_surface "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(rel_path AS BLOB) ASC;"},
@@ -116,14 +129,36 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "PRAGMA main.table_xinfo('index_coverage');",
      "SELECT project,rel_path,kind,detail FROM main.index_coverage "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(rel_path AS BLOB) ASC,CAST(kind AS BLOB) ASC;"},
-    {"index_coverage_meta", gd_index_coverage_meta, GD_COLUMNS(gd_index_coverage_meta),
+    {"index_coverage_meta", gd_index_coverage_meta, GD_COLUMNS(gd_index_coverage_meta) - 1,
      "PRAGMA main.table_xinfo('index_coverage_meta');",
      "SELECT project,generation,index_mode,recorded_at,recording_status,ignored_files_stored,"
      "ignored_files_total,coverage_version,hash_records_complete FROM main.index_coverage_meta "
      "ORDER BY CAST(project AS BLOB) ASC;"},
     {"store_meta", gd_store_meta, GD_COLUMNS(gd_store_meta),
      "PRAGMA main.table_xinfo('store_meta');",
-     "SELECT k,v FROM main.store_meta ORDER BY CAST(k AS BLOB) ASC;"}};
+     "SELECT k,v FROM main.store_meta ORDER BY CAST(k AS BLOB) ASC;"},
+    {"index_unresolved_candidates", gd_unresolved_candidates, GD_COLUMNS(gd_unresolved_candidates),
+     "PRAGMA main.table_xinfo('index_unresolved_candidates');",
+     "SELECT project,candidate,rel_path,kind FROM main.index_unresolved_candidates "
+     "ORDER BY CAST(project AS BLOB) ASC,CAST(candidate AS BLOB) ASC,"
+     "CAST(rel_path AS BLOB) ASC,CAST(kind AS BLOB) ASC;"}};
+
+/* Preserve the legacy canonical stream; newer metadata binds the independent
+ * capture completeness column as well. Both schemas are checked exactly. */
+static const gd_table_t gd_coverage_meta_current = {
+    "index_coverage_meta", gd_index_coverage_meta, GD_COLUMNS(gd_index_coverage_meta),
+    "PRAGMA main.table_xinfo('index_coverage_meta');",
+    "SELECT project,generation,index_mode,recorded_at,recording_status,ignored_files_stored,"
+    "ignored_files_total,coverage_version,hash_records_complete,unresolved_calls_complete "
+    "FROM main.index_coverage_meta ORDER BY CAST(project AS BLOB) ASC;"};
+
+/* The same for lsp_surface: index format 7 records the files each C-family
+ * file's #include lookup read (`included_files`). */
+static const gd_table_t gd_lsp_surface_current = {
+    "lsp_surface", gd_lsp_surface, GD_COLUMNS(gd_lsp_surface),
+    "PRAGMA main.table_xinfo('lsp_surface');",
+    "SELECT project,rel_path,surface_sha,defs_json,ref_bloom,config_ctx,included_files "
+    "FROM main.lsp_surface ORDER BY CAST(project AS BLOB) ASC,CAST(rel_path AS BLOB) ASC;"};
 
 #undef GD_B
 #undef GD_N
@@ -142,7 +177,30 @@ typedef struct {
     uint64_t bytes;
     bool have_uid;
     bool have_counter;
+    bool have_unresolved_completeness;
+    bool have_included_files;
 } gd_context_t;
+
+static const gd_table_t *gd_table(const gd_context_t *g, int index) {
+    if (index == GD_COVERAGE_META && g->have_unresolved_completeness) {
+        return &gd_coverage_meta_current;
+    }
+    if (index == GD_LSP_SURFACE && g->have_included_files) {
+        return &gd_lsp_surface_current;
+    }
+    return &gd_tables[index];
+}
+
+/* The newest schema a table may have, when it has a legacy one too. */
+static const gd_table_t *gd_current_table(const gd_table_t *table) {
+    if (table == &gd_tables[GD_COVERAGE_META]) {
+        return &gd_coverage_meta_current;
+    }
+    if (table == &gd_tables[GD_LSP_SURFACE]) {
+        return &gd_lsp_surface_current;
+    }
+    return NULL;
+}
 
 typedef struct {
     const unsigned char *data;
@@ -408,8 +466,29 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
     return rc == SQLITE_DONE && gd_finalize(g);
 }
 
+static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
+    if (sqlite3_column_type(g->stmt, GD_SCHEMA_PRIMARY_KEY) != SQLITE_INTEGER ||
+        sqlite3_column_type(g->stmt, GD_SCHEMA_HIDDEN) != SQLITE_INTEGER ||
+        sqlite3_column_int64(g->stmt, GD_SCHEMA_PRIMARY_KEY) != expected->primary_key ||
+        sqlite3_column_int64(g->stmt, GD_SCHEMA_HIDDEN) != expected->kind) {
+        return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+    }
+    if (expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
+        gd_text_t declared_type;
+        if (!gd_read_text(g, GD_SCHEMA_DECLARED_TYPE, &declared_type)) {
+            return false;
+        }
+        if (!gd_text_ascii_eq(declared_type, "INTEGER")) {
+            return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+        }
+    }
+    return true;
+}
+
 static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
     bool seen[GD_MAX_COLUMNS] = {false};
+    const gd_table_t *current = gd_current_table(table);
+    int allowed_columns = current ? current->column_count : table->column_count;
     if (!gd_prepare(g, table->column_query)) {
         return false;
     }
@@ -424,36 +503,32 @@ static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
             return false;
         }
         int column = -1;
-        for (int i = 0; i < table->column_count; i++) {
+        for (int i = 0; i < allowed_columns; i++) {
             if (gd_text_eq(name, table->columns[i].name)) {
                 column = i;
                 break;
             }
         }
-        if (column < 0 || seen[column] || count == table->column_count ||
-            sqlite3_column_type(g->stmt, 5) != SQLITE_INTEGER ||
-            sqlite3_column_type(g->stmt, 6) != SQLITE_INTEGER) {
+        if (column < 0 || seen[column] || count == allowed_columns ||
+            !gd_column_schema(g, &table->columns[column])) {
             return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
-        }
-        const gd_column_t *expected = &table->columns[column];
-        if (sqlite3_column_int64(g->stmt, 5) != expected->primary_key ||
-            sqlite3_column_int64(g->stmt, 6) != expected->kind) {
-            return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
-        }
-        if (expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
-            gd_text_t declared_type;
-            if (!gd_read_text(g, 2, &declared_type)) {
-                return false;
-            }
-            if (!gd_text_ascii_eq(declared_type, "INTEGER")) {
-                return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
-            }
         }
         seen[column] = true;
         count++;
     }
-    if (rc != SQLITE_DONE || count != table->column_count) {
+    if (rc != SQLITE_DONE || count < table->column_count) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+    }
+    for (int i = 0; i < table->column_count; i++) {
+        if (!seen[i]) {
+            return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+        }
+    }
+    if (table == &gd_tables[GD_COVERAGE_META]) {
+        g->have_unresolved_completeness = seen[table->column_count];
+    }
+    if (table == &gd_tables[GD_LSP_SURFACE]) {
+        g->have_included_files = seen[table->column_count];
     }
     return gd_finalize(g);
 }
@@ -481,8 +556,21 @@ static bool gd_project(gd_context_t *g, const unsigned char *project, size_t len
     return rc == SQLITE_DONE && gd_finalize(g);
 }
 
+static bool gd_validate_schema(gd_context_t *g, bool present[GD_TABLE_COUNT],
+                               const unsigned char *project, size_t length) {
+    if (!gd_encoding(g) || !gd_table_kinds(g, present)) {
+        return false;
+    }
+    for (int i = 0; i < GD_TABLE_COUNT; i++) {
+        if (present[i] && !gd_columns(g, &gd_tables[i])) {
+            return false;
+        }
+    }
+    return gd_project(g, project, length);
+}
+
 static bool gd_table_header(gd_context_t *g, int index, bool present) {
-    const gd_table_t *table = &gd_tables[index];
+    const gd_table_t *table = gd_table(g, index);
     if (!gd_u8(g, 0x20) || !gd_u32(g, (uint32_t)index) || !gd_literal(g, table->name) ||
         !gd_u32(g, (uint32_t)table->column_count)) {
         return false;
@@ -605,7 +693,7 @@ static bool gd_column_value(gd_context_t *g, int index, const gd_column_t *colum
 
 static bool gd_table_rows(gd_context_t *g, int index, bool present) {
     uint64_t rows = 0;
-    const gd_table_t *table = &gd_tables[index];
+    const gd_table_t *table = gd_table(g, index);
     if (present) {
         if (!gd_prepare(g, table->row_query)) {
             return false;
@@ -643,6 +731,20 @@ static bool gd_table_rows(gd_context_t *g, int index, bool present) {
         }
     }
     return gd_u8(g, 0x22) && gd_u64(g, rows);
+}
+
+static bool gd_stream_tables(gd_context_t *g, const bool present[GD_TABLE_COUNT]) {
+    for (int i = 0; i < GD_TABLE_COUNT; i++) {
+        /* A store without the candidate table streams the same tables as
+         * version 1; only the version word differs. */
+        if (i == GD_UNRESOLVED_CANDIDATES && !present[i]) {
+            continue;
+        }
+        if (!gd_table_header(g, i, present[i]) || !gd_table_rows(g, i, present[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool gd_project_argument(gd_context_t *g, const unsigned char *project, size_t length) {
@@ -694,15 +796,7 @@ cbm_store_graph_digest_status_t cbm_store_graph_digest(
         return g.status;
     }
     bool present[GD_TABLE_COUNT] = {false};
-    if (!gd_encoding(&g) || !gd_table_kinds(&g, present)) {
-        goto done;
-    }
-    for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        if (present[i] && !gd_columns(&g, &gd_tables[i])) {
-            goto done;
-        }
-    }
-    if (!gd_project(&g, project, project_len)) {
+    if (!gd_validate_schema(&g, present, project, project_len)) {
         goto done;
     }
     cbm_sha256_init(&g.sha);
@@ -711,10 +805,8 @@ cbm_store_graph_digest_status_t cbm_store_graph_digest(
         !gd_u8(&g, 0x10) || !gd_value(&g, GD_TEXT, project, project_len)) {
         goto done;
     }
-    for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        if (!gd_table_header(&g, i, present[i]) || !gd_table_rows(&g, i, present[i])) {
-            goto done;
-        }
+    if (!gd_stream_tables(&g, present)) {
+        goto done;
     }
     if (!gd_u8(&g, 0x7f) || !gd_u64(&g, g.rows) || !gd_check(&g)) {
         goto done;

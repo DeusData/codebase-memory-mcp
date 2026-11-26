@@ -267,6 +267,52 @@ TEST(config_missing_fields) {
     PASS();
 }
 
+/* #2114: a cold `daemon start` used to configure (and so re-enable) the UI on
+ * every start, overwriting a saved ui_enabled=false. The rule now: a bare start
+ * honours the saved choice; only an explicit --port=N or --open requests the UI
+ * (and the caller persists that choice). The real-process guard
+ * tests/test_daemon_open_readiness.py covers the same contract end to end, but
+ * no CI leg runs it, so this pure rule is what CI checks. */
+TEST(config_daemon_start_honours_saved_ui_choice) {
+    const cbm_ui_config_t disabled = {.ui_enabled = false, .ui_port = 9749};
+    const cbm_ui_config_t enabled = {.ui_enabled = true, .ui_port = 9749};
+    int port = -1;
+
+    /* Bare start, saved disabled: no UI and nothing to persist (#2114). */
+    ASSERT_FALSE(cbm_ui_config_daemon_start_ui(&disabled, 0, false, &port));
+    ASSERT_EQ(port, 0);
+
+    /* Bare start, saved enabled: the UI on the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&enabled, 0, false, &port));
+    ASSERT_EQ(port, 9749);
+
+    /* --port=N re-enables a disabled UI on N. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 9800, false, &port));
+    ASSERT_EQ(port, 9800);
+
+    /* --open re-enables a disabled UI on the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 0, true, &port));
+    ASSERT_EQ(port, 9749);
+
+    /* An explicit --port=N wins over the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&enabled, 9800, false, &port));
+    ASSERT_EQ(port, 9800);
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 9800, true, &port));
+    ASSERT_EQ(port, 9800);
+
+    /* No saved configuration requests nothing. */
+    port = -1;
+    ASSERT_FALSE(cbm_ui_config_daemon_start_ui(NULL, 9800, true, &port));
+    ASSERT_EQ(port, 0);
+
+    PASS();
+}
+
 /* ── Embedded asset tests ─────────────────────────────────────── */
 
 TEST(embedded_lookup_not_found) {
@@ -556,9 +602,199 @@ TEST(layout_to_json) {
     ASSERT(strstr(json, "\"hello\"") != NULL);
     ASSERT(strstr(json, "\"Function\"") != NULL);
 
-    free(json);
+    cbm_layout_free_json(json);
     cbm_layout_free(r);
     cbm_store_close(store);
+    PASS();
+}
+
+/* cbm_layout_to_json hands out one memory-core block of the OTHER class, and
+ * cbm_layout_free_json takes exactly that block back. A raw allocation on either
+ * side of the pair fails the count. */
+TEST(layout_json_memory_core_ownership) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "hello",
+                    .qualified_name = "test::hello",
+                    .file_path = "a.c",
+                    .start_line = 1,
+                    .end_line = 5};
+    cbm_store_upsert_node(store, &n);
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    char *json = cbm_layout_to_json(r);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"hello\"") != NULL);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >= bytes + strlen(json) + 1);
+
+    cbm_layout_free_json(json);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* handle_layout re-reads this payload with yyjson_read(..., 0). Malformed
+ * UTF-8 has to come back as U+FFFD (EF BF BD); valid text has to decode to
+ * the original string. Stack strings are not owned by the result. */
+TEST(layout_json_invalid_utf8_roundtrip) {
+    ASSERT_NULL(cbm_layout_to_json(NULL));
+
+    cbm_layout_result_t empty = {0};
+    char *json = cbm_layout_to_json(&empty);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "nodes")), 0);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "edges")), 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_nodes")), 0);
+    yyjson_doc_free(doc);
+    cbm_layout_free_json(json);
+
+    cbm_layout_node_t nodes[4] = {
+        {
+            .id = 11,
+            .x = 1.5f,
+            .y = -2.0f,
+            .z = 3.25f,
+            .label = "Section\x80", /* isolated continuation */
+            .name = "Head\xC3",     /* truncated 2-byte lead */
+            .qualified_name = "doc.md::H\xE4\xB8", /* truncated 3-byte sequence */
+            .file_path = "docs/\xFFreadme.md",     /* invalid leading byte */
+            .start_line = 4,
+            .end_line = 9,
+            .size = 2.5f,
+            .color = 0x336699,
+            .in_calls = 1,
+            .out_calls = 2,
+            .status = "structural",
+        },
+        {
+            .id = 12,
+            .label = "Section",
+            .name = "q\"\x80",            /* quote, then a continuation byte */
+            .qualified_name = "bs\\\xFF", /* backslash, then an invalid lead */
+            .file_path = "nl\n\xC2",      /* newline, then a truncated lead */
+            .size = 1.0f,
+        },
+        {
+            .id = 13,
+            .label = "Section",
+            .name = "caf\xC3\xA9",                        /* U+00E9 */
+            .qualified_name = "\xE7\xAB\xA0\xE8\x8A\x82", /* U+7AE0 U+8282 */
+            .file_path = "docs/\xF0\x9F\x98\x80.md",      /* U+1F600 */
+            .size = 1.0f,
+            .status = "structural",
+        },
+        {
+            .id = 14,
+            .x = NAN,
+            .y = INFINITY,
+            .z = -INFINITY,
+            .size = NAN,
+        },
+    };
+    cbm_layout_edge_t edges[2] = {
+        {.source = 11, .target = 12, .type = "MENTIONS\x80"},
+        {.source = 12, .target = 13, .type = NULL},
+    };
+    cbm_layout_result_t layout = {
+        .nodes = nodes,
+        .node_count = 4,
+        .edges = edges,
+        .edge_count = 2,
+        .total_nodes = 4,
+    };
+
+    json = cbm_layout_to_json(&layout);
+    ASSERT_NOT_NULL(json);
+    doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    for (size_t i = 0; json[i] != '\0'; i++) {
+        ASSERT((unsigned char)json[i] < 0x80);
+    }
+    ASSERT_NOT_NULL(strstr(json, "\"Section\""));
+    ASSERT_NOT_NULL(strstr(json, "\\u00E9"));
+    ASSERT_NOT_NULL(strstr(json, "\\u7AE0\\u8282"));
+    ASSERT_NOT_NULL(strstr(json, "\\uD83D\\uDE00"));
+    ASSERT_NOT_NULL(strstr(json, "\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "q\\\"\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "bs\\\\\\uFFFD"));
+    ASSERT_NOT_NULL(strstr(json, "nl\\n\\uFFFD"));
+
+    root = yyjson_doc_get_root(doc);
+    yyjson_val *nodes_json = yyjson_obj_get(root, "nodes");
+    yyjson_val *edges_json = yyjson_obj_get(root, "edges");
+    ASSERT_EQ((int)yyjson_arr_size(nodes_json), 4);
+    ASSERT_EQ((int)yyjson_arr_size(edges_json), 2);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(root, "total_nodes")), 4);
+
+    yyjson_val *n0 = yyjson_arr_get(nodes_json, 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "id")), 11);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "label")), "Section\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "name")), "Head\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "qualified_name")),
+                  "doc.md::H\xEF\xBF\xBD\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "file_path")), "docs/\xEF\xBF\xBDreadme.md");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n0, "status")), "structural");
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "start_line")), 4);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "end_line")), 9);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "in_calls")), 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n0, "out_calls")), 2);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "x")), 1.5, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "y")), -2.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "z")), 3.25, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n0, "size")), 2.5, 1e-6);
+
+    yyjson_val *n1 = yyjson_arr_get(nodes_json, 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n1, "id")), 12);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "label")), "Section");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "name")), "q\"\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "qualified_name")), "bs\\\xEF\xBF\xBD");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n1, "file_path")), "nl\n\xEF\xBF\xBD");
+    ASSERT_NULL(yyjson_obj_get(n1, "status"));
+
+    yyjson_val *n2 = yyjson_arr_get(nodes_json, 2);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n2, "id")), 13);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "label")), "Section");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "name")), "caf\xC3\xA9");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "qualified_name")), "\xE7\xAB\xA0\xE8\x8A\x82");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(n2, "file_path")), "docs/\xF0\x9F\x98\x80.md");
+
+    yyjson_val *n3 = yyjson_arr_get(nodes_json, 3);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(n3, "id")), 14);
+    ASSERT_NULL(yyjson_obj_get(n3, "label"));
+    ASSERT_NULL(yyjson_obj_get(n3, "name"));
+    ASSERT_NULL(yyjson_obj_get(n3, "qualified_name"));
+    ASSERT_NULL(yyjson_obj_get(n3, "file_path"));
+    ASSERT_NULL(yyjson_obj_get(n3, "status"));
+    ASSERT_NULL(yyjson_obj_get(n3, "start_line"));
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "x")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "y")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "z")), 0.0, 1e-6);
+    ASSERT_FLOAT_EQ(yyjson_get_real(yyjson_obj_get(n3, "size")), 1.0, 1e-6);
+
+    yyjson_val *e0 = yyjson_arr_get(edges_json, 0);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e0, "source")), 11);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e0, "target")), 12);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(e0, "type")), "MENTIONS\xEF\xBF\xBD");
+
+    yyjson_val *e1 = yyjson_arr_get(edges_json, 1);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e1, "source")), 12);
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(e1, "target")), 13);
+    ASSERT_NULL(yyjson_obj_get(e1, "type"));
+
+    yyjson_doc_free(doc);
+    cbm_layout_free_json(json);
     PASS();
 }
 
@@ -635,6 +871,30 @@ TEST(layout_dead_code_classification) {
                       .qualified_name = "dc::exportedfn",
                       .file_path = "src/d.c",
                       .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t framework = {.project = "dc",
+                            .label = "Function",
+                            .name = "frameworkfn",
+                            .qualified_name = "dc::frameworkfn",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t route = {.project = "dc",
+                        .label = "Route",
+                        .name = "GET /framework",
+                        .qualified_name = "dc::route",
+                        .file_path = "src/routes.c",
+                        .properties_json = "{}"};
+    cbm_node_t unrelated = {.project = "dc",
+                            .label = "Class",
+                            .name = "UnrelatedTarget",
+                            .qualified_name = "dc::unrelated",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t nonroute = {.project = "dc",
+                           .label = "Function",
+                           .name = "nonroutefn",
+                           .qualified_name = "dc::nonroutefn",
+                           .file_path = "src/routes.c",
+                           .properties_json = "{}"};
     cbm_node_t single = {.project = "dc",
                          .label = "Function",
                          .name = "calledonce",
@@ -666,6 +926,14 @@ TEST(layout_dead_code_classification) {
     cbm_store_upsert_node(store, &tst);
     cbm_store_upsert_node(store, &tstpath);
     cbm_store_upsert_node(store, &exp);
+    int64_t id_framework = cbm_store_upsert_node(store, &framework);
+    int64_t id_route = cbm_store_upsert_node(store, &route);
+    int64_t id_unrelated = cbm_store_upsert_node(store, &unrelated);
+    int64_t id_nonroute = cbm_store_upsert_node(store, &nonroute);
+    ASSERT_GT(id_framework, 0);
+    ASSERT_GT(id_route, 0);
+    ASSERT_GT(id_unrelated, 0);
+    ASSERT_GT(id_nonroute, 0);
     int64_t id_single = cbm_store_upsert_node(store, &single);
     int64_t id_norm = cbm_store_upsert_node(store, &norm);
     int64_t id_caller = cbm_store_upsert_node(store, &caller);
@@ -678,9 +946,15 @@ TEST(layout_dead_code_classification) {
     cbm_edge_t e2 = {
         .project = "dc", .source_id = id_caller, .target_id = id_norm, .type = "CALLS"};
     cbm_edge_t e3 = {.project = "dc", .source_id = id_dead, .target_id = id_norm, .type = "CALLS"};
+    cbm_edge_t framework_route = {
+        .project = "dc", .source_id = id_framework, .target_id = id_route, .type = "HANDLES"};
+    cbm_edge_t framework_unrelated = {
+        .project = "dc", .source_id = id_nonroute, .target_id = id_unrelated, .type = "HANDLES"};
     cbm_store_insert_edge(store, &e1);
     cbm_store_insert_edge(store, &e2);
     cbm_store_insert_edge(store, &e3);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_route), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_unrelated), 0);
 
     cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
     ASSERT_NOT_NULL(r);
@@ -708,6 +982,18 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "exported");
 
+    ln = find_layout_node(r, "frameworkfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "entry");
+
+    ln = find_layout_node(r, "nonroutefn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "dead");
+
+    ln = find_layout_node(r, "GET /framework");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "structural");
+
     ln = find_layout_node(r, "calledonce");
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "single");
@@ -727,7 +1013,7 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "\"status\":\"dead\"") != NULL);
     ASSERT(strstr(json, "\"in_calls\":2") != NULL);
-    free(json);
+    cbm_layout_free_json(json);
 
     cbm_layout_free(r);
     cbm_store_close(store);
@@ -2684,6 +2970,7 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_daemon_start_honours_saved_ui_choice);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
@@ -2698,6 +2985,8 @@ SUITE(ui) {
     RUN_TEST(layout_honors_budget_above_default);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
+    RUN_TEST(layout_json_memory_core_ownership);
+    RUN_TEST(layout_json_invalid_utf8_roundtrip);
     RUN_TEST(layout_null_inputs);
     RUN_TEST(layout_dead_code_classification);
     RUN_TEST(layout_coincident_nodes_bounded);

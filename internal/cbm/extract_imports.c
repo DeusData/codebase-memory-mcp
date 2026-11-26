@@ -13,7 +13,6 @@
 
 /* Local constants for magic number elimination. */
 enum {
-    USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
     /* Nested `#if` branches followed while collecting C includes. */
     C_INCLUDE_NEST_LIMIT = 64,
@@ -28,6 +27,7 @@ static void parse_go_imports(CBMExtractCtx *ctx);
 static void parse_python_imports(CBMExtractCtx *ctx);
 static void parse_es_imports(CBMExtractCtx *ctx);
 static void parse_java_imports(CBMExtractCtx *ctx);
+static void parse_scala_imports(CBMExtractCtx *ctx);
 static void parse_rust_imports(CBMExtractCtx *ctx);
 static void parse_c_imports(CBMExtractCtx *ctx);
 static void parse_ruby_imports(CBMExtractCtx *ctx);
@@ -1742,10 +1742,36 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         }
     }
     if (!found) {
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        /* A side-effect import (`import './polyfills'`) binds no name. */
+        CBMImport imp = {
+            .local_name = path_last(a, path), .module_path = path, .local_name_synthesized = true};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
     return true;
+}
+
+/* The identifier a require call is bound to when no declarator holds the call
+ * itself: a lazy assignment `winston = require('winston')`, or a declarator
+ * over one member `const dns = require('dns').promises`. NULL otherwise. */
+static const char *commonjs_require_bound_name(CBMExtractCtx *ctx, TSNode parent) {
+    if (ts_node_is_null(parent)) {
+        return NULL;
+    }
+    TSNode name = {0};
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "assignment_expression") == 0) {
+        name = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+    } else if (strcmp(kind, "member_expression") == 0) {
+        TSNode declarator = ts_node_parent(parent);
+        if (!ts_node_is_null(declarator) &&
+            strcmp(ts_node_type(declarator), "variable_declarator") == 0) {
+            name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+        }
+    }
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0) {
+        return NULL;
+    }
+    return cbm_node_text(ctx->arena, name, ctx->source);
 }
 
 /* Handle CommonJS `require("path")` call_expression nodes.  The local name
@@ -1805,11 +1831,19 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
             local_name = cbm_node_text(a, name_node, ctx->source);
         }
     }
-    if (!local_name) {
+    /* No declarator binds the module (`require('x').y`, a destructuring, a
+     * lazy assignment or a bare side-effect require): the path's last segment
+     * stands in. It is still a real binding when the statement binds exactly
+     * that name (#1128). */
+    bool synthesized = local_name == NULL;
+    if (synthesized) {
         local_name = path_last(a, path);
+        const char *bound = commonjs_require_bound_name(ctx, parent);
+        synthesized = !(bound && local_name && strcmp(bound, local_name) == 0);
     }
 
-    CBMImport imp = {.local_name = local_name, .module_path = path};
+    CBMImport imp = {
+        .local_name = local_name, .module_path = path, .local_name_synthesized = synthesized};
     cbm_imports_push(&ctx->result->imports, a, imp);
     return true;
 }
@@ -1836,8 +1870,10 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
             if (!ts_node_is_null(src)) {
                 char *path = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, src, ctx->source));
                 if (path && path[0]) {
+                    /* A re-export binds no local name in this file. */
                     CBMImport imp = {.local_name = path_last(ctx->arena, path),
-                                     .module_path = path};
+                                     .module_path = path,
+                                     .local_name_synthesized = true};
                     cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
                 }
             }
@@ -1897,9 +1933,134 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 // --- Rust imports ---
 // use_declaration -> use_list or scoped_use_list
 
-static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
+static TSNode rust_import_field(TSNode node, const char *field) {
+    return ts_node_child_by_field_name(node, field, (uint32_t)strlen(field));
+}
 
+static char *rust_import_node_text_compact(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node)) {
+        return NULL;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (end <= start) {
+        return cbm_arena_strdup(a, "");
+    }
+    char *out = (char *)cbm_arena_alloc(a, (size_t)(end - start) + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (uint32_t i = start; i < end; i++) {
+        if (!isspace((unsigned char)source[i])) {
+            out[w++] = source[i];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
+static char *rust_import_join(CBMArena *a, const char *prefix, const char *suffix) {
+    if (!prefix || !prefix[0]) {
+        return cbm_arena_strdup(a, suffix ? suffix : "");
+    }
+    if (!suffix || !suffix[0]) {
+        return cbm_arena_strdup(a, prefix);
+    }
+    return cbm_arena_sprintf(a, "%s::%s", prefix, suffix);
+}
+
+static bool rust_import_exists(const CBMImportArray *imports, const char *local,
+                               const char *module_path) {
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, module_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rust_import_push(CBMExtractCtx *ctx, const char *full, const char *alias) {
+    static const char self_suffix[] = "::self";
+    CBMArena *a = ctx->arena;
+    if (!full || !full[0]) {
+        return;
+    }
+
+    const char *module_path = full;
+    size_t len = strlen(full);
+    size_t self_len = sizeof(self_suffix) - SKIP_ONE;
+    if (len > self_len && strcmp(full + len - self_len, self_suffix) == 0) {
+        module_path = cbm_arena_strndup(a, full, len - self_len);
+    }
+
+    const char *local = alias && alias[0] ? alias : path_last(a, module_path);
+    if (!local || !local[0]) {
+        return;
+    }
+    bool keyword =
+        strcmp(local, "crate") == 0 || strcmp(local, "super") == 0 || strcmp(local, "self") == 0;
+    if (keyword && (!alias || !alias[0])) {
+        return;
+    }
+    if (rust_import_exists(&ctx->result->imports, local, module_path)) {
+        return;
+    }
+
+    CBMImport imp = {.local_name = local, .module_path = module_path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+static void rust_import_walk(CBMExtractCtx *ctx, TSNode node, const char *prefix) {
+    if (ts_node_is_null(node)) {
+        return;
+    }
+
+    CBMArena *a = ctx->arena;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "use_list") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            rust_import_walk(ctx, ts_node_named_child(node, i), prefix);
+        }
+        return;
+    }
+    if (strcmp(kind, "scoped_use_list") == 0) {
+        char *path = rust_import_node_text_compact(a, rust_import_field(node, "path"), ctx->source);
+        char *next_prefix = rust_import_join(a, prefix, path);
+        rust_import_walk(ctx, rust_import_field(node, "list"), next_prefix);
+        return;
+    }
+    if (strcmp(kind, "use_as_clause") == 0) {
+        char *path = rust_import_node_text_compact(a, rust_import_field(node, "path"), ctx->source);
+        char *alias =
+            rust_import_node_text_compact(a, rust_import_field(node, "alias"), ctx->source);
+        char *full = rust_import_join(a, prefix, path);
+        rust_import_push(ctx, full, alias);
+        return;
+    }
+    if (strcmp(kind, "use_wildcard") == 0) {
+        TSNode inner =
+            ts_node_named_child_count(node) > 0 ? ts_node_named_child(node, 0) : (TSNode){0};
+        char *path = rust_import_node_text_compact(a, inner, ctx->source);
+        char *base = rust_import_join(a, prefix, path);
+        char *full =
+            base && base[0] ? cbm_arena_sprintf(a, "%s::*", base) : cbm_arena_strdup(a, "*");
+        rust_import_push(ctx, full, NULL);
+        return;
+    }
+    if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0) {
+        return;
+    }
+
+    char *path = rust_import_node_text_compact(a, node, ctx->source);
+    char *full = rust_import_join(a, prefix, path);
+    rust_import_push(ctx, full, NULL);
+}
+
+static void parse_rust_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -1911,21 +2072,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        rust_import_walk(ctx, rust_import_field(node, "argument"), "");
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2293,8 +2440,160 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
             continue;
         }
 
+        if (ctx->language == CBM_LANG_SWIFT) {
+            /* Attributes and scoped import kinds precede the actual module path. */
+            TSNode identifier = cbm_find_child_by_kind(node, "identifier");
+            const char *path = ts_node_is_null(identifier)
+                                   ? NULL
+                                   : cbm_node_text(ctx->arena, identifier, ctx->source);
+            if (path && path[0]) {
+                CBMImport imp = {.local_name = path_last(ctx->arena, path), .module_path = path};
+                cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+            }
+            continue;
+        }
         if (!try_generic_path_fields(ctx, node)) {
             generic_import_from_text(ctx, node);
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+// --- Scala imports ---
+
+static char *scala_trim_span(CBMArena *a, const char *start, const char *end) {
+    while (start < end && isspace((unsigned char)*start)) {
+        start++;
+    }
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    return cbm_arena_strndup(a, start, (size_t)(end - start));
+}
+
+static void scala_emit_import(CBMExtractCtx *ctx, const char *path, const char *local) {
+    if (!path || !path[0] || !local || !local[0]) {
+        return;
+    }
+    CBMImport imp = {.local_name = cbm_arena_strdup(ctx->arena, local),
+                     .module_path = cbm_arena_strdup(ctx->arena, path)};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static void scala_parse_selector(CBMExtractCtx *ctx, const char *prefix, const char *start,
+                                 const char *end) {
+    char *selector = scala_trim_span(ctx->arena, start, end);
+    if (!selector || !selector[0] ||
+        (strncmp(selector, "given", 5) == 0 &&
+         (selector[5] == '\0' || isspace((unsigned char)selector[5])))) {
+        return;
+    }
+    if (strcmp(selector, "*") == 0 || strcmp(selector, "_") == 0) {
+        scala_emit_import(ctx, prefix, "*");
+        return;
+    }
+
+    char *rename = strstr(selector, "=>");
+    size_t op_len = 2;
+    if (!rename) {
+        rename = strstr(selector, " as ");
+        op_len = 4;
+    }
+    char *name = selector;
+    char *local = selector;
+    if (rename) {
+        local = scala_trim_span(ctx->arena, rename + op_len, selector + strlen(selector));
+        name = scala_trim_span(ctx->arena, selector, rename);
+        if (strcmp(local, "_") == 0 || strcmp(local, "*") == 0) {
+            return; // Scala 2 hidden selector: `Name => _`
+        }
+    }
+    if (!name[0] || !local[0]) {
+        return;
+    }
+    const char *path =
+        prefix && prefix[0] ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name) : name;
+    scala_emit_import(ctx, path, local);
+}
+
+static void scala_parse_import_expr(CBMExtractCtx *ctx, const char *start, const char *end) {
+    char *expr = scala_trim_span(ctx->arena, start, end);
+    if (!expr || !expr[0]) {
+        return;
+    }
+    char *open = strchr(expr, '{');
+    char *close = strrchr(expr, '}');
+    if (open && close && close > open) {
+        char *prefix = scala_trim_span(ctx->arena, expr, open);
+        size_t plen = strlen(prefix);
+        while (plen > 0 && (prefix[plen - 1] == '.' || isspace((unsigned char)prefix[plen - 1]))) {
+            prefix[--plen] = '\0';
+        }
+        const char *part = open + 1;
+        for (const char *p = part;; p++) {
+            if (p == close || *p == ',') {
+                scala_parse_selector(ctx, prefix, part, p);
+                if (p == close) {
+                    break;
+                }
+                part = p + 1;
+            }
+        }
+        return;
+    }
+
+    char *rename = strstr(expr, " as ");
+    if (rename) {
+        char *path = scala_trim_span(ctx->arena, expr, rename);
+        char *local = scala_trim_span(ctx->arena, rename + 4, expr + strlen(expr));
+        scala_emit_import(ctx, path, local);
+        return;
+    }
+    size_t len = strlen(expr);
+    if ((len > 2 && strcmp(expr + len - 2, ".*") == 0) ||
+        (len > 2 && strcmp(expr + len - 2, "._") == 0)) {
+        expr[len - 2] = '\0';
+        scala_emit_import(ctx, expr, "*");
+        return;
+    }
+    if (len > 6 && strcmp(expr + len - 6, ".given") == 0) {
+        expr[len - 6] = '\0';
+        scala_emit_import(ctx, expr, "*");
+        return;
+    }
+    scala_emit_import(ctx, expr, path_last(ctx->arena, expr));
+}
+
+static void parse_scala_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "import_declaration") != 0) {
+            continue;
+        }
+        char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        if (!text || strncmp(text, "import", 6) != 0) {
+            continue;
+        }
+        const char *part = text + 6;
+        int brace_depth = 0;
+        for (const char *p = part;; p++) {
+            if (*p == '{') {
+                brace_depth++;
+            } else if (*p == '}') {
+                brace_depth--;
+            }
+            if (*p == '\0' || (*p == ',' && brace_depth == 0)) {
+                scala_parse_import_expr(ctx, part, p);
+                if (*p == '\0') {
+                    break;
+                }
+                part = p + 1;
+            }
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -2729,8 +3028,13 @@ static void parse_spec_imports(CBMExtractCtx *ctx) {
         if (!spec_type_matches(spec->import_node_types, kind)) {
             continue;
         }
+        int first = ctx->result->imports.count;
         if (!try_generic_path_fields(ctx, node)) {
             generic_import_from_text(ctx, node);
+        }
+        /* the statement every row came from (CBMImport.start_byte) */
+        for (int i = first; i < ctx->result->imports.count; i++) {
+            ctx->result->imports.items[i].start_byte = ts_node_start_byte(node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -2975,6 +3279,37 @@ static void parse_embedded_imports(CBMExtractCtx *ctx) {
     }
 }
 
+// Scala chains braceless clauses: `package a` followed by `package b` puts the
+// file's symbols in a.b. Append every directly following braceless
+// package_clause to the namespace already recorded from the first one. A
+// braced clause (`package b { ... }`) scopes only its body and is left alone.
+static void join_chained_scala_packages(CBMExtractCtx *ctx, TSTreeCursor *cursor) {
+    while (ts_tree_cursor_goto_next_sibling(cursor)) {
+        TSNode next = ts_tree_cursor_current_node(cursor);
+        const char *next_kind = ts_node_type(next);
+        if (strcmp(next_kind, "comment") == 0 || strcmp(next_kind, "block_comment") == 0) {
+            continue;
+        }
+        if (strcmp(next_kind, "package_clause") != 0) {
+            return;
+        }
+        TSNode body = next;
+        if (find_first_descendant_of(next, "template_body", &body)) {
+            return;
+        }
+        TSNode name_node = next;
+        if (!find_first_descendant_of(next, "package_identifier", &name_node)) {
+            return;
+        }
+        char *segment = cbm_node_text(ctx->arena, name_node, ctx->source);
+        if (!segment || !segment[0]) {
+            return;
+        }
+        ctx->result->namespace_name =
+            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->result->namespace_name, segment);
+    }
+}
+
 // --- Namespace / package declaration capture ---
 // Java/Kotlin/C#/PHP put the file's symbols inside a namespace/package whose
 // name is NOT reflected in the path-based QN scheme.  Capturing it lets the
@@ -2986,6 +3321,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
                                      "file_scoped_namespace_declaration", // C# 10
                                      "package_declaration",               // Java / Kotlin
                                      "package_header",                    // Kotlin
+                                     "package_clause",                    // Scala
                                      "namespace_definition",              // PHP
                                      NULL};
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -3002,6 +3338,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
         // The namespace name is the first qualified_name / scoped_identifier /
         // namespace_name / identifier descendant.
         static const char *name_kinds[] = {"qualified_name",
+                                           "package_identifier",
                                            "scoped_identifier",
                                            "namespace_name",
                                            "identifier",
@@ -3019,6 +3356,9 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
             }
         }
         if (ctx->result->namespace_name) {
+            if (strcmp(kind, "package_clause") == 0) {
+                join_chained_scala_packages(ctx, &cursor);
+            }
             break;
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -4334,6 +4674,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     switch (ctx->language) {
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
     case CBM_LANG_CSHARP:
     case CBM_LANG_PHP:
         capture_namespace_decl(ctx);
@@ -4361,7 +4702,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_kotlin_imports(ctx);
         break;
     case CBM_LANG_SCALA:
-        parse_generic_imports(ctx, "import_declaration");
+        parse_scala_imports(ctx);
         break;
     case CBM_LANG_CSHARP:
         parse_csharp_imports(ctx);

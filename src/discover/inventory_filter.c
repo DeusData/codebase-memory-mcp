@@ -2,6 +2,8 @@
 #include "discover/discover.h"
 #include "discover/discover_policy_internal.h"
 
+#include <string.h>
+
 static bool cif_match(cif_context *c, const cbm_ignore_program_t *program,
                       cbm_inventory_path_t path, bool directory, cbm_ignore_decision_t *decision) {
     *decision = CBM_IGNORE_NO_OPINION;
@@ -96,29 +98,68 @@ static bool cif_file_reason(cif_context *c, size_t parent, cbm_inventory_path_t 
            cif_ignore_reason(c, parent, path, false, reason);
 }
 
+/* The directory is a Python virtual environment: one of the shared markers is
+ * a file of the inventory (which holds regular files only, never a link). */
+static bool cif_venv(cif_context *c, cbm_inventory_path_t path, bool *venv) {
+    *venv = false;
+    unsigned char buffer[CIF_PATH_MAX + 1];
+    for (size_t m = 0; CBM_DISCOVER_VENV_MARKERS[m] && !*venv; m++) {
+        size_t length = strlen(CBM_DISCOVER_VENV_MARKERS[m]);
+        /* A longer candidate cannot occur in this fully validated inventory. */
+        if (path.length > CIF_PATH_MAX - length - 1) {
+            continue;
+        }
+        if (!cif_copy(c, buffer, path.data, path.length) || !cif_bytes(c, 1)) {
+            return false;
+        }
+        buffer[path.length] = '/';
+        if (!cif_copy(c, buffer + path.length + 1, CBM_DISCOVER_VENV_MARKERS[m], length + 1)) {
+            return false;
+        }
+        size_t index = SIZE_MAX;
+        if (!cif_find_file(c, (cbm_inventory_path_t){buffer, path.length + 1 + length}, &index)) {
+            return false;
+        }
+        *venv = index != SIZE_MAX;
+    }
+    return true;
+}
+
+/* The same decision as discover.c directory_verdict. *config_only: the
+ * directory is kept for its configuration files only (CONFIG_ONLY_DIRS). */
 static bool cif_directory_reason(cif_context *c, size_t parent, cbm_inventory_path_t path,
-                                 cbm_inventory_filter_reason_t *reason) {
+                                 cbm_inventory_filter_reason_t *reason, bool *config_only) {
     const char *name = cif_basename(c->owner, parent, path);
     if (!cif_poll(c)) {
         return false;
     }
-    bool builtin = cbm_should_skip_dir(name, CBM_MODE_FULL);
+    bool venv = false;
+    if (cbm_discover_venv_candidate(name) && !cif_venv(c, path, &venv)) {
+        return false;
+    }
+    bool safety_name = cbm_discover_is_safety_core_directory(name);
+    bool named = cbm_should_skip_dir(name, CBM_MODE_FULL) || venv;
+    bool config = !named && cbm_discover_config_only_dir(name);
+    bool package = (named || config) && !safety_name &&
+                   cbm_discover_path_in_jvm_package((const char *)path.data);
+    bool builtin = named && !package;
+    config = config && !package;
     bool suffix = !builtin && cbm_discover_path_has_skip_suffix((const char *)path.data);
-    bool safety =
-        (builtin || suffix) && c->owner->cbm_program && cbm_discover_is_safety_core_directory(name);
+    bool safety = (builtin || suffix) && c->owner->cbm_program && safety_name;
     if (!cif_poll(c)) {
         return false;
     }
-    if (builtin || suffix) {
+    if (builtin || suffix || config) {
         cbm_ignore_decision_t decision = CBM_IGNORE_NO_OPINION;
         if (!safety && !cif_match(c, c->owner->cbm_program, path, true, &decision)) {
             return false;
         }
-        if (decision != CBM_IGNORE_REINCLUDED) {
+        if (decision != CBM_IGNORE_REINCLUDED && !config) {
             *reason = builtin ? CBM_INVENTORY_FILTER_REASON_DIRECTORY_BUILTIN
                               : CBM_INVENTORY_FILTER_REASON_DIRECTORY_SUFFIX;
             return true;
         }
+        *config_only = decision != CBM_IGNORE_REINCLUDED;
     }
     return cif_ignore_reason(c, parent, path, true, reason);
 }
@@ -131,6 +172,7 @@ static bool cif_file_entry(cif_context *c, size_t parent, size_t file) {
         return false;
     }
     o->rows[file].reason = reason;
+    o->rows[file].config_only = o->directories[parent].config_only;
     if (reason != CBM_INVENTORY_FILTER_REASON_NONE) {
         o->rows[file].disposition = CBM_INVENTORY_FILTER_IGNORED_FILE;
     }
@@ -141,11 +183,14 @@ static bool cif_directory_entry(cif_context *c, size_t parent, size_t directory)
     cbm_inventory_filter_t *o = c->owner;
     c->file_index = SIZE_MAX;
     cbm_inventory_filter_reason_t reason = CBM_INVENTORY_FILTER_REASON_NONE;
-    if (!cif_directory_reason(c, parent, o->directories[directory].path, &reason) ||
+    bool config_only = false;
+    if (!cif_directory_reason(c, parent, o->directories[directory].path, &reason, &config_only) ||
         !cif_bytes(c, 128)) {
         return false;
     }
     o->directories[directory].reason = reason;
+    /* Parents are filtered first, so the inherited flag is final here. */
+    o->directories[directory].config_only = o->directories[parent].config_only || config_only;
     if (reason != CBM_INVENTORY_FILTER_REASON_NONE) {
         o->directories[directory].excluded = directory;
     }

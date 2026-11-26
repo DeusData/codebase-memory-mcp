@@ -64,3 +64,10 @@ it('follows only actual call edges across components and retains their evidence'
     expect(paths[0].edges[0]).toBe(map.evidence[0]);
     expect(entryRoutes(graph.nodes[2], map.evidence)).toEqual([]);
 });
+
+it('keeps token boundaries when dropping markup from repository prose', () => {
+    const quote = sourceQuote('README.md', 'This repository provides useful source browsing and <<script>script> examples for developers.');
+    expect(quote?.text).not.toContain('<script>');
+    expect(sourceQuote('README.md', 'This repository provides useful source<b>browsing</b> for developers.')?.text)
+        .toBe('This repository provides useful source browsing for developers.');
+});

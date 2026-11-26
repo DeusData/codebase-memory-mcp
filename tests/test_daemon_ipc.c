@@ -53,6 +53,15 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
+#if defined(__has_include) && __has_include(<linux/landlock.h>)
+#include <linux/landlock.h> /* #3014 Landlock real smoke. */
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#if defined(SYS_landlock_create_ruleset) && defined(SYS_landlock_add_rule) && \
+    defined(SYS_landlock_restrict_self)
+#define IPC_TEST_HAS_LANDLOCK 1
+#endif
+#endif
 #endif
 #ifdef __APPLE__
 #include <membership.h>
@@ -2211,6 +2220,108 @@ TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen) {
     PASS();
 }
 
+/* #2178: an age-based temp cleaner unlinked the live daemon's lifetime lock
+ * and identity marker. The heartbeat must keep every listener-owned file
+ * young, and report loss (unlink, or replacement by a fresh file at the same
+ * name) so the daemon exits instead of serving under a lifetime file that
+ * coordinates nothing or leaving an unremovable socket pair behind at close. */
+TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlink-while-held of runtime files is POSIX behavior");
+#else
+    enum { TOUCH_CASES = 5 };
+    enum { LOSS_UNLINK, LOSS_REPLACE_FILE, LOSS_REPLACE_SYMLINK };
+    static const char key[] = "2178a2178a2178a0";
+    static const struct {
+        const char *suffix;
+        int loss;
+    } cases[TOUCH_CASES] = {
+        {"lifetime.lock", LOSS_UNLINK},       /* lifetime reservation */
+        {"lock", LOSS_UNLINK},                /* listener-owned participant guard */
+        {"sock.identity", LOSS_UNLINK},       /* identity marker, unlinked */
+        {"sock.identity", LOSS_REPLACE_FILE}, /* ... replaced by a fresh inode */
+        {"sock.identity", LOSS_REPLACE_SYMLINK} /* ... replaced by a symlink */,
+    };
+    const time_t stale = 1000000000;
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    bool started[TOUCH_CASES] = {false};
+    int touched_intact[TOUCH_CASES] = {0};
+    bool refreshed[TOUCH_CASES] = {false};
+    bool lost[TOUCH_CASES] = {false};
+    int touched_after_loss[TOUCH_CASES] = {1, 1, 1, 1, 1};
+    int unreadable_touch = 0;
+    int readable_again_touch = 0;
+
+    if (ipc_test_parent_new(parent, "listener-touch")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    /* A still-valid marker that merely cannot be reopened (EACCES) is a
+     * transient refresh failure, not loss: the daemon must keep serving. */
+    if (endpoint) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        char marker[TEST_PATH_CAP];
+        int written = snprintf(marker, sizeof(marker), "%s/cbm-%s.sock.identity", runtime_dir, key);
+        if (listener && written > 0 && written < (int)sizeof(marker) && chmod(marker, 0) == 0) {
+            unreadable_touch = cbm_daemon_ipc_listener_touch(listener, NULL);
+            readable_again_touch =
+                chmod(marker, 0600) == 0 ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        }
+        cbm_daemon_ipc_listener_close(listener);
+    }
+    for (size_t i = 0; endpoint && i < TOUCH_CASES; i++) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        started[i] = listener != NULL;
+        char path[TEST_PATH_CAP];
+        int written =
+            snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, cases[i].suffix);
+        bool path_ok = started[i] && written > 0 && written < (int)sizeof(path);
+        struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+        bool aged = path_ok && utimensat(AT_FDCWD, path, stale_times, AT_SYMLINK_NOFOLLOW) == 0;
+        touched_intact[i] = aged ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        struct stat after;
+        refreshed[i] = touched_intact[i] == 1 && stat(path, &after) == 0 &&
+                       after.st_atime > stale && after.st_mtime > stale;
+        lost[i] = refreshed[i] && unlink(path) == 0;
+        if (lost[i] && cases[i].loss == LOSS_REPLACE_FILE) {
+            int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            lost[i] = fd >= 0 && close(fd) == 0;
+        } else if (lost[i] && cases[i].loss == LOSS_REPLACE_SYMLINK) {
+            lost[i] = symlink("/dev/null", path) == 0;
+        }
+        touched_after_loss[i] = lost[i] ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        cbm_daemon_ipc_listener_close(listener);
+        /* A tampered marker makes close (correctly) keep the socket pair; clear
+         * this case's simulated leftovers so the next case can listen. */
+        static const char *const leftovers[] = {"sock.identity", "sock", "anc"};
+        for (size_t j = 0; j < sizeof(leftovers) / sizeof(leftovers[0]); j++) {
+            written = snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, leftovers[j]);
+            if (written > 0 && written < (int)sizeof(path)) {
+                (void)unlink(path);
+            }
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    /* Root bypasses mode 0, so the reopen succeeds there and the touch is 1. */
+    ASSERT_EQ(unreadable_touch, geteuid() == 0 ? 1 : -1);
+    ASSERT_EQ(readable_again_touch, 1);
+    for (size_t i = 0; i < TOUCH_CASES; i++) {
+        ASSERT_TRUE(started[i]);
+        ASSERT_EQ(touched_intact[i], 1);
+        ASSERT_TRUE(refreshed[i]);
+        ASSERT_TRUE(lost[i]);
+        ASSERT_EQ(touched_after_loss[i], 0);
+    }
+    PASS();
+#endif
+}
+
 TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window) {
     static const char key[] = "1029384756abcdef";
     char parent[TEST_PATH_CAP] = {0};
@@ -3476,6 +3587,222 @@ TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance) {
     ASSERT_EQ(held_after_child, 1);
     ASSERT_TRUE(parent_transfer_consumed);
     ASSERT_EQ(free_after_close, 0);
+    PASS();
+}
+
+static bool ipc_test_lifetime_lock_path(char out[TEST_PATH_CAP], const char *runtime_dir,
+                                        const char *key) {
+    int written = runtime_dir && key
+                      ? snprintf(out, TEST_PATH_CAP, "%s/cbm-%s.lifetime.lock", runtime_dir, key)
+                      : -1;
+    return written > 0 && written < TEST_PATH_CAP;
+}
+
+/* Child-process verdict on whether the lifetime lock at lock_path is held by
+ * someone else, going straight through open()/fcntl() rather than any of
+ * this codebase's APIs, so a genuinely separate process cannot inherit the
+ * parent's in-process claim registry. Distinguishes three outcomes instead
+ * of collapsing "held" and "could not even check" into the same value:
+ * IPC_TEST_LOCK_HELD only when open() succeeded and F_SETLK failed with
+ * EACCES or EAGAIN (the lock is held by another process, as expected);
+ * IPC_TEST_LOCK_TAKEN when F_SETLK succeeded (the lock was free, a bug);
+ * IPC_TEST_LOCK_ERROR for anything else (open() failed, e.g. a wrong path,
+ * or F_SETLK failed with an errno that says nothing about the lock's
+ * state), which must never be mistaken for IPC_TEST_LOCK_HELD. */
+enum {
+    IPC_TEST_LOCK_HELD = 0,
+    IPC_TEST_LOCK_TAKEN = 1,
+    IPC_TEST_LOCK_ERROR = 3,
+};
+
+static uint8_t ipc_test_lock_child_verdict(const char *lock_path) {
+    int fd = open(lock_path, O_RDWR);
+    if (fd < 0) {
+        return IPC_TEST_LOCK_ERROR;
+    }
+    struct flock record_lock = {
+        .l_type = F_WRLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0,
+    };
+    int lock_result;
+    do {
+        lock_result = fcntl(fd, F_SETLK, &record_lock);
+    } while (lock_result != 0 && errno == EINTR);
+    int lock_errno = errno;
+    (void)close(fd);
+    if (lock_result == 0) {
+        return IPC_TEST_LOCK_TAKEN;
+    }
+    return lock_errno == EACCES || lock_errno == EAGAIN ? IPC_TEST_LOCK_HELD : IPC_TEST_LOCK_ERROR;
+}
+
+TEST(daemon_ipc_posix_lifetime_reservation_probe_does_not_drop_held_lock) {
+    static const char key[] = "c1c1d2d2e3e3f4f4";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char lock_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+    int result_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    uint8_t child_result = 0;
+    int child_status = -1;
+    int acquired = -1;
+    int held_after_first_probe = -1;
+    int held_after_second_probe = -1;
+    int free_after_release = -1;
+    bool lock_path_ok = false;
+
+    if (ipc_test_parent_new(parent, "probe-holds-lock")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        lock_path_ok = ipc_test_lifetime_lock_path(lock_path, runtime_dir, key);
+        acquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &reservation);
+    }
+    if (reservation) {
+        /* Two probes, matching how a real daemon polls its own reservation
+         * repeatedly while running. Each probe of an already-held lock used
+         * to open a throwaway fd on the lock file and close it. Since
+         * fcntl(2) record locks are scoped to (process, inode), that close
+         * silently released the real lock every time, regardless of the
+         * still-open fd the reservation itself is holding. */
+        held_after_first_probe = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+        held_after_second_probe = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    if (reservation && lock_path_ok && pipe(result_pipe) == 0) {
+        child = fork();
+    }
+    if (child == 0) {
+        /* A genuinely independent process, not going through any of this
+         * codebase's APIs so it cannot inherit the parent's in-process
+         * claim registry: try to take the real OS-level lock directly. If
+         * the parent's fcntl lock survived the probes above, this fails. */
+        (void)close(result_pipe[0]);
+        child_result = ipc_test_lock_child_verdict(lock_path);
+        bool reported = ipc_test_fd_write_all(result_pipe[1], &child_result, sizeof(child_result));
+        (void)close(result_pipe[1]);
+        _exit(reported ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(result_pipe[1]);
+        result_pipe[1] = -1;
+        bool received = ipc_test_fd_read_all(result_pipe[0], &child_result, sizeof(child_result));
+        (void)close(result_pipe[0]);
+        result_pipe[0] = -1;
+        if (!received) {
+            child_result = 2;
+        }
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    if (endpoint) {
+        free_after_release = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (result_pipe[index] >= 0) {
+            (void)close(result_pipe[index]);
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_EQ(acquired, 1);
+    ASSERT_TRUE(lock_path_ok);
+    ASSERT_EQ(held_after_first_probe, 1);
+    ASSERT_EQ(held_after_second_probe, 1);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_EQ(child_result, IPC_TEST_LOCK_HELD);
+    ASSERT_EQ(free_after_release, 0);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_lifetime_reservation_try_acquire_again_does_not_drop_held_lock) {
+    static const char key[] = "a1a1b2b2c3c3d4d4";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char lock_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *second_reservation =
+        (cbm_daemon_ipc_lifetime_reservation_t *)(uintptr_t)1;
+    int result_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    uint8_t child_result = 0;
+    int child_status = -1;
+    int acquired = -1;
+    int reacquired = -1;
+    int free_after_release = -1;
+    bool lock_path_ok = false;
+
+    if (ipc_test_parent_new(parent, "try-acquire-again-holds-lock")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        lock_path_ok = ipc_test_lifetime_lock_path(lock_path, runtime_dir, key);
+        acquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &reservation);
+    }
+    if (reservation) {
+        /* This process already holds the lifetime lock. Calling try_acquire
+         * again, still in this process, must trust the in-process registry
+         * alone and return 0 (already held, nothing new to hand back)
+         * without touching the lock file: opening and closing a second fd
+         * on it would drop the fcntl(2) record lock this process already
+         * holds, exactly the way the probe's own fast path used to. */
+        reacquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &second_reservation);
+    }
+    if (reservation && lock_path_ok && pipe(result_pipe) == 0) {
+        child = fork();
+    }
+    if (child == 0) {
+        /* A genuinely independent process, not going through any of this
+         * codebase's APIs so it cannot inherit the parent's in-process
+         * claim registry: try to take the real OS-level lock directly. If
+         * the repeated try_acquire above survived, this fails. */
+        (void)close(result_pipe[0]);
+        child_result = ipc_test_lock_child_verdict(lock_path);
+        bool reported = ipc_test_fd_write_all(result_pipe[1], &child_result, sizeof(child_result));
+        (void)close(result_pipe[1]);
+        _exit(reported ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(result_pipe[1]);
+        result_pipe[1] = -1;
+        bool received = ipc_test_fd_read_all(result_pipe[0], &child_result, sizeof(child_result));
+        (void)close(result_pipe[0]);
+        result_pipe[0] = -1;
+        if (!received) {
+            child_result = 2;
+        }
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    if (endpoint) {
+        free_after_release = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (result_pipe[index] >= 0) {
+            (void)close(result_pipe[index]);
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_EQ(acquired, 1);
+    ASSERT_TRUE(lock_path_ok);
+    ASSERT_EQ(reacquired, 0);
+    ASSERT_TRUE(second_reservation == NULL);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_EQ(child_result, IPC_TEST_LOCK_HELD);
+    ASSERT_EQ(free_after_release, 0);
     PASS();
 }
 
@@ -5076,6 +5403,99 @@ TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor) {
     PASS();
 }
 
+/* #3014: a process confined by Landlock that may not list "/", or any other
+ * ancestor of its private directory, must still be able to secure that
+ * directory. The walk used to open every ancestor O_RDONLY|O_DIRECTORY, which
+ * Landlock counts as listing, so it failed at "/" in any sandbox that handles
+ * LANDLOCK_ACCESS_FS_READ_DIR without granting it on the root; the daemon then
+ * exited with "could not load saved runtime settings".
+ *
+ * The child handles READ_DIR only and is granted it beneath this test's own
+ * parent directory, then creates and secures a private directory below it.
+ * Exit protocol, as the userns smoke: 0 secured, 1 refused, 2 Landlock is not
+ * available in this kernel, 3 the harness could not build its sandbox. */
+TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014) {
+#ifdef IPC_TEST_HAS_LANDLOCK
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    if (ipc_test_parent_new(parent, "private-cache-landlock")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache);
+    }
+    if (!paths_ok) {
+        ipc_test_remove_flat_dir(parent);
+        FAIL("could not create the Landlock smoke's parent directory");
+    }
+
+    pid_t child = fork();
+    if (child == 0) {
+        struct landlock_ruleset_attr ruleset = {.handled_access_fs = LANDLOCK_ACCESS_FS_READ_DIR};
+        int ruleset_fd = (int)syscall(SYS_landlock_create_ruleset, &ruleset, sizeof(ruleset), 0U);
+        if (ruleset_fd < 0) {
+            /* 2: the kernel has no Landlock; 4: the environment refuses it
+             * (EPERM, e.g. a container's seccomp filter); 3: anything else. */
+            _exit(errno == ENOSYS || errno == EOPNOTSUPP ? 2 : errno == EPERM ? 4 : 3);
+        }
+        struct landlock_path_beneath_attr beneath = {
+            .allowed_access = LANDLOCK_ACCESS_FS_READ_DIR,
+            .parent_fd = open(parent, O_PATH | O_CLOEXEC),
+        };
+        if (beneath.parent_fd < 0 ||
+            syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &beneath, 0U) !=
+                0 ||
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+            syscall(SYS_landlock_restrict_self, ruleset_fd, 0U) != 0) {
+            _exit(3);
+        }
+        /* The sandbox must be real, or a pass below would prove nothing:
+         * listing "/" is refused from here on. */
+        int root_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (root_fd >= 0 || errno != EACCES) {
+            _exit(3);
+        }
+        _exit(cbm_daemon_ipc_private_directory_secure(cache) ? 0 : 1);
+    }
+    int status = 0;
+    if (child > 0) {
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+    struct stat secured = {0};
+    bool hardened = lstat(cache, &secured) == 0 && S_ISDIR(secured.st_mode) &&
+                    secured.st_uid == geteuid() && (secured.st_mode & 07777) == 0700;
+    (void)rmdir(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    if (child < 0) {
+        FAIL("fork failed for the Landlock smoke");
+    }
+    if (!WIFEXITED(status)) {
+        FAIL("Landlock probe did not exit normally (signalled) -- not a security verdict");
+    }
+    if (WEXITSTATUS(status) == 2) {
+        SKIP_PLATFORM("Landlock is not available in this Linux kernel");
+    }
+    if (WEXITSTATUS(status) == 4) {
+        SKIP_PLATFORM("this environment refuses Landlock (EPERM from landlock_create_ruleset, "
+                      "e.g. a container's seccomp filter); the sandbox cannot be built here");
+    }
+    if (WEXITSTATUS(status) == 3) {
+        FAIL("Landlock smoke could not build a sandbox that refuses listing /");
+    }
+    if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
+        char unexpected[128];
+        (void)snprintf(unexpected, sizeof(unexpected),
+                       "Landlock probe exited %d -- not a security verdict", WEXITSTATUS(status));
+        FAIL(unexpected);
+    }
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    ASSERT_TRUE(hardened);
+    PASS();
+#else
+    SKIP_PLATFORM("Landlock needs Linux with <linux/landlock.h> and the landlock syscall numbers");
+#endif
+}
+
 TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only) {
     char parent[TEST_PATH_CAP] = {0};
     char logs[TEST_PATH_CAP] = {0};
@@ -5868,6 +6288,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_rejects_uppercase_instance_key);
     RUN_TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy);
     RUN_TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen);
+    RUN_TEST(daemon_ipc_listener_touch_detects_lost_runtime_files);
     RUN_TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window);
     RUN_TEST(daemon_ipc_local_frame_roundtrip);
     RUN_TEST(daemon_ipc_bounded_receive_rejects_oversize_before_payload);
@@ -5896,6 +6317,8 @@ SUITE(daemon_ipc) {
 #endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
+    RUN_TEST(daemon_ipc_posix_lifetime_reservation_probe_does_not_drop_held_lock);
+    RUN_TEST(daemon_ipc_posix_lifetime_reservation_try_acquire_again_does_not_drop_held_lock);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);
     RUN_TEST(daemon_ipc_posix_publication_boundaries_recover_from_crash);
     RUN_TEST(daemon_ipc_posix_record_publication_windows_recover_from_crash);
@@ -5919,6 +6342,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_log_creates_first_ever_cache_tree_safely);
     RUN_TEST(daemon_ipc_posix_private_directory_hardens_existing_cache_root);
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
+    RUN_TEST(daemon_ipc_linux_private_directory_secures_inside_landlock_issue3014);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
 #ifndef _WIN32

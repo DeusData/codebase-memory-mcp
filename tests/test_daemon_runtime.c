@@ -8,6 +8,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "test_daemon_runtime_contract.h"
+#include "test_image_probe.h"
 
 #include "daemon/application.h"
 #include "daemon/host.h"
@@ -37,6 +38,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include "foundation/subprocess.h" /* cbm_build_win_cmdline */
 #include "foundation/win_utf8.h"
 #include <stddef.h>
 #include <windows.h>
@@ -505,6 +507,37 @@ static bool runtime_test_copy_self_image(const char *destination) {
 #endif
 }
 
+/* The image probe beside this runner (tests/test_image_probe.h): the small
+ * executable the copied-image tests copy, hash and run instead of this runner.
+ * NULL, said once on stderr, when it was not built. */
+static const char *runtime_test_probe_image(void) {
+    static char path[RUNTIME_TEST_PATH_CAP];
+    if (!path[0] && !th_image_probe_path(path, sizeof(path))) {
+        fprintf(stderr, "daemon_runtime: no image probe beside this runner; it is built "
+                        "with the runner (Makefile.cbm, <runner>-image-probe)\n");
+        return NULL;
+    }
+    return path;
+}
+
+static bool runtime_test_copy_probe_image(const char *destination) {
+    const char *probe = runtime_test_probe_image();
+#ifdef _WIN32
+    wchar_t *source_wide = probe && destination ? cbm_path_to_wide(probe) : NULL;
+    wchar_t *destination_wide = source_wide ? cbm_path_to_wide(destination) : NULL;
+    bool copied = destination_wide && CopyFileW(source_wide, destination_wide, TRUE) != 0;
+    free(destination_wide);
+    free(source_wide);
+    return copied;
+#elif defined(__APPLE__) || defined(__linux__)
+    return probe && destination && runtime_test_copy_executable(probe, destination);
+#else
+    (void)probe;
+    (void)destination;
+    return false;
+#endif
+}
+
 static bool runtime_test_paths_refer_to_same_file(const char *left, const char *right) {
     enum { CANONICAL_CAP = 4096 };
     char left_canonical[CANONICAL_CAP];
@@ -908,7 +941,8 @@ static void *runtime_application_client_request_thread(void *opaque) {
     call->status = call->tagged
                        ? cbm_daemon_runtime_client_application_request_tagged(
                              call->client, call->request_token, call->request, call->request_length,
-                             &call->response, &call->response_length, RUNTIME_TEST_TIMEOUT_MS)
+                             &call->response, &call->response_length, NULL,
+                             RUNTIME_TEST_TIMEOUT_MS)
                        : cbm_daemon_runtime_client_application_request(
                              call->client, call->request, call->request_length, &call->response,
                              &call->response_length, RUNTIME_TEST_TIMEOUT_MS);
@@ -1272,10 +1306,24 @@ static bool runtime_test_fixture_start_failed(const char *tag, const char *stage
 
 static bool runtime_test_fixture_permanent = false;
 
-static bool runtime_test_fixture_start_configured(
-    runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
-    uint32_t max_clients, uint64_t lease_timeout_ms,
-    const cbm_daemon_runtime_application_callbacks_t *application) {
+typedef struct {
+    cbm_version_cohort_manager_t *manager;
+    cbm_version_cohort_lease_t *lease;
+    cbm_daemon_ipc_participant_guard_t *guard;
+    cbm_version_cohort_daemon_claim_t *claim;
+    bool held;
+} runtime_test_coordination_t;
+
+/* When set, the fixture takes the host's coordination handles in the host's
+ * order before starting the service: cohort admission refuses once a
+ * generation is already serving. Unlike the host's start_reserved, the
+ * fixture's convenience start also joins a service-owned participant guard. */
+static runtime_test_coordination_t *runtime_test_fixture_coordination = NULL;
+
+/* The private parent, rendezvous key, endpoint and log paths of a fixture,
+ * before any daemon serves it: shared by the in-process service below and the
+ * image probe's daemon (runtime_test_probe_daemon_start). */
+static bool runtime_test_fixture_prepare(runtime_test_fixture_t *fixture, const char *tag) {
     memset(fixture, 0, sizeof(*fixture));
     if (!th_secure_runtime_parent_new(fixture->parent, sizeof(fixture->parent), tag)) {
         return runtime_test_fixture_start_failed(tag, "temporary-directory",
@@ -1310,7 +1358,16 @@ static bool runtime_test_fixture_start_configured(
     if (lock_written <= 0 || lock_written >= (int)sizeof(fixture->lock_log_path)) {
         return runtime_test_fixture_start_failed(tag, "lock-log-path", lock_written);
     }
+    return true;
+}
 
+static bool runtime_test_fixture_start_configured(
+    runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
+    uint32_t max_clients, uint64_t lease_timeout_ms,
+    const cbm_daemon_runtime_application_callbacks_t *application) {
+    if (!runtime_test_fixture_prepare(fixture, tag)) {
+        return false;
+    }
     cbm_daemon_runtime_service_config_t config = {
         .endpoint = fixture->endpoint,
         .identity = *identity,
@@ -1326,6 +1383,19 @@ static bool runtime_test_fixture_start_configured(
     };
     if (application) {
         config.application = *application;
+    }
+    runtime_test_coordination_t *coordination = runtime_test_fixture_coordination;
+    if (coordination) {
+        cbm_daemon_conflict_t conflict;
+        coordination->manager = cbm_version_cohort_manager_new(fixture->endpoint);
+        coordination->held =
+            coordination->manager &&
+            cbm_version_cohort_acquire(coordination->manager, identity, cbm_now_ms() + 5000,
+                                       &coordination->lease, &conflict) == CBM_VERSION_COHORT_OK &&
+            cbm_daemon_ipc_participant_guard_try_join(fixture->endpoint, &coordination->guard) ==
+                1 &&
+            cbm_version_cohort_daemon_claim_acquire(coordination->manager, &coordination->claim) ==
+                CBM_VERSION_COHORT_OK;
     }
     fixture->service = cbm_daemon_runtime_service_start(&config);
     if (!fixture->service) {
@@ -1380,6 +1450,110 @@ TEST(daemon_runtime_convenience_service_owns_participant_guard) {
     PASS();
 }
 
+#ifndef _WIN32
+/* The runtime's threads log concurrently while the loop stops the service, so
+ * the sink only sets flags. */
+static atomic_bool runtime_test_coordination_lost_logged;
+static atomic_bool runtime_test_window_expired_logged;
+
+static void runtime_test_lifetime_log_sink(const char *line) {
+    /* Substrings, not key=value spelling, so text and JSON formats both match. */
+    if (line && strstr(line, "daemon.lifetime_end") && strstr(line, "coordination_file_lost") &&
+        strstr(line, "cohort_lease")) {
+        atomic_store(&runtime_test_coordination_lost_logged, true);
+    }
+    if (line && strstr(line, "initial_window_expired")) {
+        atomic_store(&runtime_test_window_expired_logged, true);
+    }
+}
+#endif
+
+/* #2178: the host lifetime loop must refresh every held coordination file on
+ * its tick and stop the generation once one is lost. The claim marker is aged
+ * and the cohort lifetime lock unlinked: the tick must refresh the marker
+ * through its held handle, name the lease (touched after the claim) as lost,
+ * and stop the runtime. */
+TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlinking a held lock file is POSIX behavior");
+#else
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    identity.cache_fingerprint = RUNTIME_CACHE_A; /* cohort admission requires one */
+    runtime_test_fixture_t fixture;
+    runtime_test_coordination_t coordination = {0};
+    runtime_test_fixture_coordination = &coordination;
+    bool started = runtime_test_fixture_start(&fixture, "coordination-loss", &identity);
+    runtime_test_fixture_coordination = NULL;
+    bool held = coordination.held;
+
+    char marker[RUNTIME_TEST_PATH_CAP];
+    char lifetime[RUNTIME_TEST_PATH_CAP];
+    int marker_written = snprintf(marker, sizeof(marker), "%s/cbm-version-cohort-daemon-v1.lock",
+                                  fixture.runtime_dir);
+    int lifetime_written = snprintf(lifetime, sizeof(lifetime),
+                                    "%s/cbm-version-cohort-lifetime-v1.lock", fixture.runtime_dir);
+    const time_t stale = 1000000000;
+    struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+    bool staged = held && marker_written > 0 && marker_written < (int)sizeof(marker) &&
+                  lifetime_written > 0 && lifetime_written < (int)sizeof(lifetime) &&
+                  utimensat(AT_FDCWD, marker, stale_times, 0) == 0 && unlink(lifetime) == 0;
+
+    bool loop_ok = false;
+    if (staged) {
+        atomic_store(&runtime_test_coordination_lost_logged, false);
+        atomic_store(&runtime_test_window_expired_logged, false);
+        CBMLogLevel previous_log_level = cbm_log_get_level();
+        cbm_log_set_level(CBM_LOG_INFO);
+        cbm_log_set_sink(runtime_test_lifetime_log_sink);
+        loop_ok = cbm_daemon_host_wait_for_lifetime_for_test(fixture.service, fixture.endpoint,
+                                                             coordination.lease, coordination.claim,
+                                                             coordination.guard);
+        cbm_log_set_sink(NULL);
+        cbm_log_set_level(previous_log_level);
+    }
+    cbm_daemon_runtime_service_state_t state =
+        started ? cbm_daemon_runtime_service_state(fixture.service)
+                : CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    struct stat marker_status = {0};
+    bool marker_refreshed = staged && stat(marker, &marker_status) == 0 &&
+                            marker_status.st_mtime > stale && marker_status.st_atime > stale;
+
+    /* Host teardown order: service first, then guard, claim and lease. Every
+     * handle references the endpoint, which the fixture frees. */
+    if (started && state != CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
+        (void)cbm_daemon_runtime_service_stop(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (fixture.service && cbm_daemon_runtime_service_free(fixture.service)) {
+        fixture.service = NULL;
+    }
+    (void)cbm_daemon_ipc_participant_guard_release(&coordination.guard);
+    while (coordination.claim && cbm_version_cohort_daemon_claim_release(&coordination.claim) !=
+                                     CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (coordination.lease &&
+           cbm_version_cohort_lease_release(&coordination.lease) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    while (coordination.manager &&
+           cbm_version_cohort_manager_free(&coordination.manager) != CBM_PRIVATE_FILE_LOCK_OK) {
+        cbm_usleep(1000);
+    }
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(staged);
+    ASSERT_TRUE(loop_ok);
+    ASSERT_EQ(state, CBM_DAEMON_RUNTIME_SERVICE_EXITED);
+    ASSERT_TRUE(marker_refreshed);
+    ASSERT_TRUE(atomic_load(&runtime_test_coordination_lost_logged));
+    ASSERT_FALSE(atomic_load(&runtime_test_window_expired_logged));
+    PASS();
+#endif
+}
+
 static bool runtime_test_fixture_start_application(runtime_test_fixture_t *fixture, const char *tag,
                                                    const cbm_daemon_build_identity_t *identity,
                                                    runtime_application_context_t *context) {
@@ -1415,6 +1589,306 @@ static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
     (void)cbm_rmdir(fixture->runtime_dir);
     (void)cbm_rmdir(fixture->parent);
     memset(fixture, 0, sizeof(*fixture));
+}
+
+/* ── The image probe's daemon ────────────────────────────────────────────
+ * The copied-image tests need a daemon whose peers are separately executed
+ * copies of the daemon's own image. A runtime service starts only with its own
+ * image's fingerprint as identity, so that daemon runs in the small image
+ * probe (__cbm_runtime_serve, tests/image_probe_roles.c), not in this runner:
+ * it fingerprints every peer copy before answering, and a copy of this
+ * ~800 MB sanitized runner took 70-95 s per hash on some hosted x86 CPUs, past
+ * the clients' exchange budget. Paths, key, endpoint and cleanup are the
+ * in-process fixture's (its .service stays NULL); the daemon is driven over
+ * its stdin and stdout, and nothing here waits on a clock: every read ends on
+ * a reply or on EOF when the probe is gone. */
+typedef struct {
+    runtime_test_fixture_t fixture;
+    char build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]; /* its identity: the probe's fingerprint */
+    bool spawned;
+#ifdef _WIN32
+    HANDLE process;
+    HANDLE commands; /* the probe's stdin */
+    HANDLE replies;  /* the probe's stdout */
+#else
+    pid_t process;
+    int commands;
+    int replies;
+#endif
+} runtime_test_probe_daemon_t;
+
+#ifdef _WIN32
+/* Start argv with exactly the two pipe ends (and a duplicate of this runner's
+ * stderr, when there is one) inherited, as tf_rss_tree_start_descendant does. */
+static bool runtime_test_probe_daemon_spawn(runtime_test_probe_daemon_t *daemon,
+                                            const char *const *argv) {
+    SECURITY_ATTRIBUTES inheritable;
+    memset(&inheritable, 0, sizeof(inheritable));
+    inheritable.nLength = sizeof(inheritable);
+    inheritable.bInheritHandle = TRUE;
+    HANDLE child_input = NULL;
+    HANDLE commands = NULL;
+    HANDLE replies = NULL;
+    HANDLE child_output = NULL;
+    HANDLE child_error = NULL;
+    bool piped = CreatePipe(&child_input, &commands, &inheritable, 0) &&
+                 CreatePipe(&replies, &child_output, &inheritable, 0) &&
+                 SetHandleInformation(commands, HANDLE_FLAG_INHERIT, 0) &&
+                 SetHandleInformation(replies, HANDLE_FLAG_INHERIT, 0);
+    HANDLE error = GetStdHandle(STD_ERROR_HANDLE);
+    if (piped && error && error != INVALID_HANDLE_VALUE &&
+        !DuplicateHandle(GetCurrentProcess(), error, GetCurrentProcess(), &child_error, 0, TRUE,
+                         DUPLICATE_SAME_ACCESS)) {
+        child_error = NULL; /* the probe then runs without a stderr */
+    }
+    char command_line[RUNTIME_TEST_PATH_CAP * 4];
+    bool built = piped && cbm_build_win_cmdline(command_line, sizeof(command_line), argv);
+    wchar_t *application = built ? cbm_path_to_wide(argv[0]) : NULL;
+    wchar_t *command = application ? cbm_utf8_to_wide(command_line) : NULL;
+    HANDLE inherit[3] = {child_input, child_output, child_error};
+    DWORD inherit_count = child_error ? 3U : 2U;
+    SIZE_T attrs_size = 0;
+    (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs =
+        command ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attrs_size) : NULL;
+    bool attrs_init = attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
+    bool attrs_ready =
+        attrs_init && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                                inherit, inherit_count * sizeof(HANDLE), NULL,
+                                                NULL);
+    STARTUPINFOEXW startup;
+    memset(&startup, 0, sizeof(startup));
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = child_input;
+    startup.StartupInfo.hStdOutput = child_output;
+    startup.StartupInfo.hStdError = child_error;
+    startup.lpAttributeList = attrs;
+    PROCESS_INFORMATION process;
+    memset(&process, 0, sizeof(process));
+    bool started = attrs_ready &&
+                   CreateProcessW(application, command, NULL, NULL, TRUE,
+                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL,
+                                  &startup.StartupInfo, &process) != 0;
+    if (attrs_init) {
+        DeleteProcThreadAttributeList(attrs);
+    }
+    free(attrs);
+    free(command);
+    free(application);
+    HANDLE child_ends[3] = {child_input, child_output, child_error};
+    for (size_t i = 0; i < 3U; i++) {
+        if (child_ends[i]) {
+            (void)CloseHandle(child_ends[i]);
+        }
+    }
+    if (!started) {
+        if (commands) {
+            (void)CloseHandle(commands);
+        }
+        if (replies) {
+            (void)CloseHandle(replies);
+        }
+        return false;
+    }
+    (void)CloseHandle(process.hThread);
+    daemon->process = process.hProcess;
+    daemon->commands = commands;
+    daemon->replies = replies;
+    return true;
+}
+#elif defined(__APPLE__) || defined(__linux__)
+/* posix_spawn, not fork, for the reason runtime_test_spawn_blocked_executable
+ * gives. This runner's pipe ends are close-on-exec, so no later child holds
+ * the daemon's stdin open past its release. */
+static bool runtime_test_probe_daemon_spawn(runtime_test_probe_daemon_t *daemon,
+                                            const char *const *argv) {
+    int commands[2] = {-1, -1};
+    int replies[2] = {-1, -1};
+    if (pipe(commands) != 0) {
+        return false;
+    }
+    if (pipe(replies) != 0) {
+        (void)close(commands[0]);
+        (void)close(commands[1]);
+        return false;
+    }
+    bool private_ends = fcntl(commands[1], F_SETFD, FD_CLOEXEC) == 0 &&
+                        fcntl(replies[0], F_SETFD, FD_CLOEXEC) == 0;
+    posix_spawn_file_actions_t actions;
+    bool actions_ready = private_ends && posix_spawn_file_actions_init(&actions) == 0;
+    bool actions_set = actions_ready &&
+                       posix_spawn_file_actions_adddup2(&actions, commands[0], STDIN_FILENO) == 0 &&
+                       posix_spawn_file_actions_adddup2(&actions, replies[1], STDOUT_FILENO) == 0 &&
+                       posix_spawn_file_actions_addclose(&actions, commands[0]) == 0 &&
+                       posix_spawn_file_actions_addclose(&actions, replies[1]) == 0;
+    pid_t child = -1;
+    bool started = actions_set && posix_spawn(&child, argv[0], &actions, NULL,
+                                              (char *const *)argv, environ) == 0;
+    if (actions_ready) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+    }
+    (void)close(commands[0]);
+    (void)close(replies[1]);
+    if (!started) {
+        (void)close(commands[1]);
+        (void)close(replies[0]);
+        return false;
+    }
+    daemon->process = child;
+    daemon->commands = commands[1];
+    daemon->replies = replies[0];
+    return true;
+}
+#else
+static bool runtime_test_probe_daemon_spawn(runtime_test_probe_daemon_t *daemon,
+                                            const char *const *argv) {
+    (void)daemon;
+    (void)argv;
+    return false;
+}
+#endif
+
+/* One reply line, without its line end. false on EOF (the probe is gone), a
+ * read error, or a line longer than cap. */
+static bool runtime_test_probe_daemon_read_line(runtime_test_probe_daemon_t *daemon, char *line,
+                                                size_t cap) {
+    size_t used = 0;
+    bool fits = cap > 0;
+    for (;;) {
+        char ch = 0;
+#ifdef _WIN32
+        DWORD got = 0;
+        if (!ReadFile(daemon->replies, &ch, 1, &got, NULL) || got != 1) {
+            return false;
+        }
+#else
+        ssize_t got = read(daemon->replies, &ch, 1);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got != 1) {
+            return false;
+        }
+#endif
+        if (ch == '\n') {
+            if (fits) {
+                line[used] = '\0';
+            }
+            return fits;
+        }
+        if (ch != '\r' && fits && used + 1 < cap) {
+            line[used++] = ch;
+        } else if (ch != '\r') {
+            fits = false;
+        }
+    }
+}
+
+static bool runtime_test_probe_daemon_send(runtime_test_probe_daemon_t *daemon, char command) {
+#ifdef _WIN32
+    DWORD written = 0;
+    return WriteFile(daemon->commands, &command, 1, &written, NULL) != 0 && written == 1;
+#else
+    /* A probe that is already gone must fail the test, not kill the runner
+     * with SIGPIPE: ignore it for this one write, as test_subprocess does. */
+    struct sigaction ignore;
+    struct sigaction previous;
+    memset(&ignore, 0, sizeof(ignore));
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    if (sigaction(SIGPIPE, &ignore, &previous) != 0) {
+        return false;
+    }
+    ssize_t written;
+    do {
+        written = write(daemon->commands, &command, 1);
+    } while (written < 0 && errno == EINTR);
+    bool restored = sigaction(SIGPIPE, &previous, NULL) == 0;
+    return written == 1 && restored;
+#endif
+}
+
+/* Start the probe's daemon in a fresh fixture: true once it reported "ready"
+ * with its fingerprint, which then is daemon->build. with_owner also holds a
+ * committed session of the active image inside the probe. */
+static bool runtime_test_probe_daemon_start(runtime_test_probe_daemon_t *daemon, const char *tag,
+                                            const char *version, bool with_owner) {
+    memset(daemon, 0, sizeof(*daemon));
+    const char *probe = runtime_test_probe_image();
+    if (!probe) {
+        return runtime_test_fixture_start_failed(tag, "image-probe", 0);
+    }
+    if (!runtime_test_fixture_prepare(&daemon->fixture, tag)) {
+        return false;
+    }
+    const char *argv[] = {probe,
+                          "__cbm_runtime_serve",
+                          daemon->fixture.parent,
+                          daemon->fixture.key,
+                          version,
+                          with_owner ? "1" : "0",
+                          NULL};
+    daemon->spawned = runtime_test_probe_daemon_spawn(daemon, argv);
+    if (!daemon->spawned) {
+        return runtime_test_fixture_start_failed(tag, "image-probe-spawn",
+                                                 runtime_test_last_os_error());
+    }
+    char line[CBM_DAEMON_BUILD_FINGERPRINT_SIZE + 16] = {0};
+    bool answered = runtime_test_probe_daemon_read_line(daemon, line, sizeof(line));
+    bool ready = answered && strncmp(line, "ready ", 6) == 0 && runtime_test_is_fingerprint(line + 6);
+    if (!ready) {
+        printf("  image probe daemon did not start: tag=%s reply=%s\n", tag,
+               answered ? line : "(none: the probe exited)");
+        return false;
+    }
+    memcpy(daemon->build, line + 6, CBM_DAEMON_BUILD_FINGERPRINT_SIZE);
+    return true;
+}
+
+/* Ask the daemon one question ('i' owner interrupted, 'x' exited by itself):
+ * true when it answered, the answer in *answer. */
+static bool runtime_test_probe_daemon_ask(runtime_test_probe_daemon_t *daemon, char command,
+                                          bool *answer) {
+    char line[8] = {0};
+    bool answered = daemon->spawned && runtime_test_probe_daemon_send(daemon, command) &&
+                    runtime_test_probe_daemon_read_line(daemon, line, sizeof(line)) &&
+                    (strcmp(line, "0") == 0 || strcmp(line, "1") == 0);
+    *answer = answered && line[0] == '1';
+    return answered;
+}
+
+/* Release the daemon (EOF on its stdin), reap it and remove the fixture's
+ * paths. Returns its exit code, or -1 when it never ran or did not exit
+ * normally. Safe on a daemon whose start failed, and on a memset one. */
+static int runtime_test_probe_daemon_finish(runtime_test_probe_daemon_t *daemon) {
+    int exit_code = -1;
+    if (daemon->spawned) {
+#ifdef _WIN32
+        (void)CloseHandle(daemon->commands);
+        bool waited = runtime_test_windows_wait_image_probe(daemon->process);
+        DWORD code = 0;
+        if (waited && GetExitCodeProcess(daemon->process, &code) != 0 && code <= INT_MAX) {
+            exit_code = (int)code;
+        }
+        (void)CloseHandle(daemon->process);
+        (void)CloseHandle(daemon->replies);
+#elif defined(__APPLE__) || defined(__linux__)
+        (void)close(daemon->commands);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(daemon->process, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == daemon->process && WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
+        (void)close(daemon->replies);
+#endif
+        daemon->spawned = false;
+    }
+    runtime_test_fixture_finish(&daemon->fixture);
+    return exit_code;
 }
 
 static bool runtime_test_read_log(const char *path, char out[RUNTIME_TEST_LOG_CAP]) {
@@ -2191,8 +2665,6 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
 
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
 TEST(daemon_runtime_activation_accepts_authenticated_different_build) {
-    cbm_daemon_build_identity_t active_identity =
-        runtime_test_identity("2.4.0", runtime_test_self_build());
     char directory[RUNTIME_TEST_PATH_CAP] = {0};
     char foreign_image[RUNTIME_TEST_PATH_CAP] = {0};
     int directory_written =
@@ -2202,8 +2674,12 @@ TEST(daemon_runtime_activation_accepts_authenticated_different_build) {
     int image_written = directory_created ? snprintf(foreign_image, sizeof(foreign_image),
                                                      "%s/foreign-activation", directory)
                                           : -1;
+    /* The active daemon and the foreign requester are both the image probe
+     * (runtime_test_probe_daemon_t): the daemon hashes the requester's image
+     * to authenticate its claimed build, over a few MB instead of a copy of
+     * this runner. */
     bool copied = image_written > 0 && image_written < (int)sizeof(foreign_image) &&
-                  runtime_test_copy_self_image(foreign_image);
+                  runtime_test_copy_probe_image(foreign_image);
 #ifdef __APPLE__
     /* Appending an overlay invalidates Mach-O strict validation. A distinct
      * signing identifier changes the executable bytes while keeping the copy
@@ -2217,38 +2693,28 @@ TEST(daemon_runtime_activation_accepts_authenticated_different_build) {
     char foreign_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     bool fingerprinted =
         runnable && cbm_daemon_build_fingerprint_file(foreign_image, foreign_build);
-    bool differs = fingerprinted && strcmp(foreign_build, active_identity.build_fingerprint) != 0;
     cbm_daemon_build_identity_t foreign_identity = runtime_test_identity("9.9.9", foreign_build);
 
-    /* Finalize the foreign executable before the runtime starts any worker
-     * threads. In particular, macOS code signing is an external process; the
-     * test must not fork that helper from the live multithreaded daemon. The
-     * immutable signed copy remains the actual peer image authenticated by
-     * the activation request below. */
-    runtime_test_fixture_t fixture;
-    memset(&fixture, 0, sizeof(fixture));
-    bool started =
-        differs && runtime_test_fixture_start(&fixture, "activation-foreign", &active_identity);
-    cbm_daemon_runtime_connect_result_t owner_result = {0};
-    cbm_daemon_runtime_client_t *owner = NULL;
-    if (started) {
-        owner = cbm_daemon_runtime_client_connect(fixture.endpoint, &active_identity,
-                                                  RUNTIME_TEST_TIMEOUT_MS, &owner_result);
-    }
+    /* The foreign executable is final before the daemon starts; macOS code
+     * signing above is an external process. The immutable signed copy remains
+     * the actual peer image authenticated by the activation request below.
+     * The daemon holds one committed owner session of its own image. */
+    runtime_test_probe_daemon_t daemon;
+    memset(&daemon, 0, sizeof(daemon));
+    bool started = fingerprinted &&
+                   runtime_test_probe_daemon_start(&daemon, "activation-foreign", "2.4.0", true);
+    bool differs = started && strcmp(foreign_build, daemon.build) != 0;
     int foreign_exit = -1;
     bool foreign_ran =
-        owner && differs &&
-        runtime_test_run_activation_image(foreign_image, &fixture, &foreign_identity,
+        differs &&
+        runtime_test_run_activation_image(foreign_image, &daemon.fixture, &foreign_identity,
                                           CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL, &foreign_exit);
-    bool owner_interrupted = owner && foreign_ran &&
-                             !cbm_daemon_runtime_client_heartbeat(owner, RUNTIME_TEST_TIMEOUT_MS);
-    if (owner) {
-        (void)cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
-        owner = NULL;
-    }
-    bool exited =
-        started && cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
-    runtime_test_fixture_finish(&fixture);
+    bool owner_interrupted = false;
+    bool interrupted_asked =
+        foreign_ran && runtime_test_probe_daemon_ask(&daemon, 'i', &owner_interrupted);
+    bool exited = false;
+    bool exited_asked = started && runtime_test_probe_daemon_ask(&daemon, 'x', &exited);
+    int daemon_exit = runtime_test_probe_daemon_finish(&daemon);
     if (image_written > 0 && image_written < (int)sizeof(foreign_image)) {
         (void)cbm_unlink(foreign_image);
     }
@@ -2256,18 +2722,20 @@ TEST(daemon_runtime_activation_accepts_authenticated_different_build) {
         (void)cbm_rmdir(directory);
     }
 
-    ASSERT_TRUE(started);
-    ASSERT_EQ(owner_result.status, CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED);
     ASSERT_TRUE(directory_created);
     ASSERT_TRUE(copied);
     ASSERT_TRUE(changed);
     ASSERT_TRUE(runnable);
     ASSERT_TRUE(fingerprinted);
+    ASSERT_TRUE(started);
     ASSERT_TRUE(differs);
     ASSERT_TRUE(foreign_ran);
     ASSERT_EQ(foreign_exit, 0);
+    ASSERT_TRUE(interrupted_asked);
     ASSERT_TRUE(owner_interrupted);
+    ASSERT_TRUE(exited_asked);
     ASSERT_TRUE(exited);
+    ASSERT_EQ(daemon_exit, 0);
     PASS();
 }
 #endif
@@ -3455,7 +3923,7 @@ TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal) {
         cancel = cbm_daemon_runtime_client_application_cancel(client, request_token);
         cancelled_status = cbm_daemon_runtime_client_application_request_tagged(
             client, request_token, blocking_request, (uint32_t)sizeof(blocking_request),
-            &cancelled_response, &cancelled_response_length, RUNTIME_TEST_TIMEOUT_MS);
+            &cancelled_response, &cancelled_response_length, NULL, RUNTIME_TEST_TIMEOUT_MS);
     }
     if (cancelled_status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED) {
         next_status = cbm_daemon_runtime_client_application_request(
@@ -3512,8 +3980,10 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     bool first_reserved = false;
     bool duplicate_reservation_rejected = false;
     bool first_exact = false;
+    bool first_sent = false;
     bool second_reserved = false;
     bool second_exact = false;
+    bool second_sent = false;
     bool closed = false;
     bool exited = false;
 
@@ -3533,7 +4003,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, first_token, first_request, (uint32_t)sizeof(first_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &first_sent, RUNTIME_TEST_TIMEOUT_MS);
         first_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                       response_length == sizeof(first_request) && response &&
                       memcmp(response, first_request, sizeof(first_request)) == 0;
@@ -3549,7 +4019,7 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
         cbm_daemon_runtime_application_status_t status =
             cbm_daemon_runtime_client_application_request_tagged(
                 client, second_token, second_request, (uint32_t)sizeof(second_request), &response,
-                &response_length, RUNTIME_TEST_TIMEOUT_MS);
+                &response_length, &second_sent, RUNTIME_TEST_TIMEOUT_MS);
         second_exact = status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
                        response_length == sizeof(second_request) && response &&
                        memcmp(response, second_request, sizeof(second_request)) == 0;
@@ -3568,9 +4038,11 @@ TEST(daemon_runtime_allows_only_one_unstarted_application_token) {
     ASSERT_TRUE(first_reserved);
     ASSERT_TRUE(duplicate_reservation_rejected);
     ASSERT_TRUE(first_exact);
+    ASSERT_TRUE(first_sent);
     ASSERT_TRUE(second_reserved);
     ASSERT_EQ(second_token, first_token + 1U);
     ASSERT_TRUE(second_exact);
+    ASSERT_TRUE(second_sent);
     ASSERT_TRUE(closed);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.requests), 2);
@@ -3670,6 +4142,10 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     uint8_t *response = NULL;
     uint32_t response_length = 0;
     cbm_daemon_runtime_application_status_t status = CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    cbm_daemon_runtime_application_token_t request_token =
+        CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+    bool token_reserved = false;
+    bool request_sent = true;
     bool close_begun = false;
     bool duplicate_begin_rejected = false;
     bool close_acknowledged = false;
@@ -3680,6 +4156,8 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
                                                    RUNTIME_TEST_TIMEOUT_MS, &result);
     }
     if (client) {
+        token_reserved =
+            cbm_daemon_runtime_client_application_token_reserve(client, &request_token);
         close_begun = cbm_daemon_runtime_client_close_begin(client);
         duplicate_begin_rejected = close_begun && !cbm_daemon_runtime_client_close_begin(client);
     }
@@ -3687,9 +4165,9 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
         /* Deterministically models the frontend boundary where close begins
          * after a worker claims an item but before it enters the runtime API.
          * The retained allocation must reject the call without touching IPC. */
-        status = cbm_daemon_runtime_client_application_request(
-            client, request, (uint32_t)sizeof(request), &response, &response_length,
-            RUNTIME_TEST_TIMEOUT_MS);
+        status = cbm_daemon_runtime_client_application_request_tagged(
+            client, request_token, request, (uint32_t)sizeof(request), &response, &response_length,
+            &request_sent, RUNTIME_TEST_TIMEOUT_MS);
         close_acknowledged =
             cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS);
         client = NULL;
@@ -3707,11 +4185,13 @@ TEST(daemon_runtime_close_begin_retains_storage_and_rejects_late_exchange) {
     runtime_test_fixture_finish(&fixture);
 
     ASSERT_TRUE(started);
+    ASSERT_TRUE(token_reserved);
     ASSERT_TRUE(close_begun);
     ASSERT_TRUE(duplicate_begin_rejected);
     ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR);
     ASSERT_NULL(response);
     ASSERT_EQ(response_length, 0);
+    ASSERT_FALSE(request_sent);
     ASSERT_TRUE(close_acknowledged);
     ASSERT_TRUE(exited);
     ASSERT_EQ(atomic_load(&context.opened), 1);
@@ -4731,15 +5211,20 @@ TEST(daemon_runtime_process_fingerprint_supports_extended_length_image) {
     }
     bool directory_created = path_built && cbm_mkdir_p(directory, 0700);
     int image_written = directory_created ? snprintf(image_path, sizeof(image_path),
-                                                     "%s/test-runner-long-image.exe", directory)
+                                                     "%s/image-probe-long-image.exe", directory)
                                           : -1;
     wchar_t *ordinary_wide = image_written > 0 && image_written < (int)sizeof(image_path)
                                  ? cbm_utf8_to_wide(image_path)
                                  : NULL;
     bool exceeds_legacy_limit = ordinary_wide && wcslen(ordinary_wide) >= MAX_PATH;
     free(ordinary_wide);
-    bool copied = exceeds_legacy_limit && runtime_test_windows_copy_self(image_path);
-    const char *expected = runtime_test_self_build();
+    /* A copy of the image probe, not of this runner: the fingerprint below
+     * hashes the whole held image (runtime_test_probe_daemon_t says why). */
+    bool copied = exceeds_legacy_limit && runtime_test_copy_probe_image(image_path);
+    char expected_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    const char *probe = runtime_test_probe_image();
+    const char *expected =
+        probe && cbm_daemon_build_fingerprint_file(probe, expected_build) ? expected_build : NULL;
 
     int event_written =
         snprintf(event_name, sizeof(event_name), "Local\\cbm-runtime-long-image-%lu-%llu",
@@ -4820,10 +5305,7 @@ TEST(daemon_runtime_process_fingerprint_supports_extended_length_image) {
  * Re-signing the changed copy keeps the probe runnable on arm64 while ensuring
  * that only the deliberately injected mapping has the active identity. */
 TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active) {
-    cbm_daemon_build_identity_t identity =
-        runtime_test_identity("2.4.0", runtime_test_self_build());
     char directory[RUNTIME_TEST_PATH_CAP] = {0};
-    char active_image[RUNTIME_TEST_PATH_CAP] = {0};
     char foreign_image[RUNTIME_TEST_PATH_CAP] = {0};
     char foreign_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     int directory_written =
@@ -4833,7 +5315,11 @@ TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active) {
     int foreign_written = directory_created ? snprintf(foreign_image, sizeof(foreign_image),
                                                        "%s/foreign-client", directory)
                                             : -1;
-    bool active_resolved = runtime_test_self_image_path(active_image);
+    /* The daemon runs from the image probe (runtime_test_probe_daemon_t), so
+     * the active image the foreign client maps is the probe, and the foreign
+     * main image the daemon must hash is a re-signed copy of the probe. */
+    const char *active_image = runtime_test_probe_image();
+    bool active_resolved = active_image != NULL;
     bool foreign_copied = active_resolved && foreign_written > 0 &&
                           foreign_written < (int)sizeof(foreign_image) &&
                           runtime_test_copy_executable(active_image, foreign_image);
@@ -4843,22 +5329,20 @@ TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active) {
     bool foreign_signed = foreign_changed && runtime_test_mac_ad_hoc_sign(foreign_image);
     bool foreign_fingerprinted =
         foreign_signed && cbm_daemon_build_fingerprint_file(foreign_image, foreign_fingerprint);
-    bool fingerprint_differs =
-        foreign_fingerprinted && strcmp(foreign_fingerprint, identity.build_fingerprint) != 0;
 
-    runtime_test_fixture_t fixture;
-    memset(&fixture, 0, sizeof(fixture));
-    bool fixture_attempted = directory_created && active_resolved && fingerprint_differs;
-    bool started =
-        fixture_attempted && runtime_test_fixture_start(&fixture, "mapped-foreign", &identity);
+    runtime_test_probe_daemon_t daemon;
+    memset(&daemon, 0, sizeof(daemon));
+    bool started = directory_created && foreign_fingerprinted &&
+                   runtime_test_probe_daemon_start(&daemon, "mapped-foreign", "2.4.0", false);
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", daemon.build);
+    bool fingerprint_differs =
+        started && strcmp(foreign_fingerprint, identity.build_fingerprint) != 0;
     int foreign_exit = -1;
     bool foreign_ran =
-        started && runtime_test_run_mapped_hello_image(foreign_image, active_image, &fixture,
-                                                       &identity, &foreign_exit);
-
-    if (fixture_attempted) {
-        runtime_test_fixture_finish(&fixture);
-    }
+        fingerprint_differs && runtime_test_run_mapped_hello_image(
+                                   foreign_image, active_image, &daemon.fixture, &identity,
+                                   &foreign_exit);
+    int daemon_exit = runtime_test_probe_daemon_finish(&daemon);
     if (foreign_written > 0 && foreign_written < (int)sizeof(foreign_image)) {
         (void)cbm_unlink(foreign_image);
     }
@@ -4872,33 +5356,41 @@ TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active) {
     ASSERT_TRUE(foreign_changed);
     ASSERT_TRUE(foreign_signed);
     ASSERT_TRUE(foreign_fingerprinted);
-    ASSERT_TRUE(fingerprint_differs);
     ASSERT_TRUE(started);
+    ASSERT_TRUE(fingerprint_differs);
     ASSERT_TRUE(foreign_ran);
+    /* 26 = the daemon answered with a rejection. A probe that got no answer
+     * inside the exchange budget exits 30 and must not pass here. */
     ASSERT_EQ(foreign_exit, 26);
+    ASSERT_EQ(daemon_exit, 0);
     PASS();
 }
 #endif
 
+/* The daemon admits a peer running a DIFFERENT file only after hashing that
+ * file: identical bytes are admitted, changed bytes refused. The daemon runs
+ * from the image probe and its peers are copies of the probe
+ * (runtime_test_probe_daemon_t), so the hash it pays before answering is over
+ * a few MB, not over a copy of this runner. */
 TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed) {
-    cbm_daemon_build_identity_t identity =
-        runtime_test_identity("2.4.0", runtime_test_self_build());
-    runtime_test_fixture_t identical_fixture;
+    runtime_test_probe_daemon_t identical_daemon;
     bool identical_started =
-        runtime_test_fixture_start(&identical_fixture, "copied-identical", &identity);
+        runtime_test_probe_daemon_start(&identical_daemon, "copied-identical", "2.4.0", false);
+    cbm_daemon_build_identity_t identity = runtime_test_identity("2.4.0", identical_daemon.build);
     char identical_path[RUNTIME_TEST_PATH_CAP] = {0};
     int identical_path_written = identical_started
 #ifdef _WIN32
                                      ? snprintf(identical_path, sizeof(identical_path),
-                                                "%s/client-copy.exe", identical_fixture.parent)
+                                                "%s/client-copy.exe",
+                                                identical_daemon.fixture.parent)
 #else
                                      ? snprintf(identical_path, sizeof(identical_path),
-                                                "%s/client-copy", identical_fixture.parent)
+                                                "%s/client-copy", identical_daemon.fixture.parent)
 #endif
                                      : -1;
     bool identical_copied = identical_path_written > 0 &&
                             identical_path_written < (int)sizeof(identical_path) &&
-                            runtime_test_copy_self_image(identical_path);
+                            runtime_test_copy_probe_image(identical_path);
     char identical_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     bool identical_bytes =
         identical_copied &&
@@ -4906,35 +5398,39 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
         strcmp(identical_fingerprint, identity.build_fingerprint) == 0;
     int identical_exit = -1;
     bool identical_ran =
-        identical_bytes && runtime_test_run_hello_image(identical_path, &identical_fixture,
+        identical_bytes && runtime_test_run_hello_image(identical_path, &identical_daemon.fixture,
                                                         &identity, &identical_exit);
-    bool identical_exited =
-        identical_ran && identical_exit == 0 &&
-        cbm_daemon_runtime_service_wait_exited(identical_fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    bool identical_exited = false;
+    bool identical_asked = identical_ran && identical_exit == 0 &&
+                           runtime_test_probe_daemon_ask(&identical_daemon, 'x', &identical_exited);
     (void)cbm_unlink(identical_path);
-    runtime_test_fixture_finish(&identical_fixture);
+    int identical_daemon_exit = runtime_test_probe_daemon_finish(&identical_daemon);
 
 #ifdef __linux__
-    runtime_test_fixture_t changed_fixture;
+    runtime_test_probe_daemon_t changed_daemon;
     bool changed_started =
-        runtime_test_fixture_start(&changed_fixture, "copied-changed", &identity);
+        runtime_test_probe_daemon_start(&changed_daemon, "copied-changed", "2.4.0", false);
+    cbm_daemon_build_identity_t changed_identity =
+        runtime_test_identity("2.4.0", changed_daemon.build);
     char changed_path[RUNTIME_TEST_PATH_CAP] = {0};
-    int changed_path_written = changed_started ? snprintf(changed_path, sizeof(changed_path),
-                                                          "%s/client-copy", changed_fixture.parent)
-                                               : -1;
+    int changed_path_written =
+        changed_started ? snprintf(changed_path, sizeof(changed_path), "%s/client-copy",
+                                   changed_daemon.fixture.parent)
+                        : -1;
     bool changed_copied = changed_path_written > 0 &&
                           changed_path_written < (int)sizeof(changed_path) &&
-                          runtime_test_copy_self_image(changed_path) &&
+                          runtime_test_copy_probe_image(changed_path) &&
                           runtime_test_append_image_marker(changed_path);
     char changed_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     bool changed_bytes = changed_copied &&
                          cbm_daemon_build_fingerprint_file(changed_path, changed_fingerprint) &&
-                         strcmp(changed_fingerprint, identity.build_fingerprint) != 0;
+                         strcmp(changed_fingerprint, changed_identity.build_fingerprint) != 0;
     int changed_exit = -1;
-    bool changed_ran = changed_bytes && runtime_test_run_hello_image(changed_path, &changed_fixture,
-                                                                     &identity, &changed_exit);
+    bool changed_ran =
+        changed_bytes && runtime_test_run_hello_image(changed_path, &changed_daemon.fixture,
+                                                      &changed_identity, &changed_exit);
     (void)cbm_unlink(changed_path);
-    runtime_test_fixture_finish(&changed_fixture);
+    int changed_daemon_exit = runtime_test_probe_daemon_finish(&changed_daemon);
 #endif
 
     ASSERT_TRUE(identical_started);
@@ -4942,13 +5438,18 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
     ASSERT_TRUE(identical_bytes);
     ASSERT_TRUE(identical_ran);
     ASSERT_EQ(identical_exit, 0);
+    ASSERT_TRUE(identical_asked);
     ASSERT_TRUE(identical_exited);
+    ASSERT_EQ(identical_daemon_exit, 0);
 #ifdef __linux__
     ASSERT_TRUE(changed_started);
     ASSERT_TRUE(changed_copied);
     ASSERT_TRUE(changed_bytes);
     ASSERT_TRUE(changed_ran);
+    /* 26 = the daemon answered with a rejection; no answer inside the
+     * exchange budget exits 30 and fails here instead of passing. */
     ASSERT_EQ(changed_exit, 26);
+    ASSERT_EQ(changed_daemon_exit, 0);
 #endif
     PASS();
 }
@@ -4974,7 +5475,7 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     setup = setup && image_written > 0 && image_written < (int)sizeof(image_path) &&
             replacement_written > 0 && replacement_written < (int)sizeof(replacement_path) &&
             event_written > 0 && event_written < (int)sizeof(event_name) &&
-            runtime_test_windows_copy_self(image_path);
+            runtime_test_copy_probe_image(image_path);
 
     FILE *replacement_file = setup ? cbm_fopen(replacement_path, "wb") : NULL;
     bool replacement_written_ok =
@@ -5044,12 +5545,13 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     int replacement_written =
         setup ? snprintf(replacement_path, sizeof(replacement_path), "%s/replacement", directory)
               : -1;
-    /* The copied image is this runner in holder mode, not a system utility:
-     * a multi-call coreutils /bin/cat (uutils) prints "unknown program" and
-     * exits when executed under the copied name. */
+    /* The copied image is the image probe in holder mode, not a system
+     * utility: a multi-call coreutils /bin/cat (uutils) prints "unknown
+     * program" and exits when executed under the copied name. Not this runner
+     * either: the fingerprint below hashes the whole held image. */
     setup = setup && image_written > 0 && image_written < (int)sizeof(image_path) &&
             replacement_written > 0 && replacement_written < (int)sizeof(replacement_path) &&
-            runtime_test_copy_self_image(image_path);
+            runtime_test_copy_probe_image(image_path);
 
     FILE *replacement_file = setup ? cbm_fopen(replacement_path, "wb") : NULL;
     bool replacement_written_ok =
@@ -5089,6 +5591,196 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     ASSERT_TRUE(!fingerprinted || strcmp(observed, original) == 0);
 #endif
     ASSERT_TRUE(!fingerprinted || strcmp(observed, replacement) != 0);
+    PASS();
+}
+#endif
+
+/* The executable-image fingerprint cache short-circuits the full-image hash for
+ * a repeated file identity, and rolls its key when the binary changes so a
+ * rebuild or atomic replacement never returns a stale digest. Results are
+ * gathered first and asserted only after the stub is disarmed: an assertion
+ * returns early, and an armed stub would replace every later fingerprint in
+ * this process. */
+TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll) {
+    /* 64-hex placeholders, distinct enough to tell "cached" from "recomputed". */
+    static const char digest_a[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char digest_b[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t image = {1,   2,   3,  100,
+                                                                         200, 300, 400};
+    cbm_daemon_runtime_fingerprint_identity_for_testing_t rolled = image;
+    char miss[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char hit[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char mtime_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char ctime_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char inode_rolled[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    /* Miss: first sight of this identity pays the hash and stores digest_a. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_a);
+    bool miss_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, miss);
+    int hashes_after_miss = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* Hit: the same identity returns the cached digest without calling the
+     * hash, even though the stub would now yield a different value. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_b);
+    bool hit_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, hit);
+    int hashes_after_hit = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* Key roll: a changed mtime (a rebuilt binary) misses and recomputes. */
+    rolled = image;
+    rolled.mtime_seconds = 101;
+    bool mtime_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, mtime_rolled);
+    int hashes_after_mtime_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* A changed change time (an in-place write, a metadata edit) rolls it too. */
+    rolled = image;
+    rolled.ctime_seconds = 301;
+    bool ctime_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, ctime_rolled);
+    int hashes_after_ctime_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    /* A changed inode (atomic replacement) likewise rolls the key. */
+    rolled = image;
+    rolled.inode = 9;
+    bool inode_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&rolled, &rolled, inode_rolled);
+    int hashes_after_inode_roll = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(miss_ok);
+    ASSERT_STR_EQ(miss, digest_a);
+    ASSERT_EQ(hashes_after_miss, 1);
+    ASSERT_TRUE(hit_ok);
+    ASSERT_STR_EQ(hit, digest_a);
+    ASSERT_EQ(hashes_after_hit, 1);
+    ASSERT_TRUE(mtime_ok);
+    ASSERT_STR_EQ(mtime_rolled, digest_b);
+    ASSERT_EQ(hashes_after_mtime_roll, 2);
+    ASSERT_TRUE(ctime_ok);
+    ASSERT_STR_EQ(ctime_rolled, digest_b);
+    ASSERT_EQ(hashes_after_ctime_roll, 3);
+    ASSERT_TRUE(inode_ok);
+    ASSERT_STR_EQ(inode_rolled, digest_b);
+    ASSERT_EQ(hashes_after_inode_roll, 4);
+    PASS();
+}
+
+/* A digest is committed only when the identity observed after the hash is the
+ * one it was keyed on. An image that changed under the hash still yields the
+ * bytes read for that acquisition (the acquire chain's own post-hash stat check
+ * is what rejects it) but is never cached, so the next sight of the original
+ * identity hashes again. */
+TEST(daemon_runtime_fingerprint_cache_skips_image_changed_under_hash) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t image = {1,   2,   3,  100,
+                                                                         200, 300, 400};
+    cbm_daemon_runtime_fingerprint_identity_for_testing_t moved = image;
+    moved.ctime_seconds = 301;
+    char first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool first_ok = cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &moved, first);
+    int hashes_after_first = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool second_ok =
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(&image, &image, second);
+    int hashes_after_second = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(first_ok);
+    ASSERT_STR_EQ(first, digest);
+    ASSERT_EQ(hashes_after_first, 1);
+    ASSERT_TRUE(second_ok);
+    ASSERT_STR_EQ(second, digest);
+    ASSERT_EQ(hashes_after_second, 2);
+    PASS();
+}
+
+/* The real acquire path: fingerprinting this process twice pays the image hash
+ * once, and the second call is served from the cache inside the same bracketed
+ * identity checks. This drives cbm_daemon_runtime_process_build_fingerprint,
+ * not the seam, so a cache wired into the seam but not into the platform's
+ * acquire site fails here. */
+TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    char first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool first_ok = cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), first);
+    int hashes_after_first = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool second_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), second);
+    int hashes_after_second = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+
+    ASSERT_TRUE(first_ok);
+    ASSERT_TRUE(second_ok);
+    ASSERT_STR_EQ(first, digest);
+    ASSERT_STR_EQ(second, digest);
+    ASSERT_EQ(hashes_after_first, 1);
+    ASSERT_EQ(hashes_after_second, 1);
+    PASS();
+}
+
+#if defined(__APPLE__) || defined(__linux__)
+/* Only this process's own image is cached. The peer here is this very runner
+ * spawned in holder mode, so its image has exactly the file identity the own
+ * image is cached under: a cache keyed on that identity alone would answer for
+ * the peer. A peer must be hashed on every fingerprint, before and after the
+ * own image is cached, while the own image still costs one hash. */
+TEST(daemon_runtime_process_fingerprint_caches_only_own_image) {
+    static const char digest[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    char image_path[RUNTIME_TEST_PATH_CAP] = {0};
+    char peer_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_first[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char own_second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    char peer_after_own[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    int release_fd = -1;
+    bool setup = runtime_test_self_image_path(image_path);
+    pid_t child = setup ? runtime_test_spawn_blocked_executable(image_path, &release_fd) : -1;
+    setup = setup && child > 0;
+
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest);
+    bool peer_first_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_first);
+    bool peer_second_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_second);
+    int hashes_after_peer = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool own_first_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_first);
+    bool own_second_ok =
+        cbm_daemon_runtime_process_build_fingerprint(runtime_test_process_id(), own_second);
+    int hashes_after_own = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    bool peer_after_own_ok =
+        setup && cbm_daemon_runtime_process_build_fingerprint((uint64_t)child, peer_after_own);
+    int hashes_after_peer_again = cbm_daemon_runtime_fingerprint_hash_call_count_for_testing();
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    runtime_test_stop_blocked_executable(child, release_fd);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(peer_first_ok);
+    ASSERT_TRUE(peer_second_ok);
+    ASSERT_TRUE(own_first_ok);
+    ASSERT_TRUE(own_second_ok);
+    ASSERT_TRUE(peer_after_own_ok);
+    ASSERT_STR_EQ(peer_first, digest);
+    ASSERT_STR_EQ(peer_second, digest);
+    ASSERT_STR_EQ(own_first, digest);
+    ASSERT_STR_EQ(own_second, digest);
+    ASSERT_STR_EQ(peer_after_own, digest);
+    /* Each peer fingerprint pays its own hash: a peer is never cached. */
+    ASSERT_EQ(hashes_after_peer, 2);
+    /* The own image is hashed once, then served from the cache. */
+    ASSERT_EQ(hashes_after_own, 3);
+    /* The cached own entry never answers for the peer's identical file. */
+    ASSERT_EQ(hashes_after_peer_again, 4);
     PASS();
 }
 #endif
@@ -5287,7 +5979,14 @@ SUITE(daemon_runtime) {
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     RUN_TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path);
 #endif
+    RUN_TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll);
+    RUN_TEST(daemon_runtime_fingerprint_cache_skips_image_changed_under_hash);
+    RUN_TEST(daemon_runtime_process_fingerprint_hashes_own_image_once_per_process);
+#if defined(__APPLE__) || defined(__linux__)
+    RUN_TEST(daemon_runtime_process_fingerprint_caches_only_own_image);
+#endif
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
+    RUN_TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);

@@ -3,6 +3,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 
@@ -15,6 +16,17 @@
 enum {
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,
+};
+
+/* Bounded worktree-status stream constants.
+ * STATUS_FIELD_MAX is the largest single NUL-delimited record field we
+ * buffer; a field at/over the bound is treated as a malformed stream and the
+ * whole snapshot fails closed. PATH components of real repos are far below
+ * this even with long paths. */
+enum {
+    STATUS_HEADER_LEN = 3, /* porcelain-v1 record prefix "XY " */
+    STATUS_CHUNK_MAX = CBM_SZ_4K,
+    STATUS_FIELD_MAX = CBM_SZ_16K,
 };
 
 static char *git_strdup(const char *s) {
@@ -73,6 +85,8 @@ static int git_capture_into(const char *repo_path, const char *git_args, char *b
      * stuck git child is named by the last marker printed (spawn, read or
      * close). Silent at the default level. */
     cbm_log_debug("git.capture", "stage", "spawn", "args", git_args);
+    /* A hook or editor may export GIT_DIR/GIT_WORK_TREE for another repo.
+     * Isolate this child so git -C selects repo_path rather than that repo. */
     FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
@@ -111,6 +125,14 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
     return *out ? 0 : CBM_NOT_FOUND;
 }
 
+/* Regular file, not a directory and not a symlink. Uses the Unicode-safe
+ * path probe: stat() follows links and rejects non-ASCII paths on Windows,
+ * which upstream removed from this file in the Unicode repository-path fix. */
+static bool path_is_regular_file(const char *path) {
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular;
+}
+
 static bool path_is_absolute(const char *path) {
     if (!path || !path[0]) {
         return false;
@@ -123,6 +145,180 @@ static bool path_is_absolute(const char *path) {
 #else
     return false;
 #endif
+}
+
+/* Read the "gitdir: <path>" pointer out of a gitlink FILE at <path>/.git.
+ * Returns false when .git is missing, a directory (ordinary repo), or holds no
+ * pointer. A relative pointer is resolved against path. */
+static bool read_gitlink_target(const char *path, char *out, size_t out_size) {
+    char dot_git[GIT_OUTPUT_MAX];
+    int n = snprintf(dot_git, sizeof(dot_git), "%s/.git", path);
+    if (n < 0 || n >= (int)sizeof(dot_git)) {
+        return false;
+    }
+    if (!path_is_regular_file(dot_git)) {
+        return false;
+    }
+
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char line[GIT_OUTPUT_MAX];
+    bool got = false;
+    while (fgets(line, sizeof(line), f)) {
+        trim_newlines(line);
+        if (strncmp(line, "gitdir:", 7) != 0) {
+            continue;
+        }
+        const char *value = line + 7;
+        while (*value == ' ' || *value == '\t') {
+            value++;
+        }
+        if (!value[0]) {
+            break;
+        }
+        int written = path_is_absolute(value) ? snprintf(out, out_size, "%s", value)
+                                              : snprintf(out, out_size, "%s/%s", path, value);
+        got = written > 0 && written < (int)out_size;
+        break;
+    }
+    fclose(f);
+    return got;
+}
+
+/* 1 = linked-worktree gitlink, 0 = a different git anchor (stop walking),
+ * -1 = no .git at this directory (keep walking). */
+static int linked_worktree_anchor(const char *path) {
+    char dot_git[GIT_OUTPUT_MAX];
+    int n = snprintf(dot_git, sizeof(dot_git), "%s/.git", path);
+    if (n < 0 || n >= (int)sizeof(dot_git)) {
+        return 0;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(dot_git, &info) != CBM_PATH_INFO_OK) {
+        return -1;
+    }
+    /* A directory .git is a main checkout. Anything else that is not a
+     * regular gitlink file (a symlink, for example) is also an anchor:
+     * do not follow it, and do not blame a parent worktree for this tree. */
+    if (!info.is_regular) {
+        return 0;
+    }
+    char git_dir[GIT_OUTPUT_MAX];
+    if (!read_gitlink_target(path, git_dir, sizeof(git_dir))) {
+        return 0;
+    }
+    /* Only linked worktrees carry <gitdir>/commondir; a submodule gitlink
+     * points at <super>/.git/modules/<name>, which does not. */
+    char commondir[GIT_OUTPUT_MAX];
+    n = snprintf(commondir, sizeof(commondir), "%s/commondir", git_dir);
+    if (n < 0 || n >= (int)sizeof(commondir)) {
+        return 0;
+    }
+    return path_is_regular_file(commondir) ? 1 : 0;
+}
+
+static bool parent_directory(char *path) {
+    size_t n = strlen(path);
+    while (n > 1 && (path[n - 1] == '/' || path[n - 1] == '\\')) {
+        path[--n] = '\0';
+    }
+#ifdef _WIN32
+    if ((n == 2 && path[1] == ':') ||
+        (n == 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'))) {
+        return false;
+    }
+#endif
+    if (n <= 1) {
+        return false;
+    }
+    char *slash = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (path[i] == '/' || path[i] == '\\') {
+            slash = path + i;
+        }
+    }
+    if (!slash) {
+        return false;
+    }
+    if (slash == path) {
+        path[1] = '\0';
+        return true;
+    }
+    *slash = '\0';
+    return true;
+}
+
+/* On a linked-worktree hit, optionally copy that anchor directory into root_out. */
+static bool walk_linked_worktree_root(const char *path, char *root_out, size_t root_out_size) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    char current[GIT_OUTPUT_MAX];
+    int n = snprintf(current, sizeof(current), "%s", path);
+    if (n < 0 || n >= (int)sizeof(current)) {
+        return false;
+    }
+    size_t len = strlen(current);
+    while (len > 1 && (current[len - 1] == '/' || current[len - 1] == '\\')) {
+        current[--len] = '\0';
+    }
+    /* A session cwd or index_repository path is often a subdirectory. Walk
+     * ancestors until a git anchor so ignore_worktrees applies to the whole
+     * linked checkout, not only its root. */
+    /* Bound is the path itself: each step drops one component and stops at
+     * the filesystem root. A fixed depth would miss a deep session cwd. */
+    for (;;) {
+        int kind = linked_worktree_anchor(current);
+        if (kind >= 0) {
+            if (kind != 1) {
+                return false;
+            }
+            if (root_out && root_out_size > 0U) {
+                int written = snprintf(root_out, root_out_size, "%s", current);
+                if (written < 0 || (size_t)written >= root_out_size) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        char previous[GIT_OUTPUT_MAX];
+        snprintf(previous, sizeof(previous), "%s", current);
+        if (!parent_directory(current) || strcmp(previous, current) == 0) {
+            return false;
+        }
+    }
+}
+
+bool cbm_git_is_linked_worktree(const char *path) {
+    return walk_linked_worktree_root(path, NULL, 0U);
+}
+
+bool cbm_git_same_linked_worktree(const char *a, const char *b) {
+    char root_a[GIT_OUTPUT_MAX];
+    char root_b[GIT_OUTPUT_MAX];
+    if (!walk_linked_worktree_root(a, root_a, sizeof(root_a)) ||
+        !walk_linked_worktree_root(b, root_b, sizeof(root_b))) {
+        return false;
+    }
+    /* The gitdir file is unique per linked worktree. Comparing those pointers
+     * keeps a nested worktree from matching its parent even when both are
+     * linked checkouts. */
+    char git_a[GIT_OUTPUT_MAX];
+    char git_b[GIT_OUTPUT_MAX];
+    if (!read_gitlink_target(root_a, git_a, sizeof(git_a)) ||
+        !read_gitlink_target(root_b, git_b, sizeof(git_b))) {
+        return false;
+    }
+    /* A relative gitdir is joined onto the walked path. Canonicalize both so
+     * a symlink spelling of the cwd still matches the real project root.
+     * Fall back to the raw string when the gitdir does not exist. */
+    char norm_a[GIT_OUTPUT_MAX];
+    char norm_b[GIT_OUTPUT_MAX];
+    const char *left = cbm_canonical_path(git_a, norm_a, sizeof(norm_a)) ? norm_a : git_a;
+    const char *right = cbm_canonical_path(git_b, norm_b, sizeof(norm_b)) ? norm_b : git_b;
+    return strcmp(left, right) == 0;
 }
 
 static char *join_root_relative(const char *root, const char *rel) {
@@ -456,4 +652,211 @@ int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_
         return 0;
     }
     return off;
+}
+
+/* ── Bounded worktree status ──────────────────────────────────────────────
+ * git status --porcelain=v1 -z --untracked-files=all is parsed record by
+ * record, NUL-delimited, over a bounded chunk buffer. The full stream is
+ * counted but only max_samples paths per class (tracked / untracked) are
+ * ever retained, so a huge dirty tree cannot grow memory. Rename/copy
+ * records carry a second NUL-terminated path (the source); it is consumed
+ * without being counted so one rename counts once. */
+
+typedef struct {
+    cbm_worktree_status_t *out;
+    int max_samples;
+    bool expecting_source; /* next field is the source path of an R/C record */
+    bool parse_ok;
+    char partial[STATUS_FIELD_MAX];
+    size_t partial_len;
+} status_parser_t;
+
+/* porcelain-v1 status columns (X/Y): documented codes plus the lowercase
+ * submodule variants and type-change 'T'. Anything else is not a record
+ * header, so a malformed stream fails closed instead of being misread. */
+static bool status_code_ok(char c) {
+    switch (c) {
+    case ' ':
+    case 'M':
+    case 'A':
+    case 'D':
+    case 'R':
+    case 'C':
+    case 'U':
+    case '?':
+    case '!':
+    case 'T':
+    case 'm':
+    case 'a':
+    case 'd':
+    case 'r':
+    case 'c':
+    case 'u':
+    case 't':
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Retain one bounded sample; the running total always advances so the caller
+ * sees the true stream count even when samples are capped or OOM. */
+static void status_add_sample(int *total, char ***samples, int *sample_count, bool *truncated,
+                              int max_samples, const char *path, size_t path_len) {
+    (*total)++;
+    if (*sample_count >= max_samples) {
+        *truncated = true;
+        return;
+    }
+    char *copy = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, path_len + 1);
+    if (!copy) {
+        *truncated = true;
+        return;
+    }
+    memcpy(copy, path, path_len);
+    copy[path_len] = '\0';
+    char **grown = (char **)cbm_realloc(CBM_MEM_CLASS_OTHER, *samples,
+                                        (size_t)(*sample_count + 1) * sizeof(char *));
+    if (!grown) {
+        cbm_free(CBM_MEM_CLASS_OTHER, copy);
+        *truncated = true;
+        return;
+    }
+    *samples = grown;
+    (*samples)[*sample_count] = copy;
+    (*sample_count)++;
+}
+
+/* Parse one complete NUL-delimited field. Returns false on malformed input,
+ * which fails the whole snapshot closed. */
+static bool status_parse_record(cbm_worktree_status_t *out, status_parser_t *parser,
+                                const char *field, size_t field_len) {
+    if (parser->expecting_source) {
+        parser->expecting_source = false;
+        return true; /* second path of a rename/copy record — not counted */
+    }
+    if (field_len < STATUS_HEADER_LEN || field[2] != ' ' || !status_code_ok(field[0]) ||
+        !status_code_ok(field[1])) {
+        return false;
+    }
+    const char *path = field + STATUS_HEADER_LEN;
+    size_t path_len = field_len - STATUS_HEADER_LEN;
+    if (field[0] == '?' && field[1] == '?') {
+        status_add_sample(&out->untracked_count, &out->untracked_paths,
+                          &out->untracked_sample_count, &out->untracked_truncated,
+                          parser->max_samples, path, path_len);
+        return true;
+    }
+    if (field[0] == 'R' || field[0] == 'C' || field[1] == 'R' || field[1] == 'C') {
+        parser->expecting_source = true;
+    }
+    status_add_sample(&out->tracked_count, &out->tracked_paths, &out->tracked_sample_count,
+                      &out->tracked_truncated, parser->max_samples, path, path_len);
+    return true;
+}
+
+/* Feed a chunk of the NUL-delimited stream through the bounded record parser. */
+static void status_feed(status_parser_t *parser, const char *data, size_t data_len) {
+    size_t i = 0;
+    while (i < data_len) {
+        if (parser->partial_len >= STATUS_FIELD_MAX) {
+            parser->parse_ok = false; /* field exceeded the bound: malformed */
+            return;
+        }
+        size_t j = i;
+        while (j < data_len && data[j] != '\0' &&
+               parser->partial_len + (j - i) < STATUS_FIELD_MAX) {
+            j++;
+        }
+        size_t take = j - i;
+        memcpy(parser->partial + parser->partial_len, data + i, take);
+        parser->partial_len += take;
+        i += take;
+        if (i < data_len && data[i] == '\0') {
+            if (!status_parse_record(parser->out, parser, parser->partial, parser->partial_len)) {
+                parser->parse_ok = false;
+                return;
+            }
+            parser->partial_len = 0;
+            i++; /* consume the record terminator */
+        } else if (i >= data_len) {
+            return; /* chunk exhausted mid-record */
+        }
+    }
+}
+
+int cbm_git_worktree_status(const char *validated_root, int max_samples,
+                            cbm_worktree_status_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!validated_root || !validated_root[0] || max_samples < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (!git_validate_repo_path(validated_root)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char cmd[GIT_CMD_MAX];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git -C \"%s\" status --porcelain=v1 -z --untracked-files=all 2>%s",
+                     validated_root, null_dev);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        return CBM_NOT_FOUND;
+    }
+
+    /* An inherited GIT_DIR/GIT_WORK_TREE (a git hook, an editor) overrides
+     * `git -C`, which would report another repository's worktree here. */
+    FILE *fp = cbm_popen_git(cmd);
+    if (!fp) {
+        return 0; /* out is zeroed: available=false */
+    }
+
+    status_parser_t parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.out = out;
+    parser.max_samples = max_samples;
+    parser.parse_ok = true;
+
+    char chunk[STATUS_CHUNK_MAX];
+    size_t got;
+    bool io_error = false;
+    while (parser.parse_ok && (got = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        status_feed(&parser, chunk, got);
+    }
+    if (ferror(fp)) {
+        io_error = true;
+    }
+    int rc = cbm_pclose(fp);
+
+    if (rc != 0 || !parser.parse_ok || io_error || parser.partial_len > 0) {
+        /* Fail closed: any deviation from a clean, complete status stream is a
+         * machine-readable "unavailable", never a clean worktree. */
+        cbm_git_worktree_status_free(out);
+        return 0;
+    }
+
+    out->available = true;
+    return 0;
+}
+
+void cbm_git_worktree_status_free(cbm_worktree_status_t *st) {
+    if (!st) {
+        return;
+    }
+    for (int i = 0; i < st->tracked_sample_count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths);
+    for (int i = 0; i < st->untracked_sample_count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths[i]);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths);
+    memset(st, 0, sizeof(*st));
 }

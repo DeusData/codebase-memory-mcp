@@ -210,6 +210,11 @@ typedef struct {
     const char *func;
     cbm_func_arg_t *args;
     int arg_count;
+    /* Property reference on the RHS, e.g. a.file_path = b.file_path (#2591).
+     * When rhs_variable is set the comparison reads its operand from the row
+     * instead of `value`; rhs_property NULL = bare alias. */
+    const char *rhs_variable;
+    const char *rhs_property;
 } cbm_condition_t;
 
 /* Expression tree for WHERE clause */

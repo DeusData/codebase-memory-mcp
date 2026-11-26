@@ -343,3 +343,9 @@ describe('Spring service connection evidence', () => {
         expect(links(result)).toEqual([]);
     });
 });
+
+it.each(['$endpoint', 'endpoint$'])('tracks a literal identifier through a transport wrapper: %s', parameter => {
+    const compose = 'services:\n  web:\n    build: ./web\n  api:\n    image: example/api\n';
+    const source = `function load(${parameter}) { return fetch(${parameter}); }\nload("http://api:8080/items");`;
+    expect(links(buildContainerTopology([project(compose, { 'web/client.js': source })]))).toEqual(['web>api:http']);
+});

@@ -26,6 +26,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ts_lsp.h"
+#include <limits.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
@@ -306,6 +307,21 @@ TEST(tslsp_return_inferred_local) {
                                   "function go() { const c = makeConn(); c.ping(); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, ".go", "ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* infer_return_type_from_body visits children last-child first, so of two returns
+ * the one later in the body is tried first. Pinned so that a change to the walk
+ * order (#2091) is a visible decision rather than a side effect. */
+TEST(tslsp_return_walk_order_prefers_later_return) {
+    CBMFileResult *r =
+        extract_ts("class A { a(): void {} }\n"
+                   "class B { b(): void {} }\n"
+                   "function pick(f) { if (f) { return new A(); } return new B(); }\n"
+                   "function go() { const x = pick(true); x.b(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".go", "b"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -2771,6 +2787,125 @@ TEST(tslsp_crossfile_chain_through_return) {
     PASS();
 }
 
+/* The call target and its return signature must use the same exported name,
+ * even when the module also exports a function named like the local alias. */
+static int ts_renamed_import_return_chain(bool shared_registry) {
+    const char *source = "import { make as alias } from './lib';\n"
+                         "function go() { alias().read(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.go",
+         .short_name = "go",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.lib.Good",
+         .short_name = "Good",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .method_names_str = "read"},
+        {.qualified_name = "test.lib.Good.read",
+         .short_name = "read",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .receiver_type = "test.lib.Good"},
+        {.qualified_name = "test.lib.Bad",
+         .short_name = "Bad",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .method_names_str = "read"},
+        {.qualified_name = "test.lib.Bad.read",
+         .short_name = "read",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .receiver_type = "test.lib.Bad"},
+        {.qualified_name = "test.lib.make",
+         .short_name = "make",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .return_types = "test.lib.Good"},
+        {.qualified_name = "test.lib.alias",
+         .short_name = "alias",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .return_types = "test.lib.Bad"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"alias"};
+    const char *imp_qns[] = {"test.lib"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    if (shared_registry) {
+        CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, NDEFS);
+        ASSERT_NOT_NULL(reg);
+        cbm_run_ts_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main", false,
+                                           false, false, reg, defs, NDEFS, imp_names, imp_qns, 1,
+                                           NULL, &out);
+    } else {
+        cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                             defs, NDEFS, imp_names, imp_qns, 1, NULL, &out);
+    }
+    bool direct = has_exact_resolved(&out, "test.main.go", "test.lib.make", "lsp_import_alias");
+    bool good = has_exact_resolved(&out, "test.main.go", "test.lib.Good.read", "lsp_ts_method");
+    bool bad = has_exact_resolved(&out, "test.main.go", "test.lib.Bad.read", "lsp_ts_method");
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(direct);
+    ASSERT_FALSE(bad);
+    ASSERT_TRUE(good);
+    PASS();
+}
+
+TEST(tslsp_crossfile_renamed_import_return_chain) {
+    return ts_renamed_import_return_chain(false);
+}
+
+TEST(tslsp_crossfile_renamed_import_return_chain_shared) {
+    return ts_renamed_import_return_chain(true);
+}
+
+/* Keep the supplied import map at one entry: this measures the AST alias
+ * collector independently of the older import-map insertion path. */
+static size_t ts_import_alias_arena_bytes(int count) {
+    size_t capacity = (size_t)count * 48 + 64;
+    char *source = malloc(capacity);
+    if (!source)
+        return 0;
+    size_t len = (size_t)snprintf(source, capacity, "import { ");
+    for (int i = 0; i < count; i++) {
+        len += (size_t)snprintf(source + len, capacity - len, "%sf%d as a%d", i ? ", " : "", i, i);
+    }
+    len += (size_t)snprintf(source + len, capacity - len, " } from './lib';\n");
+    const char *imp_names[] = {"a0"};
+    const char *imp_qns[] = {"test.lib"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross(&arena, source, (int)len, "test.main", false, false, false, NULL, 0,
+                         imp_names, imp_qns, 1, NULL, &out);
+    size_t bytes = cbm_arena_total(&arena);
+    cbm_arena_destroy(&arena);
+    free(source);
+    return bytes;
+}
+
+TEST(tslsp_import_alias_arena_growth) {
+    size_t small = ts_import_alias_arena_bytes(1024);
+    size_t large = ts_import_alias_arena_bytes(2048);
+    ASSERT_GT(small, 0);
+    ASSERT_GT(large, small);
+    printf(" aliases arena bytes: 1024=%zu 2048=%zu ", small, large);
+    /* Linear source/AST work plus geometric storage stays below 3x; retaining
+     * two complete arrays at every insertion grows approximately 4x. */
+    ASSERT(large < small * 3);
+    PASS();
+}
+
 TEST(tslsp_crossfile_no_def_match) {
     /* Function that imports a symbol not in the def list — should resolve safely
      * (emit unresolved, no crash). */
@@ -2794,6 +2929,132 @@ TEST(tslsp_crossfile_no_def_match) {
 
     /* Smoke: doesn't crash. count >= 0 (likely 1 unresolved entry for `unknown`). */
     ASSERT(out.count >= 0);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Issue #2297: `import { foo as fooShared }` bound only the local alias, and
+ * every import lookup spelled `<module>.<alias>`, which names nothing, so a call
+ * through a renamed import produced no CALLS edge. The binding resolves to the
+ * name the module exports, exactly like a plain named import. Driven through
+ * the production Tier-2 path (shared sealed registry + per-file overlay). */
+TEST(tslsp_crossfile_renamed_import_issue2297) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.foo",
+         .short_name = "foo",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.lib",
+         .return_types = "number"},
+        {.qualified_name = "test.conn.Conn",
+         .short_name = "Conn",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .method_names_str = "ping"},
+        {.qualified_name = "test.conn.Conn.ping",
+         .short_name = "ping",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .receiver_type = "test.conn.Conn"},
+        {.qualified_name = "test.main.callsRenamed",
+         .short_name = "callsRenamed",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.main.viaRenamedClass",
+         .short_name = "viaRenamedClass",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"fooShared", "Connection"};
+    const char *imp_qns[] = {"test.lib", "test.conn"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, NDEFS);
+    ASSERT_NOT_NULL(reg);
+
+    const char *src = "import { foo as fooShared } from './lib';\n"
+                      "import { Conn as Connection } from './conn';\n"
+                      "export function callsRenamed() { return fooShared(1); }\n"
+                      "export function viaRenamedClass() { const c = new Connection(); c.ping(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.main", false, false,
+                                       false, reg, defs, NDEFS, imp_names, imp_qns, 2, NULL, &out);
+    /* The call site names the alias, so the join reads it from `reason`. */
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.callsRenamed", "test.lib.foo", "lsp_import_alias"));
+    ASSERT_TRUE(has_exact_resolved(&out, "test.main.viaRenamedClass", "test.conn.Conn.ping",
+                                   "lsp_ts_method"));
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The export name is looked up exactly. A renamed import of a name the module
+ * does not export must not fall back to the alias: before #2297 the alias `foo`
+ * spelled `test.lib.foo` and bound this call to an unrelated export. */
+TEST(tslsp_crossfile_renamed_import_missing_export_issue2297) {
+    const char *source = "import { missing as foo } from './lib';\n"
+                         "function go() { foo(1); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.go",
+         .short_name = "go",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.lib.foo",
+         .short_name = "foo",
+         .label = "Function",
+         .def_module_qn = "test.lib"},
+    };
+    const char *imp_names[] = {"foo"};
+    const char *imp_qns[] = {"test.lib"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                         defs, 2, imp_names, imp_qns, 1, NULL, &out);
+
+    ASSERT_EQ(find_resolved_arr(&out, "go", "test.lib.foo"), -1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* `import { default as greet }` is a default import: it keeps resolving by its
+ * local name, as `import greet from` does. */
+TEST(tslsp_crossfile_default_as_import_issue2297) {
+    const char *source = "import { default as greet } from './greetings';\n"
+                         "function go() { greet('hi'); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.go",
+         .short_name = "go",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.greetings.greet",
+         .short_name = "greet",
+         .label = "Function",
+         .def_module_qn = "test.greetings",
+         .return_types = "string"},
+    };
+    const char *imp_names[] = {"greet"};
+    const char *imp_qns[] = {"test.greetings"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                         defs, 2, imp_names, imp_qns, 1, NULL, &out);
+
+    ASSERT_GTE(find_resolved_arr(&out, "go", "test.greetings.greet"), 0);
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -3429,6 +3690,122 @@ TEST(tslsp_stress_many_classes) {
     }
     /* Allow some slop (compile/parse weirdness for huge param lists), require >= 40. */
     ASSERT(resolved >= 40);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_signature_walk_keeps_first_local_registration) {
+    CBMRegisteredFunc base_funcs[] = {{.qualified_name = "test.base.only"}};
+    CBMTypeRegistry base = {.funcs = base_funcs, .func_count = 1, .read_only = true};
+    CBMRegisteredFunc funcs[] = {
+        {.qualified_name = NULL},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.Box.identity"},
+    };
+    CBMTypeRegistry overlay = {.funcs = funcs, .func_count = 4, .fallback = &base};
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.identity"), 1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.Box.identity"), 3);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.base.only"), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.missing"), -1);
+    ASSERT_EQ(overlay.func_count, 4);
+    ASSERT_EQ(base.func_count, 1);
+    PASS();
+}
+
+TEST(tslsp_walk_pending_count_rejects_overflow) {
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(255, 300), 555);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX - 1, 1), INT_MAX);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX, 1), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(1, (uint32_t)INT_MAX), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(0, UINT32_MAX), -1);
+    PASS();
+}
+
+/* Count actual registry work, independent of machine speed. Both inputs exceed
+ * the old walk cap, and every declaration exercises rebuild and generic rewrite. */
+TEST(tslsp_signature_walk_lookup_scales_linearly) {
+    unsigned long work[2] = {0};
+    for (int scale = 0; scale < 2; scale++) {
+        const int count = 300 << scale;
+        const size_t capacity = (size_t)count * 160 + 512;
+        char *source = (char *)malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            used += (size_t)snprintf(source + used, capacity - used,
+                                     "export function identity%d<T>(x: T): T { return x; }\n", i);
+        }
+        snprintf(source + used, capacity - used,
+                 "class Box { use(): void {} }\n"
+                 "function go() { const b = identity%d(new Box()); b.use(); }\n",
+                 count - 1);
+        CBMFileResult *r = extract_ts(source);
+        free(source);
+        ASSERT_NOT_NULL(r);
+        work[scale] = cbm_ts_lsp_test_signature_lookup_work();
+        ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+        cbm_free_result(r);
+    }
+    printf("  signature lookup work: 300=%lu 600=%lu\n", work[0], work[1]);
+    ASSERT_GT(work[0], 0);
+    /* Allow 25% above ideal doubling for hash-bucket distribution. */
+    ASSERT_LT(work[1], work[0] * 5 / 2);
+    PASS();
+}
+
+TEST(tslsp_stress_declarations_past_stack_cap) {
+    /* 300 padding functions, then the generic pair that needs the AST walk.
+     * The walk used to hold 256 nodes at most, so every top-level declaration
+     * after the 256th was dropped without a word and kept whatever signature
+     * the first extraction pass had guessed. */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    ASSERT_NOT_NULL(buf);
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "function pad%d(): void {}\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "function identity<T>(x: T): T { return x; }\n");
+    p += snprintf(p, (size_t)(end - p), "class Box { use(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p),
+                  "function go() { const b = identity(new Box()); b.use(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_generic_identity_inference, 300 declarations deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_stress_return_past_stack_cap) {
+    /* infer_return_type_from_body reads the return type out of a body that
+     * carries no written one. The return here sits after 300 statements, more
+     * than the old fixed cap held, so the walk used to stop before reaching it
+     * and answer "unknown return type". */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    ASSERT_NOT_NULL(buf);
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    p += snprintf(p, (size_t)(end - p), "class Conn { ping(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p), "function makeConn() {\n");
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "  let a%d = 0;\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "  return new Conn();\n}\n");
+    p += snprintf(p, (size_t)(end - p), "function go() { const c = makeConn(); c.ping(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_return_inferred_local, 300 statements deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "ping"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -4860,6 +5237,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_return_simple);
     RUN_TEST(tslsp_return_chain);
     RUN_TEST(tslsp_return_inferred_local);
+    RUN_TEST(tslsp_return_walk_order_prefers_later_return);
     RUN_TEST(tslsp_return_async_promise);
     RUN_TEST(tslsp_return_method_no_rttype);
 
@@ -5110,7 +5488,13 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_scale_many_defs_no_crash_issue344);
     RUN_TEST(tslsp_crossfile_function_call);
     RUN_TEST(tslsp_crossfile_chain_through_return);
+    RUN_TEST(tslsp_crossfile_renamed_import_return_chain);
+    RUN_TEST(tslsp_crossfile_renamed_import_return_chain_shared);
+    RUN_TEST(tslsp_import_alias_arena_growth);
     RUN_TEST(tslsp_crossfile_no_def_match);
+    RUN_TEST(tslsp_crossfile_renamed_import_issue2297);
+    RUN_TEST(tslsp_crossfile_renamed_import_missing_export_issue2297);
+    RUN_TEST(tslsp_crossfile_default_as_import_issue2297);
 
     /* More stdlib */
     RUN_TEST(tslsp_stdlib_date_toISOString);
@@ -5189,6 +5573,11 @@ SUITE(ts_lsp) {
 
     /* Stress tests */
     RUN_TEST(tslsp_stress_many_classes);
+    RUN_TEST(tslsp_signature_walk_keeps_first_local_registration);
+    RUN_TEST(tslsp_walk_pending_count_rejects_overflow);
+    RUN_TEST(tslsp_signature_walk_lookup_scales_linearly);
+    RUN_TEST(tslsp_stress_declarations_past_stack_cap);
+    RUN_TEST(tslsp_stress_return_past_stack_cap);
     RUN_TEST(tslsp_stress_deep_inheritance);
     RUN_TEST(tslsp_stress_long_method_chain);
     RUN_TEST(tslsp_stress_megafile_mixed);

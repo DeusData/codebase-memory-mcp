@@ -1,0 +1,94 @@
+================================================================================
+An escaped char literal does not swallow the next primed definition (#2439)
+================================================================================
+
+module M where
+
+f = '\n'
+
+g' = 2
+
+h = 3
+
+--------------------------------------------------------------------------------
+
+(haskell
+  (header
+    (module
+      (module_id)))
+  (declarations
+    (bind
+      (variable)
+      (match
+        (literal
+          (char))))
+    (bind
+      (variable)
+      (match
+        (literal
+          (integer))))
+    (bind
+      (variable)
+      (match
+        (literal
+          (integer))))))
+
+================================================================================
+Escaped char literals on one line lex as separate tokens (#2439)
+================================================================================
+
+x = ['\n','\t','\'','\\','\x41','\SOH','a']
+
+--------------------------------------------------------------------------------
+
+(haskell
+  (declarations
+    (bind
+      (variable)
+      (match
+        (list
+          (literal
+            (char))
+          (literal
+            (char))
+          (literal
+            (char))
+          (literal
+            (char))
+          (literal
+            (char))
+          (literal
+            (char))
+          (literal
+            (char)))))))
+
+================================================================================
+MagicHash and quote escapes still lex whole (#2439)
+================================================================================
+
+f = '\n'#
+g = '\''
+h = ['\n', '\t']
+
+--------------------------------------------------------------------------------
+
+(haskell
+  (declarations
+    (bind
+      (variable)
+      (match
+        (literal
+          (char))))
+    (bind
+      (variable)
+      (match
+        (literal
+          (char))))
+    (bind
+      (variable)
+      (match
+        (list
+          (literal
+            (char))
+          (literal
+            (char)))))))

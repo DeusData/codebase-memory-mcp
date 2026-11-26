@@ -301,6 +301,16 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_PUPPET:
         keywords = puppet_keywords;
         break;
+    case CBM_LANG_SWIFT:
+        /* `init` and `deinit` are Swift keywords. A reference to one
+         * (`.init(...)`, `Foo.init`) names an initializer of a type the bare
+         * name does not carry, so resolving it by name can only guess among
+         * every type's initializer (#2379). Otherwise the generic set. */
+        if (strcmp(name, "init") == 0 || strcmp(name, "deinit") == 0) {
+            return true;
+        }
+        keywords = generic_keywords;
+        break;
     default:
         keywords = generic_keywords;
         break;
@@ -467,6 +477,24 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind) {
     }
     TSNode null_node = {0};
     return null_node;
+}
+
+bool cbm_objectscript_is_instance_call(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "method_call") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "do_parameter") != 0 && strcmp(kind, "job_argument") != 0) {
+        return false;
+    }
+    return !ts_node_is_null(cbm_find_child_by_kind(node, "oref_method"));
+}
+
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types) {
+    if (cbm_kind_in_set(node, call_types)) {
+        return true;
+    }
+    return lang == CBM_LANG_OBJECTSCRIPT_UDL && cbm_objectscript_is_instance_call(node);
 }
 
 int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max) {
@@ -864,7 +892,8 @@ static const char *func_kinds_ocaml[] = {"value_definition", "let_binding", NULL
 static const char *func_kinds_zig[] = {"function_declaration", "test_declaration", NULL};
 static const char *func_kinds_bash[] = {"function_definition", NULL};
 static const char *func_kinds_erlang[] = {"function_clause", NULL};
-static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration", NULL};
+static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration",
+                                          "operator_declaration", NULL};
 static const char *func_kinds_matlab[] = {"function_definition", NULL};
 static const char *func_kinds_lean[] = {"def", "theorem", "instance", "abbrev", NULL};
 static const char *func_kinds_form[] = {"procedure_definition", NULL};
@@ -1187,6 +1216,16 @@ bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
 // const", and a member lookup for "operator bool" (the implicit call in
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
+    if (lang == CBM_LANG_SWIFT) {
+        const char *kind = ts_node_type(name_node);
+        if (strcmp(kind, "init_declaration") == 0) {
+            return cbm_arena_strdup(a, "init");
+        }
+        if (strcmp(kind, "deinit_declaration") == 0) {
+            return cbm_arena_strdup(a, "deinit");
+        }
+    }
+
     char *text = cbm_node_text(a, name_node, source);
     /* A C keyword is never a function name: the definition is an error-recovery
      * artifact. No name means no def and no call scope (calls inside fall back
@@ -1203,6 +1242,13 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
             *paren = '\0';
         }
     }
+    /* C# `operator +` is named by its token alone, an anonymous node; any other C# name
+     * is a named node. Spelled like C++'s `operator+` and `operator bool`, here so the
+     * def name and the call-scope QN cannot disagree. */
+    if (text && lang == CBM_LANG_CSHARP && !ts_node_is_named(name_node)) {
+        bool word = text[0] >= 'a' && text[0] <= 'z'; /* operator true, operator false */
+        return cbm_arena_sprintf(a, "operator%s%s", word ? " " : "", text);
+    }
     /* Nix quoted attrpath segment: `"kebab-case" = a: a;` and `services."my.svc" = …`
      * are ordinary names that merely need quoting in source. The node text carries
      * the delimiters, so without this the def is named `"kebab-case"` — quotes and
@@ -1212,6 +1258,14 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
      * function, cannot disagree. */
     if (text && lang == CBM_LANG_NIX) {
         cbm_nix_strip_attr_quotes(text);
+    }
+    /* Haskell infix-form operator definition: `a <+> b = …` resolves to the bare
+     * `operator` node `<+>`, while the prefix form `(<+>) a b = …` is named by its
+     * `prefix_id` text `(<+>)`. Parenthesise here, not in the resolver, so both
+     * forms mint the same name and the def name and the call-scope QN, which both
+     * route through this function, cannot disagree (#2440). */
+    if (text && lang == CBM_LANG_HASKELL && strcmp(ts_node_type(name_node), "operator") == 0) {
+        return cbm_arena_sprintf(a, "(%s)", text);
     }
     return text;
 }
@@ -1374,6 +1428,93 @@ const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, c
     return scope ? cbm_arena_sprintf(a, "%s.%s", scope, name) : name;
 }
 
+/* ── Elixir def-head guards ─────────────────────────────────── */
+
+/* The guard sits on the head, not beside it: `def name(args) when guard` parses
+ * as a single `when` binary_operator whose left operand is `name(args)`. The
+ * operator field is an exact anonymous token, so the check is the token type
+ * rather than the node kind — `def a + b` is a binary_operator head too, and
+ * unwrapping it would name the function after its left parameter. */
+bool cbm_elixir_is_when_guard(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "binary_operator") != 0) {
+        return false;
+    }
+    TSNode op = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    return !ts_node_is_null(op) && strcmp(ts_node_type(op), "when") == 0;
+}
+
+/* One `when` level off a def's first argument, or the node unchanged.
+ *
+ * There is deliberately no named-child fallback for a missing `left`. An infix
+ * operator cannot reduce without a left operand, so tree-sitter-elixir never
+ * builds a `when` binary_operator that lacks one: measured over every guarded
+ * shape in the suite plus a corpus of truncated heads (`def when true`,
+ * `def f(x) when`, `def f(x) when when is_x(x)`, `def when() when when`),
+ * `left` was present on all 66 unwraps, ERROR-recovered parses included, and
+ * every one had the left operand as named child 0. Where the left operand was
+ * genuinely absent the grammar produced no `when` operator at all -- it read
+ * `when` as the head identifier -- so the unwrap is never entered. A
+ * named-child fallback would therefore be dead on a well-formed tree and, on
+ * the hypothetical malformed one, would hand back named child 0 without
+ * knowing it is the left operand rather than the guard expression: naming the
+ * function after its own guard. Returning the node unchanged degrades to the
+ * pre-guard behaviour instead, which is the safe direction. */
+static TSNode elixir_unwrap_one_guard(TSNode first_arg) {
+    if (!cbm_elixir_is_when_guard(first_arg)) {
+        return first_arg;
+    }
+    TSNode lhs = ts_node_child_by_field_name(first_arg, TS_FIELD("left"));
+    return ts_node_is_null(lhs) ? first_arg : lhs;
+}
+
+/* The head under every guard a def's first argument carries, or first_arg
+ * unchanged when it carries none. Elixir admits more than one guard on a
+ * clause -- `def f(x) when is_atom(x) when is_binary(x)` -- and
+ * tree-sitter-elixir nests those RIGHT-associatively, measured on that exact
+ * source: `when(f(x), when(is_atom(x), is_binary(x)))`. The declared head is
+ * therefore the outer operator's left operand and one peel reaches it. The
+ * peel still runs to a fixed point: the extra iteration is one token compare,
+ * and it is what makes the helper's contract "the head under EVERY guard"
+ * rather than "the head under the first one", which is the property the three
+ * walks rely on.
+ *
+ * Left wrapped, the defs walk drops the clause, the unified walk opens no
+ * function scope (so every call in a guarded body sources to the FILE node),
+ * the calls walk stops recognising the head and emits it as an invocation of
+ * the very function being defined, and the usages walk swallows every
+ * identifier in the guard as part of the binding. Four walks read this same
+ * argument, which is why the unwrap lives here rather than in any one of
+ * them. */
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg) {
+    for (;;) {
+        TSNode next = elixir_unwrap_one_guard(first_arg);
+        if (ts_node_eq(next, first_arg)) {
+            return first_arg;
+        }
+        first_arg = next;
+    }
+}
+
+/* True when `node` is the head a def declares, or any of the `when` guard
+ * operators wrapping it. The calls walk needs the whole chain, not just its
+ * ends: each member reaches that walk by its own route -- `def f(x) when g`
+ * arrives as the inner `f(x)` call, `def f when g` has no inner call at all and
+ * the operator itself falls through to extract_callee_name's first-identifier
+ * last resort -- and a member it fails to recognise as a declaration is emitted
+ * as an invocation of the function being defined. */
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node) {
+    for (;;) {
+        if (ts_node_eq(signature, node)) {
+            return true;
+        }
+        TSNode next = elixir_unwrap_one_guard(signature);
+        if (ts_node_eq(next, signature)) {
+            return false;
+        }
+        signature = next;
+    }
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
@@ -1398,6 +1539,11 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     if (!ts_node_is_null(name_node)) {
         return cbm_node_text(a, name_node, source);
     }
+    // C#: an overloaded operator has no name field, its token names it.
+    if (lang == CBM_LANG_CSHARP && strcmp(ts_node_type(func_node), "operator_declaration") == 0) {
+        TSNode op = ts_node_child_by_field_name(func_node, TS_FIELD("operator"));
+        return ts_node_is_null(op) ? NULL : cbm_func_name_node_text(a, op, source, lang);
+    }
     // Arrow functions: check parent variable_declarator
     if (strcmp(ts_node_type(func_node), "arrow_function") == 0) {
         TSNode parent = ts_node_parent(func_node);
@@ -1419,15 +1565,27 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 }
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path,
-                                  const char *module_qn) {
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
     }
+    /* The preprocessed view: a raw GoogleTest definition's body is that test. */
+    if (pp_test_spans && strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        const char *raw_test = cbm_test_span_owner_qn(pp_test_spans, func_node);
+        if (raw_test) {
+            return raw_test;
+        }
+    }
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
         return module_qn;
+    }
+    /* GoogleTest TEST(Suite, Case): the def walk's TEST_Suite_Case (#1266). */
+    const char *test_name = cbm_cpp_test_macro_name(a, test_macro_names, name, func_node, source);
+    if (test_name) {
+        name = test_name;
     }
 
     // Check if the function is inside a class — compute classQN.funcName.
@@ -1495,8 +1653,9 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     }
 
     // Cache miss: compute via parent walk
-    const char *qn = cbm_enclosing_func_qn(ctx->arena, node, ctx->language, ctx->source,
-                                           ctx->project, ctx->rel_path, ctx->module_qn);
+    const char *qn = cbm_enclosing_func_qn(
+        ctx->arena, node, ctx->language, ctx->source, ctx->project, ctx->rel_path, ctx->module_qn,
+        cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), ctx->pp_test_spans);
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);
@@ -2320,6 +2479,65 @@ int cbm_classify_string(const char *str, int len) {
     }
 
     return NOT_FOUND;
+}
+
+/* 1-based source-order ordinal of a top-level Go `init` function_declaration
+ * among the file's `init`s. Unlike a line number, the ordinal is stable under
+ * edits above the function — QNs are node identity, and a line-based suffix
+ * would churn nodes on every unrelated insertion (the #495 cfg suffix and the
+ * GoogleTest derivation are both edit-stable for the same reason).
+ * One cursor pass over the top-level declarations: ts_node_named_child(root, i)
+ * is O(i), so an indexed loop is O(n^2) per init on a wide file, and generated
+ * Go (.pb.go, tables) carries thousands of top-level declarations next to its
+ * init(). */
+static int go_init_ordinal(TSNode fn_node, const char *source) {
+    TSNode root = fn_node;
+    for (TSNode p = ts_node_parent(root); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        root = p;
+    }
+    int ordinal = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(child), "function_declaration") != 0) {
+                continue;
+            }
+            TSNode name = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (ts_node_is_null(name)) {
+                continue;
+            }
+            uint32_t start = ts_node_start_byte(name);
+            if (ts_node_end_byte(name) - start != 4 || memcmp(source + start, "init", 4) != 0) {
+                continue;
+            }
+            ordinal++;
+            if (ts_node_eq(child, fn_node)) {
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    return ordinal;
+}
+
+/* Qualified name of a Go `init` function (#1910). Go allows any number of
+ * init() per package — even several in one file — so the flat `pkg.init`
+ * collides and the graph upsert keeps one node. The QN folds in the file
+ * basename and the init's per-file ordinal: `pkg.init#file.go:N`. Every side
+ * that names an init calls this one function — the definition extractor, the
+ * call-scope side (compute_func_qn) and the Go LSP's enclosing-function QN —
+ * so the three cannot drift. A NULL base QN or path keeps base_qn as is. */
+const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_path, TSNode fn_node,
+                           const char *source) {
+    if (!base_qn || !rel_path) {
+        return base_qn;
+    }
+    const char *base = strrchr(rel_path, '/');
+    base = base ? base + 1 : rel_path;
+    const char *qn =
+        cbm_arena_sprintf(a, "%s#%s:%d", base_qn, base, go_init_ordinal(fn_node, source));
+    return qn ? qn : base_qn;
 }
 
 /* Flatten a JS/TS `template_string` node into plain text (issue #1006).

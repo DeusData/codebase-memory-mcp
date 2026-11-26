@@ -1020,6 +1020,42 @@ static int text_validate_markers(const char *begin_marker, const char *end_marke
     return TEXT_OK;
 }
 
+/* A managed document as read from disk, with our block located in it. */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t bom_len;
+    text_file_snapshot_t snapshot;
+    text_managed_region_t region;
+} text_managed_document_t;
+
+/* The read-validate-scan step shared by the upsert and the read-only ownership
+ * probe, so both judge a file by the same rules. An absent file reads as an
+ * empty document. On success the caller owns doc->data and releases it; on
+ * failure nothing is left allocated. */
+static int text_read_managed_document(const char *file_path, const char *begin_marker,
+                                      size_t begin_len, const char *end_marker, size_t end_len,
+                                      text_managed_document_t *doc) {
+    doc->data = NULL;
+    doc->len = 0U;
+    doc->bom_len = 0U;
+    int status = text_read_file(file_path, &doc->data, &doc->len, &doc->snapshot);
+    if (status == TEXT_OK) {
+        status = text_validate_bytes(doc->data, doc->len, 1);
+    }
+    if (status == TEXT_OK) {
+        doc->bom_len = text_bom_length(doc->data, doc->len);
+        status = text_scan_managed_region(doc->data, doc->len, doc->bom_len, begin_marker,
+                                          begin_len, end_marker, end_len, &doc->region);
+    }
+    if (status != TEXT_OK) {
+        free(doc->data);
+        doc->data = NULL;
+        return TEXT_ERROR;
+    }
+    return TEXT_OK;
+}
+
 static int text_upsert_managed_block(const char *file_path, const char *begin_marker,
                                      const char *end_marker, const char *owned_content,
                                      size_t max_document_bytes) {
@@ -1036,21 +1072,16 @@ static int text_upsert_managed_block(const char *file_path, const char *begin_ma
         return TEXT_ERROR;
     }
 
-    char *old_data = NULL;
-    size_t old_len = 0U;
-    text_file_snapshot_t snapshot;
-    if (text_read_file(file_path, &old_data, &old_len, &snapshot) != TEXT_OK ||
-        text_validate_bytes(old_data, old_len, 1) != TEXT_OK) {
-        free(old_data);
+    text_managed_document_t doc;
+    int read_status =
+        text_read_managed_document(file_path, begin_marker, begin_len, end_marker, end_len, &doc);
+    if (read_status != TEXT_OK) {
         return TEXT_ERROR;
     }
-    size_t bom_len = text_bom_length(old_data, old_len);
-    text_managed_region_t region;
-    if (text_scan_managed_region(old_data, old_len, bom_len, begin_marker, begin_len, end_marker,
-                                 end_len, &region) != TEXT_OK) {
-        free(old_data);
-        return TEXT_ERROR;
-    }
+    char *old_data = doc.data;
+    size_t old_len = doc.len;
+    text_file_snapshot_t snapshot = doc.snapshot;
+    text_managed_region_t region = doc.region;
 
     text_buffer_t updated = {0};
     int result = TEXT_ERROR;
@@ -1070,6 +1101,7 @@ static int text_upsert_managed_block(const char *file_path, const char *begin_ma
                                        &snapshot);
         }
     } else {
+        size_t bom_len = doc.bom_len;
         const char *eol = NULL;
         size_t eol_len = 0U;
         text_detect_eol(old_data + bom_len, old_len - bom_len, &eol, &eol_len);
@@ -1103,6 +1135,34 @@ int cbm_text_upsert_managed_block_limited(const char *file_path, const char *beg
                                           size_t max_document_bytes) {
     return text_upsert_managed_block(file_path, begin_marker, end_marker, owned_content,
                                      max_document_bytes);
+}
+
+int cbm_text_managed_block_status(const char *file_path, const char *begin_marker,
+                                  const char *end_marker) {
+    size_t begin_len = 0U;
+    size_t end_len = 0U;
+    if (!text_valid_path(file_path) ||
+        text_validate_markers(begin_marker, end_marker, &begin_len, &end_len) != TEXT_OK) {
+        return TEXT_ERROR;
+    }
+    text_managed_document_t doc;
+    int read_status =
+        text_read_managed_document(file_path, begin_marker, begin_len, end_marker, end_len, &doc);
+    if (read_status != TEXT_OK) {
+        return TEXT_ERROR;
+    }
+    int result = TEXT_OK;
+    if (!doc.region.present) {
+        for (size_t pos = doc.bom_len; pos < doc.len; pos++) {
+            char byte = doc.data[pos];
+            if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n') {
+                result = TEXT_UNOWNED;
+                break;
+            }
+        }
+    }
+    free(doc.data);
+    return result;
 }
 
 int cbm_text_remove_managed_block(const char *file_path, const char *begin_marker,

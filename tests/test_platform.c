@@ -7,6 +7,7 @@
 #include "../src/foundation/compat_regex.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
@@ -15,6 +16,9 @@
 #include <unistd.h>
 #ifndef _WIN32
 #include <sys/stat.h> /* chmod for the symlink-policy mode legs */
+#include <errno.h>
+#include <sys/resource.h> /* getpriority for the worker-priority leg */
+#include <sys/wait.h>
 #endif
 
 #ifdef __linux__
@@ -895,13 +899,59 @@ TEST(platform_env_long_refuses_what_it_cannot_read) {
     PASS();
 }
 
+/* cbm_env_dup (#221) gives the same environment view as cbm_safe_getenv: an
+ * installed settings resolver answers first, a handled NULL masks the
+ * variable, and an unhandled name falls through to the process environment. */
+static bool platform_env_dup_test_resolver(const char *name, const char **value) {
+    if (strcmp(name, "CBM_TEST_ENV_DUP_RESOLVED") == 0) {
+        *value = "from-settings";
+        return true;
+    }
+    if (strcmp(name, "CBM_TEST_ENV_DUP_MASKED") == 0) {
+        *value = NULL;
+        return true;
+    }
+    return false;
+}
+
+TEST(platform_env_dup_honours_the_settings_resolver) {
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_RESOLVED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_MASKED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_NATIVE", "from-environment", 1), 0);
+
+    cbm_set_environment_resolver(platform_env_dup_test_resolver);
+    char *resolved = cbm_env_dup("CBM_TEST_ENV_DUP_RESOLVED");
+    char *masked = cbm_env_dup("CBM_TEST_ENV_DUP_MASKED");
+    char *native = cbm_env_dup("CBM_TEST_ENV_DUP_NATIVE");
+    char safe[64];
+    const char *safe_value = cbm_safe_getenv("CBM_TEST_ENV_DUP_RESOLVED", safe, sizeof(safe), NULL);
+    cbm_set_environment_resolver(NULL);
+
+    bool safe_ok = safe_value && strcmp(safe_value, "from-settings") == 0;
+    bool resolved_ok = resolved && strcmp(resolved, "from-settings") == 0;
+    bool masked_ok = masked == NULL;
+    bool native_ok = native && strcmp(native, "from-environment") == 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+    cbm_free(CBM_MEM_CLASS_OTHER, masked);
+    cbm_free(CBM_MEM_CLASS_OTHER, native);
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_RESOLVED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_MASKED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_NATIVE");
+
+    ASSERT_TRUE(safe_ok);
+    ASSERT_TRUE(resolved_ok);
+    ASSERT_TRUE(masked_ok);
+    ASSERT_TRUE(native_ok);
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
  * UTF-8 path bytes through the active ANSI code page. */
 TEST(platform_setenv_preserves_utf8_in_wide_environment) {
-    static const char utf8[] = "C:/cbm-cache-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac";
-    static const wchar_t wide[] = L"C:/cbm-cache-\u0394-\u65e5\u672c";
+    static const char utf8[] = "C:/cbm-cache-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac-\xe4\xb8\x81";
+    static const wchar_t wide[] = L"C:/cbm-cache-\u0394-\u65e5\u672c-\u4e01";
     ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", utf8, 1), 0);
     wchar_t observed_wide[128];
     ASSERT_EQ(GetEnvironmentVariableW(L"CBM_CACHE_DIR", observed_wide, 128), (DWORD)(wcslen(wide)));
@@ -909,6 +959,14 @@ TEST(platform_setenv_preserves_utf8_in_wide_environment) {
     char observed_utf8[128];
     ASSERT_NOT_NULL(cbm_safe_getenv("CBM_CACHE_DIR", observed_utf8, sizeof(observed_utf8), NULL));
     ASSERT_STR_EQ(observed_utf8, utf8);
+    /* Narrow getenv must agree with the CRT's active ANSI code page. */
+    char expected_narrow[128];
+    ASSERT_GT(WideCharToMultiByte(CP_ACP, 0, wide, -1, expected_narrow,
+                                  (int)sizeof(expected_narrow), NULL, NULL),
+              0);
+    const char *observed_narrow = getenv("CBM_CACHE_DIR");
+    ASSERT_NOT_NULL(observed_narrow);
+    ASSERT_STR_EQ(observed_narrow, expected_narrow);
     (void)cbm_unsetenv("CBM_CACHE_DIR");
     PASS();
 }
@@ -1387,6 +1445,49 @@ TEST(regex_estimate_counts_brackets_and_escapes_literally) {
     PASS();
 }
 
+/* An index worker lowers its own priority (#2834). A non-root process cannot
+ * raise it back, so the helper runs in a forked child that reports its nice. */
+TEST(platform_lower_cpu_priority_nices_the_process) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX nice contract");
+#else
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    pid_t child = fork();
+    if (child == 0) {
+        (void)close(fds[0]);
+        /* report: lowered ok, nice after; then, from a nicer start, ok, target, nice after */
+        int report[5] = {cbm_lower_cpu_priority() ? 1 : 0, 0, 0, 0, 0};
+        errno = 0;
+        report[1] = getpriority(PRIO_PROCESS, 0);
+        if (errno != 0) {
+            report[0] = 0;
+        }
+        /* Never-raise leg: start nicer than the helper's level; it must leave it. */
+        report[3] = report[1] >= 15 ? 19 : 15;
+        if (setpriority(PRIO_PROCESS, 0, report[3]) == 0) {
+            report[2] = cbm_lower_cpu_priority() ? 1 : 0;
+            errno = 0;
+            report[4] = getpriority(PRIO_PROCESS, 0);
+        }
+        _exit(write(fds[1], report, sizeof(report)) == (ssize_t)sizeof(report) ? 0 : 1);
+    }
+    ASSERT_TRUE(child > 0);
+    (void)close(fds[1]);
+    int report[5] = {0, 0, 0, 0, 0};
+    ssize_t got = read(fds[0], report, sizeof(report));
+    (void)close(fds[0]);
+    int status = 0;
+    (void)waitpid(child, &status, 0);
+    ASSERT_EQ(got, (ssize_t)sizeof(report));
+    ASSERT_EQ(report[0], 1);
+    ASSERT_TRUE(report[1] >= CBM_LOW_CPU_PRIORITY_NICE);
+    ASSERT_EQ(report[2], 1);
+    ASSERT_EQ(report[4], report[3]);
+    PASS();
+#endif
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
@@ -1420,7 +1521,9 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_env_long_reads_a_clean_number);
     RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
+    RUN_TEST(platform_env_dup_honours_the_settings_resolver);
     RUN_TEST(platform_system_info);
+    RUN_TEST(platform_lower_cpu_priority_nices_the_process);
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
     RUN_TEST(regex_compile_refuses_overlong_pattern);

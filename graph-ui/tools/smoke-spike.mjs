@@ -31,9 +31,10 @@ import { createServer } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import net from 'node:net';
 import { mkdtemp, mkdir, writeFile, readFile, stat, rm } from 'node:fs/promises';
-import { existsSync, createReadStream } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { serveStaticAsset } from './smoke-static-assets.mjs';
 import { tmpdir } from 'node:os';
-import { join, dirname, resolve, extname, normalize } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -251,8 +252,6 @@ const MIME = {
 };
 
 function startStaticProxy(port, cPort) {
-  const allowedRoots = [join(ROOT, 'spike'), join(ROOT, 'node_modules')];
-
   const server = createServer((req, res) => {
     if (req.method === 'POST' && req.url.split('?')[0] === '/rpc') {
       const chunks = [];
@@ -284,16 +283,7 @@ function startStaticProxy(port, cPort) {
       return;
     }
 
-    const urlPath = decodeURIComponent(req.url.split('?')[0]);
-    const candidate = resolve(join(ROOT, normalize(urlPath)));
-    const allowed = allowedRoots.some((root) => candidate === root || candidate.startsWith(root + '/'));
-    if (!allowed || !existsSync(candidate)) {
-      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('not found');
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': MIME[extname(candidate)] ?? 'application/octet-stream' });
-    createReadStream(candidate).pipe(res);
+    serveStaticAsset(ROOT, req, res, MIME);
   });
 
   return new Promise((resolveServer, rejectServer) => {

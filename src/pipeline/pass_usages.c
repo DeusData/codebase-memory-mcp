@@ -18,6 +18,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/site_bind.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
@@ -161,6 +162,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     /* imp_keys is the IMPORTS-edge map (cbm_pxc_build_import_map). */
     cbm_php_vendor_names_t php_vendor;
     cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
+    cbm_site_file_t site;
+    cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, lang, result);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -237,11 +240,21 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             }
         }
 
+        /* The shared cross-file layer (site_bind.h) is asked at every usage no
+         * engine row was found for; a proven answer is the target and main's
+         * name chain does not run for this site. MUST match pass_parallel.c. */
+        cbm_site_answer_t scoped = {.verdict = CBM_SITE_NO_ANSWER};
+        if (!tgt && !semantic_reference && !property_read) {
+            scoped = cbm_pipeline_site_bind_usage(&site, usage, src);
+        }
+
         /* A syntactically explicit reference remains useful when exact semantic
          * resolution is unavailable, but the textual registry fallback proves
          * only value use—not an occurrence-exact callable target. Emit USAGE in
          * that case; CALL_REFERENCE is reserved for the exact LSP join. */
-        if (!tgt) {
+        if (scoped.verdict == CBM_SITE_PROVEN) {
+            tgt = scoped.target;
+        } else if (!tgt) {
             /* An occurrence-exact semantic record owns this reference even when
              * its target is not materialized in the graph (for example, a
              * Kotlin local function). Falling back by raw name here would bind
@@ -262,8 +275,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 (lang == CBM_LANG_SQL)
                     ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve_lang(ctx->registry, usage->ref_name, module_qn, imp_keys,
-                                                imp_vals, imp_count, lang);
+                    : cbm_registry_resolve_ref(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                               imp_vals, imp_count, lang,
+                                               cbm_pipeline_caller_is_test(src, rel, lang));
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -283,10 +297,15 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942/#1962: a bare Go reference can never denote a struct
-             * field; the member half of a selector may. */
-            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
-                                                      tgt->label)) {
+            /* #1942/#1962/#2666: a bare Go or C reference can never denote
+             * a struct field; the member half of a selector may. */
+            if (tgt && cbm_suppress_bare_field_ref(lang, usage->is_member_access, tgt->label)) {
+                continue;
+            }
+            /* A bare Go `init` names a local, never a package init or an init
+             * method (cbm_go_suppress_bare_init_bind). Mirrors pass_parallel.c. */
+            if (tgt && cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      usage->ref_name, res.strategy, tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
@@ -311,6 +330,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, edge_type, uprops);
         resolved++;
     }
+    cbm_pipeline_site_bind_end(&site, ctx->gbuf);
     cbm_pipeline_lsp_reference_index_free(&reference_index);
     cbm_pipeline_lsp_field_index_free(&field_index);
     cbm_pipeline_php_vendor_names_free(&php_vendor);
@@ -400,8 +420,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, rw->var_name, module_qn,
-                                                         imp_keys, imp_vals, imp_count, lang);
+        cbm_resolution_t res =
+            cbm_registry_resolve_ref(ctx->registry, rw->var_name, module_qn, imp_keys, imp_vals,
+                                     imp_count, lang, cbm_pipeline_caller_is_test(src, rel, lang));
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -416,9 +437,16 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942/#1962: a bare Go reference can never denote a struct field;
-         * a selector-LHS write (`t.err = x`) may bind it. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
+        /* #1942/#1962/#2666: a bare Go or C reference can never denote a
+         * struct field; a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_suppress_bare_field_ref(lang, rw->is_member_access, tgt->label)) {
+            continue;
+        }
+        /* `init := func(...)`: a bare Go `init` names a local, never a package
+         * init or an init method (cbm_go_suppress_bare_init_bind). Mirrors
+         * pass_parallel.c. */
+        if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, rw->is_member_access, rw->var_name,
+                                           res.strategy, tgt->label)) {
             continue;
         }
 
@@ -463,11 +491,13 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
+            CBMIncludeScope include_scope = cbm_pipeline_include_scope(ctx);
             result = cbm_pipeline_test_force_extract_null(ctx, files[i].language)
                          ? NULL
                          : cbm_extract_file_ex_with_tests(
                                source, source_len, files[i].language, ctx->project_name, rel,
-                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations);
+                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations,
+                               &include_scope);
             free(source);
             if (!cbm_pipeline_test_extraction_ok(ctx, files[i].language, result)) {
                 cbm_free_result(result);

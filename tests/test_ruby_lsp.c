@@ -46,6 +46,9 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ruby_lsp.h"
+#include "lsp/lsp_work.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Helpers (mirror test_perl_lsp.c) ──────────────────────────── */
@@ -1323,6 +1326,210 @@ TEST(rubylsp_self_rebinding_blocks_no_edge) {
     PASS();
 }
 
+/* ── 17. Bounded resolver work ────────────────────────────────────
+ *
+ * Measured with counters, never with a clock (O9): CBM_LSP_WORK
+ * (lsp_work.h, seam builds) for lookup work, and the result arena's
+ * cumulative allocation for bytes built. Each fixture is measured at n and
+ * 2n: linear work doubles (ratio about 2); anything worse lands above the
+ * gate of 3. */
+
+static uint64_t rubylsp_counted_work(const char *src, size_t *arena_bytes) {
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ruby(src);
+    uint64_t work = cbm_lsp_work_take();
+    if (arena_bytes)
+        *arena_bytes = r ? cbm_arena_total(&r->arena) : 0;
+    if (r)
+        cbm_free_result(r);
+    return work;
+}
+
+/* n modules where every module both prepends and includes the next one;
+ * the last defines one method. `Probe` reaches M0 through `include`
+ * (instance side) or `extend` (class side) and calls a method nobody
+ * defines, so the lookup must miss after searching every ancestor. */
+static char *rubylsp_mixin_chain_src(int n, bool class_side) {
+    size_t cap = (size_t)n * 96 + 256;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n)
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  prepend M%d\n  include M%d\nend\n", i, i + 1,
+                                    i + 1);
+        else
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  def leaf\n    1\n  end\nend\n", i);
+    }
+    if (class_side)
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  extend M0\n  def self.run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    else
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  include M0\n  def run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    return src;
+}
+
+static uint64_t rubylsp_mixin_chain_work(int n, bool class_side) {
+    char *src = rubylsp_mixin_chain_src(n, class_side);
+    if (!src)
+        return 0;
+    uint64_t work = rubylsp_counted_work(src, NULL);
+    free(src);
+    return work;
+}
+
+/* Review ask (a): Ruby linearizes ancestors, so a module reached through
+ * two paths (`prepend M; include M`, a diamond) is searched once. Without a
+ * visited set every level of the chain doubles the paths: 2^n visits
+ * (measured 4 -> 20,744 for n = 2..14). With it a miss costs one visit per
+ * module. Positive controls: the doubled pair still resolves through the
+ * prepend, and a diamond resolves to the shared module exactly once. */
+TEST(rubylsp_mixin_walk_visits_each_module_once) {
+    uint64_t inst_n = rubylsp_mixin_chain_work(6, false);
+    uint64_t inst_2n = rubylsp_mixin_chain_work(12, false);
+    uint64_t cls_n = rubylsp_mixin_chain_work(6, true);
+    uint64_t cls_2n = rubylsp_mixin_chain_work(12, true);
+    printf("  mixin chain work: instance n=6 %llu, n=12 %llu; class side n=6 %llu, n=12 %llu\n",
+           (unsigned long long)inst_n, (unsigned long long)inst_2n, (unsigned long long)cls_n,
+           (unsigned long long)cls_2n);
+    ASSERT(inst_n > 0 && cls_n > 0);
+    ASSERT(inst_2n <= 3 * inst_n);
+    ASSERT(cls_2n <= 3 * cls_n);
+
+    const char *src = "module Shared\n"
+                      "  def hello\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "module Left\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Right\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Twice\n"
+                      "  def twice\n"
+                      "    2\n"
+                      "  end\n"
+                      "end\n"
+                      "class Diamond\n"
+                      "  include Left\n"
+                      "  include Right\n"
+                      "  prepend Twice\n"
+                      "  include Twice\n"
+                      "  def run\n"
+                      "    hello()\n"
+                      "    twice()\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Shared.hello") == 1);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Twice.twice") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `class Probe; def run; S0::S1::...::S<n-1>.new; end; end` */
+static char *rubylsp_deep_const_src(int n) {
+    size_t cap = (size_t)n * 12 + 128;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = (size_t)snprintf(src, cap, "class Probe\n  def run\n    ");
+    for (int i = 0; i < n; i++)
+        off += (size_t)snprintf(src + off, cap - off, i ? "::S%d" : "S%d", i);
+    (void)snprintf(src + off, cap - off, ".new\n  end\nend\n");
+    return src;
+}
+
+static size_t rubylsp_deep_const_bytes(int n) {
+    char *src = rubylsp_deep_const_src(n);
+    if (!src)
+        return 0;
+    size_t bytes = 0;
+    (void)rubylsp_counted_work(src, &bytes);
+    free(src);
+    return bytes;
+}
+
+/* Review ask (b): a constant path is built in one pass. Recursing once per
+ * `::` and re-formatting the growing prefix at every level costs one stack
+ * frame per segment and quadratic bytes; the loop has no recursion and
+ * writes the path once. The positive control pins the exact class QN for a
+ * deep path and for a leading `::`. */
+TEST(rubylsp_const_path_is_linear) {
+    size_t b_n = rubylsp_deep_const_bytes(800);
+    size_t b_2n = rubylsp_deep_const_bytes(1600);
+    printf("  const path arena bytes: n=800 %zu, n=1600 %zu\n", b_n, b_2n);
+    ASSERT(b_n > 0);
+    ASSERT(b_2n <= 3 * b_n);
+
+    const char *src = "module L0\n"
+                      "  module L1\n"
+                      "    module L2\n"
+                      "      module L3\n"
+                      "        module L4\n"
+                      "          class Leaf\n"
+                      "          end\n"
+                      "        end\n"
+                      "      end\n"
+                      "    end\n"
+                      "  end\n"
+                      "end\n"
+                      "class Top\n"
+                      "  class Inner\n"
+                      "  end\n"
+                      "end\n"
+                      "class Caller\n"
+                      "  def deep\n"
+                      "    L0::L1::L2::L3::L4::Leaf.new\n"
+                      "  end\n"
+                      "  def rooted\n"
+                      "    ::Top::Inner.new\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.deep", "test.main.L0.L1.L2.L3.L4.Leaf") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.rooted", "test.main.Top.Inner") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Review ask (c): the stdlib seed must survive allocation failure. A
+ * zero-initialised arena has no blocks and no grow size, so every
+ * allocation from it returns NULL. The seed must not write through a NULL
+ * return-type vector, and must not register an entry whose formatted name
+ * came back NULL (a NULL QN would reach strcmp in finalize and in every later
+ * lookup). */
+TEST(rubylsp_stdlib_seed_survives_alloc_failure) {
+    CBMArena reg_arena;
+    cbm_arena_init(&reg_arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &reg_arena);
+    CBMArena dead;
+    memset(&dead, 0, sizeof(dead));
+    cbm_ruby_stdlib_register(&reg, &dead);
+    ASSERT(reg.type_count > 0);
+    ASSERT(reg.func_count > 0); /* Kernel built-ins carry literal names */
+    for (int i = 0; i < reg.func_count; i++) {
+        ASSERT(reg.funcs[i].qualified_name != NULL);
+        ASSERT(reg.funcs[i].short_name != NULL);
+    }
+    cbm_registry_finalize(&reg);
+    ASSERT(cbm_registry_lookup_func(&reg, "puts") != NULL);
+    cbm_arena_destroy(&reg_arena);
+    PASS();
+}
+
 /* ── 17. Cross-file: defs from another file resolve ─────────────── */
 
 TEST(rubylsp_cross_file_defs) {
@@ -1363,8 +1570,12 @@ TEST(rubylsp_cross_file_defs) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
+    /* `f = User.find(3)` with User in another file needs the cross-file half
+     * of the finder rule, which is off by default (ruby_ar_finder_cross_file). */
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.controller", defs, 3, NULL,
                            NULL, 0, NULL, &out);
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
 
     bool ctor = false;
     bool full_name = false;
@@ -1372,7 +1583,7 @@ TEST(rubylsp_cross_file_defs) {
     for (int i = 0; i < out.count; i++) {
         if (!out.items[i].callee_qn || !out.items[i].caller_qn)
             continue;
-        if (!strstr(out.items[i].caller_qn, "UsersController.show"))
+        if (strcmp(out.items[i].caller_qn, "test.app.controller.UsersController.show") != 0)
             continue;
         if (strcmp(out.items[i].callee_qn, "test.models.user.User") == 0)
             ctor = true;
@@ -1450,8 +1661,11 @@ TEST(rubylsp_cross_file_ar_repro) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
+    /* `user = User.find(id)` with User in another file: cross-file finder rule. */
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "e2e.app.services.report", defs, 6, NULL,
                            NULL, 0, NULL, &out);
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
 
     bool full_name = false;
     bool deact = false;
@@ -1493,10 +1707,12 @@ static void cross_def(CBMLSPDef *d, const char *qn, const char *short_name, cons
     d->lang = CBM_LANG_RUBY;
 }
 
-static bool out_has(const CBMResolvedCallArray *out, const char *caller_sub, const char *callee) {
+/* Caller and callee both match exactly, as find_resolved_exact does for the
+ * single-file rows: a substring match would let a row pass on the wrong caller. */
+static bool out_has(const CBMResolvedCallArray *out, const char *caller, const char *callee) {
     for (int i = 0; i < out->count; i++) {
         if (out->items[i].caller_qn && out->items[i].callee_qn &&
-            strstr(out->items[i].caller_qn, caller_sub) &&
+            strcmp(out->items[i].caller_qn, caller) == 0 &&
             strcmp(out->items[i].callee_qn, callee) == 0)
             return true;
     }
@@ -1533,9 +1749,9 @@ TEST(rubylsp_cross_reopened_class_across_files) {
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.report", defs, 4, NULL, NULL, 0,
                            NULL, &out);
-    bool ctor = out_has(&out, "Report.run", "test.a.User");
-    bool name = out_has(&out, "Report.run", "test.a.User.name");
-    bool email = out_has(&out, "Report.run", "test.b.User.email");
+    bool ctor = out_has(&out, "test.app.report.Report.run", "test.a.User");
+    bool name = out_has(&out, "test.app.report.Report.run", "test.a.User.name");
+    bool email = out_has(&out, "test.app.report.Report.run", "test.b.User.email");
     if (!(ctor && name && email))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -1565,8 +1781,8 @@ TEST(rubylsp_cross_compact_class_name) {
     memset(&out, 0, sizeof(out));
     cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.welcome", defs, 2, NULL, NULL,
                            0, NULL, &out);
-    bool ctor = out_has(&out, "Welcome.run", "test.admin.Admin::User");
-    bool greet = out_has(&out, "Welcome.run", "test.admin.Admin::User.greet");
+    bool ctor = out_has(&out, "test.app.welcome.Welcome.run", "test.admin.Admin::User");
+    bool greet = out_has(&out, "test.app.welcome.Welcome.run", "test.admin.Admin::User.greet");
     if (!(ctor && greet))
         out_dump(&out);
     cbm_arena_destroy(&arena);
@@ -1593,6 +1809,20 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     ASSERT(sh != NULL);
     int classes_before = sh->class_count;
     int funcs_before = sh->reg.func_count;
+    /* The counts cannot see a written field (a visit mark on a shared entry,
+     * say), so keep a byte copy of the class array and both hash indexes and
+     * compare them after the resolves. */
+    size_t classes_bytes = (size_t)sh->class_count * sizeof(RubyClassInfo);
+    size_t slots_bytes = ((size_t)sh->slot_mask + 1) * sizeof(int);
+    char *snap_classes = (char *)malloc(classes_bytes);
+    char *snap_by_qn = (char *)malloc(slots_bytes);
+    char *snap_by_path = (char *)malloc(slots_bytes);
+    char *snap_by_pp = (char *)malloc(slots_bytes);
+    ASSERT(snap_classes && snap_by_qn && snap_by_path && snap_by_pp);
+    memcpy(snap_classes, sh->classes, classes_bytes);
+    memcpy(snap_by_qn, sh->by_qn, slots_bytes);
+    memcpy(snap_by_path, sh->by_path, slots_bytes);
+    memcpy(snap_by_pp, sh->by_pp, slots_bytes);
 
     const char *src1 =
         "class One\n  def run\n    c = Child.new\n    c.shared_m\n    c.own_m\n  end\nend\n";
@@ -1616,11 +1846,19 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
                                          NULL, 0, NULL, &o2);
     cbm_run_ruby_lsp_cross_with_registry(&a3, src3, (int)strlen(src3), "test.app.three", sh, NULL,
                                          NULL, 0, NULL, &o3);
-    bool one_inherited = out_has(&o1, "One.run", "test.base.Base.shared_m");
-    bool one_own = out_has(&o1, "One.run", "test.child.Child.own_m");
-    bool two_inherited = out_has(&o2, "Two.run", "test.base.Base.shared_m");
-    bool three_none = !out_has(&o3, "Three.run", "test.base.Base.shared_m");
-    bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before;
+    bool one_inherited = out_has(&o1, "test.app.one.One.run", "test.base.Base.shared_m");
+    bool one_own = out_has(&o1, "test.app.one.One.run", "test.child.Child.own_m");
+    bool two_inherited = out_has(&o2, "test.app.two.Two.run", "test.base.Base.shared_m");
+    bool three_none = !out_has(&o3, "test.app.three.Three.run", "test.base.Base.shared_m");
+    bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before &&
+                     memcmp(snap_classes, sh->classes, classes_bytes) == 0 &&
+                     memcmp(snap_by_qn, sh->by_qn, slots_bytes) == 0 &&
+                     memcmp(snap_by_path, sh->by_path, slots_bytes) == 0 &&
+                     memcmp(snap_by_pp, sh->by_pp, slots_bytes) == 0;
+    free(snap_by_pp);
+    free(snap_classes);
+    free(snap_by_qn);
+    free(snap_by_path);
     if (!(one_inherited && one_own && two_inherited && three_none && untouched)) {
         out_dump(&o1);
         out_dump(&o2);
@@ -1635,6 +1873,457 @@ TEST(rubylsp_cross_registry_built_once_serves_many_files) {
     ASSERT(two_inherited);
     ASSERT(three_none);
     ASSERT(untouched);
+    PASS();
+}
+
+/* A class reopened in `reopenings` files (`Widget`, one module each, the first
+ * declaring `< CxBase`), plus the base. Work is counted for the registry build
+ * and for resolving one fixed file whose call sites all miss on the head's own
+ * methods (`label` is inherited from CxBase). */
+static bool rubylsp_reopen_work(int reopenings, uint64_t *build_work, uint64_t *resolve_work) {
+    int n = reopenings * 2 + 2;
+    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)n, sizeof(CBMLSPDef));
+    char (*names)[64] = (char (*)[64])calloc((size_t)n * 3, sizeof(*names));
+    if (!defs || !names) {
+        free(defs);
+        free(names);
+        return false;
+    }
+    int d = 0;
+    int nm = 0;
+    cross_def(&defs[d++], "test.base.CxBase", "CxBase", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[d++], "test.base.CxBase.label", "label", "Method", "test.base",
+              "test.base.CxBase", NULL);
+    for (int i = 0; i < reopenings; i++) {
+        char *mod = names[nm++];
+        char *cls = names[nm++];
+        char *meth = names[nm++];
+        snprintf(mod, 64, "test.m%d", i);
+        snprintf(cls, 64, "test.m%d.CxWidget", i);
+        snprintf(meth, 64, "test.m%d.CxWidget.own%d", i, i);
+        cross_def(&defs[d++], cls, "CxWidget", "Class", mod, NULL, i == 0 ? "CxBase" : NULL);
+        cross_def(&defs[d++], meth, "own", "Method", mod, cls, NULL);
+    }
+    CBMArena build;
+    cbm_arena_init(&build);
+    (void)cbm_lsp_work_take();
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, d);
+    *build_work = cbm_lsp_work_take();
+
+    const char *src = "class CxCaller\n  def run\n    w = CxWidget.new\n    w.label\n"
+                      "    w.label\n    w.label\n    w.label\n    w.label\n    w.label\n"
+                      "    w.label\n    w.label\n  end\nend\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    (void)cbm_lsp_work_take();
+    if (sh)
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), "test.app.caller", sh, NULL,
+                                             NULL, 0, NULL, &out);
+    *resolve_work = cbm_lsp_work_take();
+    bool resolved = out_has(&out, "test.app.caller.CxCaller.run", "test.base.CxBase.label");
+    cbm_arena_destroy(&a);
+    cbm_arena_destroy(&build);
+    free(defs);
+    free(names);
+    return sh && resolved;
+}
+
+/* Review items 2b / 2c / 3. Constants are global, so a namespace module or a
+ * model is reopened in many files. Doubling the reopenings must at most double
+ * the registry build (a per-reopening tail walk makes it R^2/2, ratio 4), and
+ * must not change what resolving one fixed file costs at all: a lookup is one
+ * probe however many files reopen the class (a group walk per miss makes it
+ * grow with R). The resolve gate is therefore 1.5, not the build gate of 3. */
+TEST(rubylsp_cross_reopened_class_work_is_bounded) {
+    uint64_t build_r = 0;
+    uint64_t resolve_r = 0;
+    uint64_t build_2r = 0;
+    uint64_t resolve_2r = 0;
+    ASSERT(rubylsp_reopen_work(64, &build_r, &resolve_r));
+    ASSERT(rubylsp_reopen_work(128, &build_2r, &resolve_2r));
+    printf("  reopened-class work: build R=64 %llu, 2R %llu; resolve R=64 %llu, 2R %llu\n",
+           (unsigned long long)build_r, (unsigned long long)build_2r, (unsigned long long)resolve_r,
+           (unsigned long long)resolve_2r);
+    ASSERT(build_2r < 3 * (build_r ? build_r : 1));
+    ASSERT(2 * resolve_2r < 3 * (resolve_r ? resolve_r : 1));
+    PASS();
+}
+
+/* Review item 4: the merged record must not depend on def order. A full build
+ * orders defs by file index; the incremental closure route appends fresh defs
+ * to the persisted ones, so the same project can arrive in any order. The head
+ * is the smallest QN, the superclass comes from the smallest-QN declaration
+ * that has one, and a method defined by two reopenings resolves to the smaller
+ * QN. Built forwards and reversed, the resolved edges must be identical. */
+static void rubylsp_order_defs(CBMLSPDef *defs, bool reversed) {
+    CBMLSPDef t[10];
+    cross_def(&t[0], "test.m2.CxWidget", "CxWidget", "Class", "test.m2", NULL, "CxOther");
+    cross_def(&t[1], "test.m2.CxWidget.dup_m", "dup_m", "Method", "test.m2", "test.m2.CxWidget",
+              NULL);
+    cross_def(&t[2], "test.m1.CxWidget", "CxWidget", "Class", "test.m1", NULL, "CxBase");
+    cross_def(&t[3], "test.m1.CxWidget.dup_m", "dup_m", "Method", "test.m1", "test.m1.CxWidget",
+              NULL);
+    cross_def(&t[4], "test.m0.CxWidget", "CxWidget", "Class", "test.m0", NULL, NULL);
+    cross_def(&t[5], "test.m0.CxWidget.own", "own", "Method", "test.m0", "test.m0.CxWidget", NULL);
+    cross_def(&t[6], "test.base.CxBase", "CxBase", "Class", "test.base", NULL, NULL);
+    cross_def(&t[7], "test.base.CxBase.label", "label", "Method", "test.base", "test.base.CxBase",
+              NULL);
+    cross_def(&t[8], "test.base.CxOther", "CxOther", "Class", "test.base", NULL, NULL);
+    cross_def(&t[9], "test.base.CxOther.label", "label", "Method", "test.base", "test.base.CxOther",
+              NULL);
+    for (int i = 0; i < 10; i++)
+        defs[i] = reversed ? t[9 - i] : t[i];
+}
+
+static bool rubylsp_order_edges(bool reversed, bool *ctor, bool *label, bool *dup, bool *own) {
+    CBMLSPDef defs[10];
+    rubylsp_order_defs(defs, reversed);
+    const char *src = "class CxCaller\n  def run\n    w = CxWidget.new\n    w.label\n"
+                      "    w.dup_m\n    w.own\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 10, NULL, NULL,
+                           0, NULL, &out);
+    *ctor = out_has(&out, "test.app.caller.CxCaller.run", "test.m0.CxWidget");
+    *label = out_has(&out, "test.app.caller.CxCaller.run", "test.base.CxBase.label");
+    *dup = out_has(&out, "test.app.caller.CxCaller.run", "test.m1.CxWidget.dup_m");
+    *own = out_has(&out, "test.app.caller.CxCaller.run", "test.m0.CxWidget.own");
+    if (!(*ctor && *label && *dup && *own))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    return true;
+}
+
+TEST(rubylsp_cross_same_named_classes_stay_in_their_package) {
+    /* Two packages of one repository each declare their own Topic. A call
+     * from inside a package reaches that package's Topic, never the other's;
+     * a caller in a third package, where the constant is declared under
+     * several roots and none is its own, resolves nothing; a constant
+     * declared under one root only still resolves from anywhere. */
+    CBMLSPDef defs[7];
+    cross_def(&defs[0], "proj.alpha.test.models.topic.Topic", "Topic", "Class",
+              "proj.alpha.test.models.topic", NULL, NULL);
+    cross_def(&defs[1], "proj.alpha.test.models.topic.Topic.hello", "hello", "Method",
+              "proj.alpha.test.models.topic", "proj.alpha.test.models.topic.Topic", NULL);
+    cross_def(&defs[2], "proj.beta.test.models.topic.Topic", "Topic", "Class",
+              "proj.beta.test.models.topic", NULL, NULL);
+    cross_def(&defs[3], "proj.beta.test.models.topic.Topic.hello", "hello", "Method",
+              "proj.beta.test.models.topic", "proj.beta.test.models.topic.Topic", NULL);
+    cross_def(&defs[4], "proj.beta.lib.only.Only", "Only", "Class", "proj.beta.lib.only", NULL,
+              NULL);
+    cross_def(&defs[5], "proj.beta.lib.only.Only.ping", "ping", "Method", "proj.beta.lib.only",
+              "proj.beta.lib.only.Only", NULL);
+    cross_def(&defs[6], "proj.alpha.lib.x.X", "X", "Class", "proj.alpha.lib.x", NULL, NULL);
+
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, 7);
+    ASSERT(sh != NULL);
+
+    const char *src =
+        "class Caller\n  def run\n    Topic.new.hello\n    Only.new.ping\n  end\nend\n";
+    const char *mods[3] = {"proj.alpha.test.cases.caller", "proj.beta.test.cases.caller",
+                           "proj.gamma.test.cases.caller"};
+    const char *callers[3] = {"proj.alpha.test.cases.caller.Caller.run",
+                              "proj.beta.test.cases.caller.Caller.run",
+                              "proj.gamma.test.cases.caller.Caller.run"};
+    bool alpha_ok = false;
+    bool beta_ok = false;
+    bool gamma_none = false;
+    bool only_all = true;
+    for (int i = 0; i < 3; i++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMResolvedCallArray o;
+        memset(&o, 0, sizeof(o));
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), mods[i], sh, NULL, NULL, 0,
+                                             NULL, &o);
+        bool alpha = out_has(&o, callers[i], "proj.alpha.test.models.topic.Topic.hello");
+        bool beta = out_has(&o, callers[i], "proj.beta.test.models.topic.Topic.hello");
+        if (i == 0)
+            alpha_ok = alpha && !beta;
+        else if (i == 1)
+            beta_ok = beta && !alpha;
+        else
+            gamma_none = !alpha && !beta;
+        only_all = only_all && out_has(&o, callers[i], "proj.beta.lib.only.Only.ping");
+        if (!(only_all && (i != 0 || alpha_ok)))
+            out_dump(&o);
+        cbm_arena_destroy(&a);
+    }
+    cbm_arena_destroy(&build);
+    ASSERT(alpha_ok);
+    ASSERT(beta_ok);
+    ASSERT(gamma_none);
+    ASSERT(only_all);
+    PASS();
+}
+
+TEST(rubylsp_cross_ambiguous_nested_constant_does_not_fall_through) {
+    /* Inside `module M`, `X` names M::X when M::X exists. Two packages
+     * declare M::X and a third declares a top-level X. A caller in a fourth
+     * package, inside module M, must not land on the top-level X (Ruby binds
+     * M::X there; which package's is unknown, so nothing). A caller in
+     * alpha binds alpha's M::X. Three packages share M::X so the per-path
+     * chain holds more than two heads. */
+    CBMLSPDef defs[8];
+    cross_def(&defs[0], "proj.alpha.lib.mx.M.X", "X", "Class", "proj.alpha.lib.mx", NULL, NULL);
+    cross_def(&defs[1], "proj.alpha.lib.mx.M.X.hello", "hello", "Method", "proj.alpha.lib.mx",
+              "proj.alpha.lib.mx.M.X", NULL);
+    cross_def(&defs[2], "proj.beta.lib.mx.M.X", "X", "Class", "proj.beta.lib.mx", NULL, NULL);
+    cross_def(&defs[3], "proj.beta.lib.mx.M.X.hello", "hello", "Method", "proj.beta.lib.mx",
+              "proj.beta.lib.mx.M.X", NULL);
+    cross_def(&defs[4], "proj.eta.lib.mx.M.X", "X", "Class", "proj.eta.lib.mx", NULL, NULL);
+    cross_def(&defs[5], "proj.eta.lib.mx.M.X.hello", "hello", "Method", "proj.eta.lib.mx",
+              "proj.eta.lib.mx.M.X", NULL);
+    cross_def(&defs[6], "proj.gamma.lib.x.X", "X", "Class", "proj.gamma.lib.x", NULL, NULL);
+    cross_def(&defs[7], "proj.gamma.lib.x.X.hello", "hello", "Method", "proj.gamma.lib.x",
+              "proj.gamma.lib.x.X", NULL);
+
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, 8);
+    ASSERT(sh != NULL);
+
+    const char *src =
+        "module M\n  class Caller\n    def run\n      X.new.hello\n    end\n  end\nend\n";
+    const char *mods[2] = {"proj.delta.lib.caller", "proj.alpha.lib.caller"};
+    const char *callers[2] = {"proj.delta.lib.caller.M.Caller.run",
+                              "proj.alpha.lib.caller.M.Caller.run"};
+    bool delta_none = false;
+    bool alpha_own = false;
+    for (int i = 0; i < 2; i++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMResolvedCallArray o;
+        memset(&o, 0, sizeof(o));
+        cbm_run_ruby_lsp_cross_with_registry(&a, src, (int)strlen(src), mods[i], sh, NULL, NULL, 0,
+                                             NULL, &o);
+        bool top = out_has(&o, callers[i], "proj.gamma.lib.x.X.hello");
+        bool alpha = out_has(&o, callers[i], "proj.alpha.lib.mx.M.X.hello");
+        bool beta = out_has(&o, callers[i], "proj.beta.lib.mx.M.X.hello");
+        bool eta = out_has(&o, callers[i], "proj.eta.lib.mx.M.X.hello");
+        if (i == 0)
+            delta_none = !top && !alpha && !beta && !eta;
+        else
+            alpha_own = alpha && !top && !beta && !eta;
+        if (!(i == 0 ? delta_none : alpha_own))
+            out_dump(&o);
+        cbm_arena_destroy(&a);
+    }
+    cbm_arena_destroy(&build);
+    ASSERT(delta_none);
+    ASSERT(alpha_own);
+    PASS();
+}
+
+TEST(rubylsp_cross_registry_is_def_order_independent) {
+    bool f[4];
+    bool r[4];
+    ASSERT(rubylsp_order_edges(false, &f[0], &f[1], &f[2], &f[3]));
+    ASSERT(rubylsp_order_edges(true, &r[0], &r[1], &r[2], &r[3]));
+    /* head = smallest QN (m0), superclass from the smallest-QN declaration
+     * that has one (m1's CxBase, not m2's CxOther), duplicate method from the
+     * smaller QN (m1) — in both orders. */
+    for (int i = 0; i < 4; i++) {
+        ASSERT(f[i]);
+        ASSERT(r[i]);
+    }
+    PASS();
+}
+
+/* ── cross-file: singleton side and mixins (review items 5, 6) ───── */
+
+static const CBMDefinition *rubylsp_find_def(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* The extractor knows what CBMLSPDef used to lose: which methods sit on the
+ * singleton side (`def self.m`, `class << self`) and which mixin macros a
+ * class body holds. Only constants count; `extend self` is not one. */
+TEST(rubylsp_extractor_flags_singleton_methods_and_mixins) {
+    const char *src = "class Widget < Base\n"
+                      "  include Auditable\n"
+                      "  prepend Admin::Guard\n"
+                      "  extend Finders\n"
+                      "  extend self\n"
+                      "  def inst\n  end\n"
+                      "  def self.make\n  end\n"
+                      "  class << self\n"
+                      "    def build\n    end\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r != NULL);
+    const CBMDefinition *w = rubylsp_find_def(r, "Widget");
+    const CBMDefinition *inst = rubylsp_find_def(r, "inst");
+    const CBMDefinition *make = rubylsp_find_def(r, "make");
+    const CBMDefinition *build = rubylsp_find_def(r, "build");
+    bool ok = w && inst && make;
+    bool mixins =
+        ok && w->mixin_refs && strcmp(w->mixin_refs, "i:Auditable|p:Admin::Guard|e:Finders") == 0;
+    /* A method inside `class << self`, when the extractor emits one at all,
+     * must be on the singleton side. */
+    bool flags = ok && !inst->is_singleton && make->is_singleton && (!build || build->is_singleton);
+    printf("    defs: Widget=%d inst=%d make=%d build=%d (class << self def emitted: %s)\n",
+           w != NULL, inst != NULL, make != NULL, build != NULL, build ? "yes" : "no");
+    if (!(mixins && flags))
+        printf("    mixin_refs=%s\n", ok && w->mixin_refs ? w->mixin_refs : "(null)");
+    cbm_free_result(r);
+    ASSERT(ok);
+    ASSERT(mixins);
+    ASSERT(flags);
+    PASS();
+}
+
+/* Review item 5. `Child` defines `def self.run` and inherits instance `run`
+ * from Base. An instance call must reach Base#run, the one Ruby would call; a
+ * class-side call must reach Child.run. Registering each method on both keys
+ * made the instance call stop at the singleton. */
+TEST(rubylsp_cross_singleton_and_instance_do_not_shadow) {
+    CBMLSPDef defs[4];
+    cross_def(&defs[0], "test.base.Base", "Base", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[1], "test.base.Base.run", "run", "Method", "test.base", "test.base.Base", NULL);
+    cross_def(&defs[2], "test.child.Child", "Child", "Class", "test.child", NULL, "Base");
+    cross_def(&defs[3], "test.child.Child.run", "run", "Method", "test.child", "test.child.Child",
+              NULL);
+    defs[3].is_singleton = true;
+
+    const char *src = "class Caller\n  def go\n    Child.new.run\n    Child.run\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, 4, NULL, NULL, 0,
+                           NULL, &out);
+    bool instance = out_has(&out, "test.app.caller.Caller.go", "test.base.Base.run");
+    bool klass = out_has(&out, "test.app.caller.Caller.go", "test.child.Child.run");
+    if (!(instance && klass))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    ASSERT(instance);
+    ASSERT(klass);
+    PASS();
+}
+
+static bool rubylsp_mixin_call(const char *decl_mixin, bool reopen_elsewhere, bool *module_hit,
+                               bool *base_hit) {
+    CBMLSPDef defs[8];
+    int n = 0;
+    cross_def(&defs[n++], "test.base.Base", "Base", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[n++], "test.base.Base.greet", "greet", "Method", "test.base", "test.base.Base",
+              NULL);
+    cross_def(&defs[n++], "test.mod.Overrides", "Overrides", "Module", "test.mod", NULL, NULL);
+    cross_def(&defs[n++], "test.mod.Overrides.greet", "greet", "Method", "test.mod",
+              "test.mod.Overrides", NULL);
+    /* The class is declared in file A (the head); the include is in A, or in
+     * a reopening in a later file Z. */
+    cross_def(&defs[n++], "test.a.Widget", "Widget", "Class", "test.a", NULL, "Base");
+    if (!reopen_elsewhere)
+        defs[n - 1].mixin_refs = decl_mixin;
+    if (reopen_elsewhere) {
+        cross_def(&defs[n++], "test.z.Widget", "Widget", "Class", "test.z", NULL, NULL);
+        defs[n - 1].mixin_refs = decl_mixin;
+    }
+    const char *src = "class Caller\n  def go\n    Widget.new.greet\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.caller", defs, n, NULL, NULL, 0,
+                           NULL, &out);
+    *module_hit = out_has(&out, "test.app.caller.Caller.go", "test.mod.Overrides.greet");
+    *base_hit = out_has(&out, "test.app.caller.Caller.go", "test.base.Base.greet");
+    if (!*module_hit && !*base_hit && out.count > 1)
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    return true;
+}
+
+/* Review item 6. A module the class includes shadows the superclass's method,
+ * whichever file the class and the include are in. A call from file B must not
+ * resolve to Base#greet, and an include of a module the table cannot see must
+ * block the walk rather than fall through to the superclass. */
+TEST(rubylsp_cross_mixin_shadows_superclass_across_files) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Overrides", false, &module_hit, &base_hit));
+    ASSERT(module_hit);
+    ASSERT(!base_hit);
+    PASS();
+}
+
+TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Overrides", true, &module_hit, &base_hit));
+    ASSERT(module_hit);
+    ASSERT(!base_hit);
+    PASS();
+}
+
+TEST(rubylsp_cross_unseen_mixin_blocks_superclass) {
+    bool module_hit;
+    bool base_hit;
+    ASSERT(rubylsp_mixin_call("i:Missing", false, &module_hit, &base_hit));
+    ASSERT(!module_hit);
+    ASSERT(!base_hit);
+    PASS();
+}
+
+/* The finder rule (`User.find` -> User, relation chains keep the model) for a
+ * model declared in ANOTHER file, the usual Rails layout. It is one switch
+ * (ruby_ar_finder_cross_file): off by default, which keeps the rule to models
+ * declared in the file being resolved, with nothing else changed; on, it also
+ * types models from other files. */
+static bool rubylsp_ar_finder_cross_edge(void) {
+    CBMLSPDef defs[2];
+    cross_def(&defs[0], "test.models.user.User", "User", "Class", "test.models.user", NULL,
+              "ApplicationRecord");
+    cross_def(&defs[1], "test.models.user.User.full_name", "full_name", "Method",
+              "test.models.user", "test.models.user.User", NULL);
+    const char *src = "class Svc\n  def go\n    User.find(1).full_name\n    "
+                      "User.where(active: true).first.full_name\n  end\nend\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.svc", defs, 2, NULL, NULL, 0,
+                           NULL, &out);
+    bool edge = out_has(&out, "test.app.svc.Svc.go", "test.models.user.User.full_name");
+    cbm_arena_destroy(&arena);
+    return edge;
+}
+
+TEST(rubylsp_cross_ar_finder_same_file_only_by_default) {
+    /* Default: a model from another file gets no finder typing, while a model
+     * declared in the file being resolved still does. */
+    bool cross = rubylsp_ar_finder_cross_edge();
+    const char *src = "class User < ApplicationRecord\n  def full_name\n    'x'\n  end\nend\n"
+                      "class UsersController < ApplicationController\n  def show\n"
+                      "    User.find(1).full_name\n  end\nend\n";
+    CBMFileResult *r = extract_ruby(src);
+    bool same = r && find_resolved(r, "UsersController.show", "User.full_name") >= 0;
+    if (r)
+        cbm_free_result(r);
+    ASSERT(!cross);
+    ASSERT(same);
+    PASS();
+}
+
+TEST(rubylsp_cross_ar_finder_crosses_files_when_switched_on) {
+    bool prev = cbm_ruby_set_ar_finder_cross_file(true);
+    bool cross = rubylsp_ar_finder_cross_edge();
+    (void)cbm_ruby_set_ar_finder_cross_file(prev);
+    ASSERT(cross);
     PASS();
 }
 
@@ -1674,9 +2363,23 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
+    RUN_TEST(rubylsp_mixin_walk_visits_each_module_once);
+    RUN_TEST(rubylsp_const_path_is_linear);
+    RUN_TEST(rubylsp_stdlib_seed_survives_alloc_failure);
     RUN_TEST(rubylsp_cross_file_defs);
     RUN_TEST(rubylsp_cross_file_ar_repro);
     RUN_TEST(rubylsp_cross_reopened_class_across_files);
     RUN_TEST(rubylsp_cross_compact_class_name);
     RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
+    RUN_TEST(rubylsp_cross_reopened_class_work_is_bounded);
+    RUN_TEST(rubylsp_cross_same_named_classes_stay_in_their_package);
+    RUN_TEST(rubylsp_cross_ambiguous_nested_constant_does_not_fall_through);
+    RUN_TEST(rubylsp_cross_registry_is_def_order_independent);
+    RUN_TEST(rubylsp_extractor_flags_singleton_methods_and_mixins);
+    RUN_TEST(rubylsp_cross_singleton_and_instance_do_not_shadow);
+    RUN_TEST(rubylsp_cross_mixin_shadows_superclass_across_files);
+    RUN_TEST(rubylsp_cross_mixin_in_reopening_shadows_superclass);
+    RUN_TEST(rubylsp_cross_unseen_mixin_blocks_superclass);
+    RUN_TEST(rubylsp_cross_ar_finder_same_file_only_by_default);
+    RUN_TEST(rubylsp_cross_ar_finder_crosses_files_when_switched_on);
 }

@@ -31,7 +31,7 @@ typedef void *cbm_daemon_application_update_worker_t;
 typedef struct {
     void *context;
     int (*start)(void *context, const char *args_json, size_t memory_budget_bytes,
-                 const char *marker_file, const char *quarantine_file,
+                 const char *marker_file, const char *quarantine_file, uint64_t duration_origin_ms,
                  cbm_daemon_application_worker_t *worker_out);
     cbm_index_worker_poll_t (*poll)(void *context, cbm_daemon_application_worker_t worker,
                                     const cbm_index_worker_result_t **result_out);
@@ -149,11 +149,12 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp(
     cbm_daemon_runtime_client_t *client, const char *message, uint8_t **response_out,
     uint32_t *response_length_out, uint32_t timeout_ms);
 
-/* Cancellable frontend variant using a token reserved on the runtime client. */
+/* Cancellable frontend variant using a token reserved on the runtime client.
+ * request_sent_out preserves the runtime's application-frame delivery fact. */
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_mcp_tagged(
     cbm_daemon_runtime_client_t *client, cbm_daemon_runtime_application_token_t request_token,
     const char *message, uint8_t **response_out, uint32_t *response_length_out,
-    uint32_t timeout_ms);
+    bool *request_sent_out, uint32_t timeout_ms);
 
 cbm_daemon_runtime_application_status_t cbm_daemon_application_client_tool(
     cbm_daemon_runtime_client_t *client, const char *tool_name, const char *args_json,

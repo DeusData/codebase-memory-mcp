@@ -484,6 +484,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#ifdef __FreeBSD__
+#include <sys/ucred.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -1263,6 +1266,13 @@ static int posix_named_shared_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *
     return posix_named_lock_try_acquire_mode(endpoint, lock_name, true, fd_out, process_entry_out);
 }
 
+/* Never open and close the lifetime lock file in a process that may already
+ * hold it: fcntl(2) record locks are scoped to (process, inode), so that
+ * close would silently release every lock this process holds on the file,
+ * regardless of which fd took it. This lock is fcntl rather than flock for
+ * exactly this reason in reverse: flock locks survive a fork, fcntl locks
+ * do not, and a forked child must never appear to hold its parent's
+ * reservation. */
 static int posix_record_lock_set(int fd, short lock_type) {
     struct flock record_lock = {
         .l_type = lock_type,
@@ -1286,6 +1296,15 @@ static int posix_lifetime_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint,
     if (process_claimed < 0) {
         return -1;
     }
+    if (process_claimed == 1) {
+        /* Already held by this process per the in-process registry: trust
+         * that alone. Opening a throwaway fd on the lock file here and then
+         * closing it would release the real fcntl(2) record lock, which is
+         * scoped to (process, inode) rather than (fd, inode): closing any
+         * fd on this inode drops every lock this process holds on it, even
+         * one held via a different, still-open fd. */
+        return endpoint_runtime_still_valid(endpoint) ? 1 : -1;
+    }
 
     int fd = openat(endpoint->dir_fd, lock_name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
@@ -1296,10 +1315,6 @@ static int posix_lifetime_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint,
         !endpoint_runtime_still_valid(endpoint)) {
         (void)close(fd);
         return -1;
-    }
-    if (process_claimed == 1) {
-        bool still_private = endpoint_runtime_still_valid(endpoint);
-        return close(fd) == 0 && still_private ? 1 : -1;
     }
     struct flock record_lock = {
         .l_type = F_WRLCK,
@@ -1338,11 +1353,13 @@ static int posix_lifetime_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *endp
     process_lock_entry_t *process_entry = NULL;
     int process_result = process_lock_claim(endpoint, lock_name, &process_entry);
     if (process_result != 1) {
-        return process_result == 0 &&
-                       private_regular_file_at_is_safe(endpoint->dir_fd, lock_name, 1) &&
-                       endpoint_runtime_still_valid(endpoint)
-                   ? 0
-                   : -1;
+        /* Already held by this process per the in-process registry: trust
+         * that alone, the same as the probe's early return above. Calling
+         * private_regular_file_at_is_safe() here would open a throwaway fd
+         * on the lock file and close it, releasing the real fcntl(2) record
+         * lock this process holds, because that lock is scoped to (process,
+         * inode) rather than (fd, inode). */
+        return process_result == 0 && endpoint_runtime_still_valid(endpoint) ? 0 : -1;
     }
     int fd = openat(endpoint->dir_fd, lock_name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0 || !fd_set_cloexec(fd)) {
@@ -2003,6 +2020,43 @@ static bool posix_directory_transition_secure(int parent_fd, int child_fd, const
     return true;
 }
 
+/* #3014: where the system has O_PATH, the walk holds each directory by an
+ * O_PATH handle. Every check below reads the handle (fstat, fstatfs), so the
+ * ownership, mode and symlink rules are unchanged, and a process confined by
+ * Landlock can validate ancestors it is not allowed to list: an O_RDONLY
+ * directory open needs the read-directory right on "/" and on every ancestor,
+ * an O_PATH open needs none. A handle that is chmod'ed or handed to the caller
+ * is first reopened through itself, which cannot name another directory. */
+#if defined(__linux__) && !defined(O_PATH)
+#error "O_PATH is not visible; the private-directory walk needs it on Linux"
+#endif
+#ifdef O_PATH
+#define PRIVATE_DIRECTORY_WALK_OPEN (O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+#else
+#define PRIVATE_DIRECTORY_WALK_OPEN (O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+#endif
+
+/* Replace a walk handle with an ordinary directory descriptor for the same
+ * directory. False leaves *directory_fd as it was. */
+static bool private_directory_walk_reopen(int *directory_fd) {
+#ifdef O_PATH
+    int opened = openat(*directory_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (opened < 0 || !fd_set_cloexec(opened)) {
+        if (opened >= 0) {
+            int saved_errno = errno;
+            (void)close(opened);
+            errno = saved_errno;
+        }
+        return false;
+    }
+    (void)close(*directory_fd);
+    *directory_fd = opened;
+#else
+    (void)directory_fd;
+#endif
+    return true;
+}
+
 static int private_directory_tree_open(const char *directory_path) {
     if (!directory_path || !directory_path[0] || O_DIRECTORY == 0 || O_NOFOLLOW == 0) {
         return -1;
@@ -2012,7 +2066,7 @@ static int private_directory_tree_open(const char *directory_path) {
         return -1;
     }
     bool absolute = path[0] == '/';
-    int current_fd = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int current_fd = open(absolute ? "/" : ".", PRIVATE_DIRECTORY_WALK_OPEN);
     bool ok = current_fd >= 0 && fd_set_cloexec(current_fd);
     char *cursor = path;
     while (ok && *cursor == '/') {
@@ -2067,16 +2121,22 @@ static int private_directory_tree_open(const char *directory_path) {
             if (!created && errno != EEXIST) {
                 ok = false;
             }
-            int next_fd =
-                ok ? openat(current_fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-                   : -1;
+            int next_fd = ok ? openat(current_fd, component, PRIVATE_DIRECTORY_WALK_OPEN) : -1;
             struct stat status;
             ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
                  S_ISDIR(status.st_mode) &&
                  posix_directory_transition_secure(current_fd, next_fd, path);
             if (ok && created) {
-                ok = status.st_uid == geteuid() && fchmod(next_fd, 0700) == 0 &&
-                     cbm_macos_extended_acl_fd_clear(next_fd) &&
+                ok = status.st_uid == geteuid();
+                if (ok && !private_directory_walk_reopen(&next_fd)) {
+                    ipc_validation_detail_set(
+                        "%s: could not reopen the new directory '%s' to set its mode (errno %d; "
+                        "it needs owner execute permission and, in a sandbox, the right to "
+                        "list it)",
+                        directory_path, component, errno);
+                    ok = false;
+                }
+                ok = ok && fchmod(next_fd, 0700) == 0 && cbm_macos_extended_acl_fd_clear(next_fd) &&
                      cbm_macos_extended_acl_fd_is_empty(next_fd);
             }
             if (ok) {
@@ -2105,6 +2165,13 @@ static int private_directory_tree_open(const char *directory_path) {
     if (ok && final_status.st_uid != geteuid()) {
         ipc_validation_detail_set("%s: owner uid %ld, expected euid %ld", directory_path,
                                   (long)final_status.st_uid, (long)geteuid());
+        ok = false;
+    }
+    if (ok && !private_directory_walk_reopen(&current_fd)) {
+        ipc_validation_detail_set("%s: could not reopen the directory to set its mode (errno %d; "
+                                  "it needs owner execute permission and, in a sandbox, the "
+                                  "right to list it)",
+                                  directory_path, errno);
         ok = false;
     }
     if (ok && fchmod(current_fd, 0700) != 0) {
@@ -3510,6 +3577,94 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener);
 }
 
+/* Touch results: 1 refreshed, 0 lost (the path no longer names the owned
+ * file), -1 transient (a still-valid file could not be refreshed). Touch
+ * through the held descriptor only after proving the path still names it:
+ * refreshing by path would keep a replacement inode fresh and hide the loss
+ * (#2178). */
+static int posix_touch_fold(int result, int next) {
+    return result == 0 || next == 0 ? 0 : (result < 0 || next < 0 ? -1 : 1);
+}
+
+/* Whether base_name still names the regular file (device, inode): 1 yes,
+ * 0 proven not (absent, another inode, a symlink or other non-regular
+ * entry), -1 undetermined (any other lookup failure, e.g. EIO or ESTALE). */
+static int posix_path_names_inode(int directory_fd, const char *base_name, dev_t device,
+                                  ino_t inode) {
+    struct stat by_path;
+    if (fstatat(directory_fd, base_name, &by_path, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    return S_ISREG(by_path.st_mode) && by_path.st_dev == device && by_path.st_ino == inode ? 1 : 0;
+}
+
+static int posix_held_file_touch(int directory_fd, const char *base_name, int fd) {
+    struct stat by_handle;
+    if (fstat(fd, &by_handle) != 0) {
+        return -1;
+    }
+    int identity =
+        by_handle.st_nlink == 0
+            ? 0
+            : posix_path_names_inode(directory_fd, base_name, by_handle.st_dev, by_handle.st_ino);
+    if (identity <= 0) {
+        return identity;
+    }
+    return futimens(fd, NULL) == 0 ? 1 : -1;
+}
+
+static int posix_held_lock_touch(int directory_fd, const process_lock_entry_t *entry, int fd) {
+    return entry ? posix_held_file_touch(directory_fd, entry->lock_name, fd) : 0;
+}
+
+static int posix_identity_marker_touch(const cbm_daemon_ipc_listener_t *listener) {
+    /* The marker is not held open. Classify by path first, so a symlink or
+     * other replacement is loss; only then reopen it to refresh, where a
+     * failure (EMFILE, EACCES) says nothing about the file and is transient. */
+    int identity = posix_path_names_inode(listener->dir_fd, listener->socket_identity_name,
+                                          listener->identity_device, listener->identity_inode);
+    if (identity <= 0) {
+        return identity;
+    }
+    int marker_fd = openat(listener->dir_fd, listener->socket_identity_name,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (marker_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    struct stat marker_status;
+    int result = -1;
+    if (fstat(marker_fd, &marker_status) == 0) {
+        /* Replaced between the lookup and the open. */
+        result = marker_status.st_dev != listener->identity_device ||
+                         marker_status.st_ino != listener->identity_inode
+                     ? 0
+                     : (futimens(marker_fd, NULL) == 0 ? 1 : -1);
+    }
+    (void)close(marker_fd);
+    return result;
+}
+
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    if (!listener || listener->dir_fd < 0 || listener->owner_pid != getpid() ||
+        !listener->lifetime_reservation) {
+        return 0;
+    }
+    int result =
+        posix_held_lock_touch(listener->dir_fd, listener->lifetime_reservation->process_entry,
+                              listener->lifetime_reservation->fd);
+    const cbm_daemon_ipc_participant_guard_t *guards[] = {listener->participant_guard,
+                                                          external_guard};
+    for (size_t i = 0; i < sizeof(guards) / sizeof(guards[0]); i++) {
+        if (guards[i]) {
+            result = posix_touch_fold(result, posix_held_lock_touch(listener->dir_fd,
+                                                                    guards[i]->legacy_process_entry,
+                                                                    guards[i]->legacy_fd));
+        }
+    }
+    return posix_touch_fold(result, posix_identity_marker_touch(listener));
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -3741,6 +3896,15 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
         return 0;
     }
     return (uint64_t)credentials.pid;
+#elif defined(__FreeBSD__)
+    struct xucred credentials;
+    socklen_t length = sizeof(credentials);
+    if (getsockopt(connection->fd, SOL_LOCAL, LOCAL_PEERCRED, &credentials, &length) != 0 ||
+        length != sizeof(credentials) || credentials.cr_version != XUCRED_VERSION ||
+        credentials.cr_uid != geteuid() || credentials.cr_pid <= 0) {
+        return 0;
+    }
+    return (uint64_t)credentials.cr_pid;
 #elif defined(SOL_LOCAL) && defined(LOCAL_PEERPID)
     pid_t peer_pid = 0;
     socklen_t length = sizeof(peer_pid);
@@ -3891,6 +4055,14 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    if (!endpoint || !guard || guard->owner_pid != getpid()) {
+        return 0;
+    }
+    return posix_held_lock_touch(endpoint->dir_fd, guard->legacy_process_entry, guard->legacy_fd);
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(
@@ -7088,6 +7260,19 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+/* Windows has no age-based cleaner of the private runtime directory, and its
+ * held handles deny deletion; the #2178 heartbeat has nothing to refresh. */
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    (void)external_guard;
+    return listener ? 1 : 0;
+}
+
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    return endpoint && guard ? 1 : 0;
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(

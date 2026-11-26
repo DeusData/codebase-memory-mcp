@@ -66,6 +66,7 @@ typedef enum {
     CBM_MEM_CLASS_STORE,       /* SQLite (bound mem methods) + store batches and row buffers */
     CBM_MEM_CLASS_HASH_TABLE,  /* CBMHashTable buckets/entries not claimed by an owner class */
     CBM_MEM_CLASS_DYN_ARRAY,   /* CBM_DYN_ARRAY item storage (every cbm_da_* user) */
+    CBM_MEM_CLASS_RESOLVE,     /* call resolution evidence and coverage capture */
     /* The daemon's in-memory adjacency layers (store/graph_mem.h): resident
      * across requests, so they are subtracted from index-worker budgets and
      * must read apart from SQLite's request-scoped memory (STORE). */
@@ -93,6 +94,15 @@ void *cbm_calloc(cbm_mem_class_t cls, size_t bytes);
 void *cbm_realloc(cbm_mem_class_t cls, void *block, size_t bytes);
 char *cbm_mem_strdup(cbm_mem_class_t cls, const char *s);
 void cbm_free(cbm_mem_class_t cls, void *block);
+
+#if defined(CBM_MEM_TEST_API) && CBM_MEM_TEST_API
+/* Test-only, current-thread fault: fail exactly the next cbm_realloc for this
+ * class, including realloc(NULL). Other classes and allocation operations are
+ * unaffected. Always reset immediately after the operation under test. */
+void cbm_mem_test_fail_next_realloc(cbm_mem_class_t cls);
+/* Disarm and clear the hook; return whether the requested fault occurred. */
+bool cbm_mem_test_reset_realloc_failure(void);
+#endif
 
 /* ── Accounting ────────────────────────────────────────────────────────
  *

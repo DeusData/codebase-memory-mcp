@@ -36,12 +36,28 @@ typedef struct {
     bool is_module;             /* `module` (mixin source) vs `class` */
     /* Shared (project-wide) table only. A class reopened in another file has
      * a different QN there (the QN carries the file's module QN) but the same
-     * constant path; the entries for one path form a group so a method defined
-     * in any reopening is found. `group_head` is the first entry of the group,
-     * `shard_next` the next one; both are table index + 1, 0 = none. Entries
-     * of a per-file table leave both 0. */
+     * constant path. All declarations of one path share one merged record: the
+     * entry with the smallest QN (the group head), which holds every
+     * reopening's methods and the superclass. `group_head` is the head's table
+     * index + 1 (the entry's own index + 1 for the head itself); 0 in a
+     * per-file table. */
     int group_head;
-    int shard_next;
+    /* Shared table only: the package root this declaration sits in ("" when
+     * it has none; see ruby_package_root), and, on a head, the next head
+     * (table index + 1) with the same constant path in another root. Two
+     * packages of one repository can each declare their own `Topic`; the
+     * merged record is per (root, path) so they are never pooled. */
+    const char *root;
+    int path_next;
+    /* Head entries only: this constant's include/prepend/extend records, a
+     * range of the registry's `mixins` array (all reopenings, in declaring-QN
+     * then source order). */
+    int mixin_start;
+    int mixin_n;
+    /* Method-lookup visit marks: the stamp of the last walk that searched
+     * this class on the instance / singleton side (ruby_walk_seen). */
+    unsigned int seen_instance;
+    unsigned int seen_singleton;
 } RubyClassInfo;
 
 struct CBMRubyCrossRegistry;
@@ -99,6 +115,9 @@ typedef struct {
      * resolution). NULL for per-file extraction. Consulted after this file's
      * own table, so a class declared here always wins. */
     const struct CBMRubyCrossRegistry *shared;
+    /* Package root of the file being resolved ("" = none); picks which
+     * root's classes a shared-table constant lookup prefers. */
+    const char *caller_root;
 
     /* Class/module table (pass 1) — this file's own declarations only. */
     RubyClassInfo *classes;
@@ -144,6 +163,18 @@ typedef struct {
     /* Recursion guards. */
     int eval_depth;
     int walk_depth;
+
+    /* Stamp of the current method-lookup walk; each walk takes a fresh one
+     * so marks left by earlier walks never match. */
+    unsigned int lookup_stamp;
+
+    /* Visit marks for entries of the shared (read-only) class table. The table
+     * is read by every resolve worker at once, so a walk never marks it; its
+     * marks live here, in an open-addressing hash keyed by the shared index and
+     * sized by what this file touches. */
+    struct RubySharedMark *shared_marks;
+    int shared_mark_cap;
+    int shared_mark_count;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
@@ -196,9 +227,19 @@ typedef struct CBMRubyCrossRegistry {
     /* Open-addressing hash indexes over `classes` (values are index + 1, 0 =
      * empty slot): by QN, and by dotted constant path (group head only). */
     int *by_qn;
-    int *by_path;
+    int *by_path; /* (package root, path) -> group head */
+    int *by_pp;   /* path alone -> first head; the rest chain via path_next */
     unsigned slot_mask;
+    RubyMixinInfo *mixins; /* owner_qn = the merged record's QN; grouped by head */
+    int mixin_count;
 } CBMRubyCrossRegistry;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test seam: turn the cross-file half of the ActiveRecord finder rule on or
+ * off (see ruby_ar_finder_cross_file in ruby_lsp.c). Returns the previous
+ * setting, so a test restores what it found rather than a fixed value. */
+bool cbm_ruby_set_ar_finder_cross_file(bool on);
+#endif
 
 /* Build the shared registry from every project def. Strings are borrowed from
  * `defs` (as the other languages' cross registries do) or copied into `arena`.

@@ -399,7 +399,11 @@ TOTAL_SKIP=$(awk -F'skip=' '{split($2,a," "); s+=a[1]} END{print s+0}' "$RESULTS
 BAD_RC=$(grep -cv ' rc=0 ' "$RESULTS_FILE" || true)
 
 echo "── 8 slowest suites ──"
-sort -t= -k6 -rn "$RESULTS_FILE" | head -8
+# Field 6 of "name rc=N pass=N fail=N skip=N secs=N" split on '=' is secs.
+# The separator is its own argument: uutils sort (Rust coreutils, on newer
+# runner images) reads the attached form -t= as an inline "=value" with an
+# empty value and rejects it, which left this table empty.
+sort -t '=' -k6,6 -rn "$RESULTS_FILE" | head -8
 grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
     suite_failure_summary "$f" "$LOGDIR/$f.log"

@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -17,7 +17,7 @@ static long mi_max_warning_count = 16; // stop outputting warnings after this (u
 
 static void mi_add_stderr_output(void);
 
-int mi_version(void) mi_attr_noexcept {
+int mi_version(void) {
   return MI_MALLOC_VERSION;
 }
 
@@ -49,7 +49,7 @@ int mi_version(void) mi_attr_noexcept {
 
 // in KiB
 #ifndef MI_DEFAULT_ARENA_RESERVE
- #if (MI_INTPTR_SIZE>4)
+ #if (MI_SIZE_SIZE>4)
   #define MI_DEFAULT_ARENA_RESERVE 1024L*1024L
  #else
   #define MI_DEFAULT_ARENA_RESERVE 128L*1024L
@@ -77,15 +77,15 @@ int mi_version(void) mi_attr_noexcept {
 #endif
 
 #ifndef MI_DEFAULT_GUARDED_SAMPLE_RATE
-#if MI_GUARDED && !MI_DEBUG
-#define MI_DEFAULT_GUARDED_SAMPLE_RATE 4000
+#if MI_GUARDED && MI_DEBUG
+#define MI_DEFAULT_GUARDED_SAMPLE_RATE  0  /* MI_MiB */
 #else
-#define MI_DEFAULT_GUARDED_SAMPLE_RATE 0
+#define MI_DEFAULT_GUARDED_SAMPLE_RATE  0
 #endif
 #endif
 
 #ifndef MI_DEFAULT_PAGEMAP_COMMIT
-#if defined(__APPLE__)  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
+#if defined(__APPLE__) && MI_PAGE_MAP_FLAT  // when overloading malloc, we still get mixed pointers sometimes on macOS; this avoids a bad access
 #define MI_DEFAULT_PAGEMAP_COMMIT 1
 #else
 #define MI_DEFAULT_PAGEMAP_COMMIT 0
@@ -104,8 +104,13 @@ int mi_version(void) mi_attr_noexcept {
 #if defined(__ANDROID__)
 #define MI_DEFAULT_ALLOW_THP  0
 #else
-#define MI_DEFAULT_ALLOW_THP  1
+// #define MI_DEFAULT_ALLOW_THP  1    // allow THP but purging may split up THP pages
+#define MI_DEFAULT_ALLOW_THP  2       // allow THP and set the minimal purge size to 2MiB to avoid breaking them up
 #endif
+#endif
+
+#ifndef MI_DEFAULT_COLLECT_MERGES_STATS
+#define MI_DEFAULT_COLLECT_MERGES_STATS  1
 #endif
 
 // Static options
@@ -121,7 +126,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { MI_DEFAULT_VERBOSE, MI_OPTION_UNINIT, MI_OPTION(verbose) },
 
   // some of the following options are experimental and not all combinations are allowed.
-  { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit) },  
+  { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit) },
   { MI_DEFAULT_ARENA_EAGER_COMMIT,
        MI_OPTION_UNINIT, MI_OPTION_LEGACY(arena_eager_commit,eager_region_commit) }, // eager commit arena's? 2 is used to enable this only on an OS that has overcommit (i.e. linux)
   { 1, MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_decommits,reset_decommits) },        // purge decommits memory (instead of reset) (note: on linux this uses MADV_DONTNEED for decommit)
@@ -134,9 +139,9 @@ static mi_option_desc_t mi_options[_mi_option_last] =
        MI_OPTION_UNINIT, MI_OPTION(reserve_os_memory)     },      // reserve N KiB OS memory in advance (use `option_get_size`)
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_segment_cache) },   // cache N segments per thread
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_page_reset) },      // reset page memory on free
-  { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_abandoned_page_purge) }, 
+  { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_abandoned_page_purge) },
   { 0, MI_OPTION_UNINIT, MI_OPTION(deprecated_segment_reset) },   // reset segment memory on free (needs eager commit)
-  { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit_delay) },  
+  { 1, MI_OPTION_UNINIT, MI_OPTION(deprecated_eager_commit_delay) },
   { 1000,MI_OPTION_UNINIT, MI_OPTION_LEGACY(purge_delay,reset_delay) },  // purge delay in milli-seconds
   { 0,   MI_OPTION_UNINIT, MI_OPTION(use_numa_nodes) },           // 0 = use available numa nodes, otherwise use at most N nodes.
   { 0,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(disallow_os_alloc,limit_os_alloc) },           // 1 = do not use OS memory for allocation (but only reserved arenas)
@@ -146,15 +151,11 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   { 10,  MI_OPTION_UNINIT, MI_OPTION(deprecated_max_segment_reclaim)},       // max. percentage of the abandoned segments to be reclaimed per try.
   { 0,   MI_OPTION_UNINIT, MI_OPTION(destroy_on_exit)},           // release all OS memory on process exit; careful with dangling pointer or after-exit frees!
   { MI_DEFAULT_ARENA_RESERVE, MI_OPTION_UNINIT, MI_OPTION(arena_reserve) }, // reserve memory N KiB at a time (=1GiB) (use `option_get_size`)
-  { 1,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's
+  { 4,   MI_OPTION_UNINIT, MI_OPTION(arena_purge_mult) },         // purge delay multiplier for arena's
   { 1,   MI_OPTION_UNINIT, MI_OPTION_LEGACY(deprecated_purge_extend_delay, decommit_extend_delay) },
   { MI_DEFAULT_DISALLOW_ARENA_ALLOC,   MI_OPTION_UNINIT, MI_OPTION(disallow_arena_alloc) }, // 1 = do not use arena's for allocation (except if using specific arena id's)
   { 400, MI_OPTION_UNINIT, MI_OPTION(retry_on_oom) },             // windows only: retry on out-of-memory for N milli seconds (=400), set to 0 to disable retries.
-#if defined(MI_VISIT_ABANDONED)
-  { 1,   MI_OPTION_INITIALIZED, MI_OPTION(visit_abandoned) },     // allow visiting theap blocks in abandoned segments; requires taking locks during reclaim.
-#else
-  { 0,   MI_OPTION_UNINIT, MI_OPTION(visit_abandoned) },
-#endif
+  { 1,   MI_OPTION_UNINIT, MI_OPTION(deprecated_visit_abandoned) },
   { 0,   MI_OPTION_UNINIT, MI_OPTION(guarded_min) },              // only used when building with MI_GUARDED: minimal rounded object size for guarded objects
   { MI_GiB, MI_OPTION_UNINIT, MI_OPTION(guarded_max) },           // only used when building with MI_GUARDED: maximal rounded object size for guarded objects
   { 0,   MI_OPTION_UNINIT, MI_OPTION(guarded_precise) },          // disregard minimal alignment requirement to always place guarded blocks exactly in front of a guard page (=0)
@@ -175,16 +176,18 @@ static mi_option_desc_t mi_options[_mi_option_last] =
          MI_OPTION_UNINIT, MI_OPTION(page_cross_thread_max_reclaim) }, // don't reclaim (small) pages across threads if we already own N pages in that size class
   { MI_DEFAULT_ALLOW_THP,
          MI_OPTION_UNINIT, MI_OPTION(allow_thp) },                // allow transparent huge pages? (=1) (on Android =0 by default). Set to 0 to disable THP for the process.
-  { 0,   MI_OPTION_UNINIT, MI_OPTION(minimal_purge_size) },       // set minimal purge size (in KiB) (=0). Using 0 resolves to either 64 (or 2048 if `mi_option_allow_thp==2`).
-  { MI_DEFAULT_ARENA_MAX_OBJECT_SIZE,   
-         MI_OPTION_UNINIT, MI_OPTION(arena_max_object_size) },    // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit). 
+  { 0,   MI_OPTION_UNINIT, MI_OPTION(minimal_purge_size) },       // set minimal purge size (in KiB) (=0). Using 0 resolves to either 64 (or 2048 if THP is enabled).
+  { MI_DEFAULT_ARENA_MAX_OBJECT_SIZE,
+         MI_OPTION_UNINIT, MI_OPTION(arena_max_object_size) },    // set maximal object size that can be allocated in an arena (in KiB) (=2GiB on 64-bit).
   { 0,   MI_OPTION_UNINIT, MI_OPTION(arena_is_numa_local) },      // associate local numa node with an initial arena allocation
+  { MI_DEFAULT_COLLECT_MERGES_STATS,
+         MI_OPTION_UNINIT, MI_OPTION(collect_merges_stats) },     // on each theap collect, stats are merged with the parent heap
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
 
 static bool mi_option_has_size_in_kib(mi_option_t option) {
-  return (option == mi_option_reserve_os_memory || option == mi_option_arena_reserve || 
+  return (option == mi_option_reserve_os_memory || option == mi_option_arena_reserve ||
           option == mi_option_minimal_purge_size || option == mi_option_arena_max_object_size);
 }
 
@@ -203,7 +206,7 @@ void _mi_options_init(void) {
       _mi_warning_message("option 'allow_large_os_pages' is disabled to allow for guarded objects\n");
     }
   }
-  #endif  
+  #endif
 }
 
 // called at actual process load, it should be safe to print now
@@ -221,15 +224,6 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
   const int vermajor = MI_MALLOC_VERSION/10000;
   const int verminor = (MI_MALLOC_VERSION%10000)/100;
   const int verpatch = (MI_MALLOC_VERSION%100);
-  /* CBM LOCAL PATCH (keep across mimalloc refreshes): upstream appends
-   * "(built on __DATE__, __TIME__)" here. mimalloc is linked into every cbm
-   * binary, so those two macros made every build byte-unique — two compilations
-   * of identical source seconds apart could never produce the same hash. That
-   * defeats reproducible builds, and it also means a released artifact can never
-   * inherit an antivirus false-positive determination made about its
-   * predecessor, because every rebuild is a brand-new file to a reputation
-   * system. The banner keeps the version; the wall clock is not diagnostics.
-   * -Wdate-time in CFLAGS_COMMON makes any new use a build failure. */
   _mi_fprintf(out, arg, "v%i.%i.%i%s%s\n", vermajor, verminor, verpatch,
       #if defined(MI_CMAKE_BUILD_TYPE)
       ", " mi_stringify(MI_CMAKE_BUILD_TYPE)
@@ -252,16 +246,34 @@ mi_decl_export void mi_options_print_out(mi_output_fun* out, void* arg) mi_attr_
     _mi_fprintf(out, arg, "option '%s': %ld %s\n", desc->name, desc->value, (mi_option_has_size_in_kib(option) ? "KiB" : ""));
   }
 
-  // show build configuration
-  _mi_fprintf(out, arg, "debug level : %d\n", MI_DEBUG );
-  _mi_fprintf(out, arg, "secure level: %d\n", MI_SECURE );
-  _mi_fprintf(out, arg, "mem tracking: %s\n", MI_TRACK_TOOL);
+  // show build configuration  
+  #if MI_PAGE_META_IS_ALIGNED && MI_PAGE_META_SMALL_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : (small) aligned, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_PAGE_META_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : aligned, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_PAGE_META_SMALL_IS_ALIGNED
+  _mi_fprintf(out, arg, "free mode   : small aligned + pagemap, page size: %zu\n", sizeof(mi_page_t));
+  #elif MI_FREE_IS_CHECKED
+  _mi_fprintf(out, arg, "free mode   : checked, page size: %zu\n", sizeof(mi_page_t));
+  #else 
+  _mi_fprintf(out, arg, "free mode   : pagemap, page size: %zu\n", sizeof(mi_page_t));
+  #endif
+  #if MI_ENCODE_FREELIST
+  _mi_fprintf(out, arg, "free lists  : encoded with %d key(s)\n", MI_PAGE_KEY_COUNT);
+  #endif
   #if MI_GUARDED
-  _mi_fprintf(out, arg, "guarded build: %s\n", mi_option_get(mi_option_guarded_sample_rate) != 0 ? "enabled" : "disabled");
+  _mi_fprintf(out, arg, "guarded mode: %s, rate=%ld\n",  MI_SAMPLE==2 ? "fine-grained" : "enabled", mi_option_get(mi_option_guarded_sample_rate));
+  #endif  
+  #if MI_PROFILE
+  _mi_fprintf(out, arg, "profiling   : %s\n", MI_SAMPLE==2 ? "fine-grained" : "enabled");
   #endif
   #if MI_TSAN
   _mi_fprintf(out, arg, "thread santizer enabled\n");
   #endif
+  _mi_fprintf(out, arg, "mem tracking: %s\n", MI_TRACK_TOOL);  
+  _mi_fprintf(out, arg, "debug level : %d\n", MI_DEBUG );
+  _mi_fprintf(out, arg, "secure level: %d\n", MI_SECURE );
+  _mi_fprintf(out, arg, "padding     : %s\n", (MI_PADDING==0 ? "none" : (MI_PADDING==1 ? "enabled" : "byte precise")));  
 }
 
 mi_decl_export void mi_options_print(void) mi_attr_noexcept {
@@ -446,25 +458,12 @@ static void mi_add_stderr_output(void) {
 static _Atomic(size_t) error_count;   // = 0;  // when >= max_error_count stop emitting errors
 static _Atomic(size_t) warning_count; // = 0;  // when >= max_warning_count stop emitting warnings
 
-// When overriding malloc, we may recurse into mi_vfprintf if an allocation
-// inside the C runtime causes another message.
-// In some cases (like on macOS) the loader already allocates which
-// calls into mimalloc; if we then access thread locals (like `recurse`)
-// this may crash as the access may call _tlv_bootstrap that tries to
-// (recursively) invoke malloc again to allocate space for the thread local
-// variables on demand. This is why we use a _mi_preloading test on such
-// platforms. However, C code generator may move the initial thread local address
-// load before the `if` and we therefore split it out in a separate function.
-static mi_decl_thread bool recurse = false;
-
 static mi_decl_noinline bool mi_recurse_enter_prim(void) {
-  if (recurse) return false;
-  recurse = true;
   return true;
 }
 
 static mi_decl_noinline void mi_recurse_exit_prim(void) {
-  recurse = false;
+  /* nothing */
 }
 
 static bool mi_recurse_enter(void) {
@@ -482,7 +481,7 @@ static void mi_recurse_exit(void) {
 }
 
 void _mi_fputs(mi_output_fun* out, void* arg, const char* prefix, const char* message) {
-  if (out==NULL || (void*)out==(void*)stdout || (void*)out==(void*)stderr) { // TODO: use mi_out_stderr for stderr?
+  if (out==NULL || (void*)out==(void*)stdout || (void*)out==(void*)stderr) { // todo: use mi_out_stderr for stderr?
     if (!mi_recurse_enter()) return;
     out = mi_out_get_default(&arg);
     if (prefix != NULL) out(prefix, arg);
@@ -514,7 +513,7 @@ void _mi_fprintf( mi_output_fun* out, void* arg, const char* fmt, ... ) {
 }
 
 static void mi_vfprintf_thread(mi_output_fun* out, void* arg, const char* prefix, const char* fmt, va_list args) {
-  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32 && !_mi_is_main_thread()) {
+  if (prefix != NULL && _mi_strnlen(prefix,33) <= 32) { // && !_mi_is_main_thread()) {
     char tprefix[64];
     _mi_snprintf(tprefix, sizeof(tprefix), "%sthread 0x%tx: ", prefix, (uintptr_t)_mi_thread_id());
     mi_vfprintf(out, arg, tprefix, fmt, args);
@@ -528,13 +527,6 @@ void _mi_raw_message(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   mi_vfprintf(NULL, NULL, NULL, fmt, args);
-  va_end(args);
-}
-
-void _mi_message(const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  mi_vfprintf_thread(NULL, NULL, "mimalloc: ", fmt, args);
   va_end(args);
 }
 
@@ -590,24 +582,27 @@ static _Atomic(void*) mi_error_arg;     // = NULL
 
 static void mi_error_default(int err) {
   MI_UNUSED(err);
-#if (MI_DEBUG>0)
-  if (err==EFAULT) {
-    #ifdef _MSC_VER
-    __debugbreak();
-    #endif
-    abort();
+  #if (MI_DEBUG>0)
+    if (err==EFAULT) {
+      #ifdef _MSC_VER
+      __debugbreak();
+      #endif
+      abort();
+    }
+  #endif
+  #if (MI_SECURE>0)
+    if (err==EFAULT) {  // abort on serious errors in secure mode (corrupted meta-data)
+      abort();
+    }
+  #endif
+  #if defined(MI_XMALLOC)
+    if (err==ENOMEM || err==EOVERFLOW || err==EINVAL) { // abort on memory allocation fails in xmalloc mode
+      abort();
+    }
+  #endif
+  if (errno==0) {
+    errno = (err==EINVAL ? EINVAL : ENOMEM /* compatibility */ );
   }
-#endif
-#if (MI_SECURE>0)
-  if (err==EFAULT) {  // abort on serious errors in secure mode (corrupted meta-data)
-    abort();
-  }
-#endif
-#if defined(MI_XMALLOC)
-  if (err==ENOMEM || err==EOVERFLOW) { // abort on memory allocation fails in xmalloc mode
-    abort();
-  }
-#endif
 }
 
 void mi_register_error(mi_error_fun* fun, void* arg) {
@@ -621,7 +616,7 @@ void _mi_error_message(int err, const char* fmt, ...) {
   va_start(args, fmt);
   mi_show_error_message(fmt, args);
   va_end(args);
-  // and call the error handler which may abort (or return normally)
+  // and call the error handler which may abort (or return normally, potentially setting errno)
   if (mi_error_handler != NULL) {
     mi_error_handler(err, mi_atomic_load_ptr_acquire(void,&mi_error_arg));
   }
@@ -630,14 +625,17 @@ void _mi_error_message(int err, const char* fmt, ...) {
   }
 }
 
+mi_decl_noinline mi_block_t* _mi_block_next_is_corrupted(const mi_page_t* page, const mi_block_t* block, const mi_block_t* next) {
+  _mi_error_message(EFAULT, "corrupted free list entry of size %zub at %p: value 0x%zx\n", mi_page_block_size(page), block, (uintptr_t)next);
+  return NULL;
+}
+    
 // --------------------------------------------------------
 // Initialize options by checking the environment
 // --------------------------------------------------------
 
 // TODO: implement ourselves to reduce dependencies on the C runtime
 #include <stdlib.h> // strtol
-#include <string.h> // strstr
-
 
 static void mi_option_init(mi_option_desc_t* desc) {
   // Read option value from the environment
@@ -645,17 +643,17 @@ static void mi_option_init(mi_option_desc_t* desc) {
   char buf[64+1];
   _mi_strlcpy(buf, "mimalloc_", sizeof(buf));
   _mi_strlcat(buf, desc->name, sizeof(buf));
-  bool found = _mi_getenv(buf, s, sizeof(s));
-  if (!found && desc->legacy_name != NULL) {
+  int err = _mi_getenv(buf, s, sizeof(s));
+  if (err==ENOENT && desc->legacy_name != NULL) {
     _mi_strlcpy(buf, "mimalloc_", sizeof(buf));
     _mi_strlcat(buf, desc->legacy_name, sizeof(buf));
-    found = _mi_getenv(buf, s, sizeof(s));
-    if (found) {
+    err = _mi_getenv(buf, s, sizeof(s));
+    if (err==0) {
       _mi_warning_message("environment option \"mimalloc_%s\" is deprecated -- use \"mimalloc_%s\" instead.\n", desc->legacy_name, desc->name);
     }
   }
 
-  if (found) {
+  if (err==0) {
     size_t len = _mi_strnlen(s, sizeof(buf) - 1);
     for (size_t i = 0; i < len; i++) {
       buf[i] = _mi_toupper(s[i]);
@@ -665,14 +663,15 @@ static void mi_option_init(mi_option_desc_t* desc) {
       desc->value = 1;
       desc->init = MI_OPTION_INITIALIZED;
     }
-    else if (_mi_streq(buf,"0") || _mi_streq(buf,"FALSE") || _mi_streq(buf,"NO") || _mi_streq(buf,"OFF")) {      
+    else if (_mi_streq(buf,"0") || _mi_streq(buf,"FALSE") || _mi_streq(buf,"NO") || _mi_streq(buf,"OFF")) {
       desc->value = 0;
       desc->init = MI_OPTION_INITIALIZED;
     }
     else {
       char* end = buf;
+      errno = 0;
       long value = strtol(buf, &end, 10);
-      if (mi_option_has_size_in_kib(desc->option)) {
+      if (errno==0 && mi_option_has_size_in_kib(desc->option)) {
         // this option is interpreted in KiB to prevent overflow of `long` for large allocations
         // (long is 32-bit on 64-bit windows, which allows for 4TiB max.)
         size_t size = (value < 0 ? 0 : (size_t)value);
@@ -687,7 +686,7 @@ static void mi_option_init(mi_option_desc_t* desc) {
         if (overflow || size > (MI_MAX_ALLOC_SIZE / MI_KiB)) { size = (MI_MAX_ALLOC_SIZE / MI_KiB); }
         value = (size > LONG_MAX ? LONG_MAX : (long)size);
       }
-      if (*end == 0) {
+      if (errno==0 && *end == 0) {
         mi_option_set(desc->option, value);
       }
       else {
@@ -707,7 +706,8 @@ static void mi_option_init(mi_option_desc_t* desc) {
     }
     mi_assert_internal(desc->init != MI_OPTION_UNINIT);
   }
-  else if (!_mi_preloading()) {
+  else if (err==ENOENT) {
     desc->init = MI_OPTION_DEFAULTED;
   }
+  // and on another error, keep unitialized to try again (can happen during preloading if getenv is not available)
 }

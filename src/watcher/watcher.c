@@ -154,6 +154,15 @@ struct cbm_watcher {
  * daemon log names the stuck project instead of only repeating the warning. */
 #define INDEX_FAIL_SUSTAINED 10
 
+/* Success cooldown (#2835): after a successful re-index the next poll waits
+ * INDEX_COOLDOWN_FACTOR x the index's own duration, counted from when the
+ * index finished, so short rebuilds spend at most ~1/(K+1) of wall time
+ * indexing one project. Sub-second indexes stay at the plain cadence. The
+ * cooldown is capped at INDEX_FAIL_CEILING_MS (5 min) so that, under
+ * continuous writes, a project never falls more than one rebuild plus five
+ * minutes behind. */
+#define INDEX_COOLDOWN_FACTOR 3
+
 /* Stale-root pruning (#286): a watched project whose root directory stays
  * missing is pruned — its cached DB is deleted and the watch entry removed.
  * Deletion is destructive (the DB can hold user-authored data such as the
@@ -175,7 +184,17 @@ struct cbm_watcher {
 
 /* ── Time helper ────────────────────────────────────────────────── */
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: nonzero freezes the watcher's scheduling clock at this value. */
+static int64_t test_clock_ns = 0;
+#endif
+
 static int64_t now_ns(void) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (test_clock_ns != 0) {
+        return test_clock_ns;
+    }
+#endif
     struct timespec ts;
     cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
     return ((int64_t)ts.tv_sec * NS_PER_SEC) + ts.tv_nsec;
@@ -202,6 +221,20 @@ int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures) {
      * the current constants can produce — the caller's contract is "a delay
      * that never shrinks as failures accumulate". */
     return (int)(delay < interval_ms ? interval_ms : delay);
+}
+
+int cbm_watcher_success_delay_ms(int interval_ms, int64_t index_elapsed_ms) {
+    if (interval_ms < 0) {
+        interval_ms = 0;
+    }
+    if (index_elapsed_ms <= 0) {
+        return interval_ms;
+    }
+    /* Divide instead of multiply so a huge elapsed cannot overflow. */
+    int64_t cooldown = index_elapsed_ms > INDEX_FAIL_CEILING_MS / INDEX_COOLDOWN_FACTOR
+                           ? INDEX_FAIL_CEILING_MS
+                           : index_elapsed_ms * INDEX_COOLDOWN_FACTOR;
+    return (int)(cooldown > interval_ms ? cooldown : interval_ms);
 }
 
 int cbm_watcher_poll_interval_ms(int file_count) {
@@ -522,14 +555,28 @@ static watcher_git_status_t git_repo_status(cbm_watcher_t *w, project_state_t *s
  * a `.git` file (the gitlink form used by linked worktrees and initialized
  * submodules). Deliberately a filesystem check, not a git invocation — the whole
  * point is to learn something `rev-parse` cannot tell us, because it walks up. */
+/* Preserve stat's link-following behavior while inspecting UTF-8 paths. */
+static int watcher_path_info(const char *path, cbm_path_info_t *info) {
+    int status = cbm_path_info_utf8(path, info);
+    if (status == CBM_PATH_INFO_OK && info->is_symlink) {
+        char canonical[CBM_SZ_4K];
+        if (!cbm_canonical_path(path, canonical, sizeof(canonical))) {
+            return CBM_PATH_INFO_UNAVAILABLE;
+        }
+        status = cbm_path_info_utf8(canonical, info);
+    }
+    return status;
+}
+
 static bool git_has_own_dot_git(const char *root_path) {
     char path[CBM_SZ_4K];
     int written = snprintf(path, sizeof(path), "%s/.git", root_path);
     if (written <= 0 || (size_t)written >= sizeof(path)) {
         return false;
     }
-    struct stat st;
-    return stat(path, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
+    cbm_path_info_t info;
+    return watcher_path_info(path, &info) == CBM_PATH_INFO_OK &&
+           (info.is_directory || info.is_regular);
 }
 
 /* Does the ancestor repository actually track anything inside this directory?
@@ -990,13 +1037,17 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
     if (!root_path) {
         return ROOT_UNCERTAIN;
     }
-    struct stat st;
-    if (stat(root_path, &st) == 0) {
-        /* Exists but is no longer a directory → the root directory is gone. */
-        return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
+    cbm_path_info_t info;
+    int status = watcher_path_info(root_path, &info);
+    if (status == CBM_PATH_INFO_OK) {
+        return info.is_directory ? ROOT_PRESENT : ROOT_MISSING;
     }
+#ifdef _WIN32
+    *out_errno = status == CBM_PATH_INFO_ABSENT ? ENOENT : EIO;
+#else
     *out_errno = errno;
-    return cbm_watcher_root_missing_errno(errno) ? ROOT_MISSING : ROOT_UNCERTAIN;
+#endif
+    return status == CBM_PATH_INFO_ABSENT ? ROOT_MISSING : ROOT_UNCERTAIN;
 }
 
 /* Sustained-absence window (seconds) before a missing root may be pruned.
@@ -1338,8 +1389,8 @@ static void publish_status(project_state_t *s, bool scanned) {
 
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
-    struct stat st;
-    if (stat(s->root_path, &st) != 0) {
+    cbm_path_info_t info;
+    if (watcher_path_info(s->root_path, &info) != CBM_PATH_INFO_OK || !info.is_directory) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;
@@ -1675,12 +1726,22 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy",
                  s->is_git ? "git" : "tree");
+    int delay_ms = -1;            /* < 0: use the failure-backoff cadence below */
+    int64_t anchor_ns = ctx->now; /* success re-anchors to when the index finished */
     if (ctx->w->index_fn) {
+        int64_t index_start = now_ns();
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
             commit_baselines(ctx->w, s);
+            anchor_ns = now_ns();
+            delay_ms =
+                cbm_watcher_success_delay_ms(s->interval_ms, (anchor_ns - index_start) / US_PER_MS);
+            if (delay_ms > s->interval_ms) {
+                cbm_log_info("watcher.cooldown", "project", s->project_name, "delay_ms",
+                             itoa_buf(delay_ms));
+            }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
@@ -1703,10 +1764,12 @@ static void poll_project(const char *key, void *val, void *ud) {
         }
     }
 
-    /* Failures back off; success and busy-skip keep the adaptive cadence. */
-    s->next_poll_ns =
-        ctx->now +
-        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
+    /* Success pays back the index's cost; failures back off; busy-skip keeps
+     * the adaptive cadence. */
+    if (delay_ms < 0) {
+        delay_ms = cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures);
+    }
+    s->next_poll_ns = anchor_ns + ((int64_t)delay_ms * US_PER_MS);
 }
 
 /* Callback to snapshot project state pointers into an array. */
@@ -1857,5 +1920,20 @@ int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
     int count = w->pending_free_count;
     cbm_mutex_unlock(&w->projects_lock);
     return count;
+}
+
+void cbm_watcher_test_set_clock_ns(int64_t ns) {
+    test_clock_ns = ns;
+}
+
+int64_t cbm_watcher_test_next_poll_ns(cbm_watcher_t *w, const char *project) {
+    if (!w || !project) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project);
+    int64_t next = s ? s->next_poll_ns : -1;
+    cbm_mutex_unlock(&w->projects_lock);
+    return next;
 }
 #endif

@@ -12,8 +12,11 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/include_path.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "discover/discover.h"
+#include "helpers.h" /* cbm_fqn_module_source_lang */
+#include "foundation/arena.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
@@ -119,13 +122,35 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     }
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
+    e->items[e->count].manifest_rel = NULL;
+    e->items[e->count].source_rel = NULL;
+    e->items[e->count].source_seq = 0;
+    e->items[e->count].npm_dependency = false;
     e->count++;
+}
+
+/* A registry dependency a package.json declares, recorded by name only:
+ * entry_rel stays NULL, so it never becomes an import target. Its name is
+ * owned by the memory core (cbm_pkg_entries_free knows by npm_dependency). */
+static void pkg_entries_push_npm_dependency(cbm_pkg_entries_t *e, const char *name) {
+    int before = e->count;
+    pkg_entries_push(e, NULL, NULL);
+    if (e->count > before) {
+        e->items[before].pkg_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name);
+        e->items[before].npm_dependency = true;
+    }
 }
 
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
-        free(e->items[i].pkg_name);
+        if (e->items[i].npm_dependency) {
+            cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].pkg_name);
+        } else {
+            free(e->items[i].pkg_name);
+        }
         free(e->items[i].entry_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].manifest_rel);
+        cbm_free(CBM_MEM_CLASS_OTHER, e->items[i].source_rel);
     }
     free(e->items);
     e->items = NULL;
@@ -284,7 +309,44 @@ static const char *resolve_pkg_entry(yyjson_val *root) {
     return "src/index.ts"; /* last resort default */
 }
 
-/* JS/TS: package.json — name + entry point resolution */
+/* A dependency version that points into the tree (`workspace:*`,
+ * `file:../x`, `link:`, `portal:`) names a local package, not a registry one. */
+static bool npm_version_is_local(const char *version) {
+    static const char *const local[] = {"workspace:", "file:", "link:", "portal:"};
+    for (size_t i = 0; i < sizeof(local) / sizeof(local[0]); i++) {
+        if (strncmp(version, local[i], strlen(local[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The registry dependencies of one package.json: every section a module
+ * import can resolve from. */
+static void push_npm_dependencies(yyjson_val *root, cbm_pkg_entries_t *entries) {
+    static const char *const sections[] = {"dependencies", "devDependencies", "peerDependencies",
+                                           "optionalDependencies"};
+    for (size_t s = 0; s < sizeof(sections) / sizeof(sections[0]); s++) {
+        yyjson_val *deps = yyjson_obj_get(root, sections[s]);
+        if (!yyjson_is_obj(deps)) {
+            continue;
+        }
+        size_t idx;
+        size_t max;
+        yyjson_val *key;
+        yyjson_val *val;
+        yyjson_obj_foreach(deps, idx, max, key, val) {
+            const char *name = yyjson_get_str(key);
+            const char *version = yyjson_get_str(val);
+            if (name && name[0] && version && !npm_version_is_local(version)) {
+                pkg_entries_push_npm_dependency(entries, name);
+            }
+        }
+    }
+}
+
+/* JS/TS: package.json — name + entry point resolution, and the names of its
+ * registry dependencies (a manifest without a name still declares those). */
 static void parse_package_json(const char *source, int source_len, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
     yyjson_doc *doc = yyjson_read(source, (size_t)source_len, 0);
@@ -298,17 +360,8 @@ static void parse_package_json(const char *source, int source_len, const char *r
     }
 
     yyjson_val *name_val = yyjson_obj_get(root, "name");
-    if (!yyjson_is_str(name_val)) {
-        yyjson_doc_free(doc);
-        return;
-    }
-    const char *name = yyjson_get_str(name_val);
-    if (!name || name[0] == '\0') {
-        yyjson_doc_free(doc);
-        return;
-    }
-
-    const char *entry = resolve_pkg_entry(root);
+    const char *name = yyjson_is_str(name_val) ? yyjson_get_str(name_val) : NULL;
+    const char *entry = name && name[0] ? resolve_pkg_entry(root) : NULL;
     if (entry) {
         char *dir = path_dirname(rel_path);
         char *resolved = join_and_strip(dir, entry);
@@ -317,6 +370,7 @@ static void parse_package_json(const char *source, int source_len, const char *r
         }
         free(dir);
     }
+    push_npm_dependencies(root, entries);
 
     yyjson_doc_free(doc);
 }
@@ -872,27 +926,78 @@ static char *swift_extract_after(const char *start, const char *end, const char 
     return swift_quoted_literal(hit + strlen(needle), end);
 }
 
+static bool swift_normalize_target_path(const char *suffix, char normalized[PKGMAP_PATH_BUF]) {
+    /* Target paths are directories; normalize dot segments without allowing
+     * a target to escape the package that declares it. */
+    size_t used = 0;
+    size_t parents[PKGMAP_PATH_BUF / PAIR_LEN];
+    size_t depth = 0;
+    if (suffix[0] == '/' || strpbrk(suffix, "\\:")) {
+        return false;
+    }
+    for (const char *part = suffix; *part;) {
+        const char *slash = strchr(part, '/');
+        size_t len = slash ? (size_t)(slash - part) : strlen(part);
+        const char *component = part;
+        part = slash ? slash + SKIP_ONE : part + len;
+        if (!len || (len == SKIP_ONE && component[0] == '.')) {
+            continue;
+        }
+        if (len == PAIR_LEN && memcmp(component, "..", PAIR_LEN) == 0) {
+            if (!depth) {
+                return false;
+            }
+            used = parents[--depth];
+            continue;
+        }
+        if (used + len + PAIR_LEN > PKGMAP_PATH_BUF ||
+            depth == sizeof(parents) / sizeof(parents[0])) {
+            return false;
+        }
+        parents[depth++] = used;
+        if (used) {
+            normalized[used++] = '/';
+        }
+        memcpy(normalized + used, component, len);
+        used += len;
+    }
+    normalized[used] = '\0';
+    return true;
+}
+
 /* Register `target_name` → its resolved source directory: the literal
  * `path:` argument the target declared, if any, else the conventional
  * `Sources/<target_name>` (fixed-convention, same approach parse_cargo_toml
  * takes for `src/lib`). `literal_path` is borrowed; caller retains
  * ownership. */
 static void swift_register_target(const char *rel_path, const char *target_name,
-                                  const char *literal_path, cbm_pkg_entries_t *entries) {
+                                  const char *literal_path, const char *source_root,
+                                  cbm_pkg_entries_t *entries) {
     if (!target_name || !target_name[0]) {
         return;
     }
     char suffix_buf[PKGMAP_PATH_BUF];
     const char *suffix;
-    if (literal_path && literal_path[0]) {
+    if (literal_path) {
         suffix = literal_path;
     } else {
-        snprintf(suffix_buf, sizeof(suffix_buf), "Sources/%s", target_name);
+        int len = snprintf(suffix_buf, sizeof(suffix_buf), "%s/%s", source_root, target_name);
+        if (len < 0 || (size_t)len >= sizeof(suffix_buf)) {
+            return;
+        }
         suffix = suffix_buf;
     }
-    char *entry = build_entry_path(rel_path, suffix);
+    char normalized[PKGMAP_PATH_BUF];
+    if (!swift_normalize_target_path(suffix, normalized)) {
+        return;
+    }
+    char *entry = normalized[0] ? build_entry_path(rel_path, normalized) : path_dirname(rel_path);
     if (entry) {
+        int before = entries->count;
         pkg_entries_push(entries, strdup(target_name), entry);
+        if (entries->count > before) {
+            entries->items[before].manifest_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        }
     }
 }
 
@@ -909,14 +1014,28 @@ static void swift_register_target(const char *rel_path, const char *target_name,
  * mint a location that is not just unconfirmed but actively likely wrong. */
 static void swift_scan_targets(const char *source, const char *end, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
-    static const char prefix[] = ".target(";
+    static const struct {
+        const char *prefix;
+        const char *root;
+    } targets[] = {
+        {".target(", "Sources"}, {".executableTarget(", "Sources"}, {".testTarget(", "Tests"},
+        {".macro(", "Sources"},  {".plugin(", "Plugins"},
+    };
     const char *cursor = source;
     while (cursor < end) {
-        const char *hit = swift_find_code_token(cursor, end, prefix);
+        const char *hit = NULL;
+        size_t selected = 0;
+        for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+            const char *candidate = swift_find_code_token(cursor, end, targets[i].prefix);
+            if (candidate && (!hit || candidate < hit)) {
+                hit = candidate;
+                selected = i;
+            }
+        }
         if (!hit) {
             return;
         }
-        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *open = hit + strlen(targets[selected].prefix) - SKIP_ONE;
         const char *close = swift_match_paren(open, end);
         if (!close) {
             return; /* unbalanced — nothing further here is trustworthy */
@@ -926,7 +1045,8 @@ static void swift_scan_targets(const char *source, const char *end, const char *
             bool path_present = false;
             char *literal_path = swift_extract_after(open, close, "path:", &path_present);
             if (literal_path || !path_present) {
-                swift_register_target(rel_path, name, literal_path, entries);
+                swift_register_target(rel_path, name, literal_path, targets[selected].root,
+                                      entries);
             }
             free(literal_path);
             free(name);
@@ -946,8 +1066,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
-bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
-                          int source_len, cbm_pkg_entries_t *entries) {
+static bool pkgmap_parse_by_basename(const char *basename, const char *rel_path, const char *source,
+                                     int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
         return false;
     }
@@ -999,12 +1119,124 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     return false;
 }
 
+/* Parse one manifest and stamp what it yielded with where it came from. The
+ * merge orders manifests by that, and keeps one manifest's entries in the order
+ * its parser pushed them (a pyproject.toml pushes src/<name> before <name>). */
+bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
+                          int source_len, cbm_pkg_entries_t *entries) {
+    int before = entries ? entries->count : 0;
+    if (!pkgmap_parse_by_basename(basename, rel_path, source, source_len, entries)) {
+        return false;
+    }
+    for (int i = before; rel_path && i < entries->count; i++) {
+        entries->items[i].source_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        entries->items[i].source_seq = i - before;
+    }
+    return true;
+}
+
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
 /* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
 static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
     size_t n = pkg_name ? strlen(pkg_name) : 0;
     return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
+}
+
+/* How far below the repository root an entry sits: 0 for the root itself. */
+static int pkgmap_entry_depth(const char *entry_rel) {
+    if (!entry_rel[0] || strcmp(entry_rel, ".") == 0) {
+        return 0;
+    }
+    int depth = SKIP_ONE;
+    for (const char *p = entry_rel; *p; p++) {
+        if (*p == '/') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Merge order: by package name, then the manifest nearest the repository root,
+ * then by manifest path, then the order in which that manifest's parser pushed
+ * its entries. Two manifests can declare one package name (a repository's
+ * go.mod and a test fixture's copy of it), and which worker parsed which is
+ * thread scheduling. Ordering the manifests here makes the winner a property of
+ * the repository, not of the run. One manifest's own entries keep their order:
+ * its parser puts the preferred candidate first. An entry no manifest stamped
+ * is ordered by its own path. */
+static int pkgmap_candidate_cmp(const void *lhs, const void *rhs) {
+    const cbm_pkg_entry_t *a = *(const cbm_pkg_entry_t *const *)lhs;
+    const cbm_pkg_entry_t *b = *(const cbm_pkg_entry_t *const *)rhs;
+    int by_name = strcmp(a->pkg_name, b->pkg_name);
+    if (by_name != 0) {
+        return by_name;
+    }
+    const char *from_a = a->source_rel ? a->source_rel : a->entry_rel;
+    const char *from_b = b->source_rel ? b->source_rel : b->entry_rel;
+    int depth_a = pkgmap_entry_depth(from_a);
+    int depth_b = pkgmap_entry_depth(from_b);
+    if (depth_a != depth_b) {
+        return depth_a < depth_b ? -SKIP_ONE : SKIP_ONE;
+    }
+    int by_source = strcmp(from_a, from_b);
+    if (by_source != 0) {
+        return by_source;
+    }
+    if (a->source_seq != b->source_seq) {
+        return a->source_seq < b->source_seq ? -SKIP_ONE : SKIP_ONE;
+    }
+    return strcmp(a->entry_rel, b->entry_rel);
+}
+
+/* The package map also records the names of the registry dependencies that
+ * package.json files declare, each under this prefix. No module specifier or
+ * package name starts with a control byte, so such a key never answers a
+ * module lookup; only pkgmap_declares_npm_dependency reads them. The key is
+ * owned by the memory core and every such entry shares one static value
+ * (pkgmap_free_entry tells them apart by the prefix). */
+static const char PKGMAP_NPM_DEPENDENCY_KEY[] = "\x01npm-dependency:";
+static char pkgmap_npm_dependency_value[] = "";
+
+static bool pkgmap_is_npm_dependency_key(const char *key) {
+    return strncmp(key, PKGMAP_NPM_DEPENDENCY_KEY, sizeof(PKGMAP_NPM_DEPENDENCY_KEY) - SKIP_ONE) ==
+           0;
+}
+
+/* Record every declared registry dependency once. Returns how many. */
+static int pkgmap_add_npm_dependencies(CBMHashTable *map, const cbm_pkg_entries_t *worker_entries,
+                                       int worker_count) {
+    int added = 0;
+    for (int w = 0; w < worker_count; w++) {
+        const cbm_pkg_entries_t *we = &worker_entries[w];
+        for (int i = 0; i < we->count; i++) {
+            const cbm_pkg_entry_t *entry = &we->items[i];
+            if (!entry->npm_dependency || !entry->pkg_name) {
+                continue;
+            }
+            size_t len = sizeof(PKGMAP_NPM_DEPENDENCY_KEY) + strlen(entry->pkg_name);
+            char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, len);
+            if (!key) {
+                continue;
+            }
+            snprintf(key, len, "%s%s", PKGMAP_NPM_DEPENDENCY_KEY, entry->pkg_name);
+            if (cbm_ht_has(map, key)) {
+                cbm_free(CBM_MEM_CLASS_OTHER, key);
+                continue;
+            }
+            cbm_ht_set(map, key, pkgmap_npm_dependency_value);
+            added++;
+        }
+    }
+    return added;
+}
+
+/* True when some package.json of the tree declares `package` as a registry
+ * dependency. */
+static bool pkgmap_declares_npm_dependency(const CBMHashTable *pkgmap, const char *package) {
+    char key[PKGMAP_PATH_BUF];
+    int n = snprintf(key, sizeof(key), "%s%s", PKGMAP_NPM_DEPENDENCY_KEY, package);
+    return pkgmap && n > 0 && (size_t)n < sizeof(key) && cbm_ht_has(pkgmap, key);
 }
 
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
@@ -1018,42 +1250,60 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
         return NULL;
     }
 
+    const cbm_pkg_entry_t **candidates =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)total * sizeof(*candidates));
+    if (!candidates) {
+        return NULL;
+    }
+    int candidate_count = 0;
+    for (int w = 0; w < worker_count; w++) {
+        const cbm_pkg_entries_t *we = &worker_entries[w];
+        for (int i = 0; i < we->count; i++) {
+            if (!we->items[i].pkg_name || !we->items[i].entry_rel) {
+                continue; /* package-boundary metadata has no import specifier */
+            }
+            candidates[candidate_count++] = &we->items[i];
+        }
+    }
+    qsort(candidates, (size_t)candidate_count, sizeof(*candidates), pkgmap_candidate_cmp);
+
     CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
     int merged = 0;
 
-    for (int w = 0; w < worker_count; w++) {
-        cbm_pkg_entries_t *we = &worker_entries[w];
-        for (int i = 0; i < we->count; i++) {
-            /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
-             * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
-             * instead: its readers map `Prefix\Sub\Class` onto a file path
-             * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
-            const char *entry_rel = we->items[i].entry_rel;
-            char *qn = pkgmap_is_psr4_prefix(we->items[i].pkg_name)
-                           ? cbm_strndup(entry_rel, strlen(entry_rel))
-                           : cbm_pipeline_fqn_module(project_name, entry_rel);
-            if (!qn) {
-                continue;
-            }
-
-            /* Check for duplicate — first wins */
-            if (cbm_ht_has(map, we->items[i].pkg_name)) {
-                free(qn);
-                continue;
-            }
-
-            /* Transfer ownership: key = strdup'd pkg_name, value = qn */
-            char *key = strdup(we->items[i].pkg_name);
-            cbm_ht_set(map, key, qn);
-            merged++;
+    for (int i = 0; i < candidate_count; i++) {
+        const cbm_pkg_entry_t *entry = candidates[i];
+        /* Duplicate name: the first in merge order wins. */
+        if (cbm_ht_has(map, entry->pkg_name)) {
+            continue;
         }
-    }
+        /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
+         * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
+         * instead: its readers map `Prefix\Sub\Class` onto a file path
+         * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
+        const char *entry_rel = entry->entry_rel;
+        char *qn = pkgmap_is_psr4_prefix(entry->pkg_name)
+                       ? cbm_strndup(entry_rel, strlen(entry_rel))
+                       : cbm_pipeline_fqn_module(project_name, entry_rel);
+        if (!qn) {
+            continue;
+        }
 
-    if (merged == 0) {
+        /* Transfer ownership: key = strdup'd pkg_name, value = qn */
+        char *key = strdup(entry->pkg_name);
+        cbm_ht_set(map, key, qn);
+        merged++;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, candidates);
+    int declared = pkgmap_add_npm_dependencies(map, worker_entries, worker_count);
+
+    if (merged == 0 && declared == 0) {
         cbm_ht_free(map);
         return NULL;
     }
     cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
+    if (declared > 0) {
+        cbm_log_info("pkgmap.build", "npm_dependencies", pkgmap_itoa(declared));
+    }
     return map;
 }
 
@@ -1061,18 +1311,7 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
  * Used by the filesystem walker; cbm_pkgmap_try_parse is the source of
  * truth for which basenames produce entries. */
 static bool is_pkgmap_manifest_basename(const char *basename) {
-    if (!basename) {
-        return false;
-    }
-    if (strcmp(basename, "package.json") == 0 || strcmp(basename, "go.mod") == 0 ||
-        strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
-        strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
-        strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
-        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
-        strcmp(basename, "Package.swift") == 0) {
-        return true;
-    }
-    return ends_with(basename, ".gemspec");
+    return cbm_discover_is_package_manifest(basename); /* one list, shared with discovery */
 }
 
 /* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
@@ -1129,6 +1368,26 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
 }
 #endif
 
+static bool pkgmap_wants_manifest(const char *name, bool swift_only) {
+    return swift_only ? strcmp(name, "Package.swift") == 0 : is_pkgmap_manifest_basename(name);
+}
+
+static bool pkgmap_parse_walk_manifest(const char *name, const char *rel_path, const char *source,
+                                       int source_len, cbm_pkg_entries_t *entries,
+                                       bool swift_only) {
+    if (!cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
+        return false;
+    }
+    if (swift_only) {
+        int before = entries->count;
+        pkg_entries_push(entries, NULL, path_dirname(rel_path));
+        if (entries->count > before) {
+            entries->items[before].manifest_rel = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel_path);
+        }
+    }
+    return true;
+}
+
 /* Recursive filesystem walker that finds and parses package manifest
  * files independently of the main discovery filter. The main discovery
  * filter intentionally hides package.json / composer.json etc. from
@@ -1144,10 +1403,23 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * recursion bound — even directory junctions / symlink cycles cannot make
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
+static bool pkgmap_dot_entry(const char *name) {
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
+static bool pkgmap_walk_paths(const char *abs_dir, const char *rel_dir, const char *name,
+                              char abs_path[PKGMAP_PATH_BUF], char rel_path[PKGMAP_PATH_BUF]) {
+    int abs_len = snprintf(abs_path, PKGMAP_PATH_BUF, "%s/%s", abs_dir, name);
+    int rel_len = rel_dir && rel_dir[0]
+                      ? snprintf(rel_path, PKGMAP_PATH_BUF, "%s/%s", rel_dir, name)
+                      : snprintf(rel_path, PKGMAP_PATH_BUF, "%s", name);
+    return abs_len >= 0 && abs_len < PKGMAP_PATH_BUF && rel_len >= 0 && rel_len < PKGMAP_PATH_BUF;
+}
+
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth, char **excluded_dirs, int excluded_count) {
+                           int depth, char **excluded_dirs, int excluded_count, bool swift_only) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
-        cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
+        cbm_log_info("pkgmap.walk", "depth_cap", rel_dir[0] ? rel_dir : ".");
         return 0;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
@@ -1158,23 +1430,23 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
     cbm_dirent_t *entry;
     while ((entry = cbm_readdir(dir)) != NULL) {
         const char *name = entry->name;
-        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+        if (pkgmap_dot_entry(name)) {
             continue;
         }
         char abs_path[PKGMAP_PATH_BUF];
         char rel_path[PKGMAP_PATH_BUF];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
-        if (rel_dir && rel_dir[0]) {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name);
-        } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", name);
+        if (!pkgmap_walk_paths(abs_dir, rel_dir, name, abs_path, rel_path)) {
+            continue;
         }
         struct stat st;
         if (pkgmap_safe_stat(abs_path, &st) != 0) {
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+            /* deploy/ and deployed/ hold no indexed program source (their
+             * configuration files only), so a package manifest there names
+             * no package of the graph: skipped, as before. */
+            if (cbm_should_skip_dir(name, CBM_MODE_FULL) || cbm_discover_config_only_dir(name) ||
                 cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
                 continue;
             }
@@ -1188,13 +1460,13 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             }
 #endif
             parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
-                                      excluded_count);
+                                      excluded_count, swift_only);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
             continue;
         }
-        if (!is_pkgmap_manifest_basename(name)) {
+        if (!pkgmap_wants_manifest(name, swift_only)) {
             continue;
         }
         int source_len = 0;
@@ -1202,7 +1474,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!source) {
             continue;
         }
-        if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
+        if (pkgmap_parse_walk_manifest(name, rel_path, source, source_len, entries, swift_only)) {
             parsed++;
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, source);
@@ -1227,9 +1499,16 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
     if (!repo_path || !entries) {
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
+    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count, false);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
+}
+
+int cbm_pkgmap_scan_swift_targets(const char *repo_path, cbm_pkg_entries_t *entries,
+                                  char **excluded_dirs, int excluded_count) {
+    return repo_path && entries
+               ? pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count, true)
+               : 0;
 }
 
 /* Build pkgmap for sequential path (reads manifest files directly) */
@@ -1300,6 +1579,10 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
 
 static void pkgmap_free_entry(const char *key, void *value, void *userdata) {
     (void)userdata;
+    if (pkgmap_is_npm_dependency_key(key)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, (void *)key); /* the value is the shared static one */
+        return;
+    }
     free((void *)key);
     free(value);
 }
@@ -1416,6 +1699,73 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
     return NULL;
 }
 
+/* Map an alias-resolved file path to its module QN. Explicit JS/TS and
+ * JSON extensions name a module even when a dotted-name module also exists.
+ * For another indexed extension a QN alone proves nothing: filename dots and
+ * path separators both become dots. So the file path decides, in this order:
+ * a module at exactly that path (styles.css, also beside styles.css.ts), then
+ * a dotted-name module at that path plus a module extension (theme.css.ts
+ * imported as ~/theme.css), then the extension drops. A bundler ?query or a
+ * #fragment on the basename is not part of the extension; a `?` in a folder
+ * name is part of the path. Unknown suffixes such as cat.service stay intact. The shared alias
+ * resolver is unchanged, so doc links keep the file identity they had. */
+static char *alias_module_qn(const cbm_pipeline_ctx_t *ctx, const char *module_path,
+                             char *aliased) {
+    static const char *const module_exts[] = {".ts",  ".tsx", ".js",  ".jsx", ".mjs",
+                                              ".cjs", ".mts", ".cts", ".json"};
+    /* The import spelled a module extension and the alias resolver removed
+     * it: what is left is the whole file stem, dots included
+     * (~/tokens.css.ts names tokens.css.ts, never tokens.css). */
+    size_t mlen = strlen(module_path);
+    size_t alen = strlen(aliased);
+    for (size_t i = 0; i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+        size_t elen = strlen(module_exts[i]);
+        bool spelled = mlen > elen && strcmp(module_path + mlen - elen, module_exts[i]) == 0;
+        bool still_there = alen > elen && strcmp(aliased + alen - elen, module_exts[i]) == 0;
+        if (spelled && !still_there) {
+            return cbm_pipeline_fqn_folder(ctx->project_name, aliased);
+        }
+    }
+    char *slash = strrchr(aliased, '/');
+    char *base = slash ? slash + SKIP_ONE : aliased;
+    char *query = strchr(base, '?');
+    if (query) {
+        *query = '\0';
+    }
+    char *ext = strrchr(base, '.');
+    char *fragment = ext ? strchr(ext, '#') : NULL;
+    if (fragment) {
+        *fragment = '\0';
+    }
+    for (size_t i = 0; ext && i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+        if (strcmp(ext, module_exts[i]) == 0) {
+            return cbm_pipeline_fqn_module(ctx->project_name, aliased);
+        }
+    }
+    char *kept = cbm_pipeline_fqn_folder(ctx->project_name, aliased);
+    if (!kept || !ext || ext == base || cbm_language_for_extension(ext) == CBM_LANG_COUNT) {
+        return kept;
+    }
+    char *stripped = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+    const cbm_gbuf_node_t *node =
+        ctx->gbuf && stripped ? cbm_gbuf_find_by_qn(ctx->gbuf, stripped) : NULL;
+    bool exact = node && node->label && strcmp(node->label, "Module") == 0 && node->file_path &&
+                 strcmp(node->file_path, aliased) == 0;
+    node = ctx->gbuf && !exact ? cbm_gbuf_find_by_qn(ctx->gbuf, kept) : NULL;
+    size_t len = strlen(aliased);
+    if (node && node->label && strcmp(node->label, "Module") == 0 && node->file_path &&
+        strncmp(node->file_path, aliased, len) == 0) {
+        for (size_t i = 0; i < sizeof(module_exts) / sizeof(module_exts[0]); i++) {
+            if (strcmp(node->file_path + len, module_exts[i]) == 0) {
+                safe_free(stripped);
+                return kept;
+            }
+        }
+    }
+    safe_free(kept);
+    return stripped;
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
@@ -1442,7 +1792,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
         if (amap) {
             char *aliased = cbm_path_alias_resolve(amap, module_path);
             if (aliased) {
-                char *qn = cbm_pipeline_fqn_module(ctx->project_name, aliased);
+                char *qn = alias_module_qn(ctx, module_path, aliased);
                 free(aliased);
                 return qn;
             }
@@ -2037,6 +2387,49 @@ static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *c
     return NULL;
 }
 
+static bool explicit_relative_path(const char *p) {
+    return strncmp(p, "./", PAIR_LEN) == 0 || strncmp(p, "../", PAIR_LEN + SKIP_ONE) == 0;
+}
+
+enum { SIBLING_MAX_CANDS = 4 };
+
+/* The paths resolve_sibling_file tries for module_path, relative to the
+ * importer's directory `dir`, in priority order. Returns how many it wrote. */
+static int sibling_file_candidates(const char *dir, const char *module_path,
+                                   char cands[SIBLING_MAX_CANDS][PKGMAP_PATH_BUF]) {
+    int ncand = 0;
+    const char *sep = dir[0] ? "/" : "";
+    const char *base = module_path;
+    /* Skip a leading "./". */
+    if (strncmp(base, "./", PAIR_LEN) == 0) {
+        base += PAIR_LEN;
+    }
+    const char *slash = strrchr(base, '/');
+    /* 1. Direct sibling: dir/<module_path>. */
+    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, sep, base);
+    /* 2. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
+    {
+        const char *bn = slash ? slash + SKIP_ONE : base;
+        char *dpart = slash ? cbm_strndup(base, (size_t)(slash - base)) : strdup("");
+        if (dpart && bn[0] != '_') {
+            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s%s_%s.scss", dir, sep, dpart,
+                     dpart[0] ? "/" : "", bn);
+        }
+        free(dpart);
+    }
+    /* 3. Meson subdir: dir/<module_path>/meson.build. */
+    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s/meson.build", dir, sep, base);
+    /* 4. Basename sibling: dir/<basename(module_path)>.  Covers include paths
+     *    that carry a non-relative prefix (Hyprlang `source = ~/.config/.../x.conf`,
+     *    absolute include paths) but reference a file sitting beside the importer.
+     *    An explicit `./` or `../` path names one location, which Strategy 1c
+     *    resolves exactly; its basename beside the importer is another file (#2797). */
+    if (slash && slash[SKIP_ONE] && !explicit_relative_path(module_path)) {
+        snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, sep, slash + SKIP_ONE);
+    }
+    return ncand;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -2063,38 +2456,8 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         return NULL;
     }
 
-    /* Candidate relative paths, in priority order. */
-    char cands[5][PKGMAP_PATH_BUF];
-    int ncand = 0;
-    const char *base = module_path;
-    /* Skip a leading "./". */
-    if (base[0] == '.' && base[1] == '/') {
-        base += 2;
-    }
-    /* 1. Direct sibling: dir/<module_path>. */
-    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, dir[0] ? "/" : "", base);
-    /* 2. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
-    {
-        const char *slash = strrchr(base, '/');
-        const char *bn = slash ? slash + 1 : base;
-        char *dpart = slash ? cbm_strndup(base, (size_t)(slash - base)) : strdup("");
-        if (dpart && bn[0] != '_') {
-            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s%s_%s.scss", dir, dir[0] ? "/" : "",
-                     dpart[0] ? dpart : "", dpart[0] ? "/" : "", bn);
-        }
-        free(dpart);
-    }
-    /* 3. Meson subdir: dir/<module_path>/meson.build. */
-    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s/meson.build", dir, dir[0] ? "/" : "", base);
-    /* 4. Basename sibling: dir/<basename(module_path)>.  Covers include paths
-     *    that carry a non-relative prefix (Hyprlang `source = ~/.config/.../x.conf`,
-     *    absolute include paths) but reference a file sitting beside the importer. */
-    {
-        const char *slash = strrchr(base, '/');
-        if (slash && slash[1]) {
-            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, dir[0] ? "/" : "", slash + 1);
-        }
-    }
+    char cands[SIBLING_MAX_CANDS][PKGMAP_PATH_BUF];
+    int ncand = sibling_file_candidates(dir, module_path, cands);
 
     const cbm_gbuf_node_t *found = NULL;
     for (int i = 0; i < ncand; i++) {
@@ -2115,22 +2478,18 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
-/* The File an explicit relative import (`./x`, `../x`) names exactly, for
- * files whose File QN differs from the module QN Strategy 1 tries
- * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). Resolved in
- * stack buffers by cbm_repo_rel_join, which refuses a path above the
- * repository root. */
-static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
-                                                    const char *source_rel, const char *module_path,
-                                                    bool php_only) {
-    if (!source_rel || !module_path || module_path[0] != '.' ||
-        !(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
-        return NULL;
+/* The repository path an explicit relative import (`./x`, `../x`) names,
+ * joined into `out` in stack buffers by cbm_repo_rel_join, which refuses a
+ * path above the repository root. False when there is none. */
+static bool relative_import_path(const char *source_rel, const char *module_path, char *out,
+                                 size_t cap) {
+    if (!source_rel || !module_path || !explicit_relative_path(module_path)) {
+        return false;
     }
     char dir[PKGMAP_PATH_BUF];
     int dir_len = snprintf(dir, sizeof(dir), "%s", source_rel);
     if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
-        return NULL;
+        return false;
     }
     char *slash = strrchr(dir, '/');
     if (slash) {
@@ -2138,12 +2497,246 @@ static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ct
     } else {
         dir[0] = '\0';
     }
+    return cbm_repo_rel_join(dir, module_path, out, cap);
+}
+
+/* The File an explicit relative import (`./x`, `../x`) names exactly, for
+ * files whose File QN differs from the module QN Strategy 1 tries
+ * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). */
+static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *module_path,
+                                                    bool php_only) {
     char path[PKGMAP_PATH_BUF];
-    if (!cbm_repo_rel_join(dir, module_path, path, sizeof(path))) {
+    if (!relative_import_path(source_rel, module_path, path, sizeof(path))) {
         return NULL;
     }
     const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
     return file && (!php_only || node_in_php_file(file)) ? file : NULL;
+}
+
+/* Python/TS from-import of a member: module_path is often "pkg.mod.symbol"
+ * while module resolution lands on the Module node "pkg.mod". Prefer the
+ * member Function/Class when it exists — required for `from M import f as g`
+ * so CALLS can import_map to f (local_name g ≠ f). */
+static const cbm_gbuf_node_t *prefer_import_member(const cbm_pipeline_ctx_t *ctx,
+                                                   const CBMImport *imp,
+                                                   const cbm_gbuf_node_t *target, bool php_only) {
+    if (!target->label ||
+        (strcmp(target->label, "Module") != 0 && strcmp(target->label, "File") != 0)) {
+        return target;
+    }
+    char symbuf[256];
+    const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
+    if (!sym || !sym[0] || strcmp(sym, "*") == 0) {
+        return target;
+    }
+    const char *mod_tail =
+        import_last_segment(target->qualified_name ? target->qualified_name : "");
+    if (mod_tail && strcmp(mod_tail, sym) == 0) {
+        return target;
+    }
+    char member_qn[CBM_SZ_512];
+    snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
+    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+    if (member && (!php_only || node_in_php_file(member)) &&
+        import_targetable_label(member->label) && strcmp(member->label, "Module") != 0 &&
+        strcmp(member->label, "File") != 0) {
+        return member;
+    }
+    return target;
+}
+
+/* ── ECMAScript import specifiers ─────────────────────────────────── */
+
+/* Importing-file languages whose imports are ECMAScript module specifiers:
+ * the script languages and the markup hosts that embed their scripts. */
+static bool es_module_importer(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
+    case CBM_LANG_HTML:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Node's built-in modules and their documented sub-paths, which a bare
+ * specifier names without the `node:` scheme. */
+static bool node_builtin_module(const char *spec) {
+    static const char builtins[] =
+        "|assert|assert/strict|async_hooks|buffer|child_process|cluster|console|constants|crypto"
+        "|dgram|diagnostics_channel|dns|dns/promises|domain|events|fs|fs/promises|http|http2"
+        "|https|inspector|inspector/promises|module|net|os|path|path/posix|path/win32|perf_hooks"
+        "|process|punycode|querystring|readline|readline/promises|repl|stream|stream/consumers"
+        "|stream/promises|stream/web|string_decoder|sys|timers|timers/promises|tls|trace_events"
+        "|tty|url|util|util/types|v8|vm|wasi|worker_threads|zlib|";
+    char key[CBM_SZ_64];
+    int n = snprintf(key, sizeof(key), "|%s|", spec);
+    return n > 0 && (size_t)n < sizeof(key) && strstr(builtins, key) != NULL;
+}
+
+/* `node:fs`, `npm:x`, `jsr:@std/path`, `https://...`: a URL scheme names no
+ * file of the tree. Two characters at least, so a drive letter never counts. */
+static bool es_specifier_has_scheme(const char *spec) {
+    if (!isalpha((unsigned char)spec[0])) {
+        return false;
+    }
+    size_t i = SKIP_ONE;
+    while (isalnum((unsigned char)spec[i]) || spec[i] == '+' || spec[i] == '-' || spec[i] == '.') {
+        i++;
+    }
+    return spec[i] == ':' && i >= PAIR_LEN;
+}
+
+/* The package a bare specifier names, `@scope/name` or `name`, without its
+ * sub-path. False when the specifier has no package shape. */
+static bool es_specifier_package(const char *spec, char *out, size_t cap) {
+    if (spec[0] == '\0' || spec[0] == '/' || spec[0] == '.' || spec[0] == '#') {
+        return false;
+    }
+    const char *end = strchr(spec, '/');
+    if (spec[0] == '@') {
+        if (!end || end[SKIP_ONE] == '\0') {
+            return false;
+        }
+        end = strchr(end + SKIP_ONE, '/');
+    }
+    size_t len = end ? (size_t)(end - spec) : strlen(spec);
+    if (len == 0 || len >= cap) {
+        return false;
+    }
+    memcpy(out, spec, len);
+    out[len] = '\0';
+    return true;
+}
+
+typedef enum {
+    ES_SPECIFIER_OTHER = 0, /* a bare specifier without evidence either way */
+    ES_SPECIFIER_TREE_PATH, /* one file of the tree */
+    ES_SPECIFIER_EXTERNAL,  /* a module outside the tree */
+} es_specifier_t;
+
+/* A bundler query on the basename (`./worker.ts?worker`, `~/a.svg?raw`) is
+ * no part of the path; a `?` in a folder name is. */
+static void cut_basename_query(char *path) {
+    char *slash = strrchr(path, '/');
+    char *query = strchr(slash ? slash + SKIP_ONE : path, '?');
+    if (query) {
+        *query = '\0';
+    }
+}
+
+/* What an ES import specifier names. TREE_PATH: one file of the tree, by an
+ * explicit relative path or a tsconfig/jsconfig alias (paths or baseUrl),
+ * read as cbm_pipeline_resolve_module reads them; `path` receives that
+ * repository path (empty when it has none). EXTERNAL: a module outside the
+ * tree, by a URL scheme (checked before the aliases, whose baseUrl rule would
+ * read `node:fs/promises` as a path), a Node builtin or a registry dependency
+ * some package.json declares, unless a package of the tree has that name.
+ * OTHER: a bare specifier without such evidence (a bundler's module
+ * directories can still make it a project path). */
+static es_specifier_t es_specifier_kind(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                        const char *spec, char *path, size_t cap) {
+    path[0] = '\0';
+    if (explicit_relative_path(spec) || strcmp(spec, ".") == 0 || strcmp(spec, "..") == 0) {
+        if (!relative_import_path(source_rel, spec, path, cap)) {
+            path[0] = '\0';
+        }
+        cut_basename_query(path);
+        return ES_SPECIFIER_TREE_PATH;
+    }
+    if (es_specifier_has_scheme(spec)) {
+        return ES_SPECIFIER_EXTERNAL;
+    }
+    if (ctx->path_aliases && source_rel) {
+        const cbm_path_alias_map_t *amap =
+            cbm_path_alias_find_for_file(ctx->path_aliases, source_rel);
+        if (amap && cbm_path_alias_resolve_into(amap, spec, path, cap)) {
+            cut_basename_query(path);
+            return ES_SPECIFIER_TREE_PATH;
+        }
+        path[0] = '\0';
+    }
+    char package[PKGMAP_PATH_BUF];
+    if (!es_specifier_package(spec, package, sizeof(package))) {
+        return ES_SPECIFIER_OTHER;
+    }
+    const CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (pkgmap && cbm_ht_has(pkgmap, package)) {
+        return ES_SPECIFIER_OTHER; /* a package of the tree */
+    }
+    if (node_builtin_module(spec) || pkgmap_declares_npm_dependency(pkgmap, package)) {
+        return ES_SPECIFIER_EXTERNAL;
+    }
+    return ES_SPECIFIER_OTHER;
+}
+
+/* The Module a module loader finds for `path`: path plus a script
+ * extension, then path/index plus one. Looked up by the Module node's name,
+ * which is its file path, so a directory whose QN segment is not its name
+ * (`.vitepress` keeps its dot in the path, not in the Module QN) resolves
+ * too. */
+static const cbm_gbuf_node_t *es_module_for_path(const cbm_pipeline_ctx_t *ctx, const char *path) {
+    static const char suffixes[] = ".ts|.tsx|.mts|.cts|.js|.jsx|.mjs|.cjs|/index.ts|/index.tsx|/"
+                                   "index.js|/index.jsx|/index.mjs";
+    char candidate[PKGMAP_PATH_BUF];
+    for (const char *s = suffixes; *s;) {
+        const char *bar = strchr(s, '|');
+        int slen = bar ? (int)(bar - s) : (int)strlen(s);
+        int w = snprintf(candidate, sizeof(candidate), "%s%.*s", path, slen, s);
+        s = bar ? bar + SKIP_ONE : s + slen;
+        if (w <= 0 || (size_t)w >= sizeof(candidate)) {
+            continue;
+        }
+        const cbm_gbuf_node_t **hits = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_name(ctx->gbuf, candidate, &hits, &count) != 0 || !hits) {
+            continue;
+        }
+        for (int h = 0; h < count; h++) {
+            const cbm_gbuf_node_t *n = hits[h];
+            if (n && n->label && strcmp(n->label, "Module") == 0 && n->file_path &&
+                strcmp(n->file_path, candidate) == 0) {
+                return n;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* The node of the one file an ES tree-path specifier names at `path`, once
+ * Strategy 1 found none: for an explicit relative path, the module of the
+ * file at exactly that path (`./App.vue`, whose Module QN drops the
+ * extension Strategy 1 keeps) or that file's File node (Strategy 1c); then,
+ * for any tree path, the module a loader finds for it by extension or index
+ * file. Nothing else. */
+static const cbm_gbuf_node_t *resolve_es_tree_file(const cbm_pipeline_ctx_t *ctx,
+                                                   const char *source_rel,
+                                                   const char *source_file_qn, const CBMImport *imp,
+                                                   const char *path) {
+    if (!path[0]) {
+        return NULL;
+    }
+    if (explicit_relative_path(imp->module_path)) {
+        const cbm_gbuf_node_t *sibling =
+            resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path, false);
+        if (sibling && sibling->file_path && strcmp(sibling->file_path, path) == 0) {
+            return sibling;
+        }
+        const cbm_gbuf_node_t *file =
+            resolve_relative_file(ctx, source_rel, imp->module_path, false);
+        if (file) {
+            return file;
+        }
+    }
+    const cbm_gbuf_node_t *module = es_module_for_path(ctx, path);
+    return module ? prefer_import_member(ctx, imp, module, false) : NULL;
 }
 
 /* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
@@ -2228,6 +2821,152 @@ static psr4_outcome_t resolve_php_psr4_class(const cbm_gbuf_t *gbuf, const char 
         }
     }
     return covered ? PSR4_UNRESOLVED : PSR4_NOT_APPLICABLE;
+}
+
+/* ── Scala top-level index ───────────────────────────────────────── */
+
+/* The two File nodes with the lexicographically smallest QNs declaring a
+ * package, borrowed from the graph buffer. The smallest is the `import pkg._`
+ * target on every platform regardless of directory-walk order; the runner-up
+ * serves when the smallest is the importing file itself. */
+typedef struct {
+    const cbm_gbuf_node_t *first;
+    const cbm_gbuf_node_t *second; /* NULL for a single-file package */
+} scala_package_files_t;
+
+struct cbm_scala_index {
+    CBMHashTable *symbols;  /* "pkg.Name" → node, or &scala_toplevel_ambiguous */
+    CBMHashTable *packages; /* "pkg" → scala_package_files_t */
+};
+
+/* Marker value in the Scala top-level index: two files of a split package
+ * declare different top-level symbols under the same name, so an import of
+ * that name is ambiguous and must not bind. */
+static const cbm_gbuf_node_t scala_toplevel_ambiguous;
+
+static const cbm_gbuf_node_t *scala_toplevel_lookup(const cbm_scala_index_t *scala_index,
+                                                    const char *package, const char *name) {
+    if (!scala_index || !scala_index->symbols || !package || !name || !name[0]) {
+        return NULL;
+    }
+    char key[PKGMAP_PATH_BUF];
+    if (snprintf(key, sizeof(key), "%s.%s", package, name) >= (int)sizeof(key)) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *node = (const cbm_gbuf_node_t *)cbm_ht_get(scala_index->symbols, key);
+    return node == &scala_toplevel_ambiguous ? NULL : node;
+}
+
+/* `import pkg._` binds the package itself: its smallest declaring file, or
+ * the runner-up when that is the importer. */
+static const cbm_gbuf_node_t *scala_package_file(const cbm_scala_index_t *scala_index,
+                                                 const char *package, const char *source_file_qn) {
+    if (!scala_index || !scala_index->packages) {
+        return NULL;
+    }
+    const scala_package_files_t *pf = cbm_ht_get(scala_index->packages, package);
+    if (!pf) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *pick = pf->first;
+    if (source_file_qn && pick && strcmp(pick->qualified_name, source_file_qn) == 0) {
+        pick = pf->second;
+    }
+    return pick;
+}
+
+/* Scala source packages are independent of the repository layout. Resolve the
+ * longest declared package prefix first, then the imported top-level symbol
+ * through the (package, name) index, then an optional member under that
+ * owner's QN. Every step fails closed: generic suffix fallback is unsafe for
+ * JVM FQNs because common names such as api/get/app occur throughout a
+ * monorepo, and a member import that binds the owner instead would turn
+ * `member()` into a CALLS edge to the owner class via resolve_import_map. */
+static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_ctx_t *ctx,
+                                                             const char *source_file_qn,
+                                                             const CBMImport *imp,
+                                                             const CBMHashTable *namespace_map,
+                                                             const cbm_scala_index_t *scala_index) {
+    if (!namespace_map || !imp || !imp->module_path || !imp->module_path[0]) {
+        return NULL;
+    }
+    char full[PKGMAP_PATH_BUF];
+    snprintf(full, sizeof(full), "%s", imp->module_path);
+    for (char *p = full; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    size_t full_len = strlen(full);
+    while (full_len > 0 && (full[full_len - 1] == '*' || full[full_len - 1] == '.')) {
+        full[--full_len] = '\0';
+    }
+
+    bool wildcard = imp->local_name && strcmp(imp->local_name, "*") == 0;
+    if (wildcard && cbm_ht_has(namespace_map, full)) {
+        return scala_package_file(scala_index, full, source_file_qn);
+    }
+
+    char package[PKGMAP_PATH_BUF];
+    snprintf(package, sizeof(package), "%s", full);
+    for (;;) {
+        char *dot = strrchr(package, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+        if (!cbm_ht_has(namespace_map, package)) {
+            continue;
+        }
+        const char *remainder = full + strlen(package) + 1;
+        char top_level[CBM_SZ_256];
+        size_t top_len = strcspn(remainder, ".");
+        if (top_len == 0 || top_len >= sizeof(top_level)) {
+            return NULL;
+        }
+        memcpy(top_level, remainder, top_len);
+        top_level[top_len] = '\0';
+        /* Only a top-level symbol of a file declaring this package qualifies;
+         * a nested class or method of the same name is not importable by
+         * `pkg.Name` and an ambiguous split-package name yields no edge. */
+        const cbm_gbuf_node_t *owner = scala_toplevel_lookup(scala_index, package, top_level);
+        if (!owner || !owner->qualified_name) {
+            return NULL;
+        }
+        if (wildcard || !strchr(remainder, '.')) {
+            return owner;
+        }
+        /* `import pkg.Owner.member`: the member must exist under the owner's
+         * QN. Binding the owner instead would mislabel the edge. */
+        char member_qn[CBM_SZ_512];
+        if (snprintf(member_qn, sizeof(member_qn), "%s.%s", owner->qualified_name,
+                     remainder + top_len + 1) >= (int)sizeof(member_qn)) {
+            return NULL;
+        }
+        const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+        if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+            return scoped;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Scala `package` clauses are resolved only by the fail-closed resolver above.
+ * Letting them feed the generic first-declaring-file walk would bind Java or
+ * Kotlin imports of a shared package prefix to an arbitrary Scala file. */
+static bool path_is_scala(const char *path) {
+    const char *base = path;
+    for (const char *p = base; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return cbm_language_for_filename(base) == CBM_LANG_SCALA;
+}
+
+static bool declaring_file_is_scala(const cbm_gbuf_node_t *node) {
+    return node && node->file_path && path_is_scala(node->file_path);
 }
 
 static bool psr4_class_label(const char *label) {
@@ -2355,6 +3094,494 @@ static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *
     return found;
 }
 
+/* The first import-targetable node the module path in `work` names, trying
+ * successively shorter parent paths while a cut keeps at least `keep` bytes
+ * (Strategy 4 below, and the Rust crate tree). rust_tree: `work` is a
+ * repository path inside a Rust crate, naming work.rs or work/mod.rs
+ * directly, so no module resolver is involved. */
+static const cbm_gbuf_node_t *resolve_module_prefixes(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel,
+                                                      const char *source_file_qn, char *work,
+                                                      size_t keep, bool rust_tree, bool php_only) {
+    for (;;) {
+        for (int form = 0; form < (rust_tree ? PAIR_LEN : SKIP_ONE); form++) {
+            char mod_rs[PKGMAP_PATH_BUF];
+            int len = form ? snprintf(mod_rs, sizeof(mod_rs), "%s/mod", work) : 0;
+            if (len < 0 || (size_t)len >= sizeof(mod_rs)) {
+                continue;
+            }
+            const char *path = form ? mod_rs : work;
+            char *rqn = rust_tree ? cbm_pipeline_fqn_module(ctx->project_name, path)
+                                  : cbm_pipeline_resolve_module(ctx, source_rel, path);
+            const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
+            free(rqn);
+            if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
+                (!source_file_qn || !n->qualified_name ||
+                 strcmp(n->qualified_name, source_file_qn) != 0)) {
+                return n;
+            }
+        }
+        char *sl = strrchr(work, '/');
+        if (!sl || (size_t)(sl - work) < keep) {
+            return NULL;
+        }
+        *sl = '\0';
+    }
+}
+
+/* ── Rust `use` paths resolve inside one crate ─────────────────────── */
+
+/* A Rust `use` path names an item of exactly one crate: `crate::` is the
+ * importing crate's root module, `self::`/`super::` are relative to the
+ * importing file's module, a workspace member's crate name is that member, a
+ * child module of the importing module is that module, and anything else
+ * (std, core, a dependency) is outside the repository. The generic strategies
+ * below instead matched the last segment against every same-named definition
+ * in the project and took the smallest QN: in a Cargo workspace,
+ * `crate::util::helper` bound a SIBLING crate's util::helper, and
+ * `serde_json::json` bound the project's own `json` function. The crate of a
+ * file is its nearest Cargo.toml; without one the generic strategies stay. */
+
+enum {
+    RUST_USE_MAX_SEGS = 64,
+    RUST_USE_CANDS = 8,
+    RUST_RS_EXT_LEN = 3,       /* strlen(".rs") */
+    RUST_MOD_TAIL_LEN = 4,     /* strlen("/mod") */
+    RUST_KEYWORD_LEN = 3,      /* strlen("pub") == strlen("use") */
+    RUST_SELF_LEN = 4,         /* strlen("self") */
+    RUST_NON_ASCII_MIN = 0x80, /* identifiers admit any byte >= 0x80 */
+};
+
+typedef enum {
+    RUST_USE_UNSCOPED = 0, /* no crate known for the importer: generic strategies */
+    RUST_USE_NO_TARGET,    /* an external crate, or a path above the crate root */
+    RUST_USE_SCOPED,       /* resolved inside one crate's module tree */
+} rust_use_kind_t;
+
+typedef struct {
+    char buf[PKGMAP_PATH_BUF]; /* the segments, NUL-separated */
+    const char *seg[RUST_USE_MAX_SEGS];
+    int n;
+    bool glob;   /* trailing `::*` */
+    bool global; /* leading `::`: an extern crate */
+} rust_path_t;
+
+typedef struct {
+    const char *name; /* a written segment of the path */
+    size_t mod_len;   /* bytes of the path naming the modules above it */
+    int nmod;         /* segments in those bytes */
+} rust_cand_t;
+
+typedef struct {
+    rust_path_t p;
+    char root[PKGMAP_PATH_BUF]; /* module root of the crate target ("crates/x/src") */
+    char path[PKGMAP_PATH_BUF]; /* module path inside root, '/'-joined, written segments last */
+    bool has_leaf;              /* cands[0] is the named item (no glob) */
+    rust_cand_t cands[RUST_USE_CANDS]; /* the written segments, innermost first */
+    int ncands;
+} rust_use_t;
+
+static bool rust_ident_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c >= RUST_NON_ASCII_MIN;
+}
+
+static const char *rust_skip_ws(const char *p) {
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+/* Skip a `pub`, `pub(crate)`, `pub(in path)` visibility and a `use` keyword
+ * that an import's text may still carry. */
+static const char *rust_skip_use_prefix(const char *p) {
+    p = rust_skip_ws(p);
+    if (strncmp(p, "pub", RUST_KEYWORD_LEN) == 0 &&
+        !rust_ident_byte((unsigned char)p[RUST_KEYWORD_LEN])) {
+        p = rust_skip_ws(p + RUST_KEYWORD_LEN);
+        if (*p == '(') {
+            const char *close = strchr(p, ')');
+            p = close ? rust_skip_ws(close + SKIP_ONE) : p;
+        }
+    }
+    if (strncmp(p, "use", RUST_KEYWORD_LEN) == 0 && isspace((unsigned char)p[RUST_KEYWORD_LEN])) {
+        p = rust_skip_ws(p + RUST_KEYWORD_LEN);
+    }
+    return p;
+}
+
+/* The written path of an import as text: a group `a::{B, C}` stands for its
+ * first member (as import_candidate_symbol does), ` as alias` is dropped. */
+static bool rust_path_text(const char *module_path, char *out, size_t outsz) {
+    const char *p = rust_skip_use_prefix(module_path);
+    const char *brace = strchr(p, '{');
+    int n;
+    if (!brace) {
+        n = snprintf(out, outsz, "%s", p);
+    } else {
+        const char *m = rust_skip_ws(brace + SKIP_ONE);
+        size_t mlen = strcspn(m, ",}{");
+        while (mlen > 0 &&
+               (isspace((unsigned char)m[mlen - SKIP_ONE]) || m[mlen - SKIP_ONE] == ':')) {
+            mlen--;
+        }
+        bool self_member = mlen == RUST_SELF_LEN && strncmp(m, "self", RUST_SELF_LEN) == 0;
+        if (mlen == 0 || self_member) {
+            n = snprintf(out, outsz, "%.*s", (int)(brace - p), p);
+        } else {
+            n = snprintf(out, outsz, "%.*s%.*s", (int)(brace - p), p, (int)mlen, m);
+        }
+    }
+    if (n < 0 || (size_t)n >= outsz) {
+        return false;
+    }
+    char *as = strstr(out, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    return true;
+}
+
+/* Split a Rust use path into its segments. False when the text is no plain
+ * path (an unparsed form keeps the generic strategies). */
+static bool rust_path_split(const char *module_path, rust_path_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!module_path || !rust_path_text(module_path, out->buf, sizeof(out->buf))) {
+        return false;
+    }
+    char *p = (char *)rust_skip_ws(out->buf);
+    size_t len = strlen(p);
+    while (len > 0 && (isspace((unsigned char)p[len - SKIP_ONE]) || p[len - SKIP_ONE] == ':')) {
+        p[--len] = '\0';
+    }
+    if (len > 0 && p[len - SKIP_ONE] == '*') {
+        out->glob = true;
+        p[--len] = '\0';
+        while (len > 0 && (isspace((unsigned char)p[len - SKIP_ONE]) || p[len - SKIP_ONE] == ':')) {
+            p[--len] = '\0';
+        }
+    }
+    if (p[0] == ':' && p[SKIP_ONE] == ':') {
+        out->global = true;
+        p += PAIR_LEN;
+    }
+    while (*p) {
+        p = (char *)rust_skip_ws(p);
+        if (strncmp(p, "r#", PAIR_LEN) == 0) {
+            p += PAIR_LEN;
+        }
+        char *start = p;
+        while (rust_ident_byte((unsigned char)*p)) {
+            p++;
+        }
+        char *end = p;
+        p = (char *)rust_skip_ws(p);
+        if (end == start || out->n >= RUST_USE_MAX_SEGS) {
+            return false;
+        }
+        if (*p == ':' && p[SKIP_ONE] == ':') {
+            p += PAIR_LEN;
+        } else if (*p) {
+            return false;
+        }
+        *end = '\0';
+        out->seg[out->n++] = start;
+    }
+    return out->n > 0;
+}
+
+/* The directory of the nearest Cargo.toml above source_rel ("" = the
+ * repository root). False when no manifest is indexed above the file. */
+static bool rust_crate_dir(const cbm_pipeline_ctx_t *ctx, const char *source_rel, char *out,
+                           size_t outsz) {
+    int n = snprintf(out, outsz, "%s", source_rel);
+    if (n < 0 || (size_t)n >= outsz) {
+        return false;
+    }
+    for (;;) {
+        char *slash = strrchr(out, '/');
+        if (slash) {
+            *slash = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        char manifest[PKGMAP_PATH_BUF];
+        n = snprintf(manifest, sizeof(manifest), "%s%sCargo.toml", out, out[0] ? "/" : "");
+        if (n > 0 && (size_t)n < sizeof(manifest) &&
+            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, manifest)) {
+            return true;
+        }
+        if (!slash) {
+            return false;
+        }
+    }
+}
+
+/* The module root of the crate target holding source_rel in the package at
+ * crate_dir: the package's first directory on the way down (src/ for the
+ * library and binaries, tests/, benches/, examples/), or crate_dir itself
+ * for a file directly in it (build.rs, a crate root: *is_root = true). */
+static bool rust_module_root(const char *source_rel, const char *crate_dir, char *out, size_t outsz,
+                             bool *is_root) {
+    size_t dl = strlen(crate_dir);
+    const char *slash = strchr(source_rel + (dl ? dl + SKIP_ONE : 0), '/');
+    size_t n = slash ? (size_t)(slash - source_rel) : dl;
+    if (n >= outsz) {
+        return false;
+    }
+    memcpy(out, source_rel, n);
+    out[n] = '\0';
+    *is_root = !slash;
+    return true;
+}
+
+/* root/rel, or rel when root is the repository root (""). */
+static bool rust_join(char *out, size_t outsz, const char *root, const char *rel) {
+    int n = snprintf(out, outsz, "%s%s%s", root, root[0] ? "/" : "", rel);
+    return n > 0 && (size_t)n < outsz;
+}
+
+/* The module path of the Rust file at path inside root, '/'-joined:
+ * root/a/b.rs and root/a/b/mod.rs are "a/b", root/lib.rs and root/main.rs
+ * are "". False when path is no .rs file under root. */
+static bool rust_file_module(const char *path, const char *root, char *out, size_t outsz) {
+    size_t rl = strlen(root);
+    if (!path || (rl && (strncmp(path, root, rl) != 0 || path[rl] != '/'))) {
+        return false;
+    }
+    const char *rel = path + (rl ? rl + SKIP_ONE : 0);
+    size_t n = strlen(rel);
+    if (n <= RUST_RS_EXT_LEN || strcmp(rel + n - RUST_RS_EXT_LEN, ".rs") != 0 ||
+        n - RUST_RS_EXT_LEN >= outsz) {
+        return false;
+    }
+    n -= RUST_RS_EXT_LEN;
+    memcpy(out, rel, n);
+    out[n] = '\0';
+    if (strcmp(out, "lib") == 0 || strcmp(out, "main") == 0 || strcmp(out, "mod") == 0) {
+        out[0] = '\0';
+    } else if (n > RUST_MOD_TAIL_LEN && strcmp(out + n - RUST_MOD_TAIL_LEN, "/mod") == 0) {
+        out[n - RUST_MOD_TAIL_LEN] = '\0';
+    }
+    return true;
+}
+
+/* The module root of the workspace member whose crate name is `name` (a
+ * Cargo package name spells '_' as '-' too). False when no member of that
+ * name has a Rust library root in the graph. */
+static bool rust_member_root(const cbm_pipeline_ctx_t *ctx, const char *name, char *out,
+                             size_t outsz) {
+    CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (!pkgmap) {
+        return false;
+    }
+    const char *qn = (const char *)cbm_ht_get(pkgmap, name);
+    char dashed[CBM_SZ_256];
+    int dn = qn || !strchr(name, '_') ? -1 : snprintf(dashed, sizeof(dashed), "%s", name);
+    if (dn > 0 && (size_t)dn < sizeof(dashed)) {
+        for (char *c = dashed; *c; c++) {
+            *c = *c == '_' ? '-' : *c;
+        }
+        qn = (const char *)cbm_ht_get(pkgmap, dashed);
+    }
+    const cbm_gbuf_node_t *lib = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    const char *fp = lib ? lib->file_path : NULL;
+    const char *slash = fp ? strrchr(fp, '/') : NULL;
+    if (!slash || !ends_with(fp, ".rs") || (size_t)(slash - fp) >= outsz) {
+        return false;
+    }
+    memcpy(out, fp, (size_t)(slash - fp));
+    out[slash - fp] = '\0';
+    return true;
+}
+
+/* Whether `name` is a child module of the module at root/own: a file
+ * root/own/name.rs or root/own/name/mod.rs is indexed. */
+static bool rust_child_module(const cbm_pipeline_ctx_t *ctx, const char *root, const char *own,
+                              const char *name) {
+    static const char *const tails[] = {".rs", "/mod.rs"};
+    char dir[PKGMAP_PATH_BUF];
+    if (!rust_join(dir, sizeof(dir), root, own)) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+        char rel[PKGMAP_PATH_BUF];
+        int n = snprintf(rel, sizeof(rel), "%s%s%s%s", dir, dir[0] ? "/" : "", name, tails[i]);
+        if (n > 0 && (size_t)n < sizeof(rel) &&
+            cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Append the segments seg[from..n) to u->path and record each one with the
+ * module path above it. False when nothing is named. */
+static bool rust_use_finish(rust_use_t *u, int from) {
+    if (!u->p.glob && from >= u->p.n) {
+        return false; /* `use super;`, `use crate::{self}`: no item */
+    }
+    size_t len = strlen(u->path);
+    int nseg = len ? SKIP_ONE : 0;
+    for (size_t i = 0; i < len; i++) {
+        nseg += u->path[i] == '/';
+    }
+    rust_cand_t seen[RUST_USE_MAX_SEGS];
+    int nseen = 0;
+    for (int i = from; i < u->p.n; i++) {
+        seen[nseen++] = (rust_cand_t){u->p.seg[i], len, nseg++};
+        int n = snprintf(u->path + len, sizeof(u->path) - len, "%s%s", len ? "/" : "", u->p.seg[i]);
+        if (n < 0 || (size_t)n >= sizeof(u->path) - len) {
+            return false;
+        }
+        len += (size_t)n;
+    }
+    u->has_leaf = !u->p.glob;
+    u->ncands = 0;
+    for (int i = nseen - SKIP_ONE; i >= 0 && u->ncands < RUST_USE_CANDS; i--) {
+        u->cands[u->ncands++] = seen[i];
+    }
+    return true;
+}
+
+/* Classify one Rust import of source_rel and, for SCOPED, fill *u. */
+static rust_use_kind_t rust_use_scope(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                      const char *module_path, rust_use_t *u) {
+    char crate_dir[PKGMAP_PATH_BUF];
+    char own[PKGMAP_PATH_BUF] = "";
+    bool is_root = false;
+    if (!source_rel || !rust_path_split(module_path, &u->p) ||
+        !rust_crate_dir(ctx, source_rel, crate_dir, sizeof(crate_dir)) ||
+        !rust_module_root(source_rel, crate_dir, u->root, sizeof(u->root), &is_root) ||
+        (!is_root && !rust_file_module(source_rel, u->root, own, sizeof(own)))) {
+        return RUST_USE_UNSCOPED;
+    }
+    u->path[0] = '\0';
+    u->ncands = 0;
+    const char *head = u->p.seg[0];
+    int from = SKIP_ONE;
+    if (!u->p.global && strcmp(head, "crate") == 0) {
+        /* the crate root: path starts empty */
+    } else if (!u->p.global && strcmp(head, "self") == 0) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+    } else if (!u->p.global && strcmp(head, "super") == 0) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+        for (from = 0; from < u->p.n && strcmp(u->p.seg[from], "super") == 0; from++) {
+            if (!u->path[0]) {
+                return RUST_USE_NO_TARGET; /* above the crate root */
+            }
+            char *up = strrchr(u->path, '/');
+            *(up ? up : u->path) = '\0';
+        }
+    } else if (!u->p.global && rust_child_module(ctx, u->root, own, head)) {
+        snprintf(u->path, sizeof(u->path), "%s", own);
+        from = 0;
+    } else if (!rust_member_root(ctx, head, u->root, sizeof(u->root))) {
+        return RUST_USE_NO_TARGET; /* std, core, a dependency */
+    }
+    return rust_use_finish(u, from) ? RUST_USE_SCOPED : RUST_USE_NO_TARGET;
+}
+
+/* How well a definition in the module cand_mod fits the module path
+ * want[0..want_len): leading segments in common, and segments it adds. */
+static void rust_module_fit(const char *cand_mod, const char *want, size_t want_len, int *common,
+                            int *extra) {
+    *common = 0;
+    *extra = 0;
+    const char *a = cand_mod;
+    size_t bi = 0;
+    bool diverged = false;
+    while (*a) {
+        size_t al = strcspn(a, "/");
+        size_t bl = 0;
+        while (bi + bl < want_len && want[bi + bl] != '/') {
+            bl++;
+        }
+        if (!diverged && bi < want_len && al == bl && strncmp(a, want + bi, al) == 0) {
+            (*common)++;
+            bi += bl + (bi + bl < want_len ? SKIP_ONE : 0);
+        } else {
+            diverged = true;
+            (*extra)++;
+        }
+        a += al + (a[al] ? SKIP_ONE : 0);
+    }
+}
+
+typedef struct {
+    const cbm_gbuf_node_t *node;
+    int extra; /* module segments below the named module */
+} rust_pick_t;
+
+/* The definition named c->name inside the module subtree the path names above
+ * it (the module itself or a submodule that re-exports through it): fewest
+ * extra segments, then smallest QN. type_only: a segment before the last
+ * names a module or a type, never a function. */
+static rust_pick_t rust_use_pick(const cbm_pipeline_ctx_t *ctx, const char *source_file_qn,
+                                 const rust_use_t *u, const rust_cand_t *c, bool type_only) {
+    rust_pick_t best = {NULL, 0};
+    const cbm_gbuf_node_t **hits = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_name(ctx->gbuf, c->name, &hits, &n) != 0 || !hits) {
+        return best;
+    }
+    for (int i = 0; i < n; i++) {
+        const cbm_gbuf_node_t *cand = hits[i];
+        char cand_mod[PKGMAP_PATH_BUF];
+        if (!cand || !cand->qualified_name || !import_targetable_label(cand->label) ||
+            (type_only && !cbm_label_is_type_like(cand->label)) ||
+            cbm_node_props_generated(cand->properties_json) ||
+            (source_file_qn && strcmp(cand->qualified_name, source_file_qn) == 0) ||
+            !rust_file_module(cand->file_path, u->root, cand_mod, sizeof(cand_mod))) {
+            continue;
+        }
+        int common = 0;
+        int extra = 0;
+        rust_module_fit(cand_mod, u->path, c->mod_len, &common, &extra);
+        if (common == c->nmod && (!best.node || extra < best.extra ||
+                                  (extra == best.extra &&
+                                   strcmp(cand->qualified_name, best.node->qualified_name) < 0))) {
+            best = (rust_pick_t){cand, extra};
+        }
+    }
+    return best;
+}
+
+/* Resolve a SCOPED Rust import inside u->root, never outside it: the item at
+ * its module, else the module the full path names (`use crate::a::b;`, a
+ * glob), else the item re-exported from a submodule of its module, else the
+ * type an associated item or enum variant belongs to. Nothing else: an item
+ * the crate re-exports from another crate is no item of this crate. */
+static const cbm_gbuf_node_t *rust_use_resolve(const cbm_pipeline_ctx_t *ctx,
+                                               const char *source_rel, const char *source_file_qn,
+                                               const rust_use_t *u) {
+    rust_pick_t leaf = {NULL, 0};
+    if (u->has_leaf) {
+        leaf = rust_use_pick(ctx, source_file_qn, u, &u->cands[0], false);
+        if (leaf.node && leaf.extra == 0) {
+            return leaf.node;
+        }
+    }
+    char work[PKGMAP_PATH_BUF];
+    if (u->path[0] && rust_join(work, sizeof(work), u->root, u->path)) {
+        const cbm_gbuf_node_t *mod = resolve_module_prefixes(ctx, source_rel, source_file_qn, work,
+                                                             strlen(work), true, false);
+        if (mod) {
+            return mod;
+        }
+    }
+    if (leaf.node) {
+        return leaf.node;
+    }
+    for (int i = u->has_leaf ? SKIP_ONE : 0; i < u->ncands; i++) {
+        rust_pick_t owner = rust_use_pick(ctx, source_file_qn, u, &u->cands[i], true);
+        if (owner.node) {
+            return owner.node;
+        }
+    }
+    return NULL;
+}
+
 /* Language-generic strategies retain their ordering. PHP name imports with
  * no namespace information (and global uses) restrict candidates before any
  * winner is selected, so a non-PHP collision cannot hide a later PHP hit.
@@ -2362,7 +3589,15 @@ static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *
  * fallbacks (#1934). */
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
-    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only) {
+    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only,
+    CBMLanguage language, const cbm_scala_index_t *scala_index) {
+    /* Strategy 0: a language whose imports name files by path (include_path.h):
+     * the path rule decides the target. */
+    const cbm_gbuf_node_t *by_path = NULL;
+    if (cbm_include_path_decides(ctx, source_rel, src_lang, imp, &by_path)) {
+        return by_path;
+    }
+
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
      * No label filter here: directory-module languages (Go/Java packages)
      * legitimately resolve straight to a Folder node -- that's the intended,
@@ -2374,32 +3609,39 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
     if (target && (!php_only || node_in_php_file(target))) {
-        /* Python/TS from-import of a member: module_path is often
-         * "pkg.mod.symbol" while resolve_module lands on the Module node
-         * "pkg.mod". Prefer the member Function/Class when it exists —
-         * required for `from M import f as g` so CALLS can import_map to f
-         * (local_name g ≠ f). */
-        if (target->label &&
-            (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
-            char symbuf[256];
-            const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
-            if (sym && sym[0] && strcmp(sym, "*") != 0) {
-                const char *mod_tail =
-                    import_last_segment(target->qualified_name ? target->qualified_name : "");
-                if (!mod_tail || strcmp(mod_tail, sym) != 0) {
-                    char member_qn[CBM_SZ_512];
-                    snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
-                    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-                    if (member && (!php_only || node_in_php_file(member)) &&
-                        import_targetable_label(member->label) &&
-                        strcmp(member->label, "Module") != 0 &&
-                        strcmp(member->label, "File") != 0) {
-                        return member;
-                    }
-                }
-            }
+        return prefer_import_member(ctx, imp, target, php_only);
+    }
+
+    /* Rust: a `use` path names an item of one crate, never a same-named
+     * definition of another crate (see rust_use_scope). */
+    if (src_lang == CBM_LANG_RUST && !php_only) {
+        rust_use_t ru;
+        switch (rust_use_scope(ctx, source_rel, imp->module_path, &ru)) {
+        case RUST_USE_NO_TARGET:
+            return NULL;
+        case RUST_USE_SCOPED:
+            return rust_use_resolve(ctx, source_rel, source_file_qn, &ru);
+        case RUST_USE_UNSCOPED:
+            break;
         }
-        return target;
+    }
+
+    /* ECMAScript: a specifier that names one file of the tree, or a module
+     * outside it, has one right target, which Strategy 1 has just missed. The
+     * name-guess fallbacks below would bind it to an unrelated definition
+     * (`./App.vue` absent -> a test's App, `ws` -> the ws.ts beside the
+     * importer, `node:assert/strict` -> a spec's assert), so such an import
+     * stays unbound, as a Go import does (#1934). */
+    if (!php_only && es_module_importer(src_lang)) {
+        char path[CBM_PATH_ALIAS_RESULT_MAX];
+        switch (es_specifier_kind(ctx, source_rel, imp->module_path, path, sizeof(path))) {
+        case ES_SPECIFIER_EXTERNAL:
+            return NULL;
+        case ES_SPECIFIER_TREE_PATH:
+            return resolve_es_tree_file(ctx, source_rel, source_file_qn, imp, path);
+        case ES_SPECIFIER_OTHER:
+            break;
+        }
     }
 
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
@@ -2427,6 +3669,10 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         resolve_relative_file(ctx, source_rel, imp->module_path, php_only);
     if (rel_file) {
         return rel_file;
+    }
+
+    if (language == CBM_LANG_SCALA) {
+        return resolve_scala_namespace_import(ctx, source_file_qn, imp, namespace_map, scala_index);
     }
 
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
@@ -2483,7 +3729,8 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                     qbuf[len] = '\0';
                     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
                     if (n && (!php_only || node_in_php_file(n)) &&
-                        (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                        (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0) &&
+                        !declaring_file_is_scala(n)) {
                         return n;
                     }
                 }
@@ -2592,6 +3839,15 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                     if (import_candidate_is_python_local(ctx->gbuf, cand)) {
                         continue;
                     }
+                    /* Nor is a generated member (a Java record's implicit
+                     * accessor, an instance method no import can name). It is
+                     * registered by qualified name only, and a package segment
+                     * that merely spells it (`javax.crypto.spec` -> spec())
+                     * must not bind the import -- or every use of the
+                     * imported name -- to it. */
+                    if (cbm_node_props_generated(cand->properties_json)) {
+                        continue;
+                    }
                     if (source_file_qn && cand->qualified_name &&
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
@@ -2659,21 +3915,8 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         if (body[0]) {
             char work[1024];
             snprintf(work, sizeof(work), "%s", body);
-            for (;;) {
-                char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
-                const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
-                free(rqn);
-                if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
-                    (!source_file_qn || !n->qualified_name ||
-                     strcmp(n->qualified_name, source_file_qn) != 0)) {
-                    return n;
-                }
-                char *sl = strrchr(work, '/');
-                if (!sl) {
-                    break;
-                }
-                *sl = '\0';
-            }
+            return resolve_module_prefixes(ctx, source_rel, source_file_qn, work, 0, false,
+                                           php_only);
         }
     }
 
@@ -2812,8 +4055,9 @@ static const cbm_gbuf_node_t *resolve_php_declared_use(const cbm_pipeline_ctx_t 
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
-                                                        CBMHashTable *namespace_map) {
+                                                        CBMLanguage language, const CBMImport *imp,
+                                                        CBMHashTable *namespace_map,
+                                                        const cbm_scala_index_t *scala_index) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
     }
@@ -2853,7 +4097,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     const php_use_shape_t php_use = php_use_shape(source_rel, imp);
     if (php_use == PHP_USE_NONE) {
         return resolve_import_strategies(ctx, source_rel, source_file_qn, imp, namespace_map,
-                                         src_lang, false);
+                                         src_lang, false, language, scala_index);
     }
     /* Any other PHP namespaced `use` resolves only through declared namespaces.
      * A global-namespace `use Closure;` and the CALLS import map (which passes
@@ -2863,7 +4107,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return resolve_php_declared_use(ctx, source_file_qn, imp, namespace_map);
     }
     return resolve_import_strategies(ctx, source_rel, source_file_qn, imp, namespace_map, src_lang,
-                                     true);
+                                     true, language, scala_index);
 }
 
 /* PHP binding evidence is per File. The first field is canonical so its
@@ -3146,7 +4390,8 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     for (int i = 0; i < count; i++) {
         const CBMImport *imp = &result->imports.items[i];
         targets[i] = imp->module_path
-                         ? cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map)
+                         ? cbm_pipeline_resolve_import_node(ctx, rel, file_qn, CBM_LANG_PHP, imp,
+                                                            namespace_map, NULL)
                          : NULL;
         if (targets[i] && targets[i]->id == file->id)
             targets[i] = NULL;
@@ -3319,6 +4564,40 @@ bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CB
     return php_vendor_kind(value, usage->ref_name, kind);
 }
 
+/* ── File node package property ──────────────────────────────────── */
+
+/* Persist a file's package clause on its File node so an incremental run
+ * can rebuild the namespace map and the Scala index for the files it does
+ * not re-extract (see incr_load_stored_namespaces). */
+static void file_node_set_package(const cbm_pipeline_ctx_t *ctx, const char *file_qn,
+                                  const char *namespace_name) {
+    cbm_gbuf_node_t *node = (cbm_gbuf_node_t *)cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    if (!node || !node->label || strcmp(node->label, "File") != 0) {
+        return;
+    }
+    /* Append to the existing object ({"extension":".scala"}); the previous
+     * generation's value is gone with the purge of a changed file, so a
+     * `package` key already present means this pass set it, or the file is
+     * one the pass does not re-extract. */
+    const char *props = node->properties_json ? node->properties_json : "{}";
+    if (strstr(props, "\"package\"")) {
+        return;
+    }
+    size_t props_len = strlen(props);
+    if (props_len < 2 || props[props_len - 1] != '}') {
+        return;
+    }
+    char escaped[PKGMAP_PATH_BUF];
+    cbm_json_escape(escaped, sizeof(escaped), namespace_name);
+    char json[PKGMAP_PATH_BUF * 2];
+    int n = snprintf(json, sizeof(json), "%.*s%s\"package\":\"%s\"}", (int)props_len - 1, props,
+                     props_len > 2 ? "," : "", escaped);
+    if (n < 0 || n >= (int)sizeof(json)) {
+        return;
+    }
+    cbm_gbuf_node_set_properties_json(node, json);
+}
+
 /* ── Namespace map ───────────────────────────────────────────────── */
 
 /* The namespace names themselves, so a caller that has parked some results on
@@ -3327,9 +4606,9 @@ bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CB
  * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
  * an incomplete map changed edge counts in both directions rather than only
  * losing edges. */
-CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
-                                                     const char *const *namespaces,
-                                                     const char *const *rels, int count) {
+static CBMHashTable *namespace_map_build(const cbm_pipeline_ctx_t *ctx, const char *project_name,
+                                         const char *const *namespaces, const char *const *rels,
+                                         int count) {
     /* NULL means no namespace information (e.g. the CALLS import map), while
      * an empty map means no project file declares a namespace. A partial map
      * cannot prove a PHP import absent, so every construction failure returns
@@ -3353,6 +4632,9 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
         if (!file_qn) {
             goto item_done;
+        }
+        if (ctx) {
+            file_node_set_package(ctx, file_qn, namespace_name);
         }
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
@@ -3420,6 +4702,12 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
     return map;
 }
 
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
+    return namespace_map_build(NULL, project_name, namespaces, rels, count);
+}
+
 /* Convenience for callers whose results are all in memory (the sequential
  * definitions pass). A caller that can SPILL must use the _names variant and
  * fill the parked slots from cbm_result_spill_namespace, or its map silently
@@ -3456,4 +4744,251 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
     }
     cbm_ht_foreach(map, ns_map_free_entry, NULL);
     cbm_ht_free(map);
+}
+
+/* ── Scala top-level index ───────────────────────────────────────── */
+
+typedef struct {
+    char *namespace_name; /* dot-normalized package clause */
+    char *module_qn;      /* language-aware module QN of the declaring file (qn_arena) */
+} scala_file_entry_t;
+
+typedef struct {
+    CBMHashTable *files; /* rel path -> scala_file_entry_t (build-time only) */
+    cbm_scala_index_t *index;
+} scala_index_build_t;
+
+/* The language whose module QN a file's top-level symbols hang off.
+ * Directory-module languages (Java, Go) put `class Outer` in Outer.java at
+ * <dir>.Outer, so <dir> is the module and Outer's methods and nested types
+ * sit two segments below it; stem-module languages (Scala `object Foo` in
+ * Foo.scala is Foo.Foo) use the file stem. The module QN itself comes from
+ * cbm_fqn_module_source_lang, the helper the extractor's definition QNs are
+ * built with, so both sides apply the same rule. */
+static CBMLanguage pkgmap_file_language(const char *rel) {
+    const char *base = rel;
+    for (const char *p = rel; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return cbm_language_for_filename(base);
+}
+
+/* Keep the two smallest File nodes of a package (see scala_package_files_t). */
+static void scala_index_note_package_file(cbm_scala_index_t *index, const char *package,
+                                          const cbm_gbuf_node_t *file_node) {
+    if (!index->packages) {
+        index->packages = cbm_ht_create(CBM_SZ_64);
+        if (!index->packages) {
+            return;
+        }
+    }
+    scala_package_files_t *pf = cbm_ht_get(index->packages, package);
+    if (!pf) {
+        pf = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*pf));
+        char *key = pf ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, package) : NULL;
+        if (!key) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pf);
+            return;
+        }
+        pf->first = file_node;
+        cbm_ht_set(index->packages, key, pf); /* index owns key + pf */
+        return;
+    }
+    int c = strcmp(file_node->qualified_name, pf->first->qualified_name);
+    if (c < 0) {
+        pf->second = pf->first;
+        pf->first = file_node;
+    } else if (c > 0 &&
+               (!pf->second || strcmp(file_node->qualified_name, pf->second->qualified_name) < 0)) {
+        pf->second = file_node;
+    }
+}
+
+/* A node is top-level when its QN is exactly <module QN>.<Name>, one segment
+ * below the declaring file's module. Nested classes and methods carry deeper
+ * QNs. Module and File nodes share those QN shapes but declare nothing
+ * importable; a File node of a declaring file is instead a candidate for the
+ * package's `import pkg._` target. */
+static void scala_index_visit_node(const cbm_gbuf_node_t *node, void *ud) {
+    scala_index_build_t *b = ud;
+    if (!node || !node->qualified_name || !node->file_path || !node->name ||
+        !import_targetable_label(node->label) || strcmp(node->label, "Module") == 0) {
+        return;
+    }
+    const scala_file_entry_t *fe =
+        (const scala_file_entry_t *)cbm_ht_get(b->files, node->file_path);
+    if (!fe) {
+        return;
+    }
+    if (strcmp(node->label, "File") == 0) {
+        scala_index_note_package_file(b->index, fe->namespace_name, node);
+        return;
+    }
+    size_t mod_len = strlen(fe->module_qn);
+    const char *qn = node->qualified_name;
+    if (strncmp(qn, fe->module_qn, mod_len) != 0 || qn[mod_len] != '.' || !qn[mod_len + 1] ||
+        strchr(qn + mod_len + 1, '.')) {
+        return;
+    }
+    const char *tail = qn + mod_len + 1;
+    char key[PKGMAP_PATH_BUF];
+    if (snprintf(key, sizeof(key), "%s.%s", fe->namespace_name, tail) >= (int)sizeof(key)) {
+        return;
+    }
+    if (!b->index->symbols) {
+        b->index->symbols = cbm_ht_create(CBM_SZ_256);
+        if (!b->index->symbols) {
+            return;
+        }
+    }
+    const char *stored_key = cbm_ht_get_key(b->index->symbols, key);
+    if (!stored_key) {
+        char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+        if (owned) {
+            cbm_ht_set(b->index->symbols, owned, (void *)node); /* index owns key */
+        }
+        return;
+    }
+    if (cbm_ht_get(b->index->symbols, stored_key) != node) {
+        cbm_ht_set(b->index->symbols, stored_key, (void *)&scala_toplevel_ambiguous);
+    }
+}
+
+static void scala_index_free_file_entry(const char *key, void *value, void *ud) {
+    (void)key; /* borrowed from the caller's rels array */
+    (void)ud;
+    scala_file_entry_t *fe = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, fe->namespace_name); /* module_qn lives in qn_arena */
+    cbm_free(CBM_MEM_CLASS_OTHER, fe);
+}
+
+static void scala_index_free_symbol(const char *key, void *value, void *ud) {
+    (void)value; /* borrowed gbuf node or the ambiguity marker */
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key); /* cbm_mem_strdup'd in scala_index_visit_node */
+}
+
+static void scala_index_free_package(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value); /* File nodes are borrowed */
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void scala_index_free(cbm_scala_index_t *index) {
+    if (!index) {
+        return;
+    }
+    if (index->symbols) {
+        cbm_ht_foreach(index->symbols, scala_index_free_symbol, NULL);
+        cbm_ht_free(index->symbols);
+    }
+    if (index->packages) {
+        cbm_ht_foreach(index->packages, scala_index_free_package, NULL);
+        cbm_ht_free(index->packages);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, index);
+}
+
+/* Every file declaring a namespace contributes, not only Scala ones: a Scala
+ * import routinely names a Java class of the same (mixed) package. */
+static cbm_scala_index_t *scala_index_build(const cbm_pipeline_ctx_t *ctx,
+                                            const char *const *namespaces, const char *const *rels,
+                                            int count) {
+    scala_index_build_t b = {0};
+    b.index = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*b.index));
+    if (!b.index) {
+        return NULL;
+    }
+    CBMArena qn_arena; /* the declaring files' module QNs, build-time only */
+    cbm_arena_init(&qn_arena);
+    for (int i = 0; i < count; i++) {
+        if (!namespaces[i] || !namespaces[i][0] || !rels[i]) {
+            continue;
+        }
+        if (!b.files) {
+            b.files = cbm_ht_create(CBM_SZ_64);
+            if (!b.files) {
+                break;
+            }
+        }
+        scala_file_entry_t *fe = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*fe));
+        if (!fe) {
+            continue;
+        }
+        fe->namespace_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespaces[i]);
+        fe->module_qn = cbm_fqn_module_source_lang(&qn_arena, ctx->project_name, rels[i],
+                                                   pkgmap_file_language(rels[i]));
+        if (!fe->namespace_name || !fe->module_qn) {
+            scala_index_free_file_entry(rels[i], fe, NULL);
+            continue;
+        }
+        for (char *p = fe->namespace_name; *p; p++) {
+            if (*p == '\\' || *p == ':' || *p == '/') {
+                *p = '.';
+            }
+        }
+        void *prev = cbm_ht_set(b.files, rels[i], fe);
+        if (prev) {
+            scala_index_free_file_entry(rels[i], prev, NULL);
+        }
+    }
+    if (!b.files) {
+        cbm_arena_destroy(&qn_arena);
+        scala_index_free(b.index);
+        return NULL;
+    }
+    cbm_gbuf_foreach_node(ctx->gbuf, scala_index_visit_node, &b);
+    cbm_ht_foreach(b.files, scala_index_free_file_entry, NULL);
+    cbm_ht_free(b.files);
+    cbm_arena_destroy(&qn_arena);
+    return b.index;
+}
+
+/* ── Import maps ─────────────────────────────────────────────────── */
+
+void cbm_pipeline_import_maps_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, const char *const *namespaces,
+                                    CBMHashTable **namespace_map, cbm_scala_index_t **scala_index) {
+    *namespace_map = NULL;
+    *scala_index = NULL;
+    if (!ctx || !ctx->gbuf || !files || !namespaces) {
+        return;
+    }
+    /* The fresh files first, then the previous generation's clauses for the
+     * files this pass does not re-extract (incremental routes only; the
+     * caller guarantees the two sets are disjoint). */
+    int stored = ctx->stored_namespaces ? ctx->stored_namespace_count : 0;
+    size_t total = (size_t)file_count + (size_t)stored;
+    const char **all_ns = cbm_calloc(CBM_MEM_CLASS_OTHER, (total ? total : 1) * sizeof(char *));
+    const char **all_rels = cbm_calloc(CBM_MEM_CLASS_OTHER, (total ? total : 1) * sizeof(char *));
+    if (!all_ns || !all_rels) {
+        cbm_free(CBM_MEM_CLASS_OTHER, all_ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, all_rels);
+        return;
+    }
+    bool scala_importer = false;
+    for (int i = 0; i < file_count; i++) {
+        all_ns[i] = namespaces[i];
+        all_rels[i] = files[i].rel_path;
+        scala_importer = scala_importer || files[i].language == CBM_LANG_SCALA;
+    }
+    for (int i = 0; i < stored; i++) {
+        all_ns[file_count + i] = ctx->stored_namespaces[i].namespace_name;
+        all_rels[file_count + i] = ctx->stored_namespaces[i].rel_path;
+    }
+    *namespace_map = namespace_map_build(ctx, ctx->project_name, all_ns, all_rels, (int)total);
+    /* Only the Scala resolver reads the index; a corpus without a Scala
+     * importer pays nothing for it. */
+    if (scala_importer) {
+        *scala_index = scala_index_build(ctx, all_ns, all_rels, (int)total);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, all_ns);
+    cbm_free(CBM_MEM_CLASS_OTHER, all_rels);
+}
+
+void cbm_pipeline_import_maps_free(CBMHashTable *namespace_map, cbm_scala_index_t *scala_index) {
+    scala_index_free(scala_index);
+    cbm_pipeline_namespace_map_free(namespace_map);
 }

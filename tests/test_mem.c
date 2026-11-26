@@ -30,6 +30,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <errno.h>
 #endif
 
 /* ASan detection — mimalloc MI_OVERRIDE=0 under ASan, mi_process_info
@@ -352,6 +353,34 @@ TEST(mem_rss_reflects_external_resident_memory) {
     mi_free(mi_buf);
     PASS();
 }
+
+#ifdef _WIN32
+/* A block the CRT's _aligned_malloc made starts past the CRT's bookkeeping
+ * header, so the aligned-free wrapper must return it through _aligned_free.
+ * Plain free receives an interior pointer: ASan reports a bad free, and the
+ * Windows heap either rejects the free (errno) or terminates the process.
+ * --wrap makes __real__aligned_malloc the CRT's own allocator, so the block is
+ * genuinely foreign to mimalloc. The wrapper is called by name: the routing
+ * inside it is what this pins, independent of which references the linker
+ * rewrites. */
+void *__real__aligned_malloc(size_t size, size_t alignment);
+void __wrap__aligned_free(void *block);
+
+TEST(mem_win_aligned_free_returns_crt_block_to_crt) {
+    enum { CRT_BLOCK_SIZE = 256, CRT_BLOCK_ALIGNMENT = 64 };
+    unsigned char *block = __real__aligned_malloc(CRT_BLOCK_SIZE, CRT_BLOCK_ALIGNMENT);
+    ASSERT_NOT_NULL(block);
+    /* Without a CRT-owned block the wrapper takes its mimalloc path instead. */
+    ASSERT_FALSE(mi_is_in_heap_region(block));
+    ASSERT_EQ((uintptr_t)block % CRT_BLOCK_ALIGNMENT, 0);
+    memset(block, 0xA5, CRT_BLOCK_SIZE);
+    errno = 0;
+    __wrap__aligned_free(block);
+    ASSERT_EQ(errno, 0);
+    ASSERT_TRUE(HeapValidate(GetProcessHeap(), 0, NULL));
+    PASS();
+}
+#endif
 
 TEST(mem_collect_rss_still_positive) {
     cbm_mem_init(0.5);
@@ -1745,6 +1774,10 @@ SUITE(mem) {
     RUN_TEST(mem_rss_reflects_external_resident_memory);
     RUN_TEST(mem_collect_no_crash);
     RUN_TEST(mem_collect_rss_still_positive);
+#ifdef _WIN32
+    /* Windows allocator wrappers */
+    RUN_TEST(mem_win_aligned_free_returns_crt_block_to_crt);
+#endif
     /* Memory pressure simulation */
     RUN_TEST(mem_progressive_alloc_rss_increases);
     RUN_TEST(mem_free_and_collect_no_crash);
