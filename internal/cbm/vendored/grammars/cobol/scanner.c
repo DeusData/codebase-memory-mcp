@@ -31,9 +31,14 @@ char* any_content_keyword[] = {
     "procedure division",
 };
 
-static bool start_with_word( TSLexer *lexer, char *words[], int number_of_words) {
+// consumed_any reports whether this call advanced the lexer at all, so the
+// caller can refuse to emit a zero-length token (tree-sitter livelock).
+static bool start_with_word(TSLexer *lexer, char *words[], int number_of_words,
+                            bool *consumed_any) {
+    *consumed_any = false;
     while(lexer->lookahead == ' ' || lexer->lookahead == '\t') {
         lexer->advance(lexer, true);
+        *consumed_any = true;
     }
 
     char *keyword_pointer[number_of_words];
@@ -60,6 +65,7 @@ static bool start_with_word( TSLexer *lexer, char *words[], int number_of_words)
         if(all_match_failed) {
             for(; lexer->get_column(lexer) < 71 && lexer->lookahead != '\n' && lexer->lookahead != 0;
             lexer->advance(lexer, true)) {
+                *consumed_any = true;
             }
             return false;
         }
@@ -83,6 +89,7 @@ static bool start_with_word( TSLexer *lexer, char *words[], int number_of_words)
 
         // next character
         lexer->advance(lexer, true);
+        *consumed_any = true;
     }
 
     return false;
@@ -106,7 +113,10 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
     }
 
     if(valid_symbols[LINE_PREFIX_COMMENT] && lexer->get_column(lexer) <= 5) {
-        while(lexer->get_column(lexer) <= 5) {
+        // EOF guard: tree-sitter's advance() is a no-op at EOF (the column
+        // never increments), so without checking lookahead this loop spins
+        // forever when the input ends at column <= 5.
+        while(lexer->get_column(lexer) <= 5 && lexer->lookahead != 0) {
             lexer->advance(lexer, true);
         }
         lexer->result_symbol = LINE_PREFIX_COMMENT;
@@ -143,7 +153,13 @@ bool tree_sitter_COBOL_external_scanner_scan(void *payload, TSLexer *lexer,
     }
 
     if(valid_symbols[COMMENT_ENTRY]) {
-        if(!start_with_word(lexer, any_content_keyword, number_of_comment_entry_keywords)) {
+        bool consumed_any = false;
+        if(!start_with_word(lexer, any_content_keyword, number_of_comment_entry_keywords, &consumed_any)) {
+            // Zero-length guard: emitting a token without consuming input
+            // livelocks the parser. Bail out and let tree-sitter recover.
+            if(!consumed_any) {
+                return false;
+            }
             lexer->mark_end(lexer);
             lexer->result_symbol = COMMENT_ENTRY;
             return true;

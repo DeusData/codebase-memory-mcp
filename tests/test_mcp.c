@@ -1349,6 +1349,7 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "INHERITS"));
     ASSERT_NOT_NULL(strstr(json, "IMPLEMENTS"));
     ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
+    ASSERT_NOT_NULL(strstr(json, "Keywords; [] ignored; else omit query."));
     free(json);
     PASS();
 }
@@ -5203,7 +5204,7 @@ TEST(tool_search_graph_rejects_bm25_and_semantic_query_together) {
 
     char *tools = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(tools);
-    ASSERT_NOT_NULL(strstr(tools, "[] ignored; otherwise omit query."));
+    ASSERT_NOT_NULL(strstr(tools, "Keywords; [] ignored; else omit query."));
     free(tools);
 
     cbm_mcp_server_free(srv);

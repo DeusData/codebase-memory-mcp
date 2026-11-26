@@ -282,6 +282,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
     cr_str(c, &d->alias_target);
+    cr_str(c, &d->mixin_refs);
     /* The type-facts record: one record, then its strings. */
     cr_array(c, (void **)&d->type_facts, d->type_facts ? 1 : 0, sizeof(CBMDefTypeFacts));
     CBMDefTypeFacts *facts = (CBMDefTypeFacts *)d->type_facts;
@@ -639,6 +640,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.diagram_arrows.cap = tmp.diagram_arrows.count;
     tmp.field_types.cap = tmp.field_types.count;
     tmp.doc_links.cap = tmp.doc_links.count;
+    tmp.scope.cap = tmp.scope.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */
