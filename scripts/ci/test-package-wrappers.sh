@@ -52,6 +52,8 @@ if ! "${PYTHON[@]}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3
     exit 2
 fi
 
+"${PYTHON[@]}" "$ROOT/tests/test_smoke_wrapper_run.py"
+
 echo "=== Package wrapper: Go ==="
 (
     cd "$ROOT/pkg/go"
