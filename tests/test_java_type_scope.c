@@ -616,6 +616,44 @@ static const jts_file_t JTS_FILES[] = {
      "    String m32() { Help32 h = new Help32(); return h.ping32(); }\n"
      "    public static void main(String[] a) { System.out.println(new C32().m32()); }\n"
      "}\n"},
+    /* 33: interface-typed calls (javac 21: invokeinterface names the
+     * interface's method): Svc's one implementer is nested in the calling
+     * file, ia/Svc.run; Supplier (a library interface) whose one implementer
+     * is nested there too, java/util/function/Supplier.get (no node); Port
+     * implemented in another file, ib/Port.open. */
+    {"src/main/java/ia/Svc.java",
+     "package ia;\n\n"
+     "public interface Svc {\n"
+     "    String run();\n"
+     "}\n"},
+    {"src/main/java/ia/Caller.java",
+     "package ia;\n\n"
+     "import java.util.function.Supplier;\n\n"
+     "public class Caller {\n"
+     "    static class OnlyImpl implements Svc {\n"
+     "        public String run() { return \"ia.Caller.OnlyImpl.run\"; }\n"
+     "    }\n"
+     "    static class Sup implements Supplier<String> {\n"
+     "        public String get() { return \"ia.Caller.Sup.get\"; }\n"
+     "    }\n"
+     "    String viaIface(Svc s) { return s.run(); }\n"
+     "    String viaLibIface(Supplier<String> s) { return s.get(); }\n"
+     "}\n"},
+    {"src/main/java/ib/Port.java",
+     "package ib;\n\n"
+     "public interface Port {\n"
+     "    String open();\n"
+     "}\n"},
+    {"src/main/java/ib/PortImpl.java",
+     "package ib;\n\n"
+     "public class PortImpl implements Port {\n"
+     "    public String open() { return \"ib.PortImpl.open\"; }\n"
+     "}\n"},
+    {"src/main/java/ib/User.java",
+     "package ib;\n\n"
+     "public class User {\n"
+     "    String viaPort(Port p) { return p.open(); }\n"
+     "}\n"},
     /* The single-tree partner of the split-package reveal. */
     {"src/test/java/split/ProbeTag.java",
      "package split;\n\n"
@@ -998,6 +1036,16 @@ static int jts_check_owner_spelled_supertype(jts_index_t *ix) {
  * ii, counted as "in a project package"). */
 static int jts_check_library_split_package(jts_index_t *ix) {
     return jts_expect_engine(ix, "m32", "ping32", "app32.Help32.ping32");
+}
+
+/* 33: an interface-typed call binds the interface's method, never the one
+ * implementer the calling file declares (main's rule drew OnlyImpl.run and
+ * Sup.get); a library interface's method has no node, so no engine edge. */
+static int jts_check_interface_call(jts_index_t *ix) {
+    int ok = jts_expect_engine(ix, "viaIface", "run", "ia.Svc.run");
+    ok &= jts_expect_no_engine_to(ix, "viaLibIface", "get", "ia.Caller.Sup.get");
+    ok &= jts_expect_engine(ix, "viaPort", "open", "ib.Port.open");
+    return ok;
 }
 
 /* Both routes draw the same engine edges for the fixture. Name-chain edges
@@ -1692,6 +1740,7 @@ JTS_ROUTES(bare_library_supertype, jts_check_bare_library_supertype)
 JTS_ROUTES(library_supertype, jts_check_library_supertype)
 JTS_ROUTES(owner_spelled_supertype, jts_check_owner_spelled_supertype)
 JTS_ROUTES(library_split_package, jts_check_library_split_package)
+JTS_ROUTES(interface_call, jts_check_interface_call)
 
 SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_single_import_sequential);
@@ -1738,6 +1787,8 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_owner_spelled_supertype_parallel);
     RUN_TEST(java_type_scope_library_split_package_sequential);
     RUN_TEST(java_type_scope_library_split_package_parallel);
+    RUN_TEST(java_type_scope_interface_call_sequential);
+    RUN_TEST(java_type_scope_interface_call_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
     RUN_TEST(java_type_scope_incremental_library_receiver);

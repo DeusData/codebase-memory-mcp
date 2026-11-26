@@ -348,9 +348,9 @@ static const char kJavaStaticCall[] =
     "    int run(int v) { return MathUtil.square(v); }\n"
     "}\n";
 
-/* lsp_interface_resolve — a call through an interface-typed receiver where the
- * interface has exactly ONE concrete implementer in the registry; the call is
- * resolved to that sole impl (java_lsp.c:1932-1985). */
+/* A call through an interface-typed receiver whose interface has exactly ONE
+ * concrete implementer: it binds the interface's method, as javac's
+ * invokeinterface names it (Shape.area), never the sole implementer. */
 static const char kJavaInterfaceResolve[] =
     "interface Shape {\n"
     "    int area();\n"
@@ -362,9 +362,8 @@ static const char kJavaInterfaceResolve[] =
     "    int run(Shape s) { return s.area(); }\n"
     "}\n";
 
-/* lsp_interface_dispatch — a call through an interface-typed receiver with NO
- * sole concrete impl (two implementers), so the resolver falls back to a
- * synthesized iface-qualified target (java_lsp.c:1989-1990). */
+/* A call through an interface-typed receiver with two implementers: it binds
+ * the interface's method as well (Shape.area). */
 static const char kJavaInterfaceDispatch[] =
     "interface Shape {\n"
     "    int area();\n"
@@ -653,12 +652,12 @@ TEST(repro_lsp_java_static_call) {
 
 TEST(repro_lsp_java_interface_resolve) {
     return assert_lsp_strategy("Client.java", kJavaInterfaceResolve,
-                               "lsp_interface_resolve");
+                               "lsp_type_dispatch");
 }
 
 TEST(repro_lsp_java_interface_dispatch) {
     return assert_lsp_strategy("Client.java", kJavaInterfaceDispatch,
-                               "lsp_interface_dispatch");
+                               "lsp_type_dispatch");
 }
 
 TEST(repro_lsp_java_method_ref_ctor) {
