@@ -1990,6 +1990,163 @@ TEST(cypher_exists_has_outgoing_calls) {
     PASS();
 }
 
+/* Bare pattern predicate: NOT (()-[:CALLS]->(f)) is the parenthesized form of
+ * NOT EXISTS { (f)<-[:CALLS]-() } — the bound variable may sit at either end.
+ * HandleOrder has no CALLS caller (only DEFINES), so it is the sole match. */
+TEST(cypher_pattern_predicate_no_callers) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE NOT (()-[:CALLS]->(f)) RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+
+    /* Positive form, bound far end: the three called functions. */
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE (()-[:CALLS]->(f)) RETURN f.name", "test",
+                            0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    cbm_cypher_result_free(&r);
+
+    /* Bound anchor end, outbound: HandleOrder and ValidateOrder call. */
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE ((f)-[:CALLS]->()) RETURN f.name", "test",
+                            0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    cbm_cypher_result_free(&r);
+
+    /* Undirected: every fixture function touches a CALLS edge, so the
+     * positive form matches all four and the negation none. */
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE ((f)-[:CALLS]-()) RETURN f.name", "test",
+                            0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WHERE NOT ((f)-[:CALLS]-()) RETURN f.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    /* A grouped Boolean expression can contain a bare pattern condition. */
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE NOT (()-[:CALLS]->(f) "
+                            "OR f.name = \"LogError\") RETURN f.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The pattern attempt must backtrack into ordinary boolean groups: ((expr))
+ * and (NOT ...) keep their meaning. */
+TEST(cypher_pattern_predicate_boolean_groups_unchanged) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) WHERE ((f.name = \"HandleOrder\")) RETURN f.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+
+    rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) WHERE (NOT (f.name = \"HandleOrder\")) RETURN f.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    cbm_cypher_result_free(&r);
+
+    /* A labeled node inside a boolean group is a HAS_LABEL condition, not a
+     * pattern predicate. */
+    rc = cbm_cypher_execute(s, "MATCH (f) WHERE ((f:Function)) RETURN f.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Unsupported pattern shapes fail with the reason, not a token-type error. */
+TEST(cypher_pattern_predicate_unsupported_shapes) {
+    static const struct {
+        const char *where;
+        const char *err_part;
+    } cases[] = {
+        {"((f)-[:CALLS]->(g))", "exactly one variable"},
+        {"((f:Function)-[:CALLS]->())", "anonymous"},
+        {"(()-[:CALLS]->(f:Function))", "anonymous"},
+        {"((f)-[:CALLS*1..3]->())", "variable-length"},
+        {"((f)-[:CALLS|USAGE]->())", "one edge type"},
+        {"(()-[:CALLS]->())", "bound variable"},
+        {"((f)-[r:CALLS]->())", "relationship variable"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char query[256];
+        snprintf(query, sizeof(query), "MATCH (f:Function) WHERE %s RETURN f.name", cases[i].where);
+        cbm_query_t *q = NULL;
+        char *err = NULL;
+        int rc = cbm_cypher_parse(query, &q, &err);
+        ASSERT_EQ(rc, -1);
+        ASSERT_NOT_NULL(err);
+        ASSERT_TRUE(strstr(err, cases[i].err_part) != NULL);
+        free(err);
+        if (q) {
+            cbm_query_free(q);
+        }
+    }
+    PASS();
+}
+
+/* OPTIONAL MATCH keeps caller-less rows with the variable unbound; count(c)
+ * counts values, so callers = 0 selects them (count(*) still counts rows). */
+TEST(cypher_optional_match_count_zero_callers) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) "
+                                "WITH f, count(c) AS callers WHERE callers = 0 RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) "
+                            "WITH f, count(c) AS callers WHERE callers = 1 RETURN f.name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    cbm_cypher_result_free(&r);
+
+    /* Every function survives the OPTIONAL MATCH; counts are 0,1,1,1 and
+     * count(*) sees the null-extended row for HandleOrder. */
+    rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) OPTIONAL MATCH (c)-[:CALLS]->(f) "
+        "WITH f, count(c) AS callers, count(*) AS rows RETURN f.name, callers, rows "
+        "ORDER BY f.name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    ASSERT_STR_EQ(r.rows[0][2], "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_calls_relationship) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4615,8 +4772,7 @@ TEST(cypher_issue2208_with_agg_groups_by_node_identity) {
     ASSERT_STR_EQ(r.rows[1][2], "1");
     ASSERT_STR_EQ(r.rows[2][0], "test.ProjectionC");
     ASSERT_STR_EQ(r.rows[2][1], "20");
-    /* rows[2][2] (count(r) for the caller-less C) is not asserted here: count()
-     * of an unbound OPTIONAL var is a separate, pre-existing defect. */
+    ASSERT_STR_EQ(r.rows[2][2], "0");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -6587,6 +6743,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_exists_no_callers);
     RUN_TEST(cypher_skill_dead_code_recipe_excludes_referenced_callbacks);
     RUN_TEST(cypher_exists_has_outgoing_calls);
+    RUN_TEST(cypher_pattern_predicate_no_callers);
+    RUN_TEST(cypher_pattern_predicate_boolean_groups_unchanged);
+    RUN_TEST(cypher_pattern_predicate_unsupported_shapes);
+    RUN_TEST(cypher_optional_match_count_zero_callers);
     RUN_TEST(cypher_exec_calls_relationship);
     RUN_TEST(cypher_exec_calls_with_where);
     RUN_TEST(cypher_exec_inbound);

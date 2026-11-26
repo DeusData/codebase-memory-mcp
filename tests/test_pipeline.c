@@ -14154,7 +14154,7 @@ static int run_rust_std_receiver_probe(int pad_files, const char *tag) {
     ASSERT_EQ(named_edge_count(s, project, "CALLS", "std_map_lookup", "std_map_lookup"), 0);
     /* POSITIVE: the typed project call keeps its edge. */
     ASSERT_EQ(named_edge_count(s, project, "CALLS", "real_caller", "join"), 1);
-    /* POSITIVE: an untyped receiver still reaches the registry fallback. */
+    /* A slice iterator supplies its item type to the closure. */
     ASSERT_EQ(named_edge_count(s, project, "CALLS", "untyped_receiver", "recalibrate_gauge"), 1);
 
     cbm_store_close(s);
@@ -14252,15 +14252,22 @@ static int rust_workspace_relative_import_case(int pad_files) {
                     "pub mod net;\npub mod util;\n\npub fn json() -> u32 {\n    7\n}\n\n"
                     "pub fn env() -> u32 {\n    8\n}\n\npub fn util() -> u32 {\n    9\n}\n");
     write_temp_file(tmp, "crates/alpha/src/util.rs", "pub fn helper() -> u32 {\n    1\n}\n");
-    write_temp_file(tmp, "crates/alpha/src/net/mod.rs", "pub mod proto;\n");
-    write_temp_file(tmp, "crates/alpha/src/net/proto.rs", "pub fn encode() -> u32 {\n    10\n}\n");
+    write_temp_file(tmp, "crates/alpha/src/net/mod.rs",
+                    "pub mod proto;\npub use self::proto::Auth;\n");
+    write_temp_file(
+        tmp, "crates/alpha/src/net/proto.rs",
+        "pub fn encode() -> u32 {\n    10\n}\n"
+        "pub struct Auth;\nimpl Auth { pub fn is_installed(&self) -> bool { true } }\n");
     write_temp_file(tmp, "crates/beta/Cargo.toml",
                     "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n");
     write_temp_file(tmp, "crates/beta/src/lib.rs",
                     "pub mod bridge;\npub mod net;\npub mod run;\npub mod util;\n");
     write_temp_file(tmp, "crates/beta/src/util.rs", "pub fn helper() -> u32 {\n    2\n}\n");
     write_temp_file(tmp, "crates/beta/src/net/mod.rs", "pub mod client;\npub mod proto;\n");
-    write_temp_file(tmp, "crates/beta/src/net/proto.rs", "pub fn encode() -> u32 {\n    20\n}\n");
+    write_temp_file(
+        tmp, "crates/beta/src/net/proto.rs",
+        "pub fn encode() -> u32 {\n    20\n}\n"
+        "pub struct Other;\nimpl Other { pub fn is_installed(&self) -> bool { false } }\n");
     write_temp_file(tmp, "crates/beta/src/net/client.rs",
                     "use super::proto::encode;\n"
                     "\n"
@@ -14282,12 +14289,22 @@ static int rust_workspace_relative_import_case(int pad_files) {
                     "}\n");
     write_temp_file(tmp, "crates/beta/build.rs",
                     "use std::env;\n\nfn main() {\n    let _ = env::var(\"OUT_DIR\");\n}\n");
-    write_temp_file(tmp, "crates/beta/src/bridge.rs",
-                    "use alpha_core::util::helper;\n"
-                    "\n"
-                    "pub fn cross() -> u32 {\n"
-                    "    helper()\n"
-                    "}\n");
+    write_temp_file(
+        tmp, "crates/beta/src/bridge.rs",
+        "use alpha_core::util::helper;\n"
+        "use alpha_core::net::Auth;\n"
+        "\n"
+        "pub fn cross() -> u32 {\n"
+        "    helper()\n"
+        "}\n"
+        "pub struct Startup { signal: alpha_core::net::Auth }\n"
+        "pub fn observe(startup: &mut Startup) -> bool { startup.signal.is_installed() }\n"
+        "pub fn summary(counts: impl Iterator<Item = (Auth, u32)>) -> String {\n"
+        "    counts.filter(|(_, n)| *n != 0)\n"
+        "        .map(|(value, n)| format!(\"{}={n}\", value.is_installed()))\n"
+        "        .collect::<Vec<_>>().join(\",\")\n"
+        "}\n"
+        "pub fn unknown<T>(value: T) { value.is_installed(); }\n");
     cbm_pipeline_t *p = NULL;
     cbm_store_t *s = rust_fixture_run(tmp, pad_files, "rust_ws.db", &p);
     ASSERT_NOT_NULL(s);
@@ -14319,6 +14336,16 @@ static int rust_workspace_relative_import_case(int pad_files) {
     /* A workspace member named by its crate name binds into that member. */
     ASSERT_EQ(rust_import_into_file_count(s, project, bridge_rs, "helper", alpha_util), 1);
     ASSERT_GTE(named_edge_to_file_count(s, project, "CALLS", "cross", "helper", alpha_util), 1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "observe", "is_installed", alpha_proto),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "observe", "is_installed", beta_proto),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "summary", "is_installed", alpha_proto),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "unknown", "is_installed", alpha_proto),
+              0);
+    ASSERT_EQ(named_edge_to_file_count(s, project, "CALLS", "unknown", "is_installed", beta_proto),
+              0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);

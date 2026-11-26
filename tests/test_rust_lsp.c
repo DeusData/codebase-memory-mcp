@@ -6422,6 +6422,231 @@ TEST(rustlsp_partial_chalk_lite_where_clause) {
     cbm_free_result(r); PASS();
 }
 
+TEST(rustlsp_iterator_associated_item_in_macro_closure) {
+    CBMFileResult *r =
+        extract_rust("enum Reason { Allowed }\n"
+                     "impl Reason { const fn name(self) -> &'static str { \"allowed\" } }\n"
+                     "fn summary(counts: impl Iterator<Item = (Reason, u64)>) -> String {\n"
+                     "    counts.filter(|(_, count)| *count != 0)\n"
+                     "        .map(|(reason, count)| format!(\"{}={count}\", reason.name()))\n"
+                     "        .collect::<Vec<_>>().join(\",\")\n"
+                     "}\n");
+    ASSERT_NOT_NULL(r);
+    int call = find_confident(&r->resolved_calls, "summary", "name");
+    ASSERT_GTE(call, 0);
+    ASSERT_NOT_NULL(strstr(r->resolved_calls.items[call].callee_qn, ".Reason.name"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The impl block's own <M: Trait> bounds scope its method bodies: a generic
+ * struct field typed as the parameter dispatches through the bound trait.
+ * Before impl-level bound collection this fell to unknown_receiver_type. */
+TEST(rustlsp_impl_generic_bound_dispatch) {
+    CBMFileResult *r =
+        extract_rust("pub trait Publication { fn write_target(&mut self, index: u32); }\n"
+                     "pub struct Controller<M> { maps: M }\n"
+                     "impl<M: Publication> Controller<M> {\n"
+                     "    pub fn publish(&mut self) { self.maps.write_target(0); }\n"
+                     "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "publish", "write_target"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_impl_generic_bound_where_clause) {
+    CBMFileResult *r =
+        extract_rust("pub trait Publication { fn write_target(&mut self, index: u32); }\n"
+                     "pub struct Controller<M> { maps: M }\n"
+                     "impl<M> Controller<M> where M: Publication {\n"
+                     "    pub fn publish(&mut self) { self.maps.write_target(0); }\n"
+                     "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "publish", "write_target"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The shared-registry path resolves the same generic-impl dispatch: field
+ * types come from field_defs strings, bounds from the walked impl block. */
+TEST(rustlsp_crossfile_impl_generic_bound_dispatch) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.ctrl.Publication";
+    defs[0].short_name = "Publication";
+    defs[0].label = "Trait";
+    defs[0].def_module_qn = "test.ctrl";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.ctrl.Publication.write_target";
+    defs[1].short_name = "write_target";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.ctrl.Publication";
+    defs[1].def_module_qn = "test.ctrl";
+    defs[1].lang = CBM_LANG_RUST;
+    defs[2].qualified_name = "test.ctrl.Controller";
+    defs[2].short_name = "Controller";
+    defs[2].label = "Struct";
+    defs[2].def_module_qn = "test.ctrl";
+    defs[2].field_defs = "maps:M";
+    defs[2].lang = CBM_LANG_RUST;
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 3);
+    ASSERT_NOT_NULL(reg);
+    const char *caller = "impl<M: Publication> Controller<M> {\n"
+                         "    pub fn publish(&mut self) { self.maps.write_target(0); }\n"
+                         "}\n";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.ctrl", reg, NULL,
+                                         NULL, 0, NULL, NULL, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "publish", "write_target"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* A fully-qualified cross-crate path whose item the module re-exports:
+ * `other_crate::signal::SignalAuthorization` is declared in
+ * signal/signal_controller.rs and re-exported by signal/mod.rs. The crate-root
+ * use row (injected by the pipeline) plus the re-export hop resolve the
+ * receiver, so the method call gets a CALLS edge. */
+TEST(rustlsp_cross_crate_reexport_receiver) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.abi.src.signal.signal_controller.SignalAuthorization";
+    defs[0].short_name = "SignalAuthorization";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.abi.src.signal.signal_controller";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name =
+        "test.abi.src.signal.signal_controller.SignalAuthorization.is_installed";
+    defs[1].short_name = "is_installed";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.abi.src.signal.signal_controller.SignalAuthorization";
+    defs[1].def_module_qn = "test.abi.src.signal.signal_controller";
+    defs[1].lang = CBM_LANG_RUST;
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    const char *caller = "fn check(s: &pinion_driver_linux_ebpf::signal::SignalAuthorization) {\n"
+                         "    s.is_installed();\n"
+                         "}\n";
+    /* The crate-root row the pipeline injects for every workspace crate. */
+    const char *imp_names[] = {"pinion_driver_linux_ebpf"};
+    const char *imp_qns[] = {"test.abi.src"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.service", reg,
+                                         imp_names, imp_qns, 1, NULL, NULL, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "check", "is_installed"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* `owner: &mut impl Trait` argument dispatch on the shared-registry path:
+ * the call resolves to the trait declaration, and the impl method carries
+ * OVERRIDE to it (pass_semantic), so orphan checks exclude the override. */
+TEST(rustlsp_crossfile_impl_trait_arg_dispatch) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.envelope.PolicyApplicationOwner";
+    defs[0].short_name = "PolicyApplicationOwner";
+    defs[0].label = "Trait";
+    defs[0].def_module_qn = "test.envelope";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.envelope.PolicyApplicationOwner.permits_retry";
+    defs[1].short_name = "permits_retry";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.envelope.PolicyApplicationOwner";
+    defs[1].def_module_qn = "test.envelope";
+    defs[1].lang = CBM_LANG_RUST;
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    const char *caller = "impl PolicyRecipient {\n"
+                         "    fn apply(&mut self, owner: &mut impl PolicyApplicationOwner) {\n"
+                         "        owner.permits_retry(DeliveryStatus::Indeterminate);\n"
+                         "    }\n"
+                         "}\n";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.envelope", reg,
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "apply", "permits_retry"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* Stdlib trait impls (Default/From/Display) have no graph trait node, so
+ * their canonical callbacks are entry points by trait+name contract; an
+ * inherent method on the same type is not. */
+TEST(rustlsp_framework_trait_impl_methods_are_entry_points) {
+    CBMFileResult *r = extract_rust(
+        "pub struct Feet(u32);\n"
+        "impl Default for Feet { fn default() -> Self { Feet(0) } }\n"
+        "impl From<u32> for Feet { fn from(v: u32) -> Self { Feet(v) } }\n"
+        "impl std::fmt::Display for Feet {\n"
+        "    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n"
+        "}\n"
+        "impl Feet { pub fn helper(&self) {} }\n");
+    ASSERT_NOT_NULL(r);
+    int default_ep = -1, from_ep = -1, fmt_ep = -1, helper_ep = -1;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "default") == 0)
+            default_ep = d->is_entry_point;
+        if (strcmp(d->name, "from") == 0)
+            from_ep = d->is_entry_point;
+        if (strcmp(d->name, "fmt") == 0)
+            fmt_ep = d->is_entry_point;
+        if (strcmp(d->name, "helper") == 0)
+            helper_ep = d->is_entry_point;
+    }
+    ASSERT_EQ(default_ep, 1);
+    ASSERT_EQ(from_ep, 1);
+    ASSERT_EQ(fmt_ep, 1);
+    ASSERT_EQ(helper_ep, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* eBPF program entries attached by attribute macro are entry points; an
+ * ordinary function and a longer-named attribute are not. */
+TEST(rustlsp_ebpf_entry_attributes) {
+    CBMFileResult *r = extract_rust("#[lsm(hook = \"task_kill\")]\n"
+                                    "pub fn pinion_task_kill(ctx: LsmContext) -> i32 { 0 }\n"
+        "#[aya_ebpf::macros::xdp]\n"
+                                    "pub fn pinion_xdp(ctx: XdpContext) -> i32 { 0 }\n"
+                                    "#[my_program]\n"
+                                    "pub fn not_an_entry() {}\n"
+                                    "pub fn ordinary() {}\n");
+    ASSERT_NOT_NULL(r);
+    int kill_ep = -1, xdp_ep = -1, mine_ep = -1, ordinary_ep = -1;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "pinion_task_kill") == 0)
+            kill_ep = d->is_entry_point;
+        if (strcmp(d->name, "pinion_xdp") == 0)
+            xdp_ep = d->is_entry_point;
+        if (strcmp(d->name, "not_an_entry") == 0)
+            mine_ep = d->is_entry_point;
+        if (strcmp(d->name, "ordinary") == 0)
+            ordinary_ep = d->is_entry_point;
+    }
+    ASSERT_EQ(kill_ep, 1);
+    ASSERT_EQ(xdp_ep, 1);
+    ASSERT_EQ(mine_ep, 0);
+    ASSERT_EQ(ordinary_ep, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* HM unification structural cases. */
 TEST(rustlsp_partial_hm_multi_var) {
     /* fn pair<A, B>(a: A, b: B) -> (A, B). Before HM extensions, only
@@ -7378,6 +7603,14 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_partial_chalk_lite_display_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_multi_bound);
     RUN_TEST(rustlsp_partial_chalk_lite_where_clause);
+    RUN_TEST(rustlsp_impl_generic_bound_dispatch);
+    RUN_TEST(rustlsp_iterator_associated_item_in_macro_closure);
+    RUN_TEST(rustlsp_impl_generic_bound_where_clause);
+    RUN_TEST(rustlsp_crossfile_impl_generic_bound_dispatch);
+    RUN_TEST(rustlsp_cross_crate_reexport_receiver);
+    RUN_TEST(rustlsp_crossfile_impl_trait_arg_dispatch);
+    RUN_TEST(rustlsp_framework_trait_impl_methods_are_entry_points);
+    RUN_TEST(rustlsp_ebpf_entry_attributes);
     RUN_TEST(rustlsp_partial_hm_multi_var);
     RUN_TEST(rustlsp_partial_hm_tuple_return);
 

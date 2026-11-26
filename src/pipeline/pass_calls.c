@@ -1344,9 +1344,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Go, and unique_name drops only when import-unreachability-penalized), so
      * it composes via cbm_go_suppress_weak_method_match instead of widening
      * the shared gate. Same lockstep rule: mirror pass_parallel.c. */
-    bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
-                                lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-                                lang == CBM_LANG_ARKTS ||
+    bool suppress_weak_member = lang == CBM_LANG_RUST || lang == CBM_LANG_PYTHON ||
+                                lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                                lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS ||
                                 /* Files whose calls are embedded JS/TS (<script>
                                  * bodies): the calls carry the JS receiver flag
                                  * but the FILE language gated them out, so

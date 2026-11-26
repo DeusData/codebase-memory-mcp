@@ -4010,9 +4010,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * note there. ArkTS belongs to the JS/TS family (#1842). Go (#1906)
          * composes via its own predicate (different drop-list — see
          * cbm_go_suppress_weak_method_match), mirrored in pass_calls.c. */
-        bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
-                                    lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-                                    lang == CBM_LANG_ARKTS ||
+        bool suppress_weak_member = lang == CBM_LANG_RUST || lang == CBM_LANG_PYTHON ||
+                                    lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                                    lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS ||
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
                                     lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||

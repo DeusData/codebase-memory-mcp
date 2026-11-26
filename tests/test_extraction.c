@@ -7327,6 +7327,85 @@ TEST(markdown_no_headings) {
     PASS();
 }
 
+TEST(go_framework_callback_methods_are_entry_points) {
+    CBMFileResult *r = extract(
+        "package ledger\n"
+        "type PolicyCounter uint64\n"
+        "func (v *PolicyCounter) UnmarshalJSON(data []byte) error { return nil }\n"
+        "func (v PolicyCounter) MarshalJSON() ([]byte, error) { return nil, nil }\n"
+        "func (v PolicyCounter) String() string { return \"\" }\n"
+        "func (v PolicyCounter) Other() string { return \"\" }\n"
+        "type Named struct{}\n"
+        "func (v *Named) UnmarshalJSON(data []byte, /* retained */) (err error) { return nil }\n"
+        "func (v Named) MarshalJSON() (data []byte, err error,) { return nil, nil }\n"
+        "func (v Named) Error() (msg string) { return \"\" }\n"
+        "type Wrapper struct{}\n"
+        "func (v Wrapper) String(n int) string { return \"\" }\n"
+        "func (v Wrapper) UnmarshalJSON(data [2][]byte) error { return nil }\n"
+        "type Multiple struct{}\n"
+        "func (v Multiple) UnmarshalJSON(left, right []byte) error { return nil }\n"
+        "type Variadic struct{}\n"
+        "func (v Variadic) UnmarshalJSON(data ...[]byte) error { return nil }\n",
+        CBM_LANG_GO, "t", "ledger/types.go");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *qn;
+        bool entry_point;
+    } cases[] = {{"PolicyCounter.UnmarshalJSON", true},
+                 {"PolicyCounter.MarshalJSON", true},
+                 {"PolicyCounter.String", true},
+                 {"PolicyCounter.Other", false},
+                 {"Named.UnmarshalJSON", true},
+                 {"Named.MarshalJSON", true},
+                 {"Named.Error", true},
+                 {"Wrapper.String", false},
+                 {"Wrapper.UnmarshalJSON", false},
+                 {"Multiple.UnmarshalJSON", false},
+                 {"Variadic.UnmarshalJSON", false}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const CBMDefinition *d = find_def_in_module(r, cases[i].qn);
+        ASSERT_NOT_NULL(d);
+        ASSERT_EQ(d->is_entry_point, cases[i].entry_point);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rust_ebpf_hooks_and_trait_implementations_are_entry_points) {
+    CBMFileResult *r =
+        extract("#[lsm(hook = \"task_kill\")]\n"
+                "pub fn task_kill(ctx: LsmContext) -> i32 { 0 }\n"
+                "#[aya_ebpf::macros::lsm (hook = \"file_set_fowner\")]\n"
+                "// The attribute still belongs to this function.\n"
+                "pub fn file_set_fowner(ctx: LsmContext) -> i32 { 0 }\n"
+                "#[doc = \"Mention #[lsm] without attaching it.\"]\n"
+                "fn mentions_hook() {}\n"
+                "#[unrelated(path::xdp)]\n"
+                "fn unrelated() {}\n"
+                "struct Counter;\n"
+                "impl Default for Counter { fn default() -> Self { Counter } }\n"
+                "impl core::convert::From<u8> for Counter { fn from(n: u8) -> Self { Counter } }\n"
+                "use core::fmt::Display as Show;\n"
+                "impl Show for Counter { fn fmt(&self, f: &mut Fmt) -> Result { Ok(()) } }\n"
+                "struct Plain;\n"
+                "impl Plain { fn default() -> Self { Plain } }\n",
+                CBM_LANG_RUST, "t", "src/signal.rs");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *qn;
+        bool entry_point;
+    } cases[] = {{"task_kill", true},   {"file_set_fowner", true}, {"mentions_hook", false},
+                 {"unrelated", false},  {"Counter.default", true}, {"Counter.from", true},
+                 {"Counter.fmt", true}, {"Plain.default", false}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const CBMDefinition *d = find_def_in_module(r, cases[i].qn);
+        ASSERT_NOT_NULL(d);
+        ASSERT_EQ(d->is_entry_point, cases[i].entry_point);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Python __init__.py Module QN collision regression
  * ═══════════════════════════════════════════════════════════════════ */
@@ -10257,12 +10336,7 @@ TEST(extract_rust_generic_impl_call_scope_matches_def) {
     PASS();
 }
 
-/* Languages OUTSIDE the is_method flag set (Perl, Python, TS/JS/TSX and Go set
- * it) must be unaffected: a Rust method call never sets is_method. */
-TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
-    /* Rust is flag-exempt: only Perl, Python, TS/JS and Go set is_method.
-     * Guards the blast radius of the receiver-aware flags for every other
-     * language. */
+TEST(extract_rust_member_call_flags_is_method) {
     CBMFileResult *r = extract("fn run(o: Obj) {\n"
                                "    o.commit();\n"
                                "    helper();\n"
@@ -10270,9 +10344,9 @@ TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
                                CBM_LANG_RUST, "t", "x.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    for (int i = 0; i < r->calls.count; i++) {
-        ASSERT_FALSE(r->calls.items[i].is_method);
-    }
+    ASSERT_EQ(r->calls.count, 2);
+    ASSERT_TRUE(r->calls.items[0].is_method);
+    ASSERT_FALSE(r->calls.items[1].is_method);
     cbm_free_result(r);
     PASS();
 }
@@ -12682,6 +12756,19 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
     ASSERT(sync == 1 && "#[test] fn is_test");
     ASSERT(asyn == 1 && "#[tokio::test] fn is_test");
 
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_rust_tests_sibling_marks_unannotated_helper) {
+    CBMFileResult *r = extract("fn helper() {}\n#[test]\nfn check() { helper(); }\n", CBM_LANG_RUST,
+                               "t", "src/decision_tests.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->is_test_file);
+    const CBMDefinition *helper = find_def(r, "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_TRUE(helper->is_test);
     cbm_free_result(r);
     PASS();
 }
@@ -16375,7 +16462,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_rust_generic_impl_call_scope_matches_def);
-    RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
+    RUN_TEST(extract_rust_member_call_flags_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
@@ -16906,6 +16993,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
+    RUN_TEST(extract_rust_tests_sibling_marks_unannotated_helper);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
@@ -16928,6 +17016,8 @@ SUITE(extraction) {
     /* #518/#519 — prose carried into docstring so nodes_fts can index it */
     RUN_TEST(markdown_section_body_becomes_docstring_issue518);
     RUN_TEST(markdown_section_body_stops_at_next_heading_issue518);
+    RUN_TEST(go_framework_callback_methods_are_entry_points);
+    RUN_TEST(rust_ebpf_hooks_and_trait_implementations_are_entry_points);
     RUN_TEST(markdown_section_body_heading_only_has_no_docstring_issue518);
     RUN_TEST(markdown_section_body_capped_utf8_safe_issue518);
     RUN_TEST(yaml_toplevel_description_promoted_to_module_issue519);

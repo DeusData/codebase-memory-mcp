@@ -4280,6 +4280,138 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
+static bool source_node_is(TSNode node, const char *source, const char *text) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    size_t len = strlen(text);
+    return ts_node_end_byte(node) - start == len && memcmp(source + start, text, len) == 0;
+}
+
+/* The kernel invokes Aya eBPF programs via the attribute's dispatch hook.
+ * Look at the attribute path itself: tokens inside its arguments or strings
+ * can contain a program macro name without attaching the macro. */
+static bool rust_def_is_entry_point(TSNode node, const char *source) {
+    static const char *const entry_macros[] = {
+        "btf_tracepoint",   "cgroup_device",
+        "cgroup_skb",       "cgroup_sock",
+        "cgroup_sock_addr", "cgroup_sockopt",
+        "cgroup_sysctl",    "classifier",
+        "fentry",           "fexit",
+        "flow_dissector",   "kprobe",
+        "kretprobe",        "lsm",
+        "lsm_cgroup",       "perf_event",
+        "raw_tracepoint",   "sk_lookup",
+        "sk_msg",           "sk_reuseport",
+        "sock_ops",         "socket_filter",
+        "stream_parser",    "stream_verdict",
+        "tracepoint",       "uprobe",
+        "uretprobe",        "xdp",
+    };
+    for (TSNode prev = ts_node_prev_named_sibling(node); !ts_node_is_null(prev);
+         prev = ts_node_prev_named_sibling(prev)) {
+        const char *kind = ts_node_type(prev);
+        if (is_comment_node(kind)) {
+            continue;
+        }
+        if (strcmp(kind, "attribute_item") != 0) {
+            break;
+        }
+        TSNode attr = cbm_find_child_by_kind(prev, "attribute");
+        if (ts_node_is_null(attr)) {
+            continue;
+        }
+        TSNode name = ts_node_named_child(attr, 0);
+        if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "scoped_identifier") == 0) {
+            name = ts_node_child_by_field_name(name, TS_FIELD("name"));
+        }
+        for (size_t i = 0; i < sizeof(entry_macros) / sizeof(entry_macros[0]); i++) {
+            if (source_node_is(name, source, entry_macros[i])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* A Go parameter declaration can introduce multiple positions, e.g.
+ * `left, right []byte`. A variadic parameter also has a different signature. */
+static TSNode go_framework_param_type(TSNode param) {
+    if (strcmp(ts_node_type(param), "parameter_declaration") != 0) {
+        return (TSNode){0};
+    }
+    TSNode type = ts_node_child_by_field_name(param, TS_FIELD("type"));
+    int names = 0;
+    uint32_t count = ts_node_named_child_count(param);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(param, i);
+        if (!ts_node_eq(child, type) && strcmp(ts_node_type(child), "identifier") == 0) {
+            names++;
+        }
+    }
+    return names <= 1 ? type : (TSNode){0};
+}
+
+static bool go_framework_param_list(TSNode list, TSNode *types, int expected) {
+    int count = 0;
+    uint32_t count_children = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < count_children; i++) {
+        TSNode child = ts_node_named_child(list, i);
+        if (is_comment_node(ts_node_type(child))) {
+            continue;
+        }
+        if (count == expected) {
+            return false;
+        }
+        types[count] = go_framework_param_type(child);
+        if (ts_node_is_null(types[count])) {
+            return false;
+        }
+        count++;
+    }
+    return count == expected;
+}
+
+static bool go_framework_byte_slice(TSNode node, const char *source) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "slice_type") != 0) {
+        return false;
+    }
+    TSNode element = ts_node_child_by_field_name(node, TS_FIELD("element"));
+    return source_node_is(element, source, "byte") || source_node_is(element, source, "uint8");
+}
+
+/* These stdlib interfaces can dispatch through encoding/json and fmt even
+ * when their declarations are outside the index. Match the signature shape
+ * in the syntax tree so names, comments, and trailing commas are immaterial. */
+static bool go_method_is_framework_callback(TSNode node, const char *name, const char *source) {
+    bool unmarshal = strcmp(name, "UnmarshalJSON") == 0;
+    bool marshal = strcmp(name, "MarshalJSON") == 0;
+    if (!unmarshal && !marshal && strcmp(name, "String") != 0 && strcmp(name, "Error") != 0) {
+        return false;
+    }
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    TSNode result = ts_node_child_by_field_name(node, TS_FIELD("result"));
+    if (ts_node_is_null(params) || ts_node_is_null(result)) {
+        return false;
+    }
+    TSNode input = {0};
+    if (!go_framework_param_list(params, &input, unmarshal ? 1 : 0) ||
+        (unmarshal && !go_framework_byte_slice(input, source))) {
+        return false;
+    }
+    TSNode results[PAIR_LEN] = {result};
+    bool result_list = strcmp(ts_node_type(result), "parameter_list") == 0;
+    if (result_list && !go_framework_param_list(result, results, marshal ? PAIR_LEN : 1)) {
+        return false;
+    }
+    if (marshal) {
+        return result_list && go_framework_byte_slice(results[0], source) &&
+               source_node_is(results[1], source, "error");
+    }
+    return source_node_is(results[0], source, unmarshal ? "error" : "string");
+}
+
 // Extract base class name text from a single base_class child node.
 static char *extract_cpp_base_text(CBMArena *a, TSNode bc, const char *source) {
     const char *bk = ts_node_type(bc);
@@ -8060,6 +8192,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // source node (calls are scoped to the plain QN).
     if (ctx->language == CBM_LANG_RUST) {
         def.is_test = rust_def_is_test(def.decorators);
+        def.is_entry_point = def.is_entry_point || rust_def_is_entry_point(node, ctx->source);
+    }
+    if (ctx->language == CBM_LANG_GO && def.label && strcmp(def.label, "Method") == 0) {
+        def.is_entry_point =
+            def.is_entry_point || go_method_is_framework_callback(func_node, name, ctx->source);
     }
 
     if (ctx->language == CBM_LANG_SWIFT) {
@@ -10817,6 +10954,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         // MinHash fingerprint
         compute_fingerprint(ctx, &def, child);
         def.docstring = extract_docstring(ctx, child, name);
+        /* The trait contract can dispatch this method even when the trait
+         * lives outside the index or is imported under an alias. */
+        def.is_entry_point = impl_trait != NULL || rust_def_is_entry_point(child, ctx->source);
 
         cbm_defs_push(&ctx->result->defs, a, def);
     }

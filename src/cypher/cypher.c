@@ -1049,6 +1049,8 @@ static void free_one_rel_pattern(cbm_rel_pattern_t *r) {
  * single-hop, edge-type-specific existence check anchored on a bound variable
  * (e.g. WHERE NOT EXISTS { (f)<-[:CALLS]-() } finds functions with no callers).
  * Multi-hop / nested-WHERE EXISTS is intentionally unsupported. */
+enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1, EXISTS_DIR_ANY = 2 };
+
 static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     advance(p); /* EXISTS */
     if (!match(p, TOK_LBRACE)) {
@@ -1074,9 +1076,76 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     c.op = heap_strdup("EXISTS");
     c.variable = heap_strdup(anchor.variable ? anchor.variable : "");
     c.value = (rel.type_count > 0 && rel.types[0]) ? heap_strdup(rel.types[0]) : NULL;
-    c.exists_dir = (rel.direction && strcmp(rel.direction, "inbound") == 0) ? 1
-                   : (rel.direction && strcmp(rel.direction, "any") == 0)   ? 2
-                                                                            : 0;
+    c.exists_dir = (rel.direction && strcmp(rel.direction, "inbound") == 0) ? EXISTS_DIR_IN
+                   : (rel.direction && strcmp(rel.direction, "any") == 0)   ? EXISTS_DIR_ANY
+                                                                            : EXISTS_DIR_OUT;
+    free_one_node_pattern(&anchor);
+    free_one_rel_pattern(&rel);
+    free_one_node_pattern(&far_node);
+    return expr_leaf(c);
+}
+
+/* A single-hop WHERE pattern can have the bound variable at either end.
+ * Probe with a copy of the parser because boolean groups also start with '('.
+ * A recognized but unsupported pattern reports its error through *fatal. */
+static cbm_expr_t *parse_pattern_predicate(parser_t *p, bool *fatal) {
+    *fatal = false;
+    parser_t probe = *p;
+
+    cbm_node_pattern_t anchor = {0};
+    cbm_rel_pattern_t rel = {0};
+    cbm_node_pattern_t far_node = {0};
+    if (parse_node(&probe, &anchor) < 0 || parse_rel(&probe, &rel) < 0 ||
+        parse_node(&probe, &far_node) < 0) {
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        return NULL;
+    }
+
+    const char *unsupported = NULL;
+    if (rel.min_hops != SKIP_ONE || rel.max_hops != SKIP_ONE) {
+        unsupported = "variable-length relationships are not supported in a pattern "
+                      "predicate — use a fixed single hop";
+    } else if (rel.variable) {
+        unsupported = "a bound relationship variable is not supported in a pattern predicate";
+    } else if (rel.type_count > SKIP_ONE) {
+        unsupported = "only one edge type is supported in a pattern predicate — combine "
+                      "predicates with AND/OR";
+    } else if (anchor.label || anchor.prop_count > 0 || far_node.label || far_node.prop_count > 0) {
+        unsupported = "pattern predicate nodes must be anonymous () or a bare bound "
+                      "variable (f)";
+    } else if (anchor.variable && far_node.variable) {
+        unsupported = "a pattern predicate must bind exactly one variable — the other "
+                      "end must be anonymous ()";
+    } else if (!anchor.variable && !far_node.variable) {
+        unsupported = "a pattern predicate needs a bound variable, e.g. (()-[:CALLS]->(f))";
+    }
+    if (unsupported) {
+        snprintf(p->error, sizeof(p->error), "%s", unsupported);
+        free_one_node_pattern(&anchor);
+        free_one_rel_pattern(&rel);
+        free_one_node_pattern(&far_node);
+        *fatal = true;
+        return NULL;
+    }
+
+    /* Normalize to the EXISTS evaluator's anchor form: the bound variable is
+     * the anchor; a bound far end flips the direction. */
+    bool far_bound = far_node.variable != NULL;
+    const char *dir = rel.direction ? rel.direction : "any";
+    int exists_dir = EXISTS_DIR_ANY;
+    if (strcmp(dir, "inbound") == 0) {
+        exists_dir = far_bound ? EXISTS_DIR_OUT : EXISTS_DIR_IN;
+    } else if (strcmp(dir, "outbound") == 0) {
+        exists_dir = far_bound ? EXISTS_DIR_IN : EXISTS_DIR_OUT;
+    }
+    cbm_condition_t c = {0};
+    c.op = heap_strdup("EXISTS");
+    c.variable = heap_strdup(far_bound ? far_node.variable : anchor.variable);
+    c.value = (rel.type_count > 0 && rel.types[0]) ? heap_strdup(rel.types[0]) : NULL;
+    c.exists_dir = exists_dir;
+    p->pos = probe.pos;
     free_one_node_pattern(&anchor);
     free_one_rel_pattern(&rel);
     free_one_node_pattern(&far_node);
@@ -1270,15 +1339,23 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
     return parse_condition_op(p, &c);
 }
 
-/* Atom: ( expr ) | condition */
+/* Atom: ( expr ) | pattern | condition */
 static cbm_expr_t *parse_atom_expr(parser_t *p) { // NOLINT(misc-no-recursion)
-    if (match(p, TOK_LPAREN)) {
+    if (check(p, TOK_LPAREN)) {
+        bool fatal = false;
+        cbm_expr_t *pat = parse_pattern_predicate(p, &fatal);
+        if (pat || fatal) {
+            return pat;
+        }
+        advance(p); /* '(' of a boolean group */
         if (!parse_depth_enter(p)) {
             return NULL;
         }
         cbm_expr_t *e = parse_or_expr(p);
         parse_depth_leave(p);
-        expect(p, TOK_RPAREN);
+        if (e) {
+            expect(p, TOK_RPAREN);
+        }
         return e;
     }
     return parse_condition_expr(p);
@@ -2770,8 +2847,6 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
     }
     return false;
 }
-
-enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
 
 /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
  * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
@@ -4757,10 +4832,18 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     return found;
 }
 
+static bool binding_has_value(binding_t *b, const char *var, const char *prop);
+
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
         if (!is_aggregate_func(wc->items[ci].func)) {
+            continue;
+        }
+        /* OPTIONAL MATCH leaves the variable unbound on caller-less rows;
+         * COUNT counts values, not rows, exactly as the RETURN path does. */
+        if (strcmp(wc->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, wc->items[ci].variable, wc->items[ci].property)) {
             continue;
         }
         agg->counts[ci]++;
