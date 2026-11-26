@@ -14572,6 +14572,76 @@ TEST(markdown_section_body_stops_at_next_heading_issue518) {
     PASS();
 }
 
+/* A Section spans its whole body — to the line before the next heading of the
+ * same or a higher level, subsections included — so get_code_snippet returns
+ * the section, not just its heading line. The docstring keeps its own-body
+ * scope (#518); only the line span grows. */
+TEST(markdown_section_spans_to_next_same_level_heading) {
+    CBMFileResult *r = extract("# Top\n"                          /* 1 */
+                               "intro\n"                          /* 2 */
+                               "## Qualification evidence\n"      /* 3 */
+                               "\n"                               /* 4 */
+                               "The lab run stored ETW health.\n" /* 5 */
+                               "### Sub detail\n"                 /* 6 */
+                               "deeper prose\n"                   /* 7 */
+                               "#### Planned replacement\n"       /* 8 */
+                               "next body\n"                      /* 9 */
+                               "## After\n"                       /* 10 */
+                               "tail\n",                          /* 11 */
+                               CBM_LANG_MARKDOWN, "t", "docs/PRD.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *qual = find_def_by_name(r, "Qualification evidence");
+    ASSERT_NOT_NULL(qual);
+    ASSERT_EQ(qual->start_line, 3);
+    ASSERT_EQ(qual->end_line, 9); /* stops before the level-2 heading at 10 */
+    ASSERT_EQ(qual->lines, 7);
+    const CBMDefinition *sub = find_def_by_name(r, "Sub detail");
+    ASSERT_NOT_NULL(sub);
+    ASSERT_EQ(sub->start_line, 6);
+    ASSERT_EQ(sub->end_line, 9); /* the level-4 heading at 8 is deeper: included */
+    const CBMDefinition *deep = find_def_by_name(r, "Planned replacement");
+    ASSERT_NOT_NULL(deep);
+    ASSERT_EQ(deep->start_line, 8);
+    ASSERT_EQ(deep->end_line, 9);
+    const CBMDefinition *top = find_def_by_name(r, "Top");
+    ASSERT_NOT_NULL(top);
+    ASSERT_EQ(top->end_line, 11); /* no higher heading: to the file's last line */
+    const CBMDefinition *after = find_def_by_name(r, "After");
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(after->start_line, 10);
+    ASSERT_EQ(after->end_line, 11);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_span_heading_only_and_setext) {
+    CBMFileResult *r = extract("# A\n"
+                               "# B\n"
+                               "body of b\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *a = find_def_by_name(r, "A");
+    ASSERT_NOT_NULL(a);
+    ASSERT_EQ(a->start_line, 1);
+    ASSERT_EQ(a->end_line, 1); /* heading-only section keeps a one-line span */
+    ASSERT_EQ(a->lines, 1);
+    cbm_free_result(r);
+
+    r = extract("Title\n=====\nprose\n\nSection\n------\nmore\n\nEnd\n===\n", CBM_LANG_MARKDOWN,
+                "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *title = find_def_by_name(r, "Title");
+    ASSERT_NOT_NULL(title);
+    ASSERT_EQ(title->start_line, 1);
+    ASSERT_EQ(title->end_line, 8); /* setext level 1 spans to before the level-1 at 9 */
+    const CBMDefinition *sect = find_def_by_name(r, "Section");
+    ASSERT_NOT_NULL(sect);
+    ASSERT_EQ(sect->start_line, 5);
+    ASSERT_EQ(sect->end_line, 8); /* the level-1 heading at 9 is higher: boundary */
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(markdown_section_body_heading_only_has_no_docstring_issue518) {
     CBMFileResult *r = extract("# Lonely\n", CBM_LANG_MARKDOWN, "t", "README.md");
     ASSERT_NOT_NULL(r);
@@ -16928,6 +16998,8 @@ SUITE(extraction) {
     /* #518/#519 — prose carried into docstring so nodes_fts can index it */
     RUN_TEST(markdown_section_body_becomes_docstring_issue518);
     RUN_TEST(markdown_section_body_stops_at_next_heading_issue518);
+    RUN_TEST(markdown_section_spans_to_next_same_level_heading);
+    RUN_TEST(markdown_section_span_heading_only_and_setext);
     RUN_TEST(markdown_section_body_heading_only_has_no_docstring_issue518);
     RUN_TEST(markdown_section_body_capped_utf8_safe_issue518);
     RUN_TEST(yaml_toplevel_description_promoted_to_module_issue519);

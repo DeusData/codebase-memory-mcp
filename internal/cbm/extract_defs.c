@@ -8358,9 +8358,10 @@ static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode head
 /* Push a config-language definition that carries prose. push_simple_class_def
  * delegates here with no docstring. */
 /* Push a definition whose qualified name ends with `qn_name` (already QN-safe)
- * rather than with its name. */
+ * rather than with its name. end_line > 0 overrides the node's own end row
+ * (Markdown sections span their body); lines then counts the span. */
 static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const char *qn_name,
-                              const char *label, const char *docstring) {
+                              const char *label, const char *docstring, int end_line) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
@@ -8370,6 +8371,10 @@ static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    if (end_line > 0) {
+        def.end_line = end_line;
+        def.lines = def.end_line - def.start_line + SKIP_ONE;
+    }
     def.is_exported = true;
     def.docstring = docstring;
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -8377,7 +8382,7 @@ static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const
 
 static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
                                       const char *label, const char *docstring) {
-    push_class_def_qn(ctx, node, name, qn_safe_segment(ctx->arena, name), label, docstring);
+    push_class_def_qn(ctx, node, name, qn_safe_segment(ctx->arena, name), label, docstring, 0);
 }
 
 static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
@@ -8533,6 +8538,8 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
  * settled once per file, on the first heading. */
 typedef struct md_heading {
     uint32_t start;       /* the heading node's first byte */
+    uint32_t start_row;   /* the heading node's 0-based row */
+    int end_line;         /* inclusive span with its subsections */
     uint32_t scope_start; /* enclosing block container, excluding section wrappers */
     uint32_t scope_end;
     int level; /* ATX and Setext heading rank, 1–6 */
@@ -8619,6 +8626,7 @@ static int md_collect_headings(CBMExtractCtx *ctx, CBMArena *a, md_heading_t *v,
             } else if (n < cap) {
                 const char *seg = md_heading_segment(ctx, a, node);
                 v[n++] = (md_heading_t){.start = ts_node_start_byte(node),
+                                        .start_row = ts_node_start_point(node).row,
                                         .scope_start = scope ? scope->start : 0,
                                         .scope_end = scope ? scope->end : 0,
                                         .level = md_heading_level(node),
@@ -8890,6 +8898,28 @@ static bool md_settle_names(CBMArena *a, md_headings_t *hs) {
     return true;
 }
 
+/* A later heading closes all sections of its own rank or a lower rank.
+ * Keep the nearest boundary seen for each rank in one backward pass. */
+static void md_settle_section_spans(CBMExtractCtx *ctx, md_headings_t *hs) {
+    int source_end = (int)cbm_source_line_count(ctx->source, ctx->source_len);
+    int next_end[MD_HEADING_LEVELS];
+    for (int i = 0; i < MD_HEADING_LEVELS; i++) {
+        next_end[i] = source_end;
+    }
+    for (int i = hs->count - SKIP_ONE; i >= 0; i--) {
+        md_heading_t *h = &hs->v[i];
+        int rank = h->level - SKIP_ONE;
+        if (rank < 0) {
+            continue;
+        }
+        int start_line = (int)h->start_row + TS_LINE_OFFSET;
+        h->end_line = next_end[rank] >= start_line ? next_end[rank] : start_line;
+        for (int j = rank; j < MD_HEADING_LEVELS; j++) {
+            next_end[j] = start_line - SKIP_ONE;
+        }
+    }
+}
+
 static const md_headings_t *md_headings(CBMExtractCtx *ctx) {
     if (ctx->md_headings) {
         return (const md_headings_t *)ctx->md_headings;
@@ -8906,16 +8936,19 @@ static const md_headings_t *md_headings(CBMExtractCtx *ctx) {
     if (hs->count < 0) {
         hs->count = 0;
     }
+    if (hs->count > 0) {
+        md_settle_section_spans(ctx, hs);
+    }
     if (hs->count > SKIP_ONE && !md_settle_names(a, hs)) {
-        hs->count = 0; /* every heading keeps its own name, as before */
+        for (int i = 0; i < hs->count; i++) {
+            hs->v[i].qn_name = hs->v[i].seg;
+        }
     }
     ctx->md_headings = hs;
     return hs;
 }
 
-/* The QN segment of a heading: its own name unless the file's names say
- * otherwise. */
-static const char *md_heading_qn_name(CBMExtractCtx *ctx, TSNode heading, const char *seg) {
+static const md_heading_t *md_heading_at(CBMExtractCtx *ctx, TSNode heading) {
     const md_headings_t *hs = md_headings(ctx);
     uint32_t start = ts_node_start_byte(heading);
     int lo = 0;
@@ -8928,10 +8961,7 @@ static const char *md_heading_qn_name(CBMExtractCtx *ctx, TSNode heading, const 
             hi = mid;
         }
     }
-    if (hs && lo < hs->count && hs->v[lo].start == start && strcmp(hs->v[lo].seg, seg) == 0) {
-        return hs->v[lo].qn_name;
-    }
-    return seg;
+    return hs && lo < hs->count && hs->v[lo].start == start ? &hs->v[lo] : NULL;
 }
 
 // INI: extract section name from section node.
@@ -9037,7 +9067,10 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
 
     if (name && name[0] && ctx->language == CBM_LANG_MARKDOWN) {
         const char *seg = qn_safe_segment(a, name);
-        push_class_def_qn(ctx, node, name, md_heading_qn_name(ctx, node, seg), label, docstring);
+        const md_heading_t *heading = md_heading_at(ctx, node);
+        const char *qn_name = heading && strcmp(heading->seg, seg) == 0 ? heading->qn_name : seg;
+        push_class_def_qn(ctx, node, name, qn_name, label, docstring,
+                          heading ? heading->end_line : 0);
     } else if (name && name[0]) {
         push_simple_class_def_doc(ctx, node, name, label, docstring);
     }

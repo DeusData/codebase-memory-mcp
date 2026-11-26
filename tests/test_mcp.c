@@ -3678,6 +3678,62 @@ TEST(tool_get_code_snippet_clips_whole_file_node) {
     PASS();
 }
 
+TEST(tool_get_code_snippet_pages_markdown_section_body) {
+    char repo[512];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-section-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/PRD.md", repo);
+    ASSERT_EQ(th_write_file(path, "# Qualification evidence\n"
+                                  "\n"
+                                  "The witness stored health.\n"
+                                  "## Run details\n"
+                                  "A second line of evidence.\n"
+                                  "# Planned replacement\n"
+                                  "Replacement prose.\n"),
+              0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", repo);
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT(response_contains_json_fragment(response, "\"status\":\"indexed\""));
+    free(response);
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"qualified_name\":\"%s.PRD.Qualification-evidence\","
+             "\"max_lines\":3,\"format\":\"json\"}",
+             project, project);
+    response = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT(response_contains_json_fragment(response, "\"original_end_line\":5"));
+    ASSERT(response_contains_json_fragment(response, "\"next_start_line\":4"));
+    ASSERT_NOT_NULL(strstr(response, "The witness stored health."));
+    ASSERT_NULL(strstr(response, "Run details"));
+    free(response);
+
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"qualified_name\":\"%s.PRD.Qualification-evidence\","
+             "\"start_line\":4,\"max_lines\":3,\"format\":\"json\"}",
+             project, project);
+    response = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT(response_contains_json_fragment(response, "\"start_line\":4"));
+    ASSERT(response_contains_json_fragment(response, "\"end_line\":5"));
+    ASSERT_NOT_NULL(strstr(response, "## Run details"));
+    ASSERT_NOT_NULL(strstr(response, "A second line of evidence."));
+    ASSERT_NULL(strstr(response, "Planned replacement"));
+    ASSERT_NULL(strstr(response, "next_start_line"));
+    free(response);
+    free(project);
+    cbm_mcp_server_free(srv);
+    th_rmtree(repo);
+    PASS();
+}
+
 TEST(tool_get_code_snippet_omits_over_budget_whole_line) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipwide_XXXXXX");
@@ -28860,6 +28916,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_code_snippet_pages_markdown_section_body);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
     RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
     RUN_TEST(tool_search_graph_includes_node_properties);
