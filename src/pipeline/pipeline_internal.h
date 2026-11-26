@@ -1701,6 +1701,10 @@ extern _Atomic uint64_t g_importance_store_rows;
 extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
 extern _Atomic uint64_t g_sh_candidates;
+/* Targets, prerequisites and target-prerequisite pairs the Make dependency
+ * drawing looked at (pass_shell.c sh_make_deps): linear in a rule line's
+ * words plus its distinct pairs, however often a name is repeated. */
+extern _Atomic uint64_t g_sh_make_pairs;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
