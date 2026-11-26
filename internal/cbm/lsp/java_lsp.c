@@ -591,6 +591,96 @@ static const CBMType *parse_type_arguments(JavaLSPContext *ctx, TSNode targs_nod
 /* "\x1c<package>": a package the shared registrar saw a project type in; the
  * key alone marks a registry that records them (java_register_types). */
 #define JAVA_PACKAGE_KEY "\x1c"
+/* "\x1b<name>": a simple name that some type of the registry declares as a
+ * member type (a type whose QN is a registered type's QN and the name, or a
+ * JAVA_MEMBER_KEY entry); the key alone marks a registry, and the registries
+ * it falls back to, as recording every such name (java_mark_member_names).
+ * A name no type declares as a member is no inherited member type of any
+ * class: the member walk for it is name-independent (java_class_unseen). */
+#define JAVA_MEMBER_NAME_KEY "\x1b"
+/* Memo keys of the name-independent results: a class's unseen supertypes
+ * (java_class_unseen) and an owner chain's rule-(i) verdict for a name no
+ * type declares as a member (java_decl_member). */
+#define JAVA_CLASS_UNSEEN_KEY "\x1a"
+#define JAVA_OWNER_CHAIN_KEY "\x19"
+
+/* Records, as JAVA_MEMBER_NAME_KEY entries, the member-type names of the types
+ * registered from `from` on: the last segment of a QN whose prefix is the QN
+ * of a type of the same batch (a JDK seed member type, a nested type of the
+ * calling file, a nested type the collector did not flatten), and the name
+ * of each JAVA_MEMBER_KEY entry. Each name once; work linear in the batch.
+ * With `seal`, also the key alone (every batch of the registry is marked). */
+static void java_mark_member_names(CBMTypeRegistry *reg, CBMArena *arena, int from, bool seal) {
+    if (!reg || !arena) {
+        return;
+    }
+    int end = reg->type_count;
+    CBMHashTable *qns = cbm_ht_create((uint32_t)((end - from) / 2 + 16));
+    CBMHashTable *names = cbm_ht_create(64);
+    if (!qns || !names) {
+        cbm_ht_free(qns);
+        cbm_ht_free(names);
+        return;
+    }
+    for (int i = from; i < end; i++) {
+        const char *q = reg->types[i].qualified_name;
+        if (q && q[0] && q[0] != JAVA_MEMBER_KEY[0]) {
+            cbm_ht_set(qns, q, (void *)q);
+        }
+    }
+    for (int i = from; i < end; i++) {
+        CBM_LSP_WORK(1);
+        const char *q = reg->types[i].qualified_name;
+        if (!q || !q[0]) {
+            continue;
+        }
+        const char *name = NULL;
+        char prefix[JAVA_LSP_BUF];
+        if (q[0] == JAVA_MEMBER_KEY[0]) {
+            const char *sep = strchr(q, '\x1f');
+            name = sep ? sep + 1 : NULL;
+        } else {
+            const char *dot = strrchr(q, '.');
+            size_t len = dot ? (size_t)(dot - q) : 0;
+            if (len > 0 && len < sizeof(prefix)) {
+                memcpy(prefix, q, len);
+                prefix[len] = '\0';
+                name = cbm_ht_get(qns, prefix) ? dot + 1 : NULL;
+            }
+        }
+        if (!name || !name[0] || cbm_ht_get(names, name)) {
+            continue;
+        }
+        cbm_ht_set(names, name, (void *)name);
+        CBMRegisteredType mark;
+        memset(&mark, 0, sizeof(mark));
+        mark.qualified_name = cbm_arena_sprintf(arena, JAVA_MEMBER_NAME_KEY "%s", name);
+        mark.short_name = JAVA_MEMBER_NAME_KEY;
+        if (mark.qualified_name) {
+            cbm_registry_add_type(reg, mark);
+        }
+    }
+    cbm_ht_free(qns);
+    cbm_ht_free(names);
+    if (seal) {
+        CBMRegisteredType mark;
+        memset(&mark, 0, sizeof(mark));
+        mark.qualified_name = JAVA_MEMBER_NAME_KEY;
+        mark.short_name = JAVA_MEMBER_NAME_KEY;
+        cbm_registry_add_type(reg, mark);
+    }
+}
+
+/* Whether `name` may be a member type some class inherits: true unless the
+ * registry records the member-type names and `name` is none of them. */
+static bool java_member_name_possible(const CBMTypeRegistry *reg, const char *name) {
+    if (!reg || !name || !name[0] || !cbm_registry_lookup_type(reg, JAVA_MEMBER_NAME_KEY)) {
+        return true;
+    }
+    char key[JAVA_LSP_BUF];
+    int n = snprintf(key, sizeof(key), JAVA_MEMBER_NAME_KEY "%s", name);
+    return n <= 0 || (size_t)n >= sizeof(key) || cbm_registry_lookup_type(reg, key) != NULL;
+}
 
 /* Whether a supertype the registry does not hold is known to lie outside the
  * project (the possible-against-proven rule): its package, read from the
@@ -848,6 +938,144 @@ static const char *java_inherited_member(const CBMTypeRegistry *reg, CBMArena *a
     return found;
 }
 
+/* The type a supertype spelling `e` leads the member walk to: `e` when the
+ * registry holds it, else the nested type a project spelling names through
+ * its owner (followed as java_inherited_member follows it); NULL with *kind
+ * the unseen kind otherwise. */
+static const char *java_unseen_target(const CBMTypeRegistry *reg, CBMArena *arena,
+                                      const JavaUnseenJudge *judge, const char *e,
+                                      unsigned *kind) {
+    *kind = 0;
+    for (int hops = 0; e && hops < JAVA_LSP_MAX_INHERIT_HOPS; hops++) {
+        if (cbm_registry_lookup_type(reg, e)) {
+            return e;
+        }
+        unsigned k = java_unseen_kind(judge, e);
+        const char *nested = NULL;
+        if (k & (JAVA_UNSEEN_PROJECT | JAVA_UNSEEN_PACKAGE)) {
+            nested = java_owner_spelled_type(reg, arena, e);
+        }
+        if (!nested) {
+            *kind = k;
+            return NULL;
+        }
+        e = nested;
+    }
+    return NULL;
+}
+
+typedef struct {
+    unsigned unseen;
+    int state; /* 0 queued, 1 expanded, 2 done */
+} JavaUnseenMemo;
+
+static JavaUnseenMemo *java_unseen_memo_at(CBMHashTable *memo, CBMArena *arena, const char *qn) {
+    char key[JAVA_LSP_BUF];
+    int n = snprintf(key, sizeof(key), JAVA_CLASS_UNSEEN_KEY "%s", qn);
+    if (n <= 0 || (size_t)n >= sizeof(key)) {
+        return NULL;
+    }
+    JavaUnseenMemo *m = (JavaUnseenMemo *)cbm_ht_get(memo, key);
+    if (!m) {
+        m = (JavaUnseenMemo *)cbm_arena_alloc(arena, sizeof(*m));
+        const char *k = cbm_arena_strdup(arena, key);
+        if (!m || !k) {
+            return NULL;
+        }
+        memset(m, 0, sizeof(*m));
+        cbm_ht_set(memo, k, m);
+    }
+    return m;
+}
+
+/* The unseen kinds java_inherited_member reports for `cls` and a name no
+ * type declares as a member (the walk then visits the whole ancestry): the
+ * union over every supertype it reaches. Kept per class in `memo` and built
+ * from the supertypes' own entries, so an ancestry shared by many classes is
+ * walked once; a cycle (javac rejects it) falls back to the walk itself. */
+static unsigned java_class_unseen(const CBMTypeRegistry *reg, CBMArena *arena, CBMHashTable *memo,
+                                  const JavaUnseenJudge *judge, const char *cls) {
+    bool none = false;
+    unsigned walked = 0;
+    if (!memo || !cls) {
+        (void)java_inherited_member(reg, arena, cls, JAVA_MEMBER_NAME_KEY, &none, judge, &walked);
+        return walked;
+    }
+    JavaUnseenMemo *root = java_unseen_memo_at(memo, arena, cls);
+    if (!root) {
+        (void)java_inherited_member(reg, arena, cls, JAVA_MEMBER_NAME_KEY, &none, judge, &walked);
+        return walked;
+    }
+    if (root->state == 2) {
+        CBM_LSP_WORK(1);
+        return root->unseen;
+    }
+    int cap = 16;
+    int sp = 0;
+    const char **stack = (const char **)cbm_arena_alloc(arena, (size_t)cap * sizeof(*stack));
+    if (!stack) {
+        return 0;
+    }
+    stack[sp++] = cls;
+    while (sp > 0) {
+        CBM_LSP_WORK(1);
+        const char *x = stack[sp - 1];
+        JavaUnseenMemo *m = java_unseen_memo_at(memo, arena, x);
+        if (!m || m->state == 2) {
+            sp--;
+            continue;
+        }
+        const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, x);
+        if (m->state == 0) {
+            m->state = 1;
+            for (int k = 0; rt && rt->embedded_types && rt->embedded_types[k]; k++) {
+                unsigned kind = 0;
+                const char *t = java_unseen_target(reg, arena, judge, rt->embedded_types[k], &kind);
+                JavaUnseenMemo *tm = t ? java_unseen_memo_at(memo, arena, t) : NULL;
+                if (!tm || tm->state != 0) {
+                    continue;
+                }
+                if (sp == cap) {
+                    const char **grown =
+                        (const char **)cbm_arena_alloc(arena, (size_t)cap * 2 * sizeof(*grown));
+                    if (!grown) {
+                        return 0;
+                    }
+                    memcpy(grown, stack, (size_t)sp * sizeof(*grown));
+                    stack = grown;
+                    cap *= 2;
+                }
+                stack[sp++] = t;
+            }
+            continue;
+        }
+        unsigned u = 0;
+        bool cycle = false;
+        for (int k = 0; rt && rt->embedded_types && rt->embedded_types[k]; k++) {
+            unsigned kind = 0;
+            const char *t = java_unseen_target(reg, arena, judge, rt->embedded_types[k], &kind);
+            if (!t) {
+                u |= kind;
+                continue;
+            }
+            JavaUnseenMemo *tm = java_unseen_memo_at(memo, arena, t);
+            if (tm && tm->state == 2) {
+                u |= tm->unseen;
+            } else {
+                cycle = true;
+            }
+        }
+        if (cycle) {
+            u = 0;
+            (void)java_inherited_member(reg, arena, x, JAVA_MEMBER_NAME_KEY, &none, judge, &u);
+        }
+        m->unseen = u;
+        m->state = 2;
+        sp--;
+    }
+    return root->unseen;
+}
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
                                            const char *cls, const char *name) {
@@ -946,6 +1174,8 @@ static void java_lsp_ctx_done(JavaLSPContext *ctx) {
     ctx->walk_memo = NULL;
     cbm_ht_free(ctx->inherit_memo); /* NULL-safe; its keys live in the arena */
     ctx->inherit_memo = NULL;
+    cbm_ht_free(ctx->unseen_memo); /* NULL-safe; its entries live in the arena */
+    ctx->unseen_memo = NULL;
 }
 
 static const char *java_resolve_type_name_in(JavaLSPContext *ctx, const char *name,
@@ -973,6 +1203,24 @@ typedef struct {
 static const char *java_inherited_member_ctx(JavaLSPContext *ctx, const char *cls,
                                              const char *name, bool *unnamed,
                                              const JavaUnseenJudge *judge, unsigned *unseen) {
+    if (!java_member_name_possible(ctx->registry, name)) {
+        /* No type declares the name as a member: no walk finds it, and what
+         * it meets is the class's, whatever the name. */
+        CBMHashTable *memo = NULL;
+        if (ctx->step0_ready) {
+            if (ctx->unseen_memo && ctx->unseen_memo_types != ctx->registry->type_count) {
+                cbm_ht_free(ctx->unseen_memo);
+                ctx->unseen_memo = NULL;
+            }
+            if (!ctx->unseen_memo) {
+                ctx->unseen_memo = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 64);
+                ctx->unseen_memo_types = ctx->registry->type_count;
+            }
+            memo = (CBMHashTable *)ctx->unseen_memo;
+        }
+        *unseen |= java_class_unseen(ctx->registry, ctx->arena, memo, judge, cls);
+        return NULL;
+    }
     char key[JAVA_LSP_BUF];
     int n = -1;
     if (ctx->step0_ready && cls) {
@@ -1075,6 +1323,12 @@ static JavaStep0 java_step0_compute(JavaLSPContext *ctx, const char *name) {
  * dropped when its type count changes, so each pair walks once (step 0 is a
  * function of the registry, the classes, the name and the judge). */
 static JavaStep0 java_step0(JavaLSPContext *ctx, const char *name) {
+    /* A name no type declares as a member: step 0 finds no member type for
+     * it, and what it meets is the enclosing classes', whatever the name, so
+     * one entry per enclosing classes serves every such name. */
+    if (!java_member_name_possible(ctx->registry, name)) {
+        name = JAVA_MEMBER_NAME_KEY;
+    }
     char key[JAVA_LSP_BUF];
     int n = -1;
     if (ctx->step0_ready) {
@@ -4120,15 +4374,90 @@ typedef struct {
 } JavaDeclMemo;
 
 static _Thread_local CBMHashTable *g_java_decl_memo;
+/* java_class_unseen's entries for the same registrar run. */
+static _Thread_local CBMHashTable *g_java_decl_unseen;
 
 static void java_decl_memo_begin(void) {
     cbm_ht_free(g_java_decl_memo); /* NULL-safe */
+    cbm_ht_free(g_java_decl_unseen);
     g_java_decl_memo = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 256);
+    g_java_decl_unseen = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 64);
 }
 
 static void java_decl_memo_end(void) {
     cbm_ht_free(g_java_decl_memo); /* NULL-safe; its entries live in the registrar's arena */
+    cbm_ht_free(g_java_decl_unseen);
     g_java_decl_memo = NULL;
+    g_java_decl_unseen = NULL;
+}
+
+/* java_decl_member_walk for a name no type declares as a member: no owner
+ * declares or inherits it, so the answer is rule (i)'s verdict along the owner
+ * links, a function of the owner alone (the first owner whose ancestry meets
+ * a supertype of rule (i) withholds; an owner whose QN two types share ends
+ * the chain). Kept per owner for the registrar run, so nested owners share
+ * their enclosing owners' verdicts; owner links that loop are not kept. */
+static JavaDeclMemo java_owner_chain_nonmember(const JavaDeclScope *s, CBMArena *a) {
+    JavaDeclMemo none = {0};
+    if (!s->owner) {
+        return none;
+    }
+    JavaUnseenJudge judge = {.reg = s->reg, .packages = g_java_reg_packages};
+    const char *local[JAVA_TYPE_QUEUE_LOCAL] = {0};
+    JavaTypeQueue chain = {.items = local, .cap = JAVA_TYPE_QUEUE_LOCAL};
+    JavaDeclMemo next = none;
+    bool looped = false;
+    for (const char *o = s->owner; o;) {
+        CBM_LSP_WORK(1);
+        char key[JAVA_LSP_BUF];
+        int n = snprintf(key, sizeof(key), JAVA_OWNER_CHAIN_KEY "%s", o);
+        const JavaDeclMemo *hit = g_java_decl_memo && n > 0 && (size_t)n < sizeof(key)
+                                      ? (const JavaDeclMemo *)cbm_ht_get(g_java_decl_memo, key)
+                                      : NULL;
+        if (hit) {
+            next = *hit;
+            break;
+        }
+        int before = chain.count;
+        java_type_queue_push(a, &chain, o);
+        if (chain.count == before) {
+            looped = true; /* met again: the owner links loop */
+            break;
+        }
+        if (java_type_ambiguous(s->reg, o)) {
+            break; /* the chain ends after this owner's own verdict */
+        }
+        n = snprintf(key, sizeof(key), JAVA_OWNER_KEY "%s", o);
+        const CBMRegisteredType *e =
+            n > 0 && (size_t)n < sizeof(key) ? cbm_registry_lookup_type(s->reg, key) : NULL;
+        o = e ? e->alias_of : NULL;
+    }
+    /* The verdicts from the outermost owner met back to s->owner. */
+    for (int i = chain.count - 1; i >= 0; i--) {
+        const char *o = chain.items[i];
+        unsigned u = java_class_unseen(s->reg, a, g_java_decl_unseen, &judge, o);
+        JavaDeclMemo r = next;
+        if (u & JAVA_UNSEEN_PROJECT) {
+            r.found = NULL;
+            r.unnamed = true; /* rule (i): no proven type for the name */
+            r.withheld = u & (JAVA_UNSEEN_PROJECT | JAVA_UNSEEN_CLOSURE);
+        } else if (java_type_ambiguous(s->reg, o)) {
+            r = none;
+        }
+        char key[JAVA_LSP_BUF];
+        int n = snprintf(key, sizeof(key), JAVA_OWNER_CHAIN_KEY "%s", o);
+        if (!looped && g_java_decl_memo && n > 0 && (size_t)n < sizeof(key)) {
+            JavaDeclMemo *slot = (JavaDeclMemo *)cbm_arena_alloc(a, sizeof(*slot));
+            const char *k = slot ? cbm_arena_strdup(a, key) : NULL;
+            if (slot && k) {
+                *slot = r;
+                cbm_ht_set(g_java_decl_memo, k, slot);
+            }
+        }
+        next = r;
+    }
+    cbm_ht_free(chain.seen); /* NULL-safe */
+    return next;
 }
 
 static const char *java_decl_member_walk(const JavaDeclScope *s, CBMArena *a, const char *name,
@@ -4174,7 +4503,8 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
                                     bool *unnamed) {
     char key[JAVA_LSP_BUF];
     int n = -1;
-    if (g_java_decl_memo && s->owner) {
+    bool member_name = java_member_name_possible(s->reg, name);
+    if (g_java_decl_memo && s->owner && member_name) {
         n = snprintf(key, sizeof(key), "%s\x1f%s", s->owner, name);
     }
     JavaDeclMemo r = {0};
@@ -4183,7 +4513,9 @@ static const char *java_decl_member(const JavaDeclScope *s, CBMArena *a, const c
         CBM_LSP_WORK(1);
         hit = (const JavaDeclMemo *)cbm_ht_get(g_java_decl_memo, key);
     }
-    if (hit) {
+    if (!member_name) {
+        r = java_owner_chain_nonmember(s, a);
+    } else if (hit) {
         r = *hit;
     } else {
         r.found = java_decl_member_walk(s, a, name, &r.unnamed, &r.withheld);
@@ -4313,6 +4645,11 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                                                         : d->qualified_name;
         cbm_registry_add_type(reg, stub);
     }
+    /* The member-type names of the types registered so far (a per-file registry's
+     * JDK seed and the file's types; an overlay's own), before the index takes
+     * them in. A per-file registry has no fallback and holds every name it can
+     * meet: it is sealed. */
+    java_mark_member_names(reg, a, 0, reg->fallback == NULL);
     /* Every local type is in: from here on a type is found by name, not by a scan of
      * every registered type per definition (first registrations, as the scan). */
     if (reg->tail_arena)
@@ -4819,6 +5156,9 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     cbm_arena_init_lazy(&scratch, JAVA_SCRATCH_ARENA_BLOCK);
     reg.tail_arena = &scratch;
     register_local_func_or_type_from_file(&ctx, &reg, result);
+    /* The registry's types are complete (patching below changes signatures and
+     * fields, not types): step 0 and the supertype walks may be memoized from here. */
+    ctx.step0_ready = true;
 
     /* Overloads share a QN, so patching a method asks for all of its registrations. */
     ctx.func_rows_arena = &scratch;
@@ -4848,7 +5188,6 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     ctx.func_name_count = 0;
 
     /* Walk the file. */
-    ctx.step0_ready = true; /* the registry is complete: step 0 may be memoized */
     java_lsp_process_file(&ctx, root);
     java_lsp_ctx_done(&ctx);
     cbm_arena_destroy(&scratch);
@@ -5201,6 +5540,7 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     /* Types, the marks of the QNs two of them share, then (indexed) their
      * supertypes and fields through their identities, then the methods. */
     java_register_types(arena, reg, jvm, type_count);
+    java_mark_member_names(reg, arena, 0, true); /* the JDK seed's and the project's */
     cbm_java_mark_ambiguous_types(arena, reg, jvm, type_count);
     cbm_registry_finalize(reg);
     java_register_type_details(arena, reg, jvm, type_count);
@@ -5370,6 +5710,7 @@ void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int so
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
     java_register_types(arena, &reg, defs, def_count);
+    java_mark_member_names(&reg, arena, 0, true); /* the JDK seed's and the closure's */
     cbm_java_mark_ambiguous_types(arena, &reg, defs, def_count);
     cbm_registry_finalize_into(&reg, &idx_arena);
     g_java_reg_packages = packages;

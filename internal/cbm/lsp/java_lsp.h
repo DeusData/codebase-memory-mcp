@@ -105,6 +105,10 @@ typedef struct {
      * count) (java_inherited_unique): made and dropped as walk_memo. */
     void *inherit_memo;
     int inherit_memo_types;
+    /* The unseen kinds of a class's ancestry (java_class_unseen): made and
+     * dropped as walk_memo. */
+    void *unseen_memo;
+    int unseen_memo_types;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */

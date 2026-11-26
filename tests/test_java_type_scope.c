@@ -2087,6 +2087,240 @@ TEST(java_type_scope_growth_inherited_rule) {
     PASS();
 }
 
+/* Distinct type names (review 4): n top-level classes g.T<i>, a chain of d
+ * classes g.A0 extends g.A1 ..., and a class extending g.A0 with a method
+ * declaring a local of each T<i> and a method p<i>(T<i> x) for each. Every
+ * name is distinct, so no (class, name) memo repeats: a name no type declares
+ * as a member type must not walk the ancestry. With k > 1 the methods sit in
+ * a class nested k deep (O0 { O1 { ... } }, each extending g.A0). With
+ * `nested_names` the T<i> are instead member types of an unrelated class
+ * g.Z, so every name may be an inherited member and is walked (the residual).
+ * The per-file engine's counted work (step 0). */
+static uint64_t jts_names_step0_work(int n, int d, int k, bool nested_names) {
+    size_t cap = (size_t)(2 * n + d + k) * 64 + 1024;
+    char *src = malloc(cap);
+    if (!src) {
+        return 0;
+    }
+    size_t at = 0;
+    at += (size_t)snprintf(src + at, cap - at, "package g;\n\n");
+    if (nested_names) {
+        at += (size_t)snprintf(src + at, cap - at, "class Z {\n");
+    }
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at,
+                               nested_names ? " static class T%d {\n }\n" : "class T%d {\n}\n", i);
+    }
+    if (nested_names) {
+        at += (size_t)snprintf(src + at, cap - at, "}\n");
+    }
+    for (int i = 0; i < d; i++) {
+        if (i + 1 < d) {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d extends A%d {\n}\n", i, i + 1);
+        } else {
+            at += (size_t)snprintf(src + at, cap - at, "class A%d {\n}\n", i);
+        }
+    }
+    for (int j = 0; j < k; j++) {
+        at += (size_t)snprintf(src + at, cap - at, "%sclass O%d extends A0 {\n", j ? " " : "", j);
+    }
+    at += (size_t)snprintf(src + at, cap - at, " void m() {\n");
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at, "  T%d t%d = null;\n", i, i);
+    }
+    at += (size_t)snprintf(src + at, cap - at, " }\n");
+    for (int i = 0; i < n; i++) {
+        at += (size_t)snprintf(src + at, cap - at, " void p%d(T%d x) {\n }\n", i, i);
+    }
+    for (int j = 0; j < k; j++) {
+        at += (size_t)snprintf(src + at, cap - at, "}\n");
+    }
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)at, CBM_LANG_JAVA, "g", "src/g/Main.java", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return work;
+}
+
+/* The same shape for the shared registrar: classes g.T<i>, the chain g.A<i>,
+ * owners g.O0 .. g.O<k-1> (each nested in the one before, the collector's
+ * member links, each extending g.A0) and n methods p<i>(T<i>) of the innermost
+ * owner. With member_names the T<i> are member types of an unrelated class
+ * g.Z (g.Z.T<i>). Its counted work. */
+static uint64_t jts_names_registrar_work(int n, int d, int k, bool member_names) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int z = member_names ? 1 : 0; /* g.Z */
+    int total = n + d + k + z + n;
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_alloc(&arena, (size_t)total * sizeof(*defs));
+    if (!defs) {
+        cbm_arena_destroy(&arena);
+        return 0;
+    }
+    memset(defs, 0, (size_t)total * sizeof(*defs));
+    int at = 0;
+    const char *tpre = member_names ? "g.Z." : "g.";
+    for (int i = 0; i < n; i++, at++) {
+        defs[at].qualified_name = cbm_arena_sprintf(&arena, "%sT%d", tpre, i);
+        defs[at].short_name = cbm_arena_sprintf(&arena, "T%d", i);
+        defs[at].label = "Class";
+        defs[at].receiver_type = member_names ? "g.Z" : NULL;
+    }
+    for (int i = 0; i < d; i++, at++) {
+        defs[at].qualified_name = cbm_arena_sprintf(&arena, "g.A%d", i);
+        defs[at].short_name = cbm_arena_sprintf(&arena, "A%d", i);
+        defs[at].label = "Class";
+        defs[at].embedded_types = i + 1 < d ? cbm_arena_sprintf(&arena, "g.A%d", i + 1) : NULL;
+    }
+    for (int j = 0; j < k; j++, at++) {
+        defs[at].qualified_name = cbm_arena_sprintf(&arena, "g.O%d", j);
+        defs[at].short_name = cbm_arena_sprintf(&arena, "O%d", j);
+        defs[at].label = "Class";
+        defs[at].embedded_types = "g.A0";
+        defs[at].receiver_type = j ? cbm_arena_sprintf(&arena, "g.O%d", j - 1) : NULL;
+    }
+    if (member_names) {
+        defs[at].qualified_name = "g.Z";
+        defs[at].short_name = "Z";
+        defs[at].label = "Class";
+        at++;
+    }
+    for (int i = 0; i < n + d + k + z; i++) {
+        defs[i].lang = CBM_LANG_JAVA;
+        defs[i].namespace_name = "g";
+    }
+    const char *owner = cbm_arena_sprintf(&arena, "g.O%d", k - 1);
+    for (int i = 0; i < n; i++, at++) {
+        const char **params = (const char **)cbm_arena_alloc(&arena, sizeof(*params));
+        if (!params) {
+            cbm_arena_destroy(&arena);
+            return 0;
+        }
+        params[0] = cbm_arena_sprintf(&arena, "T%d", i);
+        defs[at].qualified_name = cbm_arena_sprintf(&arena, "%s.p%d", owner, i);
+        defs[at].short_name = cbm_arena_sprintf(&arena, "p%d", i);
+        defs[at].label = "Method";
+        defs[at].lang = CBM_LANG_JAVA;
+        defs[at].namespace_name = "g";
+        defs[at].receiver_type = owner;
+        defs[at].signature_param_types = params;
+        defs[at].signature_param_count = 1;
+        defs[at].type_scope = cbm_arena_sprintf(&arena, "T%d=%sT%d", i, tpre, i);
+    }
+    (void)cbm_lsp_work_take();
+    CBMTypeRegistry *reg = cbm_java_build_cross_registry(&arena, defs, total);
+    uint64_t work = cbm_lsp_work_take();
+    cbm_arena_destroy(&arena);
+    return reg ? work : 0;
+}
+
+/* n distinct names in a class with an ancestry of depth d, both at 1x, 4x,
+ * 16x: step 0's counted work grows linearly (a name no type declares as a
+ * member type costs a probe, not an ancestry walk). */
+TEST(java_type_scope_growth_distinct_names_step0) {
+    uint64_t w1 = jts_names_step0_work(50, 10, 1, false);
+    uint64_t w4 = jts_names_step0_work(200, 40, 1, false);
+    uint64_t w16 = jts_names_step0_work(800, 160, 1, false);
+    printf("\n  distinct names, step 0, n/d 50/10, 200/40, 800/160: work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
+/* The same with the names used in a class nested k deep, n/d/k all scaled. */
+TEST(java_type_scope_growth_distinct_names_step0_nested) {
+    uint64_t w1 = jts_names_step0_work(50, 10, 2, false);
+    uint64_t w4 = jts_names_step0_work(200, 40, 8, false);
+    uint64_t w16 = jts_names_step0_work(800, 160, 32, false);
+    printf("\n  distinct names, step 0 nested, n/d/k 50/10/2, 200/40/8, 800/160/32: work %llu / %llu / "
+           "%llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
+/* n signatures with distinct type names of a class with an ancestry of
+ * depth d: the registrar's counted work grows linearly. */
+TEST(java_type_scope_growth_distinct_names_registrar) {
+    uint64_t w1 = jts_names_registrar_work(50, 10, 1, false);
+    uint64_t w4 = jts_names_registrar_work(200, 40, 1, false);
+    uint64_t w16 = jts_names_registrar_work(800, 160, 1, false);
+    printf("\n  distinct names, registrar, n/d 50/10, 200/40, 800/160: work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
+/* The same for an owner nested k deep: the enclosing owners' verdicts are
+ * shared, n/d/k all scaled. */
+TEST(java_type_scope_growth_distinct_names_registrar_nested) {
+    uint64_t w1 = jts_names_registrar_work(50, 10, 2, false);
+    uint64_t w4 = jts_names_registrar_work(200, 40, 8, false);
+    uint64_t w16 = jts_names_registrar_work(800, 160, 32, false);
+    printf("\n  distinct names, registrar nested, n/d/k 50/10/2, 200/40/8, 800/160/32: work %llu / %llu "
+           "/ %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w4 <= (double)w1 * 4.0 * 1.25);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 16.0 * 1.25);
+    PASS();
+}
+
+/* The residual: names that some type declares as a member type (here member
+ * types of an unrelated class g.Z) are walked once per (class, name), so the
+ * work grows with names times ancestry. Measured, and held to that bound. */
+TEST(java_type_scope_growth_member_names_residual) {
+    uint64_t w1 = jts_names_step0_work(50, 10, 1, true);
+    uint64_t w4 = jts_names_step0_work(200, 40, 1, true);
+    uint64_t w16 = jts_names_step0_work(800, 160, 1, true);
+    printf("\n  member-type names (residual), step 0, n/d 50/10, 200/40, 800/160: work %llu / %llu / "
+           "%llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 256.0 * 1.25);
+    PASS();
+}
+
+/* The residual inside a class nested k deep: each enclosing class walks its
+ * ancestry once per member-type name, so names times nesting times ancestry
+ * (n/d/k all scaled: 4,096 at 16x). Measured, and held to that bound. */
+TEST(java_type_scope_growth_member_names_residual_nested) {
+    uint64_t w1 = jts_names_step0_work(50, 10, 2, true);
+    uint64_t w4 = jts_names_step0_work(200, 40, 8, true);
+    uint64_t w16 = jts_names_step0_work(800, 160, 32, true);
+    printf("\n  member-type names (residual), step 0 nested, n/d/k 50/10/2, 200/40/8, 800/160/32: work "
+           "%llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 4096.0 * 1.25);
+    PASS();
+}
+
+/* The registrar's residual: a member-type name walks the owner chain's
+ * ancestries once per (owner, name), names times nesting times ancestry
+ * (n/d/k all scaled). Measured, and held to that bound. */
+TEST(java_type_scope_growth_member_names_residual_registrar) {
+    uint64_t w1 = jts_names_registrar_work(50, 10, 2, true);
+    uint64_t w4 = jts_names_registrar_work(200, 40, 8, true);
+    uint64_t w16 = jts_names_registrar_work(800, 160, 32, true);
+    printf("\n  member-type names (residual), registrar nested, n/d/k 50/10/2, 200/40/8, 800/160/32: "
+           "work %llu / %llu / %llu\n",
+           (unsigned long long)w1, (unsigned long long)w4, (unsigned long long)w16);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE((double)w16 <= (double)w1 * 4096.0 * 1.25);
+    PASS();
+}
+
 TEST(java_type_scope_growth_supertype_chain) {
     bool f1 = false;
     bool f4 = false;
@@ -2215,5 +2449,12 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_growth_nested_epochs);
     RUN_TEST(java_type_scope_growth_registrar_walks);
     RUN_TEST(java_type_scope_growth_inherited_rule);
+    RUN_TEST(java_type_scope_growth_distinct_names_step0);
+    RUN_TEST(java_type_scope_growth_distinct_names_step0_nested);
+    RUN_TEST(java_type_scope_growth_distinct_names_registrar);
+    RUN_TEST(java_type_scope_growth_distinct_names_registrar_nested);
+    RUN_TEST(java_type_scope_growth_member_names_residual);
+    RUN_TEST(java_type_scope_growth_member_names_residual_nested);
+    RUN_TEST(java_type_scope_growth_member_names_residual_registrar);
 #endif
 }
