@@ -3096,6 +3096,100 @@ TEST(probe_kustomize_helm_charts_deploy_their_chart) {
     PASS();
 }
 
+/* Every REFERENCES_FILE edge a local `uses:` draws, as
+ * "<file> -> <target file> (uses:line)", sorted, one per line. */
+static char *gpf_local_uses(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' "
+            "AND json_extract(e.properties,'$.via')='uses' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A local `uses:` ("./...") is a path from the repository root, wherever the
+ * workflow or action lies. A step's names an action by its directory: the
+ * edge goes to that directory's action.yml or action.yaml, the one it holds.
+ * A job's names a reusable workflow file. Each file once, at the first use.
+ * No edge for an action of another repository, a path with an expression, a
+ * directory with no action file, or one holding both spellings. */
+TEST(probe_github_actions_local_uses_reference_their_files) {
+    static const GpfFile files[] = {
+        {".github/workflows/ci.yml", "name: ci\n"
+                                     "on: [push]\n"
+                                     "jobs:\n"
+                                     "  build:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - uses: actions/checkout@v4\n"
+                                     "      - uses: ./.github/actions/setup\n"
+                                     "      - uses: ./\n"
+                                     "      - uses: ./.github/actions/${{ matrix.kind }}\n"
+                                     "      - uses: ./.github/actions/missing\n"
+                                     "      - uses: ./.github/actions/both\n"
+                                     "      - name: again\n"
+                                     "        uses: ./.github/actions/setup\n"
+                                     "      - run: echo done\n"
+                                     "  call:\n"
+                                     "    uses: ./.github/workflows/reusable.yml\n"
+                                     "  far:\n"
+                                     "    uses: org/repo/.github/workflows/x.yml@main\n"},
+        {".github/workflows/reusable.yml", "on:\n"
+                                           "  workflow_call: {}\n"
+                                           "jobs:\n"
+                                           "  a:\n"
+                                           "    runs-on: ubuntu-latest\n"
+                                           "    steps:\n"
+                                           "      - run: echo a\n"},
+        {".github/actions/setup/action.yml", "name: setup\n"
+                                             "runs:\n"
+                                             "  using: composite\n"
+                                             "  steps:\n"
+                                             "    - uses: ./.github/actions/inner\n"
+                                             "    - run: echo setup\n"
+                                             "      shell: bash\n"},
+        {".github/actions/inner/action.yaml", "name: inner\n"
+                                              "runs:\n"
+                                              "  using: composite\n"
+                                              "  steps:\n"
+                                              "    - run: echo inner\n"
+                                              "      shell: bash\n"},
+        {".github/actions/both/action.yml", "name: both\nruns:\n  using: composite\n  steps: []\n"},
+        {".github/actions/both/action.yaml", "name: both\nruns:\n  using: composite\n  steps: []\n"},
+        {"action.yaml", "name: root\nruns:\n  using: composite\n  steps: []\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_local_uses(files, n);
+    static const char want[] =
+        ".github/actions/setup/action.yml -> .github/actions/inner/action.yaml (uses:5)\n"
+        ".github/workflows/ci.yml -> .github/actions/setup/action.yml (uses:8)\n"
+        ".github/workflows/ci.yml -> .github/workflows/reusable.yml (uses:17)\n"
+        ".github/workflows/ci.yml -> action.yaml (uses:9)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "local uses got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("local uses");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every Terraform reference edge as
  * "<file> <block> -> <file> <block> <type> <ref>:<line>", then a line
  * "other tf edges <n>": USAGE / CALLS edges leaving a .tf file that the
@@ -7427,6 +7521,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_ci_and_scripts_run_scripts);
+    RUN_TEST(probe_github_actions_local_uses_reference_their_files);
     RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_make_rules_have_a_node_per_target);
     RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);

@@ -5565,6 +5565,85 @@ TEST(incremental_terraform_file_reference_follows_its_file) {
     PASS();
 }
 
+/* A workflow's local action whose action file appears after the workflow was
+ * indexed. */
+TEST(incremental_local_uses_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps(".github/workflows/ci.yml",
+                                              "name: ci\n"
+                                              "on: [push]\n"
+                                              "jobs:\n"
+                                              "  build:\n"
+                                              "    runs-on: ubuntu-latest\n"
+                                              "    steps:\n"
+                                              "      - uses: ./.github/actions/late\n",
+                                              NULL, NULL, ".github/actions/late/action.yml",
+                                              "uses", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A local action is named by its directory, and the edge goes to the one
+ * action file it holds. With both spellings there is none; deleting one of
+ * the two makes the other the action, although no workflow changed. The
+ * repair reads no workflow again, so that deletion takes the full route. */
+TEST(incremental_local_action_pair_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_actpair_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, ".github/workflows/ci.yml", "name: ci\n"
+                                                     "on: [push]\n"
+                                                     "jobs:\n"
+                                                     "  build:\n"
+                                                     "    runs-on: ubuntu-latest\n"
+                                                     "    steps:\n"
+                                                     "      - uses: ./.github/actions/both\n");
+    static const char action[] = "name: both\nruns:\n  using: composite\n  steps: []\n";
+    write_temp_file(tmp, ".github/actions/both/action.yml", action);
+    write_temp_file(tmp, ".github/actions/both/action.yaml", action);
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/actpair.db", tmp);
+    static const char uses[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='uses'";
+    static const char to_yml[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='.github/actions/both/action.yml'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int uses_full = k8s_inc_count(db_path, uses);
+
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\necho edited\n");
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int uses_other = k8s_inc_count(db_path, uses);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.github/actions/both/action.yaml", tmp);
+    (void)remove(path);
+    int rc_pair = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t pair_route = cbm_pipeline_incremental_test_last_route();
+    int uses_pair = k8s_inc_count(db_path, uses);
+    int yml_pair = k8s_inc_count(db_path, to_yml);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(uses_full, 0); /* two action files: which one GitHub reads is not ours to say */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(uses_other, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_pair, 0);
+    ASSERT_EQ(uses_pair, 1); /* action.yml is the action now */
+    ASSERT_EQ(yml_pair, 1);
+    ASSERT_EQ(pair_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -37106,6 +37185,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_docker_copy_reference_follows_its_file);
     RUN_TEST(incremental_compose_file_reference_follows_its_file);
     RUN_TEST(incremental_terraform_file_reference_follows_its_file);
+    RUN_TEST(incremental_local_uses_reference_follows_its_file);
+    RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

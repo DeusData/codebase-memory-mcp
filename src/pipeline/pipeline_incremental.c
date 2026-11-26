@@ -2781,6 +2781,35 @@ static const char *closure_docker_context_decline(const cbm_file_info_t *files, 
     return decline;
 }
 
+/* A workflow names a local action by its directory, and its edge goes to the
+ * one action file that directory holds (pass_shell.c sh_ci_use); with both
+ * spellings, action.yml and action.yaml, there is none. Deleting one of the
+ * two makes the other the action: an edge the full index draws from a
+ * workflow that did not change, and the repair reads no workflow again. So
+ * a deleted action file whose other spelling is still indexed declines.
+ * One lookup per deleted file. Returns the reason, or NULL. */
+static const char *closure_local_action_decline(CBMHashTable *files_by_path, char **deleted,
+                                                int n_deleted) {
+    static const char *const names[PAIR_LEN] = {"action.yml", "action.yaml"};
+    for (int i = 0; i < n_deleted; i++) {
+        const char *p = deleted[i];
+        const char *slash = p ? strrchr(p, '/') : NULL;
+        const char *base = slash ? slash + SKIP_ONE : p;
+        for (int k = 0; base && k < PAIR_LEN; k++) {
+            if (strcmp(base, names[k]) != 0) {
+                continue;
+            }
+            char other[CBM_SZ_4K];
+            int n = snprintf(other, sizeof(other), "%.*s%s", (int)(base - p), p,
+                             names[PAIR_LEN - SKIP_ONE - k]);
+            if (n > 0 && (size_t)n < sizeof(other) && cbm_ht_get(files_by_path, other)) {
+                return "local_action_pair_deleted";
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -3357,6 +3386,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     decline = closure_docker_context_decline(files, file_count, files_by_path,
                                              changed_paths + n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_local_action_decline(files_by_path, changed_paths + n_changed, n_deleted);
     if (decline) {
         goto done;
     }

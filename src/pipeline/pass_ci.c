@@ -14,6 +14,9 @@
  *    unknown one. In the text, `${{ github.workspace }}` is
  *    $GITHUB_WORKSPACE, `${{ github.action_path }}` $GITHUB_ACTION_PATH, any
  *    other `${{ }}` an unknown variable (its line breaks kept).
+ *    A local `uses:` ("./...", a path from the repository root) is handed on
+ *    as well: a step's names an action directory, a job's a reusable
+ *    workflow file; one with `${{` in it is none.
  *  - Prow: a file with a top-level presubmits / postsubmits / periodics key
  *    (in-repo job config). A job container's command + args is exec'd, no
  *    shell: the words are literal, a kubelet `$(VAR)` unknown; `bash -c TEXT`
@@ -53,6 +56,8 @@ typedef struct {
     const char *src;
     const char *rel;
     cbm_ci_cmd_fn fn;
+    cbm_ci_use_fn use_fn;              /* local `uses:`; NULL: not wanted */
+    void *use_ud;                      /* use_fn's own userdata */
     cbm_build_site_fn site_fn;         /* a build-site walk's callback */
     cbm_compose_service_fn service_fn; /* a compose walk's callback */
     void *ud;
@@ -451,10 +456,29 @@ static const char *ci_run_default(const ci_t *c, TSNode m, const char *key) {
     return ci_get_str(c, ci_get(c, ci_get(c, m, "defaults"), "run"), key);
 }
 
+static const char *ci_repo_path(CBMArena *a, const char *base, const char *rel);
+
+/* The `uses:` of step or job `owner` when it names something of this
+ * repository: "./dir", "./.github/workflows/x.yml". One with an expression in
+ * it, or leaving the repository, is none. */
+static void ci_local_use(const ci_t *c, TSNode owner, bool job) {
+    int row = 0;
+    const char *uses = c->use_fn ? ci_scalar(c, ci_get(c, owner, "uses"), &row) : NULL;
+    if (!uses || uses[0] != '.' || uses[SKIP_ONE] != '/' || strstr(uses, CI_EXPR_OPEN)) {
+        return;
+    }
+    const char *path = ci_repo_path(c->a, "", uses);
+    if (path) {
+        cbm_ci_use_t use = {.path = path, .job = job, .line = row + SKIP_ONE};
+        c->use_fn(&use, c->use_ud);
+    }
+}
+
 static void ci_gha_steps(const ci_t *c, TSNode steps, const char *job, const ci_scope_t *sc) {
     int n = 0;
     TSNode *items = ci_items(c, steps, &n);
     for (int i = 0; i < n; i++) {
+        ci_local_use(c, items[i], false);
         int row = 0;
         const char *run = ci_scalar(c, ci_get(c, items[i], "run"), &row);
         if (!run) {
@@ -500,6 +524,7 @@ static void ci_workflow(const ci_t *c, TSNode root) {
     ci_pair_t *jobs = ci_pairs(c, ci_get(c, root, "jobs"), &n);
     for (int i = 0; i < n; i++) {
         TSNode j = jobs[i].value;
+        ci_local_use(c, j, true);
         const char *wd = ci_run_default(c, j, "working-directory");
         const char *sh = ci_run_default(c, j, "shell");
         ci_scope_t sc = {.env = ci_env_add(c, &wenv, ci_get(c, j, "env")),
@@ -1392,7 +1417,7 @@ bool cbm_ci_path(const char *rel) {
 }
 
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
-                     void *ud) {
+                     void *ud, cbm_ci_use_fn use_fn, void *use_ud) {
     if (!ci_yaml_ext(rel)) {
         return;
     }
@@ -1405,7 +1430,8 @@ void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, 
         tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
     }
     if (tree) {
-        ci_t c = {.a = a, .src = src, .rel = rel, .fn = fn, .ud = ud};
+        ci_t c = {
+            .a = a, .src = src, .rel = rel, .fn = fn, .ud = ud, .use_fn = use_fn, .use_ud = use_ud};
         TSNode stream = ts_tree_root_node(tree);
         for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++) {
             TSNode doc = ts_node_named_child(stream, i);

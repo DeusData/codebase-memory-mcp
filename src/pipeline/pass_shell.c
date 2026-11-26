@@ -4020,11 +4020,53 @@ static void sh_ci_cmd(const cbm_ci_cmd_t *cmd, void *ud) {
     sh_state_free(&s);
 }
 
+typedef struct {
+    sh_pass_t *p;
+    const char *rel;
+    CBMArena *a;
+    CBMHashTable *seen; /* target paths drawn */
+} sh_ci_use_t;
+
+/* A local `uses:` of a workflow or composite action: REFERENCES_FILE {via:
+ * uses, line} from its File to the file it names -- a job's reusable
+ * workflow, a step's action by its action.yml or action.yaml (the one the
+ * directory holds; with both, or neither, there is no edge) -- once per
+ * file, at the first use. */
+static void sh_ci_use(const cbm_ci_use_t *use, void *ud) {
+    static const char *const NAMES[PAIR_LEN] = {"action.yml", "action.yaml"};
+    sh_ci_use_t *x = ud;
+    const sh_index_t *ix = x->p->ix;
+    const char *target = use->job ? use->path : NULL;
+    for (int k = 0; !use->job && k < PAIR_LEN; k++) {
+        const char *cand =
+            cbm_arena_sprintf(x->a, "%s%s%s", use->path, use->path[0] ? "/" : "", NAMES[k]);
+        if (cand && cbm_ht_get(ix->file_ids, cand)) {
+            if (target) {
+                return; /* both spellings: which one GitHub reads is not ours to say */
+            }
+            target = cand;
+        }
+    }
+    int64_t src = (int64_t)(intptr_t)cbm_ht_get(ix->file_ids, x->rel);
+    int64_t tgt = target ? (int64_t)(intptr_t)cbm_ht_get(ix->file_ids, target) : 0;
+    if (src <= 0 || tgt <= 0 || src == tgt || !x->seen || cbm_ht_get(x->seen, target)) {
+        return;
+    }
+    cbm_ht_set(x->seen, target, (void *)target);
+    char props[CBM_SZ_64];
+    snprintf(props, sizeof(props), "{\"via\":\"uses\",\"line\":%d}", use->line);
+    cbm_gbuf_insert_edge(ix->ctx->gbuf, src, tgt, "REFERENCES_FILE", props);
+}
+
 static void sh_ci_file(sh_pass_t *p, const char *rel, const char *src, size_t len) {
     CBMArena a;
     cbm_arena_init(&a);
     sh_ci_t x = {.p = p, .rel = rel, .a = &a};
-    cbm_ci_commands(&a, rel, src, len, sh_ci_cmd, &x);
+    sh_ci_use_t u = {.p = p, .rel = rel, .a = &a, .seen = cbm_ht_create(0)};
+    cbm_ci_commands(&a, rel, src, len, sh_ci_cmd, &x, sh_ci_use, &u);
+    if (u.seen) {
+        cbm_ht_free(u.seen);
+    }
     cbm_arena_destroy(&a);
 }
 
