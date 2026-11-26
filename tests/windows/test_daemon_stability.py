@@ -520,6 +520,41 @@ def section_churn_stability(binary, work):
         kill_pid(daemon_pid)
 
 
+UNREADABLE_TRACE = b"worker trace temporarily unreadable"
+
+
+def read_cleanup_trace(err_path, cache, traces):
+    # The supervisor removes successful worker logs while this guard polls them.
+    paths = [err_path]
+    log_dir = os.path.join(cache, "logs")
+    if os.path.isdir(log_dir):
+        paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
+                     if name.startswith(".worker-log-"))
+    unavailable = []
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                traces[path] = handle.read()
+        except FileNotFoundError:
+            pass
+        except PermissionError as error:
+            # Windows also refuses opens during deletion/sharing contention.
+            # Keep the last trace and retry on the next poll; retain diagnostics.
+            if path == err_path or getattr(error, "winerror", None) not in (5, 32):
+                raise
+            unavailable.append(UNREADABLE_TRACE + (": " + str(error)).encode())
+    return b"\n".join(list(traces.values()) + unavailable)
+
+
+def trace_deadline_failure(trace, setup_message):
+    """At a polling deadline: a worker log that is still unreadable is RED (the
+    guard cannot see the work it checks); anything else is a setup failure."""
+    if UNREADABLE_TRACE in trace:
+        print("RED: a worker log was still unreadable at the deadline:\n" + excerpt(trace))
+        return False
+    raise SetupFailure(setup_message + excerpt(trace))
+
+
 def section_local_cleanup_waits_for_startup_gate(binary, work):
     """A live startup owner must not turn completed local work into failure."""
     if os.name != "nt":
@@ -553,22 +588,6 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
     locked = False
     traces = {}
 
-    def read_trace():
-        # The daemon supervises indexing in a worker. Worker progress goes to
-        # its own durable log; the outer CLI only reports the final response.
-        paths = [err_path]
-        log_dir = os.path.join(cache, "logs")
-        if os.path.isdir(log_dir):
-            paths.extend(os.path.join(log_dir, name) for name in os.listdir(log_dir)
-                         if name.startswith(".worker-log-"))
-        for path in paths:
-            try:
-                with open(path, "rb") as handle:
-                    traces[path] = handle.read()
-            except FileNotFoundError:
-                pass  # The supervisor removes a successful worker's log.
-        return b"\n".join(traces.values())
-
     with open(gates[0], "r+b") as gate, open(err_path, "wb") as errors:
         try:
             process = subprocess.Popen(
@@ -581,7 +600,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
             # Extraction is after begin_work released startup-v2. Observe that
             # event before acquiring the real one-byte native startup lock.
             while time.monotonic() < deadline:
-                trace = read_trace()
+                trace = read_cleanup_trace(err_path, cache, traces)
                 if b"msg=parallel.extract" in trace or b"msg=pass.definitions" in trace:
                     gate.seek(0)
                     try:
@@ -596,9 +615,9 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
                                        excerpt(trace))
                 time.sleep(0.01)
             if not locked:
-                raise SetupFailure("index never entered local work:\n" + excerpt(trace))
+                return trace_deadline_failure(trace, "index never entered local work:\n")
             while time.monotonic() < deadline:
-                trace = read_trace()
+                trace = read_cleanup_trace(err_path, cache, traces)
                 if b"Completed index_repository (" in trace:
                     break
                 if process.poll() is not None:
@@ -607,7 +626,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
                     return False
                 time.sleep(0.01)
             else:
-                raise SetupFailure("CLI did not finish its work:\n" + excerpt(trace))
+                return trace_deadline_failure(trace, "CLI did not finish its work:\n")
             # The outer CLI flushes this completion message after receiving
             # the worker result and closing its daemon session, immediately
             # before local cleanup. pipeline.done is too early: worker result
@@ -619,7 +638,7 @@ def section_local_cleanup_waits_for_startup_gate(binary, work):
             msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
             locked = False
             stdout, _ = process.communicate(timeout=30)
-            trace = read_trace()
+            trace = read_cleanup_trace(err_path, cache, traces)
             if not stayed_alive or process.returncode != 0 or b"cleanup_timeout" in trace:
                 print("RED: completed work must wait out startup contention and exit 0 "
                       "after release (rc=%s):\n%s" %
