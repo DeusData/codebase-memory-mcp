@@ -4121,14 +4121,33 @@ static const char php_import_complete[] = "{\"php_imports_complete\":1,";
  * same-named PHP type anywhere admit an absence proof. A covered-but-missing
  * PSR-4 file, any other global use, or an unavailable namespace map leaves the
  * whole file unknown; already resolved IMPORTS are still written. */
-/* A global-namespace class `use Exception;` names a project type only when a
- * PHP file declares a class-like symbol of that name. With no such node at all
- * (namespaced ones included, so the proof stays conservative), the import is
- * absent from the project: the PHP builtin or a vendor class. Without this a
- * single `use Exception;` left the whole file's evidence unknown, and its
+/* Whether a node of this label could be what a global `use` of this kind
+ * names: a class-like type for a class use, a function for `use function`, a
+ * constant for `use const`; a File or Module of the name for any of them. */
+static bool php_global_use_could_bind(const char *label, CBMImportKind kind) {
+    if (strcmp(label, "File") == 0 || strcmp(label, "Module") == 0) {
+        return true;
+    }
+    if (kind == CBM_IMPORT_KIND_FUNCTION) {
+        return strcmp(label, "Function") == 0;
+    }
+    if (kind == CBM_IMPORT_KIND_CONST) {
+        return strcmp(label, "Constant") == 0 || strcmp(label, "Variable") == 0;
+    }
+    return strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+           strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0;
+}
+
+/* A global-namespace `use Exception;`, `use function sprintf;` or `use const
+ * PHP_EOL;` names a project symbol only when a PHP file declares one of that
+ * name that such a use can bind (php_global_use_could_bind). With no such node
+ * at all (namespaced ones included, so the proof stays conservative), the
+ * import is absent from the project: a PHP builtin or a vendor symbol. Without
+ * this a single such use left the whole file's evidence unknown, and its
  * project imports reached the PHP LSP as File QNs again. */
 static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport *imp) {
-    if (!gbuf || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+    if (!gbuf || (imp->kind != CBM_IMPORT_KIND_DEFAULT && imp->kind != CBM_IMPORT_KIND_FUNCTION &&
+                  imp->kind != CBM_IMPORT_KIND_CONST)) {
         return false;
     }
     const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
@@ -4145,9 +4164,7 @@ static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport 
         if (!n || !n->label || !node_in_php_file(n)) {
             continue;
         }
-        if (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0 ||
-            strcmp(n->label, "Trait") == 0 || strcmp(n->label, "Enum") == 0 ||
-            strcmp(n->label, "File") == 0 || strcmp(n->label, "Module") == 0) {
+        if (php_global_use_could_bind(n->label, imp->kind)) {
             return false;
         }
     }
