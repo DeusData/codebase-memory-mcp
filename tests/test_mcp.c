@@ -1349,6 +1349,7 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "INHERITS"));
     ASSERT_NOT_NULL(strstr(json, "IMPLEMENTS"));
     ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
+    ASSERT_NOT_NULL(strstr(json, "Keywords; [] ignored; else omit query."));
     free(json);
     PASS();
 }
@@ -5104,6 +5105,48 @@ TEST(tool_search_graph_bm25_ranks_exact_name_first) {
     PASS();
 }
 
+TEST(tool_search_graph_empty_semantic_query_is_ignored) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-find");
+    bm25_findability_fixture(store, "bm25-find");
+
+    const char *cases[] = {
+        "\"query\":\"Table\",\"label\":\"Class\",",
+        "\"query\":\"Table\",\"semantic_limit\":0,",
+        "\"query\":\"\",",
+        "\"name_pattern\":\"^Table$\",",
+        "",
+    };
+    const char *formats[] = {"json", "tree"};
+    for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char args[512];
+            snprintf(args, sizeof(args), "{\"project\":\"bm25-find\",%s\"format\":\"%s\"}",
+                     cases[i], formats[f]);
+            char *baseline = cbm_mcp_handle_tool(srv, "search_graph", args);
+            ASSERT_NOT_NULL(baseline);
+            ASSERT_NULL(strstr(baseline, "\"isError\":true"));
+            ASSERT_NOT_NULL(strstr(baseline, "Table"));
+
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"bm25-find\",%s\"semantic_query\":[],\"format\":\"%s\"}",
+                     cases[i], formats[f]);
+            char *response = cbm_mcp_handle_tool(srv, "search_graph", args);
+            ASSERT_NOT_NULL(response);
+            ASSERT_NULL(strstr(response, "\"isError\":true"));
+            ASSERT_STR_EQ(response, baseline);
+            free(response);
+            free(baseline);
+        }
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* `query` selects the BM25 fast path, which returns before semantic_query is
  * evaluated. Accepting both therefore used to report success while silently
  * discarding one of the caller's two requested result sets. The contract is
@@ -5139,12 +5182,29 @@ TEST(tool_search_graph_rejects_bm25_and_semantic_query_together) {
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(response, "query and semantic_query are mutually exclusive"));
+    ASSERT_NOT_NULL(strstr(response, "remove the semantic_query key"));
+    ASSERT_NOT_NULL(strstr(response, "remove the query key entirely"));
+    ASSERT_NOT_NULL(strstr(response, "do not retry unchanged arguments"));
     ASSERT_NULL(strstr(response, "\"search_mode\":\"bm25\""));
     free(response);
 
+    const char *invalid[] = {"null", "\"meaning\"", "[42]", "[\"meaning\",42]"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        char args[256];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"mixed-search-modes\",\"query\":\"mixedneedle\","
+                 "\"semantic_query\":%s,\"format\":\"json\"}",
+                 invalid[i]);
+        response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        ASSERT_NULL(strstr(response, "\"search_mode\":\"bm25\""));
+        free(response);
+    }
+
     char *tools = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(tools);
-    ASSERT_NOT_NULL(strstr(tools, "Not with query"));
+    ASSERT_NOT_NULL(strstr(tools, "Keywords; [] ignored; else omit query."));
     free(tools);
 
     cbm_mcp_server_free(srv);
@@ -20478,7 +20538,8 @@ static bool dc_walk_fixture_open(dc_walk_fixture_t *fx) {
     }
     /* Same git invocation rules as the #1363 fixture above. */
     char cmd[1200];
-    const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
+    const char *steps[] = {"init -q", "config diff.mnemonicPrefix true", "add -A",
+                           "commit -q -m init"};
     for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
         snprintf(cmd, sizeof(cmd),
                  "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=main "
@@ -28818,6 +28879,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate);
     RUN_TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
+    RUN_TEST(tool_search_graph_empty_semantic_query_is_ignored);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);

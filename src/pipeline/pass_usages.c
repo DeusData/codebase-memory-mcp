@@ -151,7 +151,8 @@ static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const
 /* Resolve USAGE edges for one file's extracted usages. */
 static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count, CBMLanguage lang) {
+                               const char **imp_vals, int imp_count, CBMLanguage lang,
+                               cbm_site_memo_t **site_memo) {
     int resolved = 0;
     cbm_pipeline_lsp_reference_index_t reference_index = {0};
     bool reference_index_ready =
@@ -163,7 +164,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     cbm_php_vendor_names_t php_vendor;
     cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
     cbm_site_file_t site;
-    cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, lang, result);
+    cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, lang, result, site_memo, NULL);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -321,13 +322,22 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         /* ref_name is sliced source text and can contain quotes/newlines —
-         * escape it or the edge properties JSON is malformed. */
-        char esc_ref[CBM_SZ_256];
-        cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+         * escape it or the edge properties JSON is malformed. A proven answer
+         * of the shared layer names its strategy (site_bind.h). MUST match
+         * pass_parallel.c. */
         char uprops[CBM_SZ_512];
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        if (scoped.verdict == CBM_SITE_PROVEN) {
+            cbm_pipeline_site_usage_props(uprops, sizeof(uprops), usage, CBM_SITE_PROVEN);
+        } else {
+            char esc_ref[CBM_SZ_256];
+            cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
+            snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        }
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, edge_type, uprops);
+        if (scoped.verdict == CBM_SITE_POSSIBLE) {
+            cbm_pipeline_site_bind_usage_drawn(&site, usage, tgt);
+        }
         resolved++;
     }
     cbm_pipeline_site_bind_end(&site, ctx->gbuf);
@@ -458,8 +468,20 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
     return resolved;
 }
 
+static int pass_usages_files(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                             cbm_site_memo_t **site_memo);
+
 int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                              int file_count) {
+    /* the shared layer's memo for this pass (site_bind.h) */
+    cbm_site_memo_t *site_memo = NULL;
+    int rc = pass_usages_files(ctx, files, file_count, &site_memo);
+    cbm_pipeline_site_memo_free(site_memo);
+    return rc;
+}
+
+static int pass_usages_files(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                             cbm_site_memo_t **site_memo) {
     cbm_log_info("pass.start", "pass", "usages", "files", itoa_log(file_count));
 
     int usage_resolved = 0;
@@ -533,7 +555,7 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                                                       pu_module_is_dir(files[i].language));
 
         usage_resolved += resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
-                                              imp_count, files[i].language);
+                                              imp_count, files[i].language, site_memo);
         throw_resolved += resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
                                               imp_count, files[i].language);
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count,

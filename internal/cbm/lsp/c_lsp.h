@@ -83,6 +83,9 @@ typedef struct {
     CBMResolvedCallArray *resolved_calls;
     CBMSourceOrigin source_origin; // source buffer represented by emitted occurrence spans
     const CBMFileResult *test_definition_owners; /* borrowed, prevalidated raw source identity */
+    /* The preprocessed per-file run only: the raw view's GoogleTest spans and
+     * the line map (cbm_test_span_owner_qn). Borrowed; NULL otherwise. */
+    const CBMTestSpanMap *pp_test_spans;
     int test_owner_seen_count;
     bool test_owner_error;
 
@@ -113,6 +116,8 @@ typedef struct {
 
     // Flags
     bool cpp_mode;        // C++ features enabled
+    bool test_macro_names; // GoogleTest heads are named as the def walk names them
+                           // (CBMFileResult.cpp_test_macro_names, cbm_cpp_test_macro_name)
     bool in_template;     // currently inside template declaration
     bool registry_shared; // ctx->registry is the Tier-2 cross registry, shared
                           // READ-ONLY across resolve workers — never mutate it
@@ -175,8 +180,11 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 // --- Entry points ---
 
 // Single-file LSP: build registry from file defs + stdlib, run resolution.
+// pp_test_spans: for the preprocessed view, the raw GoogleTest spans and line
+// map (cbm_test_span_owner_qn); NULL otherwise.
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin);
+                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
+                   const CBMTestSpanMap *pp_test_spans);
 
 // A memo allocation/capacity failure is an explicit incomplete-refinement error.
 #define CBM_C_LSP_DEPTH_ERROR "C/C++ expression recursion depth limit exceeded"
@@ -191,13 +199,15 @@ uint32_t cbm_c_lsp_test_walks_take(void);
 
 // Cross-file LSP: build registry from defs + stdlib, re-parse and resolve.
 // Status variants distinguish memo/depth failure. Bool wrappers report success.
-// Completed output before a failed walk is kept.
+// Completed output before a failed walk is kept. test_macro_names: the file's
+// CBMFileResult.cpp_test_macro_names (the bool wrappers pass cpp_mode, the
+// extraction default without configuration).
 CBMLSPStatus cbm_run_c_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
                                         const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
                                         int def_count, const char **include_paths,
                                         const char **include_ns_qns, int include_count,
                                         TSTree *cached_tree, // NULL = parse internally
-                                        CBMResolvedCallArray *out);
+                                        CBMResolvedCallArray *out, bool test_macro_names);
 
 bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
                          bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
@@ -217,7 +227,7 @@ CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
     CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
     const char **include_paths, const char **include_ns_qns, int include_count,
     TSTree *cached_tree, // NULL = parse internally
-    CBMResolvedCallArray *out);
+    CBMResolvedCallArray *out, bool test_macro_names);
 
 bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                        const char *module_qn, bool cpp_mode,
@@ -239,18 +249,18 @@ bool cbm_run_c_lsp_with_test_owners(
     CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
     TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
     const CBMFileResult *test_owners);
-bool cbm_run_c_lsp_cross_with_test_owners(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
-    const char **include_ns_qns, int include_count, TSTree *cached_tree,
-    CBMResolvedCallArray *out, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners);
+bool cbm_run_c_lsp_cross_with_test_owners(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
+                                          int def_count, const char **include_paths,
+                                          const char **include_ns_qns, int include_count,
+                                          TSTree *cached_tree, CBMResolvedCallArray *out,
+                                          CBMSourceOrigin source_origin,
+                                          const CBMFileResult *test_owners, bool test_macro_names);
 bool cbm_run_c_lsp_cross_with_registry_with_test_owners(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    bool cpp_mode, CBMTypeRegistry *reg, const char **include_paths,
-    const char **include_ns_qns, int include_count, TSTree *cached_tree,
-    CBMResolvedCallArray *out, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners);
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    CBMSourceOrigin source_origin, const CBMFileResult *test_owners, bool test_macro_names);
 
 // Register C stdlib types and functions into a registry.
 void cbm_c_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);

@@ -479,6 +479,24 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind) {
     return null_node;
 }
 
+bool cbm_objectscript_is_instance_call(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "method_call") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "do_parameter") != 0 && strcmp(kind, "job_argument") != 0) {
+        return false;
+    }
+    return !ts_node_is_null(cbm_find_child_by_kind(node, "oref_method"));
+}
+
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types) {
+    if (cbm_kind_in_set(node, call_types)) {
+        return true;
+    }
+    return lang == CBM_LANG_OBJECTSCRIPT_UDL && cbm_objectscript_is_instance_call(node);
+}
+
 int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max) {
     int n = 0;
     uint32_t count = ts_node_child_count(parent);
@@ -1547,15 +1565,27 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
 }
 
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path,
-                                  const char *module_qn) {
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans) {
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
     }
+    /* The preprocessed view: a raw GoogleTest definition's body is that test. */
+    if (pp_test_spans && strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        const char *raw_test = cbm_test_span_owner_qn(pp_test_spans, func_node);
+        if (raw_test) {
+            return raw_test;
+        }
+    }
     const char *name = func_node_name(a, func_node, source, lang);
     if (!name || !name[0]) {
         return module_qn;
+    }
+    /* GoogleTest TEST(Suite, Case): the def walk's TEST_Suite_Case (#1266). */
+    const char *test_name = cbm_cpp_test_macro_name(a, test_macro_names, name, func_node, source);
+    if (test_name) {
+        name = test_name;
     }
 
     // Check if the function is inside a class — compute classQN.funcName.
@@ -1623,8 +1653,9 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
     }
 
     // Cache miss: compute via parent walk
-    const char *qn = cbm_enclosing_func_qn(ctx->arena, node, ctx->language, ctx->source,
-                                           ctx->project, ctx->rel_path, ctx->module_qn);
+    const char *qn = cbm_enclosing_func_qn(
+        ctx->arena, node, ctx->language, ctx->source, ctx->project, ctx->rel_path, ctx->module_qn,
+        cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), ctx->pp_test_spans);
 
     // Cache the result: find the enclosing function's byte range
     TSNode func_node = cbm_find_enclosing_func(node, ctx->language);

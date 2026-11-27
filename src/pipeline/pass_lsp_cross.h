@@ -14,7 +14,7 @@
  *
  * The languages covered are the rows of one engine table (pass_lsp_cross.c
  * pxc_engines): Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/TSX, PHP,
- * C#, Java, Kotlin and Rust. Anything else short-circuits via
+ * C#, Ruby, Java, Kotlin and Rust. Anything else short-circuits via
  * cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
@@ -38,6 +38,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
+#include "lsp/ruby_lsp.h" /* cbm_ruby_build_cross_registry; _cross is the per-file fallback */
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/type_scope.h" /* cbm_type_scope_file_t */
 #include <stdbool.h>

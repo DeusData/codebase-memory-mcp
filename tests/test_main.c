@@ -210,14 +210,12 @@ static void tf_cleanup_cache_sentinel(void) {
     }
 }
 
-/* Client home overrides the CLI honours BEFORE $HOME, so redirecting HOME alone
- * does not isolate them: cbm_codex_config_dir() and its siblings return the
- * ambient path and the suite resolves against the developer's real config —
- * reading its state and writing to it. Same inventory the shell fixtures are
- * already required to neutralize (tests/test_smoke_fixture_contract.sh), kept
- * in one place so a new client cannot be isolated in the smoke scripts and
- * forgotten here. A test that exercises one of these sets it after setup. */
+/* These paths take precedence over HOME and can escape the private fixture.
+ * A test that exercises an override sets it after setup. */
 static const char *const tf_client_home_overrides[] = {
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "KIRO_HOME",
@@ -1678,6 +1676,8 @@ extern void suite_route_canon(void);
 extern void suite_path_alias(void);
 extern void suite_site_bind(void);
 extern void suite_scope_facts(void);
+extern void suite_include_path(void);
+extern void suite_scope_closure(void);
 extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
@@ -1687,6 +1687,8 @@ extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
 extern void suite_php_lsp(void);
+extern void suite_member_walk(void);
+extern void suite_php_member_walk(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
 extern void suite_perl_lsp(void);
@@ -2546,6 +2548,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(path_alias);
     RUN_SELECTED_SUITE(site_bind);
     RUN_SELECTED_SUITE(scope_facts);
+    RUN_SELECTED_SUITE(include_path);
+    RUN_SELECTED_SUITE(scope_closure);
 
     /* Watcher (M10) */
     RUN_SELECTED_SUITE(svn_state);
@@ -2565,6 +2569,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(go_lsp);
     RUN_SELECTED_SUITE(c_lsp);
     RUN_SELECTED_SUITE(php_lsp);
+    RUN_SELECTED_SUITE(member_walk);
+    RUN_SELECTED_SUITE(php_member_walk);
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);

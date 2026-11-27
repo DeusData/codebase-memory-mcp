@@ -102,9 +102,10 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
  * contract; the pending stack is not — BT_STACK is only the on-stack first
  * chunk and spills to the heap, because a full fixed stack dropped a wide
  * body's FIRST children and sampled a mid-body window instead.
+ * Subtrees ending at or before from_byte are skipped (0 = whole body).
  * Returns arena-allocated string, or NULL when there are no identifiers or the
  * stack could not be grown (logged; no truncated sample is ever returned). */
-static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+static char *extract_ident_tokens_from(CBMExtractCtx *ctx, TSNode body, uint32_t from_byte) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
     TSNode bt_inline[BT_STACK];
     TSNode *bt_stack = bt_inline;
@@ -119,6 +120,9 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
 
     while (bt_top > 0 && bt_count < BT_MAX_IDENTS) {
         TSNode nd = bt_stack[--bt_top];
+        if (ts_node_end_byte(nd) <= from_byte) {
+            continue;
+        }
         uint32_t nc = ts_node_child_count(nd);
         if (nc == 0) {
             const char *k = ts_node_type(nd);
@@ -154,6 +158,10 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
         return cbm_arena_strdup(ctx->arena, bt_buf);
     }
     return NULL;
+}
+
+static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+    return extract_ident_tokens_from(ctx, body, 0);
 }
 
 /* Compute MinHash fingerprint for a function body node and store in def.
@@ -4552,6 +4560,516 @@ static const char **extract_php_bases(CBMArena *a, TSNode node, const char *sour
     return result;
 }
 
+/* PHP, for the member lookup (lsp/member_walk.h): the kind of each
+ * base_classes entry, in the order extract_php_bases records them ('e' for
+ * `extends`, 'i' for `implements`; a trailing '+' when bases past its cap were
+ * not recorded), and the traits the body uses with the adaptation clauses of
+ * those uses. Traits stay out of base_classes: that list makes INHERITS edges.
+ * Rules, ';'-separated: "x T m U" (T::m insteadof U, one per excluded U) and
+ * "a T m alias" ("a - m alias" when the trait is not named); an `as` that only
+ * changes visibility renames nothing. */
+/* The namespace and class `use` aliases in force where a PHP class is
+ * written, so a trait name can be qualified there, by PHP's own compile-time
+ * rule, before it reaches another file's resolver. */
+typedef struct {
+    const char *ns;      /* "App\\Models"; NULL in the global namespace */
+    const char **alias;  /* local names */
+    const char **target; /* their full names, `\`-separated, no leading `\` */
+    int count;
+    int cap;
+} php_names_t;
+
+static bool php_names_add(CBMArena *a, php_names_t *n, const char *alias, const char *target) {
+    if (!alias || !alias[0] || !target || !target[0]) {
+        return true;
+    }
+    if (n->count == n->cap) {
+        int cap = n->cap ? n->cap * 2 : 8;
+        const char **al = (const char **)cbm_arena_alloc(a, (size_t)cap * sizeof(*al));
+        const char **tg = (const char **)cbm_arena_alloc(a, (size_t)cap * sizeof(*tg));
+        if (!al || !tg) {
+            return false;
+        }
+        if (n->count) {
+            memcpy(al, n->alias, (size_t)n->count * sizeof(*al));
+            memcpy(tg, n->target, (size_t)n->count * sizeof(*tg));
+        }
+        n->alias = al;
+        n->target = tg;
+        n->cap = cap;
+    }
+    n->alias[n->count] = alias;
+    n->target[n->count] = target[0] == '\\' ? target + 1 : target;
+    n->count++;
+    return true;
+}
+
+/* Whether `word` (lower case) starts at p, as a whole word, in any case. */
+static bool php_word_at(const char *p, const char *end, const char *word) {
+    size_t n = strlen(word);
+    if ((size_t)(end - p) < n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)p[i]) != word[i]) {
+            return false;
+        }
+    }
+    return p + n == end || !(isalnum((unsigned char)p[n]) || p[n] == '_');
+}
+
+/* `use function ...` / `use const ...` (a declaration, or one clause of a
+ * group): not a class name. Read from the text: the keyword's node shape
+ * differs between grammar versions. */
+static bool php_use_is_class(TSNode node, const char *source) {
+    const char *p = source + ts_node_start_byte(node);
+    const char *end = source + ts_node_end_byte(node);
+    if (php_word_at(p, end, "use")) {
+        p += 3;
+    }
+    while (p < end && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return !php_word_at(p, end, "function") && !php_word_at(p, end, "const");
+}
+
+static void php_names_clause(CBMArena *a, TSNode clause, const char *source, const char *prefix,
+                             php_names_t *n) {
+    char *name = NULL;
+    char *alias = NULL;
+    uint32_t cc = ts_node_named_child_count(clause);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode c = ts_node_named_child(clause, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "qualified_name") == 0 || strcmp(k, "name") == 0) {
+            if (!name) {
+                name = cbm_node_text(a, c, source);
+            } else if (!alias) {
+                alias = cbm_node_text(a, c, source);
+            }
+        } else if (strcmp(k, "namespace_aliasing_clause") == 0) {
+            TSNode an = cbm_find_child_by_kind(c, "name");
+            if (!ts_node_is_null(an)) {
+                alias = cbm_node_text(a, an, source);
+            }
+        }
+    }
+    if (!name || !name[0]) {
+        return;
+    }
+    const char *full = prefix && prefix[0] ? cbm_arena_sprintf(a, "%s\\%s", prefix, name) : name;
+    if (!alias) {
+        const char *last = strrchr(full, '\\');
+        alias = (char *)(last ? last + 1 : full);
+    }
+    (void)php_names_add(a, n, alias, full);
+}
+
+static void php_names_use(CBMArena *a, TSNode decl, const char *source, php_names_t *n) {
+    if (!php_use_is_class(decl, source)) {
+        return;
+    }
+    const char *prefix = NULL;
+    uint32_t nc = ts_node_named_child_count(decl);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(decl, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "namespace_use_clause") == 0) {
+            php_names_clause(a, c, source, NULL, n);
+        } else if (strcmp(k, "namespace_name") == 0 || strcmp(k, "qualified_name") == 0 ||
+                   strcmp(k, "name") == 0) {
+            prefix = cbm_node_text(a, c, source); /* use App\{A, B as C}; */
+        } else if (strcmp(k, "namespace_use_group") == 0) {
+            uint32_t gc = ts_node_named_child_count(c);
+            for (uint32_t j = 0; j < gc; j++) {
+                TSNode g = ts_node_named_child(c, j);
+                const char *gk = ts_node_type(g);
+                if ((strcmp(gk, "namespace_use_clause") == 0 ||
+                     strcmp(gk, "namespace_use_group_clause") == 0) &&
+                    php_use_is_class(g, source)) {
+                    php_names_clause(a, g, source, prefix, n);
+                }
+            }
+        }
+    }
+}
+
+static const char *php_namespace_name(CBMArena *a, TSNode ns_def, const char *source) {
+    TSNode nn = cbm_find_child_by_kind(ns_def, "namespace_name");
+    return ts_node_is_null(nn) ? NULL : cbm_node_text(a, nn, source);
+}
+
+/* The file's namespace changes and class aliases in byte order (one cursor
+ * pass per file), and the names in force up to the last class asked: classes
+ * come in source order, so each one only applies the events before it. */
+enum { PHP_EV_NS = 1, PHP_EV_USE = 2 };
+
+typedef struct {
+    uint32_t at;
+    uint8_t kind;
+    const char *a; /* NS: the namespace (NULL: global); USE: the alias */
+    const char *b; /* USE: the target */
+} php_name_ev_t;
+
+typedef struct {
+    php_name_ev_t *ev;
+    int count;
+    int cap;
+    int next;
+    uint32_t last_at;
+    php_names_t cur;
+} php_names_state_t;
+
+static bool php_ev_add(CBMArena *a, php_names_state_t *st, uint32_t at, uint8_t kind, const char *x,
+                       const char *y) {
+    if (st->count == st->cap) {
+        int cap = st->cap ? st->cap * 2 : 16;
+        php_name_ev_t *ev = (php_name_ev_t *)cbm_arena_alloc(a, (size_t)cap * sizeof(*ev));
+        if (!ev) {
+            return false;
+        }
+        if (st->count) {
+            memcpy(ev, st->ev, (size_t)st->count * sizeof(*ev));
+        }
+        st->ev = ev;
+        st->cap = cap;
+    }
+    php_name_ev_t *e = &st->ev[st->count++];
+    e->at = at;
+    e->kind = kind;
+    e->a = x;
+    e->b = y;
+    return true;
+}
+
+static void php_ev_uses(CBMArena *a, php_names_state_t *st, TSNode decl, const char *source) {
+    php_names_t one;
+    memset(&one, 0, sizeof(one));
+    php_names_use(a, decl, source, &one);
+    for (int i = 0; i < one.count; i++) {
+        (void)php_ev_add(a, st, ts_node_start_byte(decl), PHP_EV_USE, one.alias[i], one.target[i]);
+    }
+}
+
+static php_names_state_t *php_names_build(CBMArena *a, TSNode root, const char *source) {
+    php_names_state_t *st = (php_names_state_t *)cbm_arena_alloc(a, sizeof(*st));
+    if (!st) {
+        return NULL;
+    }
+    memset(st, 0, sizeof(*st));
+    TSTreeCursor cur = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode c = ts_tree_cursor_current_node(&cur);
+            if (!ts_node_is_named(c)) {
+                continue;
+            }
+            const char *k = ts_node_type(c);
+            if (strcmp(k, "namespace_use_declaration") == 0) {
+                php_ev_uses(a, st, c, source);
+                continue;
+            }
+            if (strcmp(k, "namespace_definition") != 0) {
+                continue;
+            }
+            /* `namespace X;` starts anew; `namespace X { ... }` holds its own
+             * uses, and after it the global namespace has none. */
+            (void)php_ev_add(a, st, ts_node_start_byte(c), PHP_EV_NS,
+                             php_namespace_name(a, c, source), NULL);
+            TSNode body = cbm_find_child_by_kind(c, "compound_statement");
+            if (ts_node_is_null(body)) {
+                continue;
+            }
+            TSTreeCursor in = ts_tree_cursor_new(body);
+            if (ts_tree_cursor_goto_first_child(&in)) {
+                do {
+                    TSNode u = ts_tree_cursor_current_node(&in);
+                    if (ts_node_is_named(u) &&
+                        strcmp(ts_node_type(u), "namespace_use_declaration") == 0) {
+                        php_ev_uses(a, st, u, source);
+                    }
+                } while (ts_tree_cursor_goto_next_sibling(&in));
+            }
+            ts_tree_cursor_delete(&in);
+            (void)php_ev_add(a, st, ts_node_end_byte(c), PHP_EV_NS, NULL, NULL);
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    return st;
+}
+
+/* The names in force where `cls` is written. */
+static void php_names_at(CBMExtractCtx *ctx, TSNode cls, php_names_t *out) {
+    memset(out, 0, sizeof(*out));
+    CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+    php_names_state_t *st = (php_names_state_t *)ctx->php_names;
+    if (!st) {
+        st = php_names_build(a, ts_tree_root_node(cls.tree), ctx->source);
+        ctx->php_names = st;
+        if (!st) {
+            return;
+        }
+    }
+    uint32_t at = ts_node_start_byte(cls);
+    if (at < st->last_at) {
+        st->next = 0; /* asked out of source order: from the start again */
+        st->cur.ns = NULL;
+        st->cur.count = 0;
+    }
+    while (st->next < st->count && st->ev[st->next].at < at) {
+        const php_name_ev_t *e = &st->ev[st->next++];
+        if (e->kind == PHP_EV_NS) {
+            st->cur.ns = e->a;
+            st->cur.count = 0;
+        } else {
+            (void)php_names_add(a, &st->cur, e->a, e->b);
+        }
+    }
+    st->last_at = at;
+    *out = st->cur;
+}
+
+static bool php_seg_eq(const char *a, const char *b, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) {
+            return false;
+        }
+    }
+    return a[len] == '\0';
+}
+
+/* The fully qualified name (leading `\`) a class-name spelling denotes
+ * where it is written: as is when qualified; its first segment replaced by
+ * the target of the class `use` that aliases it; else under the namespace. */
+static const char *php_fq_class(CBMArena *a, const php_names_t *n, const char *spelled) {
+    if (!spelled || !spelled[0] || strcmp(spelled, "-") == 0) {
+        return spelled;
+    }
+    if (spelled[0] == '\\') {
+        return spelled;
+    }
+    const char *bs = strchr(spelled, '\\');
+    size_t seg = bs ? (size_t)(bs - spelled) : strlen(spelled);
+    if (bs && seg == 9 && php_word_at(spelled, bs, "namespace")) {
+        /* `namespace\Sub\X`: relative to the current namespace, never an alias. */
+        return n->ns && n->ns[0] ? cbm_arena_sprintf(a, "\\%s%s", n->ns, bs)
+                                 : cbm_arena_sprintf(a, "%s", bs);
+    }
+    for (int i = n->count - 1; i >= 0; i--) {
+        if (php_seg_eq(n->alias[i], spelled, seg)) {
+            return cbm_arena_sprintf(a, "\\%s%s", n->target[i], bs ? bs : "");
+        }
+    }
+    return n->ns && n->ns[0] ? cbm_arena_sprintf(a, "\\%s\\%s", n->ns, spelled)
+                             : cbm_arena_sprintf(a, "\\%s", spelled);
+}
+
+static void php_rule_append(CBMArena *a, char **rules, const char *kind, const char *trait,
+                            const char *method, const char *other) {
+    if (!method || !method[0] || !other || !other[0]) {
+        return;
+    }
+    const char *t = trait && trait[0] ? trait : "-";
+    *rules = *rules ? cbm_arena_sprintf(a, "%s;%s %s %s %s", *rules, kind, t, method, other)
+                    : cbm_arena_sprintf(a, "%s %s %s %s", kind, t, method, other);
+}
+
+/* A node spelling a class or trait name: `T`, `A\T`, `\A\T`, or
+ * `namespace\T` (relative_name). */
+static bool php_class_name_node(const char *k) {
+    return strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0 ||
+           strcmp(k, "relative_name") == 0;
+}
+
+/* `T::m` of a class_constant_access_expression: its two name parts. */
+static void php_scoped_member(CBMArena *a, TSNode n, const char *source, char **trait,
+                              char **method) {
+    uint32_t nc = ts_node_named_child_count(n);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(n, i);
+        const char *k = ts_node_type(c);
+        if (!php_class_name_node(k)) {
+            continue;
+        }
+        if (!*trait) {
+            *trait = cbm_node_text(a, c, source);
+        } else if (!*method) {
+            *method = cbm_node_text(a, c, source);
+        }
+    }
+}
+
+static void php_use_list_rules(CBMArena *a, TSNode list, const char *source, char **rules,
+                               const php_names_t *names) {
+    uint32_t nc = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode cl = ts_node_named_child(list, i);
+        const char *ck = ts_node_type(cl);
+        bool instead = strcmp(ck, "use_instead_of_clause") == 0;
+        if (!instead && strcmp(ck, "use_as_clause") != 0) {
+            continue;
+        }
+        char *trait = NULL;
+        char *method = NULL;
+        char *alias = NULL;
+        uint32_t cc = ts_node_named_child_count(cl);
+        for (uint32_t j = 0; j < cc; j++) {
+            TSNode p = ts_node_named_child(cl, j);
+            const char *pk = ts_node_type(p);
+            if (strcmp(pk, "class_constant_access_expression") == 0) {
+                php_scoped_member(a, p, source, &trait, &method);
+                if (trait) {
+                    trait = (char *)php_fq_class(a, names, trait);
+                }
+            } else if (php_class_name_node(pk)) {
+                char *t = cbm_node_text(a, p, source);
+                if (instead) {
+                    /* one excluded trait */
+                    php_rule_append(a, rules, "x", trait, method, php_fq_class(a, names, t));
+                } else if (!method) {
+                    method = t;
+                } else if (!alias) {
+                    alias = t;
+                }
+            }
+        }
+        if (!instead) {
+            php_rule_append(a, rules, "a", trait, method, alias);
+        }
+    }
+}
+
+static CBMDefTypeFacts *def_type_facts(CBMArena *a, CBMDefinition *def);
+
+static void extract_php_member_bases(CBMExtractCtx *ctx, CBMArena *a, TSNode node,
+                                     CBMDefinition *def) {
+    const char *source = ctx->source;
+    /* The namespace and class aliases in force where the type is written:
+     * its own namespace (a file may hold several; the file-level
+     * namespace_name keeps only the first), and its trait names' meaning. */
+    php_names_t names;
+    php_names_at(ctx, node, &names);
+    def->decl_namespace = cbm_arena_strdup(a, names.ns ? names.ns : "");
+    char kinds[MAX_BASES + 2];
+    int nk = 0;
+    bool truncated = false;
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_child(node, i);
+        const char *ck = ts_node_type(child);
+        bool ext = strcmp(ck, "base_clause") == 0;
+        if (!ext && strcmp(ck, "class_interface_clause") != 0) {
+            continue;
+        }
+        /* The same entries push_base_text keeps: non-empty after the generic
+         * arguments and the namespace are cut. */
+        uint32_t cc = ts_node_named_child_count(child);
+        for (uint32_t j = 0; j < cc; j++) {
+            char *t = cbm_node_text(a, ts_node_named_child(child, j), source);
+            if (!t) {
+                continue;
+            }
+            char *angle = strchr(t, '<');
+            if (angle) {
+                *angle = '\0';
+            }
+            char *last_bs = strrchr(t, '\\');
+            if (!(last_bs ? last_bs[1] : t[0])) {
+                continue;
+            }
+            if (nk >= MAX_BASES_MINUS_1) {
+                truncated = true;
+                continue;
+            }
+            kinds[nk++] = ext ? 'e' : 'i';
+        }
+    }
+    if (truncated) {
+        kinds[nk++] = '+';
+    }
+    kinds[nk] = '\0';
+    int bases = 0;
+    while (def->base_classes && def->base_classes[bases]) {
+        bases++;
+    }
+    /* Kinds only when they describe exactly the recorded bases. */
+    if (nk - (truncated ? 1 : 0) == bases && nk > 0) {
+        CBMDefTypeFacts *f = def_type_facts(a, def);
+        if (f) {
+            f->base_kinds = cbm_arena_strdup(a, kinds);
+        }
+    }
+
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        body = cbm_find_child_by_kind(node, "declaration_list");
+    }
+    if (ts_node_is_null(body)) {
+        body = cbm_find_child_by_kind(node, "enum_declaration_list");
+    }
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    int count = 0;
+    int cap = 0;
+    const char **mixins = NULL;
+    char *rules = NULL;
+    uint32_t bc = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < bc; i++) {
+        TSNode use = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(use), "use_declaration") != 0) {
+            continue;
+        }
+        /* A trait is named as the class's file names it (`names`). */
+        uint32_t uc = ts_node_named_child_count(use);
+        for (uint32_t j = 0; j < uc; j++) {
+            TSNode c = ts_node_named_child(use, j);
+            const char *k = ts_node_type(c);
+            if (strcmp(k, "use_list") == 0) {
+                php_use_list_rules(a, c, source, &rules, &names);
+                continue;
+            }
+            if (!php_class_name_node(k)) {
+                continue;
+            }
+            char *t = cbm_node_text(a, c, source);
+            if (!t || !t[0]) {
+                continue;
+            }
+            if (count + 1 >= cap) {
+                int ncap = cap ? cap * 2 : 4;
+                const char **grown =
+                    (const char **)cbm_arena_alloc(a, (size_t)ncap * sizeof(*grown));
+                if (!grown) {
+                    return;
+                }
+                if (count > 0) {
+                    memcpy(grown, mixins, (size_t)count * sizeof(*grown));
+                }
+                mixins = grown;
+                cap = ncap;
+            }
+            mixins[count++] = php_fq_class(a, &names, t);
+        }
+    }
+    CBMDefTypeFacts *f = count > 0 || rules ? def_type_facts(a, def) : NULL;
+    if (!f) {
+        return;
+    }
+    if (count > 0) {
+        mixins[count] = NULL;
+        char *mk = (char *)cbm_arena_alloc(a, (size_t)count + 1);
+        if (!mk) {
+            return;
+        }
+        memset(mk, 't', (size_t)count);
+        mk[count] = '\0';
+        f->mixins = mixins;
+        f->mixin_kinds = mk;
+    }
+    f->member_rules = rules;
+}
+
 /* Kotlin: supertypes live in `delegation_specifier` children.  Each holds
  * either a bare `user_type` (interface) or a `constructor_invocation` whose
  * `user_type` is the superclass.  Descend to the `type_identifier`. */
@@ -5976,30 +6494,82 @@ static bool is_cpp_test_macro(const char *name) {
  * Returns an arena-allocated string, or NULL when the parameters cannot be
  * resolved (caller keeps the original name in that case). */
 static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
-                                         const char *source) {
+                                         const char *source);
+
+char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNode func_node,
+                              const char *source) {
+    if (!enabled || !name || !source || ts_node_is_null(func_node) || !is_cpp_test_macro(name)) {
+        return NULL;
+    }
+    return resolve_cpp_test_macro_name(a, name, func_node, source);
+}
+
+/* An argument's text without comments and without the blanks around it, in
+ * place: `Suite /\* c *\/` reads `Suite`, as the compiler (and the second,
+ * preprocessed view) sees it. */
+static char *cpp_test_arg_text(char *text) {
+    if (!text) {
+        return NULL;
+    }
+    char *w = text;
+    for (const char *r = text; *r;) {
+        if (r[0] == '/' && r[1] == '*') {
+            const char *close = strstr(r + 2, "*/");
+            r = close ? close + 2 : r + strlen(r);
+            *w++ = ' ';
+        } else if (r[0] == '/' && r[1] == '/') {
+            while (*r && *r != '\n') {
+                r++;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+    while (w > text && (w[-1] == ' ' || w[-1] == '\t' || w[-1] == '\n' || w[-1] == '\r')) {
+        *--w = '\0';
+    }
+    char *start = text;
+    while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r') {
+        start++;
+    }
+    return start;
+}
+
+/* The first two arguments of a GoogleTest-style head `MACRO(a, b) {`: the text
+ * of each named parameter, its type node where the grammar gives one (`Suite`
+ * parses as a parameter whose type is that name). A comment in the head is an
+ * extra of the grammar, not an argument. Returns how many it found, at most
+ * two. */
+static int cpp_test_macro_args(CBMArena *a, TSNode node, const char *source, const char *args[2]) {
     TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
     if (ts_node_is_null(params)) {
         params = find_c_params(node);
     }
     if (ts_node_is_null(params)) {
-        return NULL;
+        return 0;
     }
-
-    const char *args[2] = {NULL, NULL};
     int count = 0;
     uint32_t nc = ts_node_named_child_count(params);
     for (uint32_t i = 0; i < nc && count < 2; i++) {
         TSNode child = ts_node_named_child(params, i);
-        if (ts_node_is_null(child)) {
+        if (ts_node_is_null(child) || strcmp(ts_node_type(child), "comment") == 0) {
             continue;
         }
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        char *text = cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source);
+        char *text = cpp_test_arg_text(
+            cbm_node_text(a, ts_node_is_null(type_node) ? child : type_node, source));
         if (text && text[0]) {
             args[count++] = text;
         }
     }
+    return count;
+}
 
+static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode node,
+                                         const char *source) {
+    const char *args[2] = {NULL, NULL};
+    int count = cpp_test_macro_args(a, node, source, args);
     if (count == 2) {
         return cbm_arena_sprintf(a, "%s_%s_%s", macro, args[0], args[1]);
     }
@@ -6007,6 +6577,192 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
         return cbm_arena_sprintf(a, "%s_%s", macro, args[0]);
     }
     return NULL;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_test_span_work = 0;
+void cbm_test_span_test_reset(void) {
+    atomic_store_explicit(&g_test_span_work, 0, memory_order_relaxed);
+}
+uint64_t cbm_test_span_test_work(void) {
+    return atomic_load_explicit(&g_test_span_work, memory_order_relaxed);
+}
+void cbm_test_span_test_count(uint64_t work) {
+    atomic_fetch_add_explicit(&g_test_span_work, work, memory_order_relaxed);
+}
+#define TEST_SPAN_WORK(n) cbm_test_span_test_count(n)
+#else
+#define TEST_SPAN_WORK(n) ((void)0)
+#endif
+
+static int test_span_cmp(const CBMTestSpan *s, uint32_t start, uint32_t end) {
+    if (s->start_line != start) {
+        return s->start_line < start ? -1 : 1;
+    }
+    return s->end_line == end ? 0 : (s->end_line < end ? -1 : 1);
+}
+
+/* The raw test span (start, end): its index, or -1 when none or two raw tests
+ * share it. Binary search. */
+static int test_span_at(const CBMTestSpanMap *map, uint32_t start, uint32_t end) {
+    int lo = 0;
+    int hi = map->count;
+    while (lo < hi) { /* the first span not below (start, end) */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (test_span_cmp(&map->spans[mid], start, end) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->count || test_span_cmp(&map->spans[lo], start, end) != 0 ||
+        (lo + 1 < map->count && test_span_cmp(&map->spans[lo + 1], start, end) == 0)) {
+        return -1; /* none, or two raw tests on one span */
+    }
+    return lo;
+}
+
+/* The raw test span a preprocessed-view definition's first and last lines map
+ * onto, or -1. */
+static int test_span_of(const CBMTestSpanMap *map, TSNode function) {
+    uint32_t first = ts_node_start_point(function).row + 1;
+    uint32_t last = ts_node_end_point(function).row + 1;
+    if (last < first || last > (uint32_t)map->line_count || !map->in_main_file[first] ||
+        !map->in_main_file[last]) {
+        return -1;
+    }
+    uint32_t start = map->raw_line_by_line[first];
+    uint32_t end = map->raw_line_by_line[last];
+    return start && end ? test_span_at(map, start, end) : -1;
+}
+
+/* Nodes whose children are still top level: namespace, extern-block and
+ * template bodies and the branches of conditionals. */
+static bool test_view_container(const char *kind) {
+    return strcmp(kind, "namespace_definition") == 0 || strcmp(kind, "declaration_list") == 0 ||
+           strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "template_declaration") == 0 || strncmp(kind, "preproc_", 8) == 0;
+}
+
+void cbm_test_span_index_view(CBMTestSpanMap *map, CBMArena *a, TSNode root) {
+    if (!map) {
+        return;
+    }
+    map->view_defs = NULL;
+    map->view_def_count = 0;
+    if (map->count <= 0 || !map->raw_line_by_line || !map->in_main_file || !a ||
+        ts_node_is_null(root)) {
+        return;
+    }
+    CBMTestViewDef *defs = NULL;
+    int count = 0;
+    int cap = 0;
+    bool failed = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    int depth = 1;
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    while (more && !failed) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TEST_SPAN_WORK(1);
+        if (strcmp(kind, "function_definition") == 0) {
+            int span = test_span_of(map, node);
+            if (span >= 0 && count == cap) {
+                int grown_cap = cap ? cap * 2 : 16;
+                CBMTestViewDef *grown =
+                    cbm_arena_alloc(a, (size_t)grown_cap * sizeof(CBMTestViewDef));
+                if (!grown) {
+                    failed = true;
+                    break;
+                }
+                if (count) {
+                    memcpy(grown, defs, (size_t)count * sizeof(CBMTestViewDef));
+                }
+                defs = grown;
+                cap = grown_cap;
+            }
+            if (span >= 0) {
+                defs[count++] =
+                    (CBMTestViewDef){ts_node_start_byte(node), ts_node_end_byte(node), span};
+            }
+        } else if (test_view_container(kind) && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!(more = ts_tree_cursor_goto_next_sibling(&cursor)) && depth > 1) {
+            ts_tree_cursor_goto_parent(&cursor);
+            depth--;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    int *per_span =
+        failed || count == 0 ? NULL : cbm_arena_alloc(a, (size_t)map->count * sizeof(int));
+    if (!per_span) {
+        return; /* nothing maps, or out of memory: no body is named from a span */
+    }
+    memset(per_span, 0, (size_t)map->count * sizeof(int));
+    for (int i = 0; i < count; i++) {
+        per_span[defs[i].span]++;
+    }
+    for (int i = 0; i < count; i++) {
+        if (per_span[defs[i].span] != 1) {
+            defs[i].span = -1; /* two definitions of this view on one span: neither */
+        }
+    }
+    map->view_defs = defs;
+    map->view_def_count = count;
+}
+
+/* The raw test span of an indexed top-level definition of the preprocessed
+ * view, or -1: not indexed (not top level, or mapping onto no single raw
+ * test), or sharing its span with another such definition. */
+static int test_view_def_span(const CBMTestSpanMap *map, TSNode function) {
+    if (!map || map->view_def_count <= 0 || ts_node_is_null(function)) {
+        return -1;
+    }
+    uint32_t start = ts_node_start_byte(function);
+    int lo = 0;
+    int hi = map->view_def_count;
+    while (lo < hi) { /* the first indexed definition not before `function` */
+        int mid = lo + (hi - lo) / 2;
+        TEST_SPAN_WORK(1);
+        if (map->view_defs[mid].start_byte < start) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= map->view_def_count || map->view_defs[lo].start_byte != start ||
+        map->view_defs[lo].end_byte != ts_node_end_byte(function)) {
+        return -1; /* not an indexed top-level definition of the view */
+    }
+    return map->view_defs[lo].span; /* -1 on a shared span */
+}
+
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function) {
+    int span = test_view_def_span(map, function);
+    return span >= 0 ? map->spans[span].qualified_name : NULL;
+}
+
+/* Record a raw test definition's span for the preprocessed view (in scratch;
+ * amortised constant work per test). */
+static void record_test_span(CBMExtractCtx *ctx, const CBMDefinition *def) {
+    if (ctx->test_span_count == ctx->test_span_cap) {
+        int cap = ctx->test_span_cap ? ctx->test_span_cap * 2 : 16;
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        CBMTestSpan *grown = cbm_arena_alloc(scratch, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return; /* the second view then names this body from its own head */
+        }
+        if (ctx->test_span_count) {
+            memcpy(grown, ctx->test_spans, (size_t)ctx->test_span_count * sizeof(*grown));
+        }
+        ctx->test_spans = grown;
+        ctx->test_span_cap = cap;
+    }
+    ctx->test_spans[ctx->test_span_count++] =
+        (CBMTestSpan){def->start_line, def->end_line, def->qualified_name};
 }
 
 /* Configured macro definitions are interpreted only in their raw source.
@@ -6131,11 +6887,21 @@ bool cbm_test_declarations_validate(CBMFileResult *result,
     return result->test_declarations_status == CBM_TEST_EXTRACT_OK;
 }
 
-static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
-    if (!ctx->test_declarations)
+static bool tdx_preset_of(const cbm_test_declarations_t *declarations, cbm_test_preset_t preset) {
+    if (!declarations)
         return preset != CBM_TEST_PRESET_C_CBM;
     bool enabled = false;
-    return cbm_test_declarations_preset(ctx->test_declarations, preset, &enabled) && enabled;
+    return cbm_test_declarations_preset(declarations, preset, &enabled) && enabled;
+}
+
+static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
+    return tdx_preset_of(ctx->test_declarations, preset);
+}
+
+bool cbm_cpp_test_macro_names_on(CBMLanguage language,
+                                 const cbm_test_declarations_t *declarations) {
+    return (language == CBM_LANG_CPP || language == CBM_LANG_CUDA) &&
+           tdx_preset_of(declarations, CBM_TEST_PRESET_GTEST);
 }
 
 static bool tdx_equal(const char *name, const char *text, size_t size) {
@@ -7567,6 +8333,24 @@ static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDef
     }
 }
 
+/* A Ruby `def self.m` (a singleton_method node) or a `def m` inside
+ * `class << self` lives on the singleton side of its class. */
+static bool ruby_def_is_singleton(TSNode node) {
+    if (strcmp(ts_node_type(node), "singleton_method") == 0) {
+        return true;
+    }
+    for (TSNode p = ts_node_parent(node); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        const char *t = ts_node_type(p);
+        if (strcmp(t, "singleton_class") == 0) {
+            return true;
+        }
+        if (strcmp(t, "class") == 0 || strcmp(t, "module") == 0 || strcmp(t, "program") == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -7610,7 +8394,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     /* C++/CUDA: GoogleTest macros (TEST, TEST_F, TEST_P, ...) parse as
      * function definitions whose name resolves to the bare macro identifier.
      * Multiple test cases per file collide on qualified name; derive a unique
-     * name from the macro arguments so each gets its own graph node (#1266). */
+     * name from the macro arguments so each gets its own graph node (#1266).
+     * The callers of calls in the body are named by the same helper. */
     bool is_gtest = false;
     const char *configured_name = NULL;
     TDXRule configured_rule;
@@ -7620,14 +8405,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
         name = (char *)configured_name;
     }
-    if (!configured && tdx_preset(ctx, CBM_TEST_PRESET_GTEST) &&
-        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
-        is_cpp_test_macro(name)) {
-        char *gtest_name = resolve_cpp_test_macro_name(a, name, node, ctx->source);
-        if (gtest_name) {
-            name = gtest_name;
-            is_gtest = true;
-        }
+    char *gtest_name =
+        configured ? NULL
+                   : cbm_cpp_test_macro_name(
+                         a, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations),
+                         name, node, ctx->source);
+    if (gtest_name) {
+        name = gtest_name;
+        is_gtest = true;
     }
 
     /* Nix `"${foo}" = x: …`: an interpolated attrpath segment has no statically
@@ -7704,6 +8489,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "function_signature_item") == 0) {
         def.is_abstract = true;
+    }
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.is_singleton = ruby_def_is_singleton(node);
     }
 
     // Parameters — use func_node (inner function for templates)
@@ -7918,6 +8706,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
             return;
     }
     cbm_defs_push(&ctx->result->defs, a, def);
+    if (is_gtest && ctx->test_declarations_raw_source && def.qualified_name) {
+        record_test_span(ctx, &def);
+    }
     if (ctx->language == CBM_LANG_MAKEFILE && strcmp(ts_node_type(node), "rule") == 0) {
         push_make_rule_targets(ctx, node, &def);
     }
@@ -9518,6 +10309,59 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     emit_class_def(ctx, node, spec, kind, name);
 }
 
+/* The `include`/`prepend`/`extend` macros of a Ruby class/module body as
+ * "<k>:<Const>" pairs joined by '|' (k = i, p, e), in source order; NULL when
+ * there are none. Only constant arguments count (`extend self` is not one),
+ * and only bare or `self.` calls, as the per-file resolver reads them. */
+static const char *ruby_class_mixin_refs(CBMArena *a, TSNode node, const char *source) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    TSNode scope = ts_node_is_null(body) ? node : body;
+    const char *out = NULL;
+    uint32_t n = ts_node_named_child_count(scope);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode call = ts_node_named_child(scope, i);
+        if (strcmp(ts_node_type(call), "call") != 0) {
+            continue;
+        }
+        TSNode meth = ts_node_child_by_field_name(call, TS_FIELD("method"));
+        TSNode recv = ts_node_child_by_field_name(call, TS_FIELD("receiver"));
+        TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+        if (ts_node_is_null(meth) || ts_node_is_null(args) ||
+            (!ts_node_is_null(recv) && strcmp(ts_node_type(recv), "self") != 0)) {
+            continue;
+        }
+        char *mname = cbm_node_text(a, meth, source);
+        char kind;
+        if (mname && strcmp(mname, "include") == 0) {
+            kind = 'i';
+        } else if (mname && strcmp(mname, "prepend") == 0) {
+            kind = 'p';
+        } else if (mname && strcmp(mname, "extend") == 0) {
+            kind = 'e';
+        } else {
+            continue;
+        }
+        uint32_t ac = ts_node_named_child_count(args);
+        for (uint32_t j = 0; j < ac; j++) {
+            TSNode arg = ts_node_named_child(args, j);
+            const char *at = ts_node_type(arg);
+            if (strcmp(at, "constant") != 0 && strcmp(at, "scope_resolution") != 0) {
+                continue;
+            }
+            char *ref = cbm_node_text(a, arg, source);
+            if (!ref || !ref[0]) {
+                continue;
+            }
+            while (ref[0] == ':') {
+                ref++;
+            }
+            out = out ? cbm_arena_sprintf(a, "%s|%c:%s", out, kind, ref)
+                      : cbm_arena_sprintf(a, "%c:%s", kind, ref);
+        }
+    }
+    return out;
+}
+
 /* Emit the class-like def for `node` under `name`, plus its members (enum
  * members, methods, fields, class variables). Split from extract_class_def so a
  * C `typedef struct { ... } Name;` can name its anonymous struct after the
@@ -9638,6 +10482,12 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         }
     }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    if (ctx->language == CBM_LANG_PHP) {
+        extract_php_member_bases(ctx, a, node, &def);
+    }
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.mixin_refs = ruby_class_mixin_refs(a, node, ctx->source);
+    }
     // Go identity alias `type A = B` (#2033): keep the aliased type text so the
     // cross-file registries can set alias_of. A defined type `type A B` is a
     // type_spec and never gets here with this kind.
@@ -10148,6 +10998,15 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
     }
+    /* PHP: a method without a body (`abstract function`, an interface's) is a
+     * declaration; the member lookup lets a trait's be satisfied further on. */
+    if (ctx->language == CBM_LANG_PHP && strcmp(ts_node_type(child), "method_declaration") == 0 &&
+        ts_node_is_null(ts_node_child_by_field_name(child, TS_FIELD("body")))) {
+        def.is_abstract = true;
+    }
+    if (ctx->language == CBM_LANG_RUBY) {
+        def.is_singleton = ruby_def_is_singleton(child);
+    }
 
     TSNode params = find_function_params(child, ctx->language);
     if (!ts_node_is_null(params)) {
@@ -10604,6 +11463,13 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
             def.signature_param_types = extract_signature_param_types(
                 a, params, ctx->source, ctx->language, true, &def.signature_param_count);
+        }
+
+        // Return type, as extract_func_def reads it for a free `fn`.
+        TSNode rt = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+        if (!ts_node_is_null(rt)) {
+            def.return_type = cbm_node_text(a, rt, ctx->source);
+            def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -13190,6 +14056,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
                         if (strcmp(member_label, "Storage") == 0) {
                             TSNode sbody = cbm_find_child_by_kind(child, "storage_body");
+                            if (ts_node_is_null(sbody)) {
+                                sbody =
+                                    cbm_find_child_by_kind(child, "external_method_body_content");
+                            }
                             if (!ts_node_is_null(sbody)) {
                                 char *xml = cbm_node_text(a, sbody, ctx->source);
                                 if (xml) {
@@ -13291,13 +14161,27 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                         }
 
                         if (strcmp(member_label, "Trigger") == 0) {
+                            /* Grammar v1.9.15+ hides the core_trigger /
+                             * external_trigger wrapper; the body is then
+                             * everything after trigger_name. */
                             TSNode tbody = cbm_find_child_by_kind(child, "core_trigger");
                             if (ts_node_is_null(tbody)) {
                                 tbody = cbm_find_child_by_kind(child, "external_trigger");
                             }
+                            uint32_t body_from = 0;
+                            if (ts_node_is_null(tbody)) {
+                                tbody = child;
+                                body_from = ts_node_end_byte(nname);
+                            }
                             if (!ts_node_is_null(tbody)) {
-                                mdef.body_tokens = extract_body_ident_tokens(ctx, tbody);
+                                mdef.body_tokens = extract_ident_tokens_from(ctx, tbody, body_from);
                                 char *raw = cbm_node_text(a, tbody, ctx->source);
+                                if (raw && body_from > ts_node_start_byte(tbody)) {
+                                    raw += body_from - ts_node_start_byte(tbody);
+                                    while (*raw == ' ' || *raw == '\t') {
+                                        raw++;
+                                    }
+                                }
                                 if (raw && raw[0]) {
                                     char esc[CBM_SZ_512];
                                     int ei = 0;

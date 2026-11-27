@@ -1896,6 +1896,97 @@ TEST(lrp_python_subclass_constructor_own_init_only) {
     PASS();
 }
 
+/* ── Ruby: cross-file through the prebuilt project registry ──────────
+ * Rails/Zeitwerk code names classes in other files with no require, and a
+ * class may be reopened in a third file. Both edges must come out of the
+ * Ruby resolver (ruby_* strategy), not the name-based one. */
+TEST(lrp_ruby_cross_file_zeitwerk) {
+    const LRP_File files[] = {
+        {"app/widget.rb", "class Widget\n"
+                          "  def run\n"
+                          "    h = Helper.new\n"
+                          "    h.assist\n"
+                          "    h.extra_step\n"
+                          "  end\n"
+                          "end\n"},
+        {"app/helper.rb", "class Helper\n"
+                          "  def assist\n"
+                          "    1\n"
+                          "  end\n"
+                          "end\n"},
+        {"lib/helper_ext.rb", "class Helper\n"
+                              "  def extra_step\n"
+                              "    2\n"
+                              "  end\n"
+                              "end\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 3);
+    int assist = lrp_exact_calls_by_name(store, lp.project, "run", "assist");
+    int extra = lrp_exact_calls_by_name(store, lp.project, "run", "extra_step");
+    int typed = lrp_count_calls_with_strategy(store, lp.project, "ruby_method_typed");
+    if (assist < 1 || extra < 1 || typed < 2) {
+        fprintf(stderr, "  [LRP] ruby cross-file FAIL assist=%d extra_step=%d typed_edges=%d\n",
+                assist, extra, typed);
+        lrp_diag(store, lp.project, "ruby cross-file");
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (store &&
+            cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &n) == CBM_STORE_OK) {
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "    [LRP] CALLS %s\n",
+                        edges[i].properties_json ? edges[i].properties_json : "(none)");
+            cbm_store_free_edges(edges, n);
+        }
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(assist >= 1);
+    ASSERT_TRUE(extra >= 1);
+    ASSERT_TRUE(typed >= 2);
+    PASS();
+}
+
+/* ── Ruby: singleton side and cross-file mixins, through real extraction ──
+ * The hand-built-def rows pass the singleton flag and mixin macros in
+ * themselves; this one has the extractor produce them. `Child.run` is a
+ * `def self.run`, `Child.new.run` is Base's instance `run`, and `Widget`
+ * includes a module that overrides Base#greet, all from a caller in a fifth
+ * file. */
+TEST(lrp_ruby_cross_file_singleton_and_mixin) {
+    const LRP_File files[] = {
+        {"app/base.rb", "class Base\n  def run\n    1\n  end\n  def greet\n    2\n  end\nend\n"},
+        {"app/overrides.rb", "module Overrides\n  def greet\n    3\n  end\nend\n"},
+        {"app/child.rb", "class Child < Base\n  def self.run\n    4\n  end\nend\n"},
+        {"app/widget.rb", "class Widget < Base\n  include Overrides\nend\n"},
+        {"app/caller.rb", "class Caller\n"
+                          "  def go\n"
+                          "    Child.new.run\n"
+                          "    Child.run\n"
+                          "    Widget.new.greet\n"
+                          "  end\n"
+                          "end\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 5);
+    const char *p = store ? lp.project : NULL;
+    int inst = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.run");
+    int klass =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "child.Child.run");
+    int mixin = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go",
+                                            "overrides.Overrides.greet");
+    int base_greet =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "caller.Caller.go", "base.Base.greet");
+    if (inst != 1 || klass != 1 || mixin != 1 || base_greet != 0)
+        fprintf(stderr, "  [LRP] ruby singleton/mixin FAIL instance=%d class=%d mixin=%d base=%d\n",
+                inst, klass, mixin, base_greet);
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(inst, 1);
+    ASSERT_EQ(klass, 1);
+    ASSERT_EQ(mixin, 1);
+    ASSERT_EQ(base_greet, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ══════════════════════════════════════════════════════════════════════ */
@@ -2014,4 +2105,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
     RUN_TEST(lrp_python_subclass_constructor_own_init_only);
+
+    /* ── Ruby (project registry built once) ── */
+    RUN_TEST(lrp_ruby_cross_file_zeitwerk);
+    RUN_TEST(lrp_ruby_cross_file_singleton_and_mixin);
 }

@@ -581,7 +581,8 @@ static const tool_def_t TOOLS[] = {
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
-     "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Not with query.\"},"
+     "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Keywords; [] ignored; "
+     "else omit query.\"},"
      "\"semantic_limit\":{\"type\":\"integer\",\"default\":50,\"minimum\":0,"
      "\"maximum\":500},"
      "\"semantic_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,"
@@ -4794,7 +4795,7 @@ static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *st
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
     yyjson_val *sq_val = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
-    if (out_present && sq_val) {
+    if (out_present && sq_val && (!yyjson_is_arr(sq_val) || yyjson_arr_size(sq_val) > 0)) {
         *out_present = true;
     }
     sq_run_status_t status = SQ_RUN_OK;
@@ -4824,10 +4825,11 @@ static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *st
     return status;
 }
 
-static bool search_graph_arg_present(const char *args, const char *name) {
+static bool search_graph_semantic_query_present(const char *args) {
     yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    bool present = root && yyjson_is_obj(root) && yyjson_obj_get(root, name) != NULL;
+    yyjson_val *sq_val = root ? yyjson_obj_get(root, "semantic_query") : NULL;
+    bool present = sq_val && (!yyjson_is_arr(sq_val) || yyjson_arr_size(sq_val) > 0);
     if (doc) {
         yyjson_doc_free(doc);
     }
@@ -5619,13 +5621,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * and return early. If FTS5 is unavailable or the query is empty after
      * tokenization, fall through to the regex path. */
     char *query = cbm_mcp_get_string_arg(args, "query");
-    if (query && search_graph_arg_present(args, "semantic_query")) {
+    if (query && search_graph_semantic_query_present(args)) {
         free(query);
         free(project);
         return cbm_mcp_text_result(
-            "query and semantic_query are mutually exclusive — use query for BM25 full-text "
-            "ranking or semantic_query for vector ranking, then issue a separate request for "
-            "the other mode.",
+            "query and semantic_query are mutually exclusive. For BM25 search, remove the "
+            "semantic_query key (an empty array is also accepted). For vector search, remove the "
+            "query key entirely. To run both modes, send two separate requests; do not retry "
+            "unchanged arguments.",
             true);
     }
     if (query && query[0]) {
@@ -20751,21 +20754,34 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     int hunk_count = 0;
     if (!seed_rows.failed && (want_symbols || seed_req.list)) {
         char hunk_cmd[CBM_SZ_2K];
+        int hunk_len;
 #ifdef _WIN32
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
-                 root_path, merge_base, head_oid, root_path);
+        hunk_len =
+            snprintf(hunk_cmd, sizeof(hunk_cmd),
+                     "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " \"%s\" \"%s\" -- 2>NUL && "
+                     "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>NUL",
+                     root_path, merge_base, head_oid, root_path);
 #else
-        snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
-                 root_path, merge_base, head_oid, root_path);
+        hunk_len =
+            snprintf(hunk_cmd, sizeof(hunk_cmd),
+                     "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " '%s' '%s' -- 2>/dev/null && "
+                     "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                     " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>/dev/null",
+                     root_path, merge_base, head_oid, root_path);
 #endif
+        /* A root path long enough to truncate the command would run a cut-off
+         * git command (an error, or a flag list without --unified=0): skip hunk
+         * scoping instead, which leaves whole-file seeding. */
+        bool hunk_cmd_fits = hunk_len > 0 && (size_t)hunk_len < sizeof(hunk_cmd);
         char hunk_output_path[CBM_SZ_2K] = {0};
         cbm_proc_result_t hunk_result = {0};
         int hunk_run =
-            mcp_run_shell_command_cancellable(srv, hunk_cmd, hunk_output_path, &hunk_result);
+            hunk_cmd_fits
+                ? mcp_run_shell_command_cancellable(srv, hunk_cmd, hunk_output_path, &hunk_result)
+                : -1;
         bool hunk_cancelled = hunk_result.cancellation_requested || mcp_request_cancelled(srv);
         FILE *hfp = (!hunk_cancelled && hunk_run == 0 && hunk_result.exit_code == 0)
                         ? cbm_fopen(hunk_output_path, "rb")

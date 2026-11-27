@@ -1122,7 +1122,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                const char **imp_vals, int imp_count, CBMLanguage lang,
                                const CBMImportArray *imports, const char *route_mount,
                                const cbm_php_vendor_names_t *php_vendor,
-                               cbm_external_import_index_t *ext_imports, CBMCallEvidence *evidence,
+                               cbm_external_import_index_t *ext_imports,
+                               const cbm_pipeline_lsp_index_t *lsp_index, CBMCallEvidence *evidence,
                                cbm_site_file_t *site) {
     const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
@@ -1133,8 +1134,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
-        lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
+    const CBMResolvedCall *lsp = cbm_pipeline_lsp_index_find(lsp_index, lsp_calls, call, allow_tail,
+                                                             ctx->gbuf, ctx->project_name);
     /* #1186: a PHP call on a vendor type (`new Request`, or a receiver the LSP
      * typed as an imported vendor class) takes the LSP result or no target: a
      * same-named project symbol found by name alone is never the vendor's.
@@ -1397,7 +1398,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                             cbm_pipeline_get_nsmap()) ||
         /* MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
-         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry)) ||
+         cbm_pipeline_lsp_index_php_receiver_unindexed(lsp_index, lsp_calls, call,
+                                                       ctx->registry)) ||
         /* Same-module bound-receiver suppression (#1128): `axios.get()` with
          * axios imported must not bind the `get` this file happens to define.
          * The language list is inside the helper - MUST match pass_parallel.c. */
@@ -1591,9 +1593,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int resolved = 0;
     int unresolved = 0;
     int errors = 0;
+    /* the shared layer's memo for this pass (site_bind.h) */
+    cbm_site_memo_t *site_memo = NULL;
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_NOT_FOUND;
         }
 
@@ -1602,6 +1607,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
             if (atomic_load(&ctx->test_declarations_failed)) {
+                cbm_pipeline_site_memo_free(site_memo);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
             errors++;
@@ -1612,6 +1618,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             if (result_owned) {
                 cbm_free_result(result);
             }
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
@@ -1643,11 +1650,19 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_laravel_file_route_mount(ctx->repo_path, rel, files[i].language, result, route_mount,
                                      sizeof(route_mount));
 
+        /* The file's engine rows by caller, leaf and span: one lookup per call
+         * instead of a scan of every row (shared with pass_parallel.c). */
+        cbm_pipeline_lsp_index_t lsp_index;
+        cbm_pipeline_lsp_index_build(&lsp_index, &result->resolved_calls, ctx->gbuf,
+                                     ctx->project_name,
+                                     cbm_pipeline_lsp_allow_tail_match(files[i].language));
+
         /* Resolve each call */
         cbm_external_import_index_t ext_imports = {0};
         cbm_spawn_file_begin(result->imports.items, result->imports.count);
         cbm_site_file_t site;
-        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result);
+        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result,
+                                     &site_memo, evidence);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1657,7 +1672,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             total_calls++;
             if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
                                     imp_count, files[i].language, &result->imports, route_mount,
-                                    &php_vendor, &ext_imports,
+                                    &php_vendor, &ext_imports, &lsp_index,
                                     calls_evidence_at(evidence, c, &fallback), &site)) {
                 resolved++;
             } else {
@@ -1667,6 +1682,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_pipeline_site_bind_end(&site, ctx->gbuf);
         cbm_spawn_file_end();
         cbm_pipeline_external_import_index_free(&ext_imports);
+        cbm_pipeline_lsp_index_free(&lsp_index);
 
         cbm_pipeline_record_unresolved_calls(ctx->pipeline, rel, result, evidence);
         cbm_free(CBM_MEM_CLASS_RESOLVE, evidence);
@@ -1678,6 +1694,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
 
+    cbm_pipeline_site_memo_free(site_memo);
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));

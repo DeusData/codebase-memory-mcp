@@ -1322,6 +1322,15 @@ typedef struct {
     int line;
 } k8s_kchart_t;
 
+/* A file a kustomization reads (extract_k8s.c FILE fact): input to its
+ * build, no member of it. */
+typedef struct {
+    char *kust;      /* the kustomization file */
+    char *path;      /* the file, from the repository root */
+    const char *via; /* static: configMapGenerator, secretGenerator, configurations */
+    int line;
+} k8s_kfile_t;
+
 typedef struct {
     k8s_ref_t *refs;
     int ref_n;
@@ -1350,6 +1359,9 @@ typedef struct {
     k8s_kchart_t *kcharts;
     int kchart_n;
     int kchart_cap;
+    k8s_kfile_t *kfiles;
+    int kfile_n;
+    int kfile_cap;
 } k8s_facts_t;
 
 static void k8s_facts_free(k8s_facts_t *f) {
@@ -1407,6 +1419,11 @@ static void k8s_facts_free(k8s_facts_t *f) {
         cbm_free(CBM_MEM_CLASS_OTHER, c->values);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, f->kcharts);
+    for (int i = 0; i < f->kfile_n; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles[i].kust);
+        cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles[i].path);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, f->kfiles);
     cbm_free(CBM_MEM_CLASS_OTHER, f->envs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->hrs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->srcs);
@@ -3250,6 +3267,101 @@ static char *k8s_skeleton(const char *src, int len, int *out_len) {
     return out;
 }
 
+/* ── Dependency-manifest text encoding (#2941) ────────────────────── */
+
+enum { DEP_UTF8_BOM_LEN = 3, DEP_UTF16_UNIT = 2, DEP_UTF8_MAX_PER_UNIT = 3 };
+
+/* One UTF-16 code unit at `u`, little- or big-endian. */
+static uint32_t dep_utf16_unit(const unsigned char *u, bool le) {
+    return le ? (uint32_t)u[0] | ((uint32_t)u[1] << 8U) : ((uint32_t)u[0] << 8U) | (uint32_t)u[1];
+}
+
+/* Append BMP code point `c` (one UTF-16 unit, not a surrogate) to `out` as
+ * UTF-8; returns the bytes written (at most 3). */
+static size_t dep_put_utf8_bmp(char *out, uint32_t c) {
+    unsigned char *o = (unsigned char *)out;
+    if (c < 0x80U) {
+        o[0] = (unsigned char)c;
+        return 1;
+    }
+    if (c < 0x800U) {
+        o[0] = (unsigned char)(0xC0U | (c >> 6U));
+        o[1] = (unsigned char)(0x80U | (c & 0x3FU));
+        return 2;
+    }
+    o[0] = (unsigned char)(0xE0U | (c >> 12U));
+    o[1] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
+    o[2] = (unsigned char)(0x80U | (c & 0x3FU));
+    return 3;
+}
+
+/* Append the code point of surrogate pair `hi`/`lo` to `out` as UTF-8 (always
+ * 4 bytes, fits the 3-bytes-per-unit budget of the two units). */
+static size_t dep_put_utf8_pair(char *out, uint32_t hi, uint32_t lo) {
+    uint32_t c = 0x10000U + ((hi - 0xD800U) << 10U) + (lo - 0xDC00U);
+    unsigned char *o = (unsigned char *)out;
+    o[0] = (unsigned char)(0xF0U | (c >> 18U));
+    o[1] = (unsigned char)(0x80U | ((c >> 12U) & 0x3FU));
+    o[2] = (unsigned char)(0x80U | ((c >> 6U) & 0x3FU));
+    o[3] = (unsigned char)(0x80U | (c & 0x3FU));
+    return 4;
+}
+
+/* requirements.txt / go.mod as UTF-8 text. pip decodes a requirements file by
+ * its BOM, and Windows tools write BOMs: Windows PowerShell 5.1 saves
+ * `pip freeze > requirements.txt` as UTF-16 LE with a BOM, and many editors
+ * put a UTF-8 BOM in front. Read as raw bytes, UTF-16 stops at the NUL after
+ * the first letter, and a UTF-8 BOM sticks to the first package name.
+ * Drops a UTF-8 BOM in place (the freed tail bytes are zeroed, so the zero tail
+ * k8s_read_file adds stays intact), or returns a new UTF-8 buffer with a
+ * K8S_TS_PAD zero tail for UTF-16 (BOM dropped, `src` freed). A non-positive
+ * length (an empty file, or a size k8s_read_file could not represent as int)
+ * is returned unchanged. */
+static char *dep_manifest_utf8(char *src, int *len) {
+    if (*len <= 0) {
+        return src;
+    }
+    const unsigned char *b = (const unsigned char *)src;
+    size_t n = (size_t)*len;
+    if (n >= DEP_UTF8_BOM_LEN && b[0] == 0xEFU && b[1] == 0xBBU && b[2] == 0xBFU) {
+        memmove(src, src + DEP_UTF8_BOM_LEN, n - DEP_UTF8_BOM_LEN);
+        memset(src + n - DEP_UTF8_BOM_LEN, 0, DEP_UTF8_BOM_LEN);
+        *len = (int)(n - DEP_UTF8_BOM_LEN);
+        return src;
+    }
+    bool le = n >= DEP_UTF16_UNIT && b[0] == 0xFFU && b[1] == 0xFEU;
+    bool be = n >= DEP_UTF16_UNIT && b[0] == 0xFEU && b[1] == 0xFFU;
+    if (!le && !be) {
+        return src;
+    }
+    size_t units = (n - DEP_UTF16_UNIT) / DEP_UTF16_UNIT;
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, (units * DEP_UTF8_MAX_PER_UNIT) + K8S_TS_PAD);
+    if (!out) {
+        return src;
+    }
+    const unsigned char *u = b + DEP_UTF16_UNIT;
+    size_t w = 0;
+    for (size_t i = 0; i < units; i++) {
+        uint32_t c = dep_utf16_unit(u + (i * DEP_UTF16_UNIT), le);
+        if (c >= 0xD800U && c <= 0xDBFFU && i + SKIP_ONE < units) {
+            uint32_t lo = dep_utf16_unit(u + ((i + SKIP_ONE) * DEP_UTF16_UNIT), le);
+            if (lo >= 0xDC00U && lo <= 0xDFFFU) {
+                w += dep_put_utf8_pair(out + w, c, lo);
+                i++;
+                continue;
+            }
+        }
+        if (c >= 0xD800U && c <= 0xDFFFU) {
+            c = 0xFFFDU; /* unpaired surrogate */
+        }
+        w += dep_put_utf8_bmp(out + w, c);
+    }
+    memset(out + w, 0, K8S_TS_PAD);
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+    *len = (int)w;
+    return out;
+}
+
 static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
     cbm_pipeline_ctx_t *ctx = job->ctx;
     const char *path = job->files[i].path;
@@ -3259,6 +3371,9 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
 
     if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
         out->source = k8s_read_file(path, &out->src_len);
+        if (out->source) {
+            out->source = dep_manifest_utf8(out->source, &out->src_len);
+        }
         out->kind = out->source ? K8S_DEP : K8S_SKIP;
     } else if (lang == CBM_LANG_KUSTOMIZE) {
         /* Its `namespace:` is the namespace of the objects it builds; its
@@ -5270,21 +5385,59 @@ static void k8s_kchart_keep(k8s_facts_t *f, const char *kust, const CBMK8sFact *
                                                .line = x->line};
 }
 
-/* Keep a kustomization's facts: its patches (PATCH) and the charts it
- * inflates (DEPLOY via "kustomize"), each file as a repository path -- a
- * patch file outside the repository (or a URL) names no file of it, a values
- * file there is left out. */
+/* The static name of a FILE fact's `via`; NULL: not one of ours. */
+static const char *k8s_kfile_via(const char *via) {
+    static const char *const names[] = {"configMapGenerator", "secretGenerator", "configurations"};
+    for (size_t i = 0; via && i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(via, names[i]) == 0) {
+            return names[i];
+        }
+    }
+    return NULL;
+}
+
+/* A file kustomization `kust` reads, at repository path `path`. */
+static void k8s_kfile_keep(k8s_facts_t *f, const char *kust, const CBMK8sFact *x,
+                           const char *path) {
+    const char *via = k8s_kfile_via(x->via);
+    if (!via || !k8s_grow((void **)&f->kfiles, &f->kfile_cap, f->kfile_n, sizeof(*f->kfiles))) {
+        return;
+    }
+    char *kust_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, kust);
+    char *path_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, path);
+    if (!kust_copy || !path_copy) {
+        cbm_free(CBM_MEM_CLASS_OTHER, kust_copy);
+        cbm_free(CBM_MEM_CLASS_OTHER, path_copy);
+        return;
+    }
+    f->kfiles[f->kfile_n++] =
+        (k8s_kfile_t){.kust = kust_copy, .path = path_copy, .via = via, .line = x->line};
+}
+
+/* Keep a kustomization's facts: its patches (PATCH), the charts it inflates
+ * (DEPLOY via "kustomize") and the files it reads (FILE), each file as a
+ * repository path -- a patch file outside the repository (or a URL) names no
+ * file of it, a values file or a read file there is left out. */
 static void k8s_kustomize_keep(k8s_facts_t *f, const char *kust, const CBMFileResult *res) {
     char dir[CBM_SZ_1K];
     k8s_dirname(kust, dir, sizeof(dir));
     for (int i = 0; res && i < res->k8s_facts.count; i++) {
         const CBMK8sFact *x = &res->k8s_facts.items[i];
         bool chart = x->fact == CBM_K8S_FACT_DEPLOY && x->via && strcmp(x->via, "kustomize") == 0;
-        if (x->fact != CBM_K8S_FACT_PATCH && !chart) {
+        bool file = x->fact == CBM_K8S_FACT_FILE;
+        if (x->fact != CBM_K8S_FACT_PATCH && !chart && !file) {
             continue;
         }
         char path[CBM_SZ_1K];
         bool in_repo = x->path && k8s_repo_path(dir, x->path, path, sizeof(path));
+        if (file) {
+            /* An absolute path names a file of the machine, not of the
+             * repository: k8s_repo_path would read it from the directory. */
+            if (in_repo && x->path[0] != '/') {
+                k8s_kfile_keep(f, kust, x, path);
+            }
+            continue;
+        }
         if (chart) {
             k8s_kchart_keep(f, kust, x, in_repo ? path : NULL);
             continue;
@@ -5544,6 +5697,59 @@ static void k8s_patch_builds(const k8s_kusts_t *ks, const k8s_ints_t *inc, int k
         if (k8s_grow((void **)&out->items, &out->cap, out->count, sizeof(int))) {
             out->items[out->count++] = inc[k].items[i];
         }
+    }
+}
+
+static int k8s_cmp_kfile(const void *a, const void *b) {
+    const k8s_kfile_t *x = a;
+    const k8s_kfile_t *y = b;
+    int c = strcmp(x->kust, y->kust);
+    if (c == 0) {
+        c = (x->line > y->line) - (x->line < y->line);
+    }
+    return c ? c : strcmp(x->path, y->path);
+}
+
+/* The files kustomizations read -> REFERENCES_FILE {via: configMapGenerator |
+ * secretGenerator | configurations, line}, the kustomization's File to the
+ * file's File: once per kustomization and file, at the first line naming it.
+ * A file the index does not hold (a generated kubeconfig, a secret kept out
+ * of the repository) is none. Never an IMPORTS: that would make the file a
+ * member of the build (k8s_kusts_wire). */
+static void k8s_link_kfiles(cbm_pipeline_ctx_t *ctx, k8s_facts_t *f) {
+    if (f->kfile_n == 0) {
+        return;
+    }
+    k8s_qsort(f->kfiles, (size_t)f->kfile_n, sizeof(*f->kfiles), k8s_cmp_kfile);
+    CBMArena keys;
+    cbm_arena_init_lazy(&keys, CBM_SZ_4K);
+    CBMHashTable *seen = cbm_ht_create((uint32_t)f->kfile_n);
+    int edges = 0;
+    for (int i = 0; seen && i < f->kfile_n; i++) {
+        const k8s_kfile_t *x = &f->kfiles[i];
+        const cbm_gbuf_node_t *tgt = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, x->path);
+        int64_t src = k8s_file_of(ctx, x->kust);
+        /* a File's QN folds `/` and `.` alike: the path itself must be the file's */
+        if (src <= 0 || !tgt || !tgt->file_path || strcmp(tgt->file_path, x->path) != 0 ||
+            tgt->id == src) {
+            continue;
+        }
+        const char *key = cbm_arena_sprintf(&keys, "%s\x01%s", x->kust, x->path);
+        if (!key || cbm_ht_get(seen, key)) {
+            continue;
+        }
+        cbm_ht_set(seen, key, (void *)key);
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"via\":\"%s\",\"line\":%d}", x->via, x->line);
+        cbm_gbuf_insert_edge(ctx->gbuf, src, tgt->id, "REFERENCES_FILE", props);
+        edges++;
+    }
+    if (seen) {
+        cbm_ht_free(seen);
+    }
+    cbm_arena_destroy(&keys);
+    if (edges > 0) {
+        cbm_log_info("pass.k8s.kustomize_files", "edges", itoa_k8s(edges));
     }
 }
 
@@ -6013,6 +6219,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_helm_collect(ctx, &facts, &helm);
     k8s_link_envs(ctx, &facts);
     k8s_link_patches(ctx, &kusts, &facts);
+    k8s_link_kfiles(ctx, &facts);
     k8s_link_renames(ctx, &kusts);
     k8s_facts_free(&facts);
     k8s_records_free(&recs);

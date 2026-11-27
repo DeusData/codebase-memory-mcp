@@ -3019,6 +3019,59 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
         .items = items, .count = n, .cap = n, .is_test = is_test, .is_test_cap = n, .lang = lang};
 }
 
+/* ── Scala, Strategy 4 with an import map (#2360 follow-up) ──────────
+ * Since Scala imports resolve (#2360), almost every Scala file reaches
+ * Strategy 4 with an import map, and resolve_multi_with_imports keeps only
+ * the import-reachable candidates. A method of the calling file itself is
+ * never import-reachable, so an imported type's same-named method displaced
+ * it: a bare `bimap` in EitherT.scala went to Bifunctor's syntax class. Scala
+ * only; every other language keeps the shared path unchanged. */
+
+/* The best candidate declared in the calling file (its QN extends the
+ * caller's module QN), ranked as every pick is; NULL when there is none. */
+static const char *scala_module_local_pick(const cbm_registry_t *r, const qn_array_t *arr,
+                                           const char *module_qn, bool caller_test) {
+    size_t mlen = module_qn ? strlen(module_qn) : 0;
+    if (mlen == 0) {
+        return NULL;
+    }
+    const char *local[CBM_SZ_256];
+    uint8_t local_test[CBM_SZ_256];
+    uint8_t local_lang[CBM_SZ_256];
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
+    int n = 0;
+    for (int i = 0; i < arr->count && n < CBM_SZ_256; i++) {
+        const char *qn = arr->items[i];
+        if (strncmp(qn, module_qn, mlen) == 0 && qn[mlen] == '.') {
+            local[n] = qn;
+            local_test[n] = flags[i];
+            local_lang[n] = langs ? langs[i] : (uint8_t)CBM_LANG_COUNT;
+            n++;
+        }
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    return best_by_import_distance(r, local, local_test, langs ? local_lang : NULL, n, module_qn,
+                                   caller_test);
+}
+
+/* Same-file candidate first: the calling file's own candidate, when the
+ * receiver gate a file without imports applies admits it (the exit at the end
+ * of resolve_name_candidates). An empty result means: continue as before. */
+static cbm_resolution_t scala_local_first(const cbm_registry_t *r, const qn_array_t *arr,
+                                          const char *callee_name, const char *module_qn,
+                                          bool caller_test) {
+    const char *local = scala_module_local_pick(r, arr, module_qn, caller_test);
+    if (!local || !receiver_chain_admits(callee_name, local, CBM_LANG_SCALA) ||
+        value_receiver_blind(r, arr, callee_name, local, module_qn, NULL, 0, CBM_LANG_SCALA)) {
+        return empty_result();
+    }
+    double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+    return (cbm_resolution_t){local, "suffix_match", conf, arr->count};
+}
+
 /* Strategies 3.5, 3 and 4 over one same-name candidate set. `lang` reaches
  * receiver_chain_admits and value_receiver_blind only (see there): it is the
  * calling file's language on the CALLS path and CBM_LANG_COUNT on every other
@@ -3056,6 +3109,12 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     }
 
     /* Strategy 4: multiple candidates */
+    if (lang == CBM_LANG_SCALA && import_vals && import_count > 0) {
+        cbm_resolution_t local = scala_local_first(r, arr, callee_name, module_qn, caller_test);
+        if (local.qualified_name) {
+            return local;
+        }
+    }
     if (import_vals && import_count > 0) {
         cbm_resolution_t res =
             resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count, caller_test);

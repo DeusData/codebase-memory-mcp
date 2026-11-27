@@ -16,6 +16,7 @@
 #include "pipeline/worker_pool.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/helm_template.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -5155,6 +5156,597 @@ TEST(incremental_deleted_spawner_drops_its_process) {
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
     ASSERT_EQ(left, 1);
 #endif
+    PASS();
+}
+
+/* A Dockerfile below the root reads a COPY source under its own directory or
+ * under the repository root, the one that holds the file; a source both hold
+ * is no REFERENCES_FILE edge. Deleting one file of such a pair leaves a single
+ * candidate, and the edge to it comes from a Dockerfile that did not change:
+ * the planner declines to the full route, and the graph is the fresh index's.
+ * Both directions: the root's file of a pair goes (both.sh), and the
+ * Dockerfile directory's file of a pair goes (svc/twin.sh). Deleting a file
+ * that has no partner stays a repair. */
+TEST(incremental_docker_context_pair_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkpair_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY both.sh /both.sh\n"
+                                           "COPY entry.sh /entry.sh\n"
+                                           "COPY twin.sh /twin.sh\n");
+    write_temp_file(tmp, "svc/entry.sh", "#!/bin/sh\necho entry\n");
+    write_temp_file(tmp, "svc/both.sh", "#!/bin/sh\necho svc\n");
+    write_temp_file(tmp, "both.sh", "#!/bin/sh\necho root\n");
+    write_temp_file(tmp, "svc/twin.sh", "#!/bin/sh\necho svc twin\n");
+    write_temp_file(tmp, "twin.sh", "#!/bin/sh\necho root twin\n");
+    write_temp_file(tmp, "other.sh", "#!/bin/sh\necho other\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkpair.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_svc_both[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='svc/both.sh'";
+    static const char to_root_twin[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='twin.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/other.sh", tmp);
+    (void)remove(path);
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int refs_other = k8s_inc_count(db_path, refs);
+
+    snprintf(path, sizeof(path), "%s/both.sh", tmp);
+    (void)remove(path);
+    int rc_pair = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t pair_route = cbm_pipeline_incremental_test_last_route();
+    int refs_pair = k8s_inc_count(db_path, refs);
+    int svc_both = k8s_inc_count(db_path, to_svc_both);
+
+    snprintf(path, sizeof(path), "%s/svc/twin.sh", tmp);
+    (void)remove(path);
+    int rc_twin = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t twin_route = cbm_pipeline_incremental_test_last_route();
+    int refs_twin = k8s_inc_count(db_path, refs);
+    int root_twin = k8s_inc_count(db_path, to_root_twin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1); /* entry.sh; both.sh and twin.sh are files under both contexts */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(refs_other, 1);
+    ASSERT_EQ(rc_pair, 0);
+    ASSERT_EQ(refs_pair, 2); /* svc/both.sh is the only candidate now */
+    ASSERT_EQ(svc_both, 1);
+    ASSERT_EQ(pair_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(rc_twin, 0);
+    ASSERT_EQ(refs_twin, 3); /* the root's twin.sh is the only candidate now */
+    ASSERT_EQ(root_twin, 1);
+    ASSERT_EQ(twin_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A source that is a file under one context and a directory under the other
+ * is no edge either: with the other context the instruction copies the
+ * directory. When the directory's last file goes, the file is the single
+ * candidate, and the edge comes from a Dockerfile that did not change: the
+ * planner declines to the full route. Both directions: the directory under
+ * the Dockerfile's own directory (svc/conf.sh/), and the directory under
+ * the root (tool.sh/). Deleting a file with no such partner stays a repair.
+ *
+ * The deletion of a file an image copies takes the full route already (the
+ * env join's rule), and an image copies a directory's files in the context
+ * its sources vote for. So each Dockerfile here has two more sources that
+ * put its image in the OTHER context than the directory's: svc's image is
+ * built from the root (a.sh, b.sh), app's from its own directory (c.sh,
+ * d.sh), and neither holds the file that goes. Shell scripts, so no rule
+ * for YAML sends the deletions to the full route either. */
+TEST(incremental_docker_context_directory_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkdir_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY conf.sh /etc/conf.sh\n"
+                                           "COPY a.sh /a.sh\n"
+                                           "COPY b.sh /b.sh\n");
+    write_temp_file(tmp, "conf.sh", "#!/bin/sh\necho root\n");
+    write_temp_file(tmp, "a.sh", "#!/bin/sh\necho a\n");
+    write_temp_file(tmp, "b.sh", "#!/bin/sh\necho b\n");
+    write_temp_file(tmp, "svc/conf.sh/part.sh", "#!/bin/sh\necho part\n");
+    write_temp_file(tmp, "app/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY tool.sh /etc/tool.sh\n"
+                                           "COPY c.sh /c.sh\n"
+                                           "COPY d.sh /d.sh\n");
+    write_temp_file(tmp, "app/tool.sh", "#!/bin/sh\necho app\n");
+    write_temp_file(tmp, "app/c.sh", "#!/bin/sh\necho c\n");
+    write_temp_file(tmp, "app/d.sh", "#!/bin/sh\necho d\n");
+    write_temp_file(tmp, "tool.sh/part.sh", "#!/bin/sh\necho part\n");
+    write_temp_file(tmp, "other.sh", "#!/bin/sh\necho other\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkdir.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_root_conf[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='conf.sh'";
+    static const char to_app_tool[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='app/tool.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+    int conf_full = k8s_inc_count(db_path, to_root_conf);
+    int tool_full = k8s_inc_count(db_path, to_app_tool);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/other.sh", tmp);
+    (void)remove(path);
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int refs_other = k8s_inc_count(db_path, refs);
+
+    snprintf(path, sizeof(path), "%s/svc/conf.sh/part.sh", tmp);
+    (void)remove(path);
+    int rc_svc = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t svc_route = cbm_pipeline_incremental_test_last_route();
+    int refs_svc = k8s_inc_count(db_path, refs);
+    int conf_svc = k8s_inc_count(db_path, to_root_conf);
+
+    snprintf(path, sizeof(path), "%s/tool.sh/part.sh", tmp);
+    (void)remove(path);
+    int rc_root = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t root_route = cbm_pipeline_incremental_test_last_route();
+    int refs_root = k8s_inc_count(db_path, refs);
+    int tool_root = k8s_inc_count(db_path, to_app_tool);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 4); /* a.sh, b.sh, app/c.sh, app/d.sh */
+    ASSERT_EQ(conf_full, 0); /* a directory under the Dockerfile's own directory */
+    ASSERT_EQ(tool_full, 0); /* a directory under the root */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(refs_other, 4);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_svc, 0);
+    ASSERT_EQ(refs_svc, 5); /* the root's conf.sh is the only candidate now */
+    ASSERT_EQ(conf_svc, 1);
+    ASSERT_EQ(svc_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(rc_root, 0);
+    ASSERT_EQ(refs_root, 6); /* app/tool.sh is the only candidate now */
+    ASSERT_EQ(tool_root, 1);
+    ASSERT_EQ(root_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A COPY source's REFERENCES_FILE edge belongs to the Dockerfile. Editing the
+ * target keeps it: the Dockerfile did not change, and the edge is re-linked to
+ * the target's new node. Editing the Dockerfile redraws its edges from the new
+ * text, each once: a source it gains is drawn, a source it loses is gone. */
+TEST(incremental_docker_copy_reference_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY entry.sh /entry.sh\n");
+    write_temp_file(tmp, "entry.sh", "#!/bin/sh\necho entry\n");
+    write_temp_file(tmp, "tool.sh", "#!/bin/sh\necho tool\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkedit.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_entry[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='entry.sh'";
+    static const char to_tool[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='tool.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "entry.sh", "#!/bin/sh\necho entry\necho edited\n");
+    int rc_target = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t target_route = cbm_pipeline_incremental_test_last_route();
+    int refs_target = k8s_inc_count(db_path, refs);
+    int entry_target = k8s_inc_count(db_path, to_entry);
+
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY entry.sh /entry.sh\n"
+                                       "COPY tool.sh /tool.sh\n");
+    int rc_gain = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t gain_route = cbm_pipeline_incremental_test_last_route();
+    int refs_gain = k8s_inc_count(db_path, refs);
+    int entry_gain = k8s_inc_count(db_path, to_entry);
+    int tool_gain = k8s_inc_count(db_path, to_tool);
+
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY tool.sh /tool.sh\n");
+    int rc_lose = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t lose_route = cbm_pipeline_incremental_test_last_route();
+    int refs_lose = k8s_inc_count(db_path, refs);
+    int entry_lose = k8s_inc_count(db_path, to_entry);
+    int tool_lose = k8s_inc_count(db_path, to_tool);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1);
+    ASSERT_EQ(rc_target, 0);
+    ASSERT_EQ(refs_target, 1);
+    ASSERT_EQ(entry_target, 1);
+    ASSERT_EQ(target_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gain, 0);
+    ASSERT_EQ(refs_gain, 2);
+    ASSERT_EQ(entry_gain, 1);
+    ASSERT_EQ(tool_gain, 1);
+    ASSERT_EQ(gain_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_lose, 0);
+    ASSERT_EQ(refs_lose, 1);
+    ASSERT_EQ(entry_lose, 0);
+    ASSERT_EQ(tool_lose, 1);
+    ASSERT_EQ(lose_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    PASS();
+}
+
+/* A compose service's REFERENCES_FILE edge to a file it mounts follows the
+ * files, with the compose file untouched: editing the target keeps the edge,
+ * deleting the target removes it, bringing the target back draws it again.
+ * Editing the compose file redraws its services' edges from the new text. */
+TEST(incremental_compose_file_reference_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cmpref_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "compose.yaml", "services:\n"
+                                         "  web:\n"
+                                         "    image: nginx:1.27\n"
+                                         "    volumes:\n"
+                                         "      - ./nginx.conf:/etc/nginx/nginx.conf:ro\n");
+    write_temp_file(tmp, "nginx.conf", "worker_processes 1;\n");
+    write_temp_file(tmp, "extra.conf", "gzip on;\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cmpref.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='volume'";
+    static const char to_nginx[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='nginx.conf'";
+    static const char to_extra[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='extra.conf'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "nginx.conf", "worker_processes 2;\n");
+    int rc_edit = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t edit_route = cbm_pipeline_incremental_test_last_route();
+    int refs_edit = k8s_inc_count(db_path, refs);
+    int nginx_edit = k8s_inc_count(db_path, to_nginx);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/nginx.conf", tmp);
+    (void)remove(path);
+    int rc_gone = k8s_inc_index(tmp, db_path);
+    int refs_gone = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "nginx.conf", "worker_processes 3;\n");
+    int rc_back = k8s_inc_index(tmp, db_path);
+    int refs_back = k8s_inc_count(db_path, refs);
+    int nginx_back = k8s_inc_count(db_path, to_nginx);
+
+    write_temp_file(tmp, "compose.yaml", "services:\n"
+                                         "  web:\n"
+                                         "    image: nginx:1.27\n"
+                                         "    volumes:\n"
+                                         "      - ./extra.conf:/etc/nginx/extra.conf:ro\n");
+    int rc_swap = k8s_inc_index(tmp, db_path);
+    int refs_swap = k8s_inc_count(db_path, refs);
+    int nginx_swap = k8s_inc_count(db_path, to_nginx);
+    int extra_swap = k8s_inc_count(db_path, to_extra);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1);
+    ASSERT_EQ(rc_edit, 0);
+    ASSERT_EQ(refs_edit, 1);
+    ASSERT_EQ(nginx_edit, 1);
+    ASSERT_EQ(edit_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gone, 0);
+    ASSERT_EQ(refs_gone, 0);
+    ASSERT_EQ(rc_back, 0);
+    ASSERT_EQ(refs_back, 1);
+    ASSERT_EQ(nginx_back, 1);
+    ASSERT_EQ(rc_swap, 0);
+    ASSERT_EQ(refs_swap, 1);
+    ASSERT_EQ(nginx_swap, 0);
+    ASSERT_EQ(extra_swap, 1);
+    PASS();
+}
+
+/* One referring file `ref_path` (text `ref_text`) names one target file that
+ * does not exist yet. With the referring file untouched: the target appears
+ * (the edge is drawn), is edited (the edge stays), is deleted (the edge is
+ * gone). counts[0..4): the REFERENCES_FILE edges {via: `via`} after the first
+ * index and after each of the three steps. Returns 0, or -1 when a run fails. */
+static int incremental_file_reference_steps(const char *ref_path, const char *ref_text,
+                                            const char *other_path, const char *other_text,
+                                            const char *target, const char *via, int counts[4]) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fileref_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, ref_path, ref_text);
+    if (other_path) {
+        write_temp_file(tmp, other_path, other_text);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fileref.db", tmp);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+             "e.type='REFERENCES_FILE' AND json_extract(e.properties,'$.via')='%s' AND "
+             "t.file_path='%s'",
+             via, target);
+    int rc = k8s_inc_index(tmp, db_path);
+    counts[0] = k8s_inc_count(db_path, sql);
+    write_temp_file(tmp, target, "first = 1\n");
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[1] = k8s_inc_count(db_path, sql);
+    write_temp_file(tmp, target, "first = 1\nsecond = 2\n");
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[2] = k8s_inc_count(db_path, sql);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", tmp, target);
+    (void)remove(path);
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[3] = k8s_inc_count(db_path, sql);
+    th_rmtree(tmp);
+    return rc == 0 ? 0 : -1;
+}
+
+/* A Dockerfile's COPY source that appears after the Dockerfile was indexed. */
+TEST(incremental_docker_copy_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("Dockerfile",
+                                              "FROM alpine:3.20\n"
+                                              "COPY late.properties /late.properties\n",
+                                              NULL, NULL, "late.properties", "copy", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A compose bind mount whose host file appears after the compose file was
+ * indexed. */
+TEST(incremental_compose_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("compose.yaml",
+                                              "services:\n"
+                                              "  web:\n"
+                                              "    image: nginx:1.27\n"
+                                              "    volumes:\n"
+                                              "      - ./late.properties:/etc/late.properties\n",
+                                              NULL, NULL, "late.properties", "volume", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A Terraform file function whose file appears after the module was indexed. */
+TEST(incremental_terraform_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps(
+        "infra/main.tf",
+        "locals {\n"
+        "  settings = file(\"${path.module}/late.properties\")\n"
+        "}\n",
+        NULL, NULL, "infra/late.properties", "file", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A workflow's local action whose action file appears after the workflow was
+ * indexed. */
+TEST(incremental_local_uses_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps(".github/workflows/ci.yml",
+                                              "name: ci\n"
+                                              "on: [push]\n"
+                                              "jobs:\n"
+                                              "  build:\n"
+                                              "    runs-on: ubuntu-latest\n"
+                                              "    steps:\n"
+                                              "      - uses: ./.github/actions/late\n",
+                                              NULL, NULL, ".github/actions/late/action.yml",
+                                              "uses", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A local action is named by its directory, and the edge goes to the one
+ * action file it holds. With both spellings there is none; deleting one of
+ * the two makes the other the action, although no workflow changed. The
+ * repair reads no workflow again, so that deletion takes the full route. */
+TEST(incremental_local_action_pair_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_actpair_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, ".github/workflows/ci.yml", "name: ci\n"
+                                                     "on: [push]\n"
+                                                     "jobs:\n"
+                                                     "  build:\n"
+                                                     "    runs-on: ubuntu-latest\n"
+                                                     "    steps:\n"
+                                                     "      - uses: ./.github/actions/both\n");
+    static const char action[] = "name: both\nruns:\n  using: composite\n  steps: []\n";
+    write_temp_file(tmp, ".github/actions/both/action.yml", action);
+    write_temp_file(tmp, ".github/actions/both/action.yaml", action);
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/actpair.db", tmp);
+    static const char uses[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='uses'";
+    static const char to_yml[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='.github/actions/both/action.yml'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int uses_full = k8s_inc_count(db_path, uses);
+
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\necho edited\n");
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int uses_other = k8s_inc_count(db_path, uses);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.github/actions/both/action.yaml", tmp);
+    (void)remove(path);
+    int rc_pair = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t pair_route = cbm_pipeline_incremental_test_last_route();
+    int uses_pair = k8s_inc_count(db_path, uses);
+    int yml_pair = k8s_inc_count(db_path, to_yml);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(uses_full, 0); /* two action files: which one GitHub reads is not ours to say */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(uses_other, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_pair, 0);
+    ASSERT_EQ(uses_pair, 1); /* action.yml is the action now */
+    ASSERT_EQ(yml_pair, 1);
+    ASSERT_EQ(pair_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A kustomization's generator file that appears after the kustomization was
+ * indexed. */
+TEST(incremental_kustomize_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("deploy/kustomization.yaml",
+                                              "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                              "kind: Kustomization\n"
+                                              "resources:\n"
+                                              "  - deployment.yaml\n"
+                                              "configMapGenerator:\n"
+                                              "  - name: app-config\n"
+                                              "    files:\n"
+                                              "      - late.properties\n",
+                                              "deploy/deployment.yaml",
+                                              "apiVersion: apps/v1\n"
+                                              "kind: Deployment\n"
+                                              "metadata:\n"
+                                              "  name: app\n"
+                                              "spec:\n"
+                                              "  replicas: 1\n",
+                                              "deploy/late.properties", "configMapGenerator",
+                                              counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
+/* A Make prerequisite's DEPENDS_ON edge lies inside its makefile. Editing
+ * another file keeps it: the makefile is not read again. Editing the makefile
+ * redraws its edges from the new text, each once: a prerequisite a rule gains
+ * is drawn, one it loses is gone. */
+TEST(incremental_make_prerequisite_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_mkdep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    static const char rules[] = "build:\n"
+                                "\techo build\n\n"
+                                "test:\n"
+                                "\techo test\n";
+    char text[512];
+    snprintf(text, sizeof(text), "all: build\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mkdep.db", tmp);
+    static const char deps[] = "SELECT COUNT(*) FROM edges WHERE type='DEPENDS_ON' AND "
+                               "json_extract(properties,'$.via')='prerequisite'";
+    static const char to_build[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='build'";
+    static const char to_test[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='test'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int deps_full = k8s_inc_count(db_path, deps);
+    int build_full = k8s_inc_count(db_path, to_build);
+
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\necho edited\n");
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int deps_other = k8s_inc_count(db_path, deps);
+    int build_other = k8s_inc_count(db_path, to_build);
+
+    snprintf(text, sizeof(text), "all: build test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_gain = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t gain_route = cbm_pipeline_incremental_test_last_route();
+    int deps_gain = k8s_inc_count(db_path, deps);
+    int build_gain = k8s_inc_count(db_path, to_build);
+    int test_gain = k8s_inc_count(db_path, to_test);
+
+    snprintf(text, sizeof(text), "all: test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_lose = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t lose_route = cbm_pipeline_incremental_test_last_route();
+    int deps_lose = k8s_inc_count(db_path, deps);
+    int build_lose = k8s_inc_count(db_path, to_build);
+    int test_lose = k8s_inc_count(db_path, to_test);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(deps_full, 1);
+    ASSERT_EQ(build_full, 1);
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(deps_other, 1);
+    ASSERT_EQ(build_other, 1);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gain, 0);
+    ASSERT_EQ(deps_gain, 2);
+    ASSERT_EQ(build_gain, 1);
+    ASSERT_EQ(test_gain, 1);
+    ASSERT_EQ(gain_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_lose, 0);
+    ASSERT_EQ(deps_lose, 1);
+    ASSERT_EQ(build_lose, 0);
+    ASSERT_EQ(test_lose, 1);
+    ASSERT_EQ(lose_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     PASS();
 }
 
@@ -32849,7 +33441,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":6,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -32980,24 +33572,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"v\":6,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -33017,7 +33609,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -33045,7 +33637,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":6,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -33135,10 +33727,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope (codec version 4) with
+            /* The row is the versioned codec envelope (codec version 6) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":6") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -35611,6 +36203,590 @@ TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
     PASS();
 }
 
+/* GoogleTest bodies: the CALLS edges of a call written in a TEST or TEST_F
+ * body start at the test's own node (TEST_Suite_Case, #1266), not at the File
+ * node. local_helper is bound by the C/C++ engine in the file's own pass, so
+ * its lsp_ strategy also proves the engine and the text path name the same
+ * caller (they join by exact caller QN); cross_helper lives in another file.
+ * pad_files > 0 adds filler C++ files past MIN_FILES_FOR_PARALLEL. */
+static void write_cpp_gtest_caller_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "lib/helper.h", "int cross_helper(int v);\n");
+    write_temp_file(tmp, "lib/helper.cc",
+                    "#include \"helper.h\"\n"
+                    "int cross_helper(int v) { return v + 1; }\n");
+    write_temp_file(tmp, "test/widget_test.cc",
+                    "#include \"../lib/helper.h\"\n"
+                    "static int local_helper(int v) { return v * 2; }\n"
+                    "class WidgetFixture {\n"
+                    " public:\n"
+                    "  int Prepare() { return 1; }\n"
+                    "};\n"
+                    "TEST(WidgetSuite, Adds) {\n"
+                    "  local_helper(1);\n"
+                    "  cross_helper(2);\n"
+                    "}\n"
+                    "TEST_F(WidgetFixture, Runs) {\n"
+                    "  local_helper(3);\n"
+                    "  cross_helper(4);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.cc", i);
+        snprintf(body, sizeof(body), "int filler%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int assert_cpp_gtest_caller_edges(cbm_store_t *s, const char *project, bool parallel) {
+    static const char *const tests[] = {".test.widget_test.TEST_WidgetSuite_Adds",
+                                        ".test.widget_test.TEST_F_WidgetFixture_Runs"};
+    const char *mode = parallel ? "parallel" : "sequential";
+    int local[2];
+    int cross[2];
+    for (int i = 0; i < 2; i++) {
+        local[i] = go_calls_between(s, project, tests[i], ".test.widget_test.local_helper",
+                                    "\"strategy\":\"lsp_");
+        cross[i] = go_calls_between(s, project, tests[i], ".lib.helper.cross_helper", NULL);
+        if (local[i] != 1 || cross[i] != 1) {
+            printf("  [%s] %s: local_helper %d (lsp), cross_helper %d\n", mode, tests[i], local[i],
+                   cross[i]);
+        }
+    }
+    /* The File node keeps no copy (the rows above are the positive partner;
+     * its DEFINES edge proves the File node's name, which keeps the file's
+     * extension). */
+    const char *file_qn = ".test.widget_test.cc.__file__";
+    int file_defines =
+        go_edges_between(s, project, "DEFINES", file_qn, ".test.widget_test.local_helper");
+    int file_local = go_calls_between(s, project, file_qn, ".test.widget_test.local_helper", NULL);
+    int file_cross = go_calls_between(s, project, file_qn, ".lib.helper.cross_helper", NULL);
+    if (file_local != 0 || file_cross != 0) {
+        printf("  [%s] File node: local_helper %d, cross_helper %d\n", mode, file_local,
+               file_cross);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(local[i], 1); /* RED on 08a7a586: sourced at the File node */
+        ASSERT_EQ(cross[i], 1); /* RED on 08a7a586: sourced at the File node */
+    }
+    ASSERT_EQ(file_defines, 1);
+    ASSERT_EQ(file_local, 0);
+    ASSERT_EQ(file_cross, 0);
+    return 0;
+}
+
+TEST(pipeline_cpp_gtest_body_calls_start_at_test_node) {
+    int runs[2] = {-1, -1};
+    int verdicts[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_caller_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_caller_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/gtest_caller.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run == 0 ? cbm_store_open_path(db_path) : NULL;
+        int verdict =
+            s ? assert_cpp_gtest_caller_edges(s, cbm_pipeline_project_name(p), parallel) : -1;
+        if (s) {
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        runs[mode] = run;
+        verdicts[mode] = verdict;
+    }
+    ASSERT_EQ(runs[0], 0);
+    ASSERT_EQ(runs[1], 0);
+    ASSERT_EQ(verdicts[0], 0); /* sequential resolver */
+    ASSERT_EQ(verdicts[1], 0); /* parallel resolver */
+    PASS();
+}
+
+/* The reviewer's shapes (ctest-review finding 5): the preprocessed second view
+ * of a file spells the head differently from the raw view (a project macro in
+ * the arguments, comments, a project's own TEST macro). Each call written in
+ * such a body has one source, the test's node; the File keeps none. */
+static void write_cpp_gtest_pp_view_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "lib/sites.h",
+                    "int s01();\nint s02();\nint s09();\nint s10();\nint s11();\nint s17();\n");
+    write_temp_file(
+        tmp, "lib/sites.cc",
+        "#include \"sites.h\"\n"
+        "int s01() { return 1; }\nint s02() { return 2; }\nint s09() { return 9; }\n"
+        "int s10() { return 10; }\nint s11() { return 11; }\nint s17() { return 17; }\n");
+    write_temp_file(tmp, "test/misc_test.cc",
+                    "#include \"../lib/sites.h\"\n"
+                    "#define MY_SUITE RealSuite\n"
+                    "TEST(MY_SUITE, ViaMacro) { s09(); }\n"
+                    "TEST(CommentSuite, /* why */ Commented) { s10(); }\n"
+                    "TEST(LineCommentSuite,  // why\n"
+                    "     LineCommented) {\n"
+                    "  s11();\n"
+                    "}\n"
+                    "TEST(BlockSuite /* c */, Commented) { s17(); }\n");
+    write_temp_file(tmp, "test/own_test_macro.cc",
+                    "#include \"../lib/sites.h\"\n"
+                    "#define TEST(name) void test_##name()\n"
+                    "TEST(alpha) { s01(); }\n"
+                    "TEST(beta) { s02(); }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.cc", i);
+        snprintf(body, sizeof(body), "int filler%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int assert_cpp_gtest_pp_view_edges(cbm_store_t *s, const char *project, bool parallel) {
+    static const struct {
+        const char *file;
+        const char *test;
+        const char *callee;
+    } rows[] = {
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_MY_SUITE_ViaMacro", ".lib.sites.s09"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_CommentSuite_Commented",
+         ".lib.sites.s10"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_LineCommentSuite_LineCommented",
+         ".lib.sites.s11"},
+        {".test.misc_test.cc.__file__", ".test.misc_test.TEST_BlockSuite_Commented",
+         ".lib.sites.s17"},
+        {".test.own_test_macro.cc.__file__", ".test.own_test_macro.TEST_alpha", ".lib.sites.s01"},
+        {".test.own_test_macro.cc.__file__", ".test.own_test_macro.TEST_beta", ".lib.sites.s02"},
+    };
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        int defines = go_edges_between(s, project, "DEFINES", rows[i].file, rows[i].test);
+        int from_test = go_calls_between(s, project, rows[i].test, rows[i].callee, NULL);
+        int from_file = go_calls_between(s, project, rows[i].file, rows[i].callee, NULL);
+        if (defines != 1 || from_test != 1 || from_file != 0) {
+            printf("  [%s] %s -> %s: DEFINES %d, from the test %d, from the File %d\n",
+                   parallel ? "parallel" : "sequential", rows[i].test, rows[i].callee, defines,
+                   from_test, from_file);
+            bad++;
+        }
+    }
+    ASSERT_EQ(bad, 0); /* RED on cbm-ctest-caller-c2a10ffd: the File keeps a second edge */
+    return 0;
+}
+
+TEST(pipeline_cpp_gtest_preprocessed_view_one_source) {
+    int runs[2] = {-1, -1};
+    int verdicts[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_ppview_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_pp_view_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/gtest_ppview.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run == 0 ? cbm_store_open_path(db_path) : NULL;
+        int verdict =
+            s ? assert_cpp_gtest_pp_view_edges(s, cbm_pipeline_project_name(p), parallel) : -1;
+        if (s) {
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        runs[mode] = run;
+        verdicts[mode] = verdict;
+    }
+    ASSERT_EQ(runs[0], 0);
+    ASSERT_EQ(runs[1], 0);
+    ASSERT_EQ(verdicts[0], 0); /* sequential resolver */
+    ASSERT_EQ(verdicts[1], 0); /* parallel resolver */
+    PASS();
+}
+
+/* Which definitions of the second view are matched to a raw test (review of
+ * round 2, shapes (a) to (c)): only a top-level one, and none when two
+ * top-level definitions of that view cover one raw span. The program answers
+ * come from compiling this file with gtest's TEST expansion, each site
+ * printing where it runs: s01 and s02 in L::f, s03 in helper3, s04 and
+ * helper3 in Pair_Helper, s05 in RealSuite2_A, s06 in Other2_B, s07 in
+ * Plain_One. */
+static void write_cpp_gtest_view_guard_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "lib/sites.h",
+                    "int s01();\nint s02();\nint s03();\nint s04();\nint s05();\nint s06();\n"
+                    "int s07();\n");
+    write_temp_file(tmp, "lib/sites.cc",
+                    "#include \"sites.h\"\n"
+                    "int s01() { return 1; }\nint s02() { return 2; }\nint s03() { return 3; }\n"
+                    "int s04() { return 4; }\nint s05() { return 5; }\nint s06() { return 6; }\n"
+                    "int s07() { return 7; }\n");
+    write_temp_file(tmp, "test/views_test.cc",
+                    "#include \"../lib/sites.h\"\n"
+                    "TEST(OneLine, Local) { struct L { int f() { return s01(); } }; L().f(); }\n"
+                    "TEST(Span, Local) { struct L { int f() {\n"
+                    "  return s02();\n"
+                    "} }; L().f(); }\n"
+                    "static int helper3() { return s03(); } TEST(Pair, Helper) { s04(); helper3(); }\n"
+                    "#define MY_SUITE2 RealSuite2\n"
+                    "TEST(MY_SUITE2, A) { s05(); } TEST(Other2, B) { s06(); }\n"
+                    "TEST(Plain, One) { s07(); }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.cc", i);
+        snprintf(body, sizeof(body), "int filler%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+typedef struct {
+    const char *caller; /* QN suffix of the source node */
+    const char *callee; /* QN suffix of the target */
+    int want;           /* CALLS edges */
+} ViewGuardEdge;
+
+#define VG_FILE ".test.views_test.cc.__file__"
+#define VG_TEST(name) ".test.views_test.TEST_" name
+
+/* Index the fixture sequentially and in parallel; every edge is checked and
+ * reported before the verdict: the number of edges that differ (-1: a run
+ * failed). */
+static int view_guard_edges(const ViewGuardEdge *edges, size_t n) {
+    int bad = 0;
+    for (int mode = 0; mode < 2 && bad >= 0; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_vguard_XXXXXX");
+        if (!cbm_mkdtemp(tmp)) {
+            return -1;
+        }
+        write_cpp_gtest_view_guard_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/vguard.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_store_t *s = run == 0 ? cbm_store_open_path(db_path) : NULL;
+        if (!s) {
+            bad = -1;
+        }
+        for (size_t i = 0; s && i < n; i++) {
+            int got = go_calls_between(s, cbm_pipeline_project_name(p), edges[i].caller,
+                                       edges[i].callee, NULL);
+            if (got != edges[i].want) {
+                printf("  [%s] %s -> %s: %d, want %d\n", parallel ? "parallel" : "sequential",
+                       edges[i].caller, edges[i].callee, got, edges[i].want);
+                bad++;
+            }
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+    }
+    return bad;
+}
+
+/* (a) A method of a local class whose lines are the test's lines (one line,
+ * or head line to closing line). The raw view draws its call from the File
+ * (main's rule for local-class methods); the second view must not name the
+ * method's body as the test, or the call has two sources. Partner: a plain
+ * one-line test's call is still at the test. */
+TEST(pipeline_cpp_gtest_view_guard_local_class_method) {
+    static const ViewGuardEdge edges[] = {
+        {VG_TEST("OneLine_Local"), ".lib.sites.s01", 0},
+        {VG_FILE, ".lib.sites.s01", 1},
+        {VG_TEST("Span_Local"), ".lib.sites.s02", 0},
+        {VG_FILE, ".lib.sites.s02", 1},
+        {VG_TEST("Plain_One"), ".lib.sites.s07", 1},
+        {VG_FILE, ".lib.sites.s07", 0},
+    };
+    ASSERT_EQ(view_guard_edges(edges, sizeof(edges) / sizeof(edges[0])), 0);
+    PASS();
+}
+
+/* (b) A function defined on the line of a one-line test: two top-level
+ * definitions of the second view cover the test's span, so neither is the
+ * test. The helper's call stays the helper's (no TEST_Pair_Helper -> s03);
+ * the test's own calls stay the test's (partner). */
+TEST(pipeline_cpp_gtest_view_guard_helper_on_test_line) {
+    static const ViewGuardEdge edges[] = {
+        {VG_TEST("Pair_Helper"), ".lib.sites.s03", 0},
+        {".test.views_test.helper3", ".lib.sites.s03", 1},
+        {VG_TEST("Pair_Helper"), ".lib.sites.s04", 1},
+        {VG_TEST("Pair_Helper"), ".test.views_test.helper3", 1},
+    };
+    ASSERT_EQ(view_guard_edges(edges, sizeof(edges) / sizeof(edges[0])), 0);
+    PASS();
+}
+
+/* (c) Two tests on one line, one head spelled through a project macro: the
+ * span is shared, so the rule gives no answer and the second view names each
+ * body from its own expanded head. TEST(MY_SUITE2, A) becomes
+ * TEST_RealSuite2_A there, a name no node carries, so its call is drawn from
+ * the test (raw view) and from the File (main's own edge): two sources, one
+ * target, the right one. A known limit; this pins what the graph draws. The
+ * other test's call is at its test only (partner). */
+TEST(pipeline_cpp_gtest_view_guard_shared_line_macro_head) {
+    static const ViewGuardEdge edges[] = {
+        {VG_TEST("MY_SUITE2_A"), ".lib.sites.s05", 1},
+        {VG_FILE, ".lib.sites.s05", 1},
+        {VG_TEST("Other2_B"), ".lib.sites.s06", 1},
+        {VG_FILE, ".lib.sites.s06", 0},
+    };
+    ASSERT_EQ(view_guard_edges(edges, sizeof(edges) / sizeof(edges[0])), 0);
+    PASS();
+}
+
+/* Every node (qualified name, label) and every edge (type, source QN, target
+ * QN, properties by key) of a store, one row each, sorted. Node ids and the
+ * index bookkeeping differ between two stores; the graph content must not. */
+typedef struct {
+    char **rows;
+    int count;
+} CppGtestRows;
+
+static void cpp_gtest_rows_free(CppGtestRows *r) {
+    for (int i = 0; i < r->count; i++) {
+        free(r->rows[i]);
+    }
+    free(r->rows);
+    r->rows = NULL;
+    r->count = 0;
+}
+
+static int cpp_gtest_row_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static bool cpp_gtest_rows_add(CppGtestRows *out, int *cap, sqlite3_stmt *stmt) {
+    const char *cols[4];
+    size_t len = 4;
+    for (int c = 0; c < 4; c++) {
+        cols[c] = (const char *)sqlite3_column_text(stmt, c);
+        len += cols[c] ? strlen(cols[c]) : 0;
+    }
+    if (out->count == *cap) {
+        int grown_cap = *cap ? *cap * 2 : 256;
+        char **grown = realloc(out->rows, (size_t)grown_cap * sizeof(char *));
+        if (!grown) {
+            return false;
+        }
+        out->rows = grown;
+        *cap = grown_cap;
+    }
+    char *row = malloc(len + 1);
+    if (!row) {
+        return false;
+    }
+    snprintf(row, len + 1, "%s|%s|%s|%s", cols[0] ? cols[0] : "", cols[1] ? cols[1] : "",
+             cols[2] ? cols[2] : "", cols[3] ? cols[3] : "");
+    out->rows[out->count++] = row;
+    return true;
+}
+
+static bool cpp_gtest_rows(const char *db_path, CppGtestRows *out) {
+    memset(out, 0, sizeof(*out));
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return false;
+    }
+    static const char *const queries[] = {
+        "SELECT 'N', qualified_name, label, '' FROM nodes",
+        /* Properties with their top-level keys sorted: the incremental route
+         * writes CALLS properties in another key order than a full index
+         * (on 08a7a586 as well), which is not a difference of content. */
+        "SELECT 'E' || e.type, s.qualified_name, t.qualified_name, "
+        "CASE WHEN json_valid(e.properties) THEN (SELECT group_concat(key || '=' || value, ',') "
+        "FROM (SELECT key, value FROM json_each(e.properties) ORDER BY key)) "
+        "ELSE coalesce(e.properties, '') END "
+        "FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id"};
+    int cap = 0;
+    bool ok = true;
+    for (size_t q = 0; q < 2 && ok; q++) {
+        sqlite3_stmt *stmt = NULL;
+        ok = sqlite3_prepare_v2(cbm_store_get_db(s), queries[q], -1, &stmt, NULL) == SQLITE_OK;
+        while (ok && sqlite3_step(stmt) == SQLITE_ROW) {
+            ok = cpp_gtest_rows_add(out, &cap, stmt);
+        }
+        sqlite3_finalize(stmt);
+    }
+    cbm_store_close(s);
+    if (!ok) {
+        cpp_gtest_rows_free(out);
+        return false;
+    }
+    qsort(out->rows, (size_t)out->count, sizeof(char *), cpp_gtest_row_cmp);
+    return true;
+}
+
+/* 0 when both stores hold the same rows; else prints the first difference. */
+static int cpp_gtest_rows_diff(const char *label, const CppGtestRows *a, const CppGtestRows *b) {
+    int i = 0;
+    int j = 0;
+    while (i < a->count && j < b->count) {
+        int c = strcmp(a->rows[i], b->rows[j]);
+        if (c != 0) {
+            printf("  [%s] first difference: %s\n      against: %s\n", label,
+                   c < 0 ? a->rows[i] : b->rows[j],
+                   c < 0 ? "(missing on the right)" : "(missing on the left)");
+            return 1;
+        }
+        i++;
+        j++;
+    }
+    if (i < a->count || j < b->count) {
+        printf("  [%s] row counts %d vs %d\n", label, a->count, b->count);
+        return 1;
+    }
+    return 0;
+}
+
+/* A single-file edit of a gtest file, taken by the incremental route, gives
+ * the graph a full index of the edited tree gives (every node and every edge
+ * by content), sequential and parallel; the edited body's remaining call
+ * starts at the test's own node and the removed one is gone. The caller naming lives in extraction
+ * and in the C/C++ engine dispatch, which every route shares; this pins that no route names a test
+ * body differently. */
+TEST(pipeline_cpp_gtest_caller_incremental_matches_full) {
+    int verdicts[2] = {-1, -1};
+    int routes[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        char tmp[256];
+        char dbs[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_cpp_gtest_incr_XXXXXX");
+        snprintf(dbs, sizeof(dbs), "/tmp/cbm_cpp_gtest_incr_db_XXXXXX");
+        if (!cbm_mkdtemp(tmp) || !cbm_mkdtemp(dbs)) {
+            FAIL("tmpdir");
+        }
+        write_cpp_gtest_caller_fixture(tmp, parallel ? 52 : 0);
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+        char incr_db[512];
+        char full_db[512];
+        snprintf(incr_db, sizeof(incr_db), "%s/incr.db", dbs);
+        snprintf(full_db, sizeof(full_db), "%s/full.db", dbs);
+        int verdict = 1;
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, incr_db, CBM_MODE_FULL);
+        int run = p ? cbm_pipeline_run(p) : -1;
+        cbm_pipeline_free(p);
+        /* A body-only edit (a new definition name would decline the closure
+         * planner to a full rebuild): the TEST body drops its local_helper
+         * call and keeps cross_helper. */
+        if (run == 0) {
+            write_temp_file(tmp, "test/widget_test.cc",
+                            "#include \"../lib/helper.h\"\n"
+                            "static int local_helper(int v) { return v * 2; }\n"
+                            "class WidgetFixture {\n"
+                            " public:\n"
+                            "  int Prepare() { return 1; }\n"
+                            "};\n"
+                            "TEST(WidgetSuite, Adds) {\n"
+                            "  cross_helper(2);\n"
+                            "}\n"
+                            "TEST_F(WidgetFixture, Runs) {\n"
+                            "  local_helper(3);\n"
+                            "  cross_helper(4);\n"
+                            "}\n");
+            p = cbm_pipeline_new(tmp, incr_db, CBM_MODE_FULL);
+            run = p ? cbm_pipeline_run(p) : -1;
+            routes[mode] = (int)cbm_pipeline_incremental_test_last_route();
+            cbm_store_t *s = run == 0 ? cbm_store_open_path(incr_db) : NULL;
+            const char *proj = p ? cbm_pipeline_project_name(p) : NULL;
+            int kept = s ? go_calls_between(s, proj, ".test.widget_test.TEST_WidgetSuite_Adds",
+                                            ".lib.helper.cross_helper", NULL)
+                         : -1;
+            int dropped = s ? go_calls_between(s, proj, ".test.widget_test.TEST_WidgetSuite_Adds",
+                                               ".test.widget_test.local_helper", NULL)
+                            : -1;
+            int later = kept == 1 && dropped == 0 ? 1 : 0;
+            if (s) {
+                cbm_store_close(s);
+            }
+            cbm_pipeline_free(p);
+            cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+            int full_run = full ? cbm_pipeline_run(full) : -1;
+            cbm_pipeline_free(full);
+            CppGtestRows a;
+            CppGtestRows b;
+            bool read = run == 0 && full_run == 0 && cpp_gtest_rows(incr_db, &a);
+            bool read_b = read && cpp_gtest_rows(full_db, &b);
+            if (later != 1) {
+                printf("  [%s] after the edit TEST_WidgetSuite_Adds: cross_helper %d, "
+                       "local_helper %d (want 1, 0)\n",
+                       parallel ? "parallel" : "sequential", kept, dropped);
+            }
+            verdict = read_b && later == 1 && a.count > 0
+                          ? cpp_gtest_rows_diff(parallel ? "parallel" : "sequential", &a, &b)
+                          : 1;
+            if (read) {
+                cpp_gtest_rows_free(&a);
+            }
+            if (read_b) {
+                cpp_gtest_rows_free(&b);
+            }
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        th_rmtree(tmp);
+        th_rmtree(dbs);
+        verdicts[mode] = verdict;
+    }
+    printf("  routes: sequential %d, parallel %d  ", routes[0], routes[1]);
+    /* Both edits took an incremental route, not a full rebuild. */
+    ASSERT_TRUE(routes[0] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL ||
+                routes[0] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(routes[1] == CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL ||
+                routes[1] == CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(verdicts[0], 0);
+    ASSERT_EQ(verdicts[1], 0);
+    PASS();
+}
+
 /* ── calls_append_args: an argument longer than its formatting buffer ────── */
 
 #if !defined(_WIN32)
@@ -36109,6 +37285,671 @@ TEST(pipeline_c_header_edit_refreshes_includers_incrementally) {
     PASS();
 }
 
+/* The sequential resolver looked each call's engine row up by scanning every
+ * row of the file: O(calls x rows) per file, 13.4 s for one generated
+ * file of 16,000 tests. It now uses the parallel resolver's per-file index.
+ * lsp_lookup_work counts index lookups plus rows read by a scan (counted
+ * inside the scan, whoever calls it) for one Go file of `n` functions, each
+ * calling two methods of a typed receiver, on the sequential resolver. */
+static uint64_t lsp_lookup_work(int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_lsp_work_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    char path[512];
+    int rc = 0;
+    snprintf(path, sizeof(path), "%s/go.mod", tmp);
+    rc |= th_write_file(path, "module example.com/work\n\ngo 1.21\n");
+    snprintf(path, sizeof(path), "%s/calc/calc.go", tmp);
+    rc |= th_write_file(path, "package calc\n\n"
+                              "type Calc struct{}\n\n"
+                              "func (c *Calc) Add(a, b int) int { return a + b }\n\n"
+                              "func (c *Calc) Positive(a int) bool { return a > 0 }\n");
+    size_t cap = (size_t)n * 128 + 128;
+    char *body = malloc(cap);
+    if (!body) {
+        th_rmtree(tmp);
+        return 0;
+    }
+    size_t len = (size_t)snprintf(body, cap, "package calc\n\n");
+    for (int i = 0; i < n && len < cap; i++) {
+        len += (size_t)snprintf(
+            body + len, cap - len,
+            "func Case%d(c *Calc) bool {\n\treturn c.Positive(c.Add(%d, 1))\n}\n\n", i, i);
+    }
+    snprintf(path, sizeof(path), "%s/calc/cases.go", tmp);
+    rc |= th_write_file(path, body);
+    free(body);
+    uint64_t work = 0;
+    if (rc == 0) {
+        XlangEnvSave save = xlang_env_select(false);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/work.db", tmp);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline && cbm_pipeline_run(pipeline) == 0) {
+            work = cbm_pp_lsp_scan_rows() + cbm_pp_lsp_index_lookups();
+        }
+        if (pipeline) {
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return work;
+}
+
+TEST(pipeline_sequential_lsp_lookup_work_grows_linearly) {
+    uint64_t w1 = lsp_lookup_work(40);
+    uint64_t w4 = lsp_lookup_work(160);
+    uint64_t w16 = lsp_lookup_work(640);
+    ASSERT_TRUE(w1 > 0);
+    /* Linear within 12.5%: a scan of every row per call grows 16x and 256x. */
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+/* Two call shapes the index used to hand back to the scan on both resolvers:
+ * a call of a JVM file that has no row of its own caller (the matcher's tail
+ * phase read every row of the file, after the first phase had), and a call
+ * that needs the engine (a C++ operator expression, a JSX tag, a Kotlin
+ * operator), which read every row whenever the engine had none for it. The
+ * same count as lsp_lookup_work for one generated file of `n` cases; each case
+ * also makes one call the engine resolves, so the file's rows grow with `n`. */
+typedef enum {
+    LSP_WORK_JAVA_UNRESOLVED,  /* a call the engine has no row for, in a Java file */
+    LSP_WORK_CPP_OPERATORS,    /* two built-in operator expressions per function */
+    LSP_WORK_KOTLIN_OPERATORS, /* the same in Kotlin: needs the engine, JVM caller */
+} lsp_work_shape_t;
+
+static uint64_t lsp_lookup_work_shape(lsp_work_shape_t shape, int n) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_lsp_shape_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    size_t cap = (size_t)n * 128 + 256;
+    char *body = malloc(cap);
+    if (!body) {
+        th_rmtree(tmp);
+        return 0;
+    }
+    char path[512];
+    int rc = 0;
+    size_t len = 0;
+    if (shape == LSP_WORK_JAVA_UNRESOLVED) {
+        snprintf(path, sizeof(path), "%s/calc/Calc.java", tmp);
+        rc |= th_write_file(path, "package calc;\n\n"
+                                  "public class Calc {\n"
+                                  "    public int add(int a, int b) { return a + b; }\n"
+                                  "}\n");
+        len = (size_t)snprintf(body, cap, "package calc;\n\npublic class Cases {\n");
+        for (int i = 0; i < n && len < cap; i++) {
+            len += (size_t)snprintf(
+                body + len, cap - len,
+                "    static int case%d(Calc c) { return c.add(%d, Missing.value()); }\n", i, i);
+        }
+        if (len < cap) {
+            len += (size_t)snprintf(body + len, cap - len, "}\n");
+        }
+        snprintf(path, sizeof(path), "%s/calc/Cases.java", tmp);
+    } else if (shape == LSP_WORK_KOTLIN_OPERATORS) {
+        snprintf(path, sizeof(path), "%s/calc/Calc.kt", tmp);
+        rc |= th_write_file(path, "package calc\n\n"
+                                  "class Calc {\n"
+                                  "    fun add(a: Int, b: Int): Int = a + b\n"
+                                  "}\n");
+        len = (size_t)snprintf(body, cap, "package calc\n\n");
+        for (int i = 0; i < n && len < cap; i++) {
+            len += (size_t)snprintf(body + len, cap - len,
+                                    "fun case%d(c: Calc, x: Int): Int = c.add(x, %d) + x * 2\n", i,
+                                    i);
+        }
+        snprintf(path, sizeof(path), "%s/calc/Cases.kt", tmp);
+    } else {
+        len = (size_t)snprintf(body, cap,
+                               "struct Calc {\n"
+                               "    int add(int a, int b) { return a + b; }\n"
+                               "};\n\n");
+        for (int i = 0; i < n && len < cap; i++) {
+            len += (size_t)snprintf(
+                body + len, cap - len,
+                "int case%d(Calc &c, int x) { return c.add(x, %d) + x * 2; }\n", i, i);
+        }
+        snprintf(path, sizeof(path), "%s/cases.cpp", tmp);
+    }
+    rc |= th_write_file(path, body);
+    free(body);
+    uint64_t work = 0;
+    if (rc == 0) {
+        XlangEnvSave save = xlang_env_select(false);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/work.db", tmp);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline && cbm_pipeline_run(pipeline) == 0) {
+            work = cbm_pp_lsp_scan_rows() + cbm_pp_lsp_index_lookups();
+        }
+        if (pipeline) {
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return work;
+}
+
+TEST(pipeline_jvm_tail_lookup_work_grows_linearly) {
+    uint64_t w1 = lsp_lookup_work_shape(LSP_WORK_JAVA_UNRESOLVED, 40);
+    uint64_t w4 = lsp_lookup_work_shape(LSP_WORK_JAVA_UNRESOLVED, 160);
+    uint64_t w16 = lsp_lookup_work_shape(LSP_WORK_JAVA_UNRESOLVED, 640);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+TEST(pipeline_needs_engine_lookup_work_grows_linearly) {
+    uint64_t w1 = lsp_lookup_work_shape(LSP_WORK_CPP_OPERATORS, 40);
+    uint64_t w4 = lsp_lookup_work_shape(LSP_WORK_CPP_OPERATORS, 160);
+    uint64_t w16 = lsp_lookup_work_shape(LSP_WORK_CPP_OPERATORS, 640);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+TEST(pipeline_kotlin_operator_lookup_work_grows_linearly) {
+    uint64_t w1 = lsp_lookup_work_shape(LSP_WORK_KOTLIN_OPERATORS, 40);
+    uint64_t w4 = lsp_lookup_work_shape(LSP_WORK_KOTLIN_OPERATORS, 160);
+    uint64_t w16 = lsp_lookup_work_shape(LSP_WORK_KOTLIN_OPERATORS, 640);
+    ASSERT_TRUE(w1 > 0);
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+/* The index lookup answers exactly what the matcher answers. Seeded rows and
+ * calls over two callers, exact / legacy / corrupt spans, both origins,
+ * floors, references, reason joins, destructor rows, calls that need the
+ * engine, and JVM tail matching on and off; every answer is compared with
+ * cbm_pipeline_find_lsp_resolution_in_graph's. */
+static uint32_t lsp_prop_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state >> 8;
+}
+
+TEST(pipeline_lsp_index_find_agrees_with_the_matcher) {
+    /* "a.K.f" and "b.K.f" share the Class.method tail the JVM tail phase joins
+     * by; "p.f|g" with leaf "m1" and "p.f" with leaf "g|m1" spell the same
+     * text around the key's separator. */
+    static const char *const callers[] = {"p.f", "p.g", "a.K.f", "b.K.f", "p.f|g"};
+    static const char *const callees[] = {"p.A.m1", "p.B.m1",  "p.A.m2",
+                                          "p.C.~C", "p.D.run", "p.B.g|m1"};
+    static const char *const strategies[] = {"lsp_direct", "lsp_type_dispatch", "lsp_destructor",
+                                             "lsp_callable_alias"};
+    static const char *const reasons[] = {NULL, "m1", "m2", "run"};
+    static const char *const names[] = {"x.m1", "m2", "~", "run", "y.run", "m1", "g|m1"};
+    static const uint32_t spans[][2] = {{0, 0}, {10, 20}, {30, 40}, {5, 5}, {9, 3}};
+    uint32_t seed = 0x5eed1234u;
+    int mismatches = 0;
+    int answered = 0;
+    int tail_answered = 0;
+    int two_rows = 0;
+    int scanned = 0;
+    int needs_engine_answered = 0;
+    int tail_exact = 0;
+    int tail_legacy = 0;
+    int tail_by_bare_name = 0;
+    for (int trial = 0; trial < 20000; trial++) {
+        CBMResolvedCall rows[8];
+        int nrows = 1 + (int)(lsp_prop_next(&seed) % 8);
+        for (int i = 0; i < nrows; i++) {
+            memset(&rows[i], 0, sizeof(rows[i]));
+            rows[i].caller_qn = callers[lsp_prop_next(&seed) % 5];
+            rows[i].callee_qn = callees[lsp_prop_next(&seed) % 6];
+            rows[i].strategy = strategies[lsp_prop_next(&seed) % 4];
+            rows[i].reason = reasons[lsp_prop_next(&seed) % 4];
+            uint32_t conf = lsp_prop_next(&seed) % 5;
+            rows[i].confidence = conf == 0 ? 0.5f : 0.7f + 0.05f * (float)conf;
+            rows[i].kind = lsp_prop_next(&seed) % 7 == 0 ? CBM_RESOLVED_CALL_REFERENCE
+                                                         : CBM_RESOLVED_INVOCATION;
+            const uint32_t *span = spans[lsp_prop_next(&seed) % 5];
+            rows[i].site_start_byte = span[0];
+            rows[i].site_end_byte = span[1];
+            rows[i].source_origin = lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                                  : CBM_SOURCE_ORIGIN_RAW;
+            /* One row in three sits at the previous row's caller and
+             * occurrence, so two rows under one key (the same target, another
+             * target, another confidence) are common. */
+            if (i > 0 && lsp_prop_next(&seed) % 3 == 0) {
+                rows[i].caller_qn = rows[i - 1].caller_qn;
+                rows[i].site_start_byte = rows[i - 1].site_start_byte;
+                rows[i].site_end_byte = rows[i - 1].site_end_byte;
+                rows[i].source_origin = rows[i - 1].source_origin;
+            }
+        }
+        CBMResolvedCallArray arr = {rows, nrows, nrows};
+        CBMCall call;
+        memset(&call, 0, sizeof(call));
+        call.callee_name = names[lsp_prop_next(&seed) % 7];
+        call.enclosing_func_qn = callers[lsp_prop_next(&seed) % 5];
+        const uint32_t *span = spans[lsp_prop_next(&seed) % 5];
+        call.site_start_byte = span[0];
+        call.site_end_byte = span[1];
+        call.source_origin =
+            lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW;
+        call.requires_lsp_resolution = lsp_prop_next(&seed) % 3 == 0;
+        bool allow_tail = lsp_prop_next(&seed) % 2 == 0;
+        /* Two calls in three are aimed at one of the rows: its caller, its
+         * occurrence, and its leaf or the leaf of its reason. One aimed call
+         * in four then moves to the caller's tail twin, which only the tail
+         * phase can join. */
+        if (lsp_prop_next(&seed) % 3 != 0) {
+            const CBMResolvedCall *aim = &rows[lsp_prop_next(&seed) % (uint32_t)nrows];
+            call.enclosing_func_qn = aim->caller_qn;
+            call.callee_name = (aim->reason && lsp_prop_next(&seed) % 2 == 0)
+                                   ? aim->reason
+                                   : cbm_lsp_bare_segment(aim->callee_qn);
+            call.site_start_byte = aim->site_start_byte;
+            call.site_end_byte = aim->site_end_byte;
+            call.source_origin = aim->source_origin;
+            /* One aimed call in eight moves on to a caller that shares only
+             * the bare name ("p.f" and "a.K.f"), which the tail phase joins
+             * for a row at the call's exact occurrence and for no other. */
+            uint32_t move = lsp_prop_next(&seed) % 8;
+            if (move < 2) {
+                if (strcmp(call.enclosing_func_qn, "a.K.f") == 0) {
+                    call.enclosing_func_qn = "b.K.f";
+                } else if (strcmp(call.enclosing_func_qn, "b.K.f") == 0) {
+                    call.enclosing_func_qn = "a.K.f";
+                }
+            } else if (move == 2) {
+                if (strcmp(call.enclosing_func_qn, "p.f") == 0) {
+                    call.enclosing_func_qn = "a.K.f";
+                } else if (strcmp(call.enclosing_func_qn, "a.K.f") == 0) {
+                    call.enclosing_func_qn = "p.f";
+                }
+            }
+        }
+        cbm_pipeline_lsp_index_t idx;
+        cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, allow_tail);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        const CBMResolvedCall *by_index =
+            cbm_pipeline_lsp_index_find(&idx, &arr, &call, allow_tail, NULL, NULL);
+        scanned += cbm_pp_lsp_scan_rows() != 0;
+        const CBMResolvedCall *by_matcher =
+            cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, allow_tail, NULL, NULL);
+        cbm_pipeline_lsp_index_free(&idx);
+        if (by_index != by_matcher) {
+            mismatches++;
+        }
+        /* What the trial exercised: an answer at all; an answer only the
+         * tail phase gives, from a row at the call's occurrence, from a row
+         * without a span, and through the bare name alone; an answer to a call
+         * that needs the engine; two or more rows that are this call's. */
+        answered += by_matcher != NULL;
+        bool tail_only =
+            allow_tail && by_matcher &&
+            !cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, false, NULL, NULL);
+        tail_answered += tail_only;
+        if (tail_only) {
+            bool at_occurrence = cbm_pipeline_source_site_present(by_matcher->site_start_byte,
+                                                                  by_matcher->site_end_byte);
+            tail_exact += at_occurrence;
+            tail_legacy += !at_occurrence;
+            tail_by_bare_name += !cbm_pipeline_qn_class_method_tail_eq(
+                by_matcher->caller_qn,
+                cbm_pipeline_qn_class_method_tail(call.enclosing_func_qn));
+        }
+        needs_engine_answered += by_matcher && call.requires_lsp_resolution;
+        int mine = 0;
+        for (int i = 0; i < nrows; i++) {
+            int rank = cbm_pipeline_invocation_site_rank(&rows[i], &call);
+            mine += rows[i].kind == CBM_RESOLVED_INVOCATION &&
+                    rows[i].confidence >= CBM_LSP_CONFIDENCE_FLOOR &&
+                    strcmp(rows[i].caller_qn, call.enclosing_func_qn) == 0 && rank != 0 &&
+                    cbm_pipeline_invocation_leaf_matches(&rows[i], &call, rank);
+        }
+        two_rows += mine >= 2;
+    }
+    if (mismatches != 0 || scanned != 0 || answered <= 3000 || tail_exact <= 130 ||
+        tail_legacy <= 25 || tail_by_bare_name <= 60 || needs_engine_answered <= 500 ||
+        two_rows <= 300) {
+        printf("  generator coverage: answered=%d tail=%d (exact %d, legacy %d, bare %d) "
+               "needs_engine=%d two_rows=%d scanned=%d\n",
+               answered, tail_answered, tail_exact, tail_legacy, tail_by_bare_name,
+               needs_engine_answered, two_rows, scanned);
+    }
+    ASSERT_EQ(mismatches, 0);
+    /* No trial has an empty name or a failed allocation, so the index answers
+     * every one without the matcher's scan. */
+    ASSERT_EQ(scanned, 0);
+    /* The comparison is not all "no row", and each path of the index gives
+     * answers: the tail phase from a row at the call's occurrence, from a row
+     * without a span, and through the bare name alone; calls that need the
+     * engine; several rows for one call. */
+    ASSERT_TRUE(answered > 3000);
+    ASSERT_TRUE(tail_exact > 130);
+    ASSERT_TRUE(tail_legacy > 25);
+    ASSERT_TRUE(tail_by_bare_name > 60);
+    ASSERT_TRUE(needs_engine_answered > 500);
+    ASSERT_TRUE(two_rows > 300);
+    PASS();
+}
+
+/* The tail table exists only in an index built for tail matching. An index
+ * built without it, asked with tail matching on, must not read "no such
+ * table" as "no such row": it hands the call to the matcher. */
+TEST(pipeline_lsp_index_built_without_tail_asks_the_matcher) {
+    CBMResolvedCall row;
+    memset(&row, 0, sizeof(row));
+    row.caller_qn = "a.K.f";
+    row.callee_qn = "p.A.m1";
+    row.strategy = "lsp_direct";
+    row.confidence = 0.9f;
+    row.kind = CBM_RESOLVED_INVOCATION; /* no span: a row the tail table would hold */
+    CBMResolvedCallArray arr = {&row, 1, 1};
+    CBMCall call;
+    memset(&call, 0, sizeof(call));
+    call.enclosing_func_qn = "b.K.f"; /* the same Class.method tail, another package */
+    call.callee_name = "m1";
+    call.site_start_byte = 10;
+    call.site_end_byte = 20;
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, true, NULL, NULL) == &row);
+
+    cbm_pipeline_lsp_index_t idx;
+    cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, false);
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, true, NULL, NULL) == &row);
+    ASSERT_TRUE(cbm_pp_lsp_scan_rows() > 0); /* the matcher's answer */
+    cbm_pipeline_lsp_index_free(&idx);
+
+    cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, true);
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, true, NULL, NULL) == &row);
+    ASSERT_EQ(cbm_pp_lsp_scan_rows(), 0); /* the tail table's */
+    cbm_pipeline_lsp_index_free(&idx);
+    PASS();
+}
+
+/* Rows of the call's own caller that disagree end the lookup with no answer,
+ * also when another caller with the same Class.method tail has a row at the
+ * call's exact occurrence. The matcher stops after its first phase there, so
+ * the index must not go on to its tail tables. */
+TEST(pipeline_lsp_index_own_caller_disagreement_ends_the_lookup) {
+    CBMResolvedCall rows[3];
+    memset(rows, 0, sizeof(rows));
+    for (int i = 0; i < 3; i++) {
+        rows[i].strategy = "lsp_direct";
+        rows[i].confidence = 0.9f;
+        rows[i].kind = CBM_RESOLVED_INVOCATION;
+    }
+    rows[0].caller_qn = "b.K.f"; /* the call's own caller, no span */
+    rows[0].callee_qn = "p.A.m1";
+    rows[1].caller_qn = "b.K.f"; /* the same caller, another target */
+    rows[1].callee_qn = "q.B.m1";
+    rows[2].caller_qn = "a.K.f"; /* the same Class.method tail, at the call's occurrence */
+    rows[2].callee_qn = "r.C.m1";
+    rows[2].site_start_byte = 10;
+    rows[2].site_end_byte = 20;
+    CBMResolvedCallArray arr = {rows, 3, 3};
+    CBMCall call;
+    memset(&call, 0, sizeof(call));
+    call.enclosing_func_qn = "b.K.f";
+    call.callee_name = "m1";
+    call.site_start_byte = 10;
+    call.site_end_byte = 20;
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, true, NULL, NULL) == NULL);
+
+    cbm_pipeline_lsp_index_t idx;
+    cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, true);
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, true, NULL, NULL) == NULL);
+    ASSERT_EQ(cbm_pp_lsp_scan_rows(), 0); /* the index's own answer */
+    cbm_pipeline_lsp_index_free(&idx);
+
+    /* Without the two disagreeing rows the same call takes the tail row. */
+    CBMResolvedCallArray tail_only = {&rows[2], 1, 1};
+    cbm_pipeline_lsp_index_build(&idx, &tail_only, NULL, NULL, true);
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &tail_only, &call, true, NULL, NULL) ==
+                &rows[2]);
+    cbm_pipeline_lsp_index_free(&idx);
+    PASS();
+}
+
+/* One engine row whose leaf is empty must not switch the file's index off.
+ * The C engine writes such a row for a call through a project `operator->`
+ * (the callee ends in a separator). With it in the file, a call without a
+ * row of its own is still answered without a scan, and the row's own call,
+ * which has no key, is still decided by the matcher. */
+TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete) {
+    CBMResolvedCall rows[2];
+    memset(rows, 0, sizeof(rows));
+    rows[0].caller_qn = "p.f";
+    rows[0].callee_qn = "p.T.operator->";
+    rows[0].strategy = "lsp_direct";
+    rows[0].confidence = 0.9f;
+    rows[0].kind = CBM_RESOLVED_INVOCATION;
+    rows[0].site_start_byte = 10;
+    rows[0].site_end_byte = 20;
+    rows[1] = rows[0];
+    rows[1].callee_qn = "p.A.m1";
+    rows[1].site_start_byte = 30;
+    rows[1].site_end_byte = 40;
+    CBMResolvedCallArray arr = {rows, 2, 2};
+    ASSERT_TRUE(cbm_lsp_bare_segment(rows[0].callee_qn)[0] == '\0'); /* the premise */
+
+    cbm_pipeline_lsp_index_t idx;
+    cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, false);
+    ASSERT_TRUE(idx.exact_complete);
+
+    CBMCall call;
+    memset(&call, 0, sizeof(call));
+    call.enclosing_func_qn = "p.f";
+    call.callee_name = "other";
+    call.site_start_byte = 50;
+    call.site_end_byte = 60;
+    cbm_pp_lsp_linear_fallback_rows_reset();
+    ASSERT_NULL(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL));
+    call.callee_name = "m1";
+    call.site_start_byte = 30;
+    call.site_end_byte = 40;
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL) == &rows[1]);
+    ASSERT_EQ(cbm_pp_lsp_scan_rows(), 0); /* neither lookup read the rows */
+
+    call.callee_name = "operator->";
+    call.site_start_byte = 10;
+    call.site_end_byte = 20;
+    ASSERT_TRUE(cbm_pipeline_lsp_index_find(&idx, &arr, &call, false, NULL, NULL) == &rows[0]);
+    ASSERT_TRUE(cbm_pp_lsp_scan_rows() > 0); /* that one was the matcher's */
+    cbm_pipeline_lsp_index_free(&idx);
+    PASS();
+}
+
+/* PHP's check for a receiver typed as a class the index does not hold read
+ * every row of the file for every call it was asked about. It now reads the
+ * per-file index. php_receiver_check_work counts index lookups plus rows read
+ * by a scan (counted inside the scan) for one PHP method of `n` calls on such a receiver, each of which
+ * the name resolver would bind to the one project method of that name. */
+static uint64_t php_receiver_check_work(int n, int *edges_to_project_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_check_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+    char path[512];
+    int rc = 0;
+    snprintf(path, sizeof(path), "%s/src/Item.php", tmp);
+    rc |= th_write_file(path, "<?php\n"
+                              "namespace App;\n\n"
+                              "class Item\n"
+                              "{\n"
+                              "    public function getUid(): int\n"
+                              "    {\n"
+                              "        return 1;\n"
+                              "    }\n"
+                              "}\n");
+    size_t cap = (size_t)n * 32 + 256;
+    char *body = malloc(cap);
+    if (!body) {
+        th_rmtree(tmp);
+        return 0;
+    }
+    size_t len = (size_t)snprintf(body, cap,
+                                  "<?php\n"
+                                  "namespace App;\n\n"
+                                  "class Big\n"
+                                  "{\n"
+                                  "    public function run(Missing $m): void\n"
+                                  "    {\n");
+    for (int i = 0; i < n && len < cap; i++) {
+        len += (size_t)snprintf(body + len, cap - len, "        $m->getUid();\n");
+    }
+    if (len < cap) {
+        snprintf(body + len, cap - len, "    }\n}\n");
+    }
+    snprintf(path, sizeof(path), "%s/src/Big.php", tmp);
+    rc |= th_write_file(path, body);
+    free(body);
+    uint64_t work = 0;
+    if (rc == 0) {
+        XlangEnvSave save = xlang_env_select(false);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/work.db", tmp);
+        cbm_pp_lsp_linear_fallback_rows_reset();
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline && cbm_pipeline_run(pipeline) == 0) {
+            work = cbm_pp_lsp_scan_rows() + cbm_pp_lsp_index_lookups();
+            if (edges_to_project_method) {
+                cbm_store_t *store = cbm_store_open_path(db_path);
+                *edges_to_project_method =
+                    store ? named_edge_count(store, cbm_pipeline_project_name(pipeline), "CALLS",
+                                             "run", "getUid")
+                          : -1;
+                if (store) {
+                    cbm_store_close(store);
+                }
+            }
+        }
+        if (pipeline) {
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return work;
+}
+
+TEST(pipeline_php_receiver_check_work_grows_linearly) {
+    int edges = -1;
+    uint64_t w1 = php_receiver_check_work(40, &edges);
+    uint64_t w4 = php_receiver_check_work(160, NULL);
+    uint64_t w16 = php_receiver_check_work(640, NULL);
+    ASSERT_TRUE(w1 > 0);
+    /* The check ran and held: no call on the unindexed receiver is bound to
+     * the project method of the same name (#606). */
+    ASSERT_EQ(edges, 0);
+    /* Linear within 12.5%: a scan of every row per call grows 16x and 256x. */
+    ASSERT_TRUE(w4 * 8 <= w1 * 4 * 9);
+    ASSERT_TRUE(w16 * 8 <= w1 * 16 * 9);
+    PASS();
+}
+
+/* The index answers PHP's unindexed-receiver check exactly as the scan does.
+ * Seeded rows and calls over three callers (one pair of caller and leaf that
+ * spells the same text around the key's separator as another pair), exact /
+ * legacy / corrupt spans, both origins, rows of another strategy, callees
+ * without a class, references, and calls that need the engine; a registry in
+ * which one of the receiver classes is a project type. Every answer is
+ * compared with cbm_pipeline_php_receiver_type_unindexed's. */
+TEST(pipeline_lsp_index_php_receiver_check_agrees_with_the_scan) {
+    /* "p.f|g" with leaf "m1" and "p.f" with leaf "g|m1": one text around the key's
+     * separator, two keys, because a key carries its caller's length. */
+    static const char *const callers[] = {"p.f", "p.g", "p.f|g"};
+    /* Two receiver classes under one leaf, twice each: rows that answer the
+     * same call with different verdicts are common. */
+    static const char *const callees[] = {"V.A.m1", "V.B.m1", "V.A.m1",  "V.B.m1",  "W.A.m2",
+                                          "m1",     ".m1",    "V.B.run", "V.B.g|m1"};
+    static const char *const strategies[] = {"php_method_typed_unindexed",
+                                             "php_method_typed_unindexed",
+                                             "php_method_typed_unindexed", "php_method_typed"};
+    static const char *const names[] = {"x.m1", "m2", "run", "y.run", "m1", "B::m1", "g|m1"};
+    static const uint32_t spans[][2] = {{0, 0}, {0, 0}, {10, 20}, {30, 40}, {5, 5}, {9, 3}};
+    cbm_registry_t *registry = cbm_registry_new();
+    cbm_registry_t *no_types = cbm_registry_new();
+    ASSERT_NOT_NULL(registry);
+    ASSERT_NOT_NULL(no_types);
+    cbm_registry_add(registry, "A", "p.A", "Class", false);
+    ASSERT_TRUE(cbm_registry_has_type_named(registry, "A"));
+    ASSERT_FALSE(cbm_registry_has_type_named(registry, "B"));
+    uint32_t seed = 0x0606beefu;
+    int mismatches = 0;
+    int answered = 0;
+    int suppressed = 0;
+    for (int trial = 0; trial < 20000; trial++) {
+        CBMResolvedCall rows[8];
+        int nrows = 1 + (int)(lsp_prop_next(&seed) % 8);
+        for (int i = 0; i < nrows; i++) {
+            memset(&rows[i], 0, sizeof(rows[i]));
+            rows[i].caller_qn = callers[lsp_prop_next(&seed) % 3];
+            rows[i].callee_qn = callees[lsp_prop_next(&seed) % 9];
+            rows[i].strategy = strategies[lsp_prop_next(&seed) % 4];
+            rows[i].confidence = lsp_prop_next(&seed) % 4 == 0 ? 0.95f : 0.55f;
+            rows[i].kind = lsp_prop_next(&seed) % 7 == 0 ? CBM_RESOLVED_CALL_REFERENCE
+                                                         : CBM_RESOLVED_INVOCATION;
+            const uint32_t *span = spans[lsp_prop_next(&seed) % 6];
+            rows[i].site_start_byte = span[0];
+            rows[i].site_end_byte = span[1];
+            rows[i].source_origin = lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                                  : CBM_SOURCE_ORIGIN_RAW;
+        }
+        CBMResolvedCallArray arr = {rows, nrows, nrows};
+        CBMCall call;
+        memset(&call, 0, sizeof(call));
+        call.callee_name = names[lsp_prop_next(&seed) % 7];
+        call.enclosing_func_qn = callers[lsp_prop_next(&seed) % 3];
+        const uint32_t *span = spans[lsp_prop_next(&seed) % 6];
+        call.site_start_byte = span[0];
+        call.site_end_byte = span[1];
+        call.source_origin =
+            lsp_prop_next(&seed) % 6 == 0 ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW;
+        call.requires_lsp_resolution = lsp_prop_next(&seed) % 3 == 0;
+        /* Two calls in three are aimed at one of the rows (its caller, leaf,
+         * span and origin), so that a row answers in a fifth of the trials. */
+        if (lsp_prop_next(&seed) % 3 != 0) {
+            const CBMResolvedCall *aim = &rows[lsp_prop_next(&seed) % (uint32_t)nrows];
+            call.enclosing_func_qn = aim->caller_qn;
+            call.callee_name = cbm_lsp_bare_segment(aim->callee_qn);
+            call.site_start_byte = aim->site_start_byte;
+            call.site_end_byte = aim->site_end_byte;
+            call.source_origin = aim->source_origin;
+        }
+        cbm_pipeline_lsp_index_t idx;
+        cbm_pipeline_lsp_index_build(&idx, &arr, NULL, NULL, false);
+        bool by_index = cbm_pipeline_lsp_index_php_receiver_unindexed(&idx, &arr, &call, registry);
+        bool by_scan = cbm_pipeline_php_receiver_type_unindexed(&arr, &call, registry);
+        cbm_pipeline_lsp_index_free(&idx);
+        if (by_index != by_scan) {
+            mismatches++;
+        }
+        /* With no project type every answering row says "suppress". */
+        answered += cbm_pipeline_php_receiver_type_unindexed(&arr, &call, no_types);
+        suppressed += by_scan;
+    }
+    cbm_registry_free(registry);
+    cbm_registry_free(no_types);
+    ASSERT_EQ(mismatches, 0);
+    /* The comparison is not all "no row": a row answers in thousands of
+     * trials, with both verdicts. */
+    ASSERT_TRUE(answered > 2000);
+    ASSERT_TRUE(suppressed > 1000);
+    ASSERT_TRUE(answered - suppressed > 800);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_c_header_edit_refreshes_includers_incrementally);
     RUN_TEST(pipeline_c_include_lookup_uses_repo_root);
@@ -36238,6 +38079,16 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_parallel);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
+    RUN_TEST(pipeline_sequential_lsp_lookup_work_grows_linearly);
+    RUN_TEST(pipeline_jvm_tail_lookup_work_grows_linearly);
+    RUN_TEST(pipeline_needs_engine_lookup_work_grows_linearly);
+    RUN_TEST(pipeline_kotlin_operator_lookup_work_grows_linearly);
+    RUN_TEST(pipeline_lsp_index_find_agrees_with_the_matcher);
+    RUN_TEST(pipeline_lsp_index_built_without_tail_asks_the_matcher);
+    RUN_TEST(pipeline_lsp_index_own_caller_disagreement_ends_the_lookup);
+    RUN_TEST(pipeline_lsp_index_empty_leaf_row_keeps_the_index_complete);
+    RUN_TEST(pipeline_php_receiver_check_work_grows_linearly);
+    RUN_TEST(pipeline_lsp_index_php_receiver_check_agrees_with_the_scan);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
@@ -36676,6 +38527,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153);
     RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
+    RUN_TEST(pipeline_cpp_gtest_body_calls_start_at_test_node);
+    RUN_TEST(pipeline_cpp_gtest_caller_incremental_matches_full);
+    RUN_TEST(pipeline_cpp_gtest_preprocessed_view_one_source);
+    RUN_TEST(pipeline_cpp_gtest_view_guard_local_class_method);
+    RUN_TEST(pipeline_cpp_gtest_view_guard_helper_on_test_line);
+    RUN_TEST(pipeline_cpp_gtest_view_guard_shared_line_macro_head);
     RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
 }
 
@@ -36692,6 +38549,17 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_ansible_under_deploy_sequential_pass);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_caller_drops_its_route);
+    RUN_TEST(incremental_docker_context_pair_deleted_takes_the_full_route);
+    RUN_TEST(incremental_docker_context_directory_deleted_takes_the_full_route);
+    RUN_TEST(incremental_docker_copy_reference_follows_edits);
+    RUN_TEST(incremental_compose_file_reference_follows_edits);
+    RUN_TEST(incremental_docker_copy_reference_follows_its_file);
+    RUN_TEST(incremental_compose_file_reference_follows_its_file);
+    RUN_TEST(incremental_terraform_file_reference_follows_its_file);
+    RUN_TEST(incremental_local_uses_reference_follows_its_file);
+    RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
+    RUN_TEST(incremental_kustomize_file_reference_follows_its_file);
+    RUN_TEST(incremental_make_prerequisite_follows_edits);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
