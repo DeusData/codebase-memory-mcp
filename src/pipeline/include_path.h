@@ -87,7 +87,9 @@ typedef enum {
 } cbm_include_path_verdict_t;
 
 /* The file the import `imp` of the file `rel` names, written into buf.
- * `graph`/`project`: the run's File nodes, which count as existing. */
+ * `graph`/`project` take no part: a file exists when its exact path is listed
+ * (a File node found by name may be another file's: a.b.proto and a/b.proto
+ * share one name). */
 cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
