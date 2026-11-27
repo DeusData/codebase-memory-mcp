@@ -991,9 +991,11 @@ TEST(phpmw_relative_trait_name_through_the_pipeline) {
  * function is PHP's own, so the file's imports are complete and the class
  * import reaches the engine as the class. Before, one unresolved global
  * function use made the whole file's imports unknown, the class import reached
- * the engine as a File QN, and the typed call was lost. php: the property's
- * type is App\Dbal\DatabaseInterface and Db::getTable (its implementation)
- * runs. Partner: no edge to the other class's same-named method. */
+ * the engine as a File QN, and the typed call was lost. Asserted: the call's
+ * edge goes to the interface's declaration DatabaseInterface::getTable, drawn
+ * by the engine (php, with an implementing class added to the program: the
+ * property's type is App\Dbal\DatabaseInterface and the implementation's
+ * getTable runs). Partner: no edge to the other class's same-named method. */
 TEST(phpmw_use_function_keeps_class_imports) {
     static const PmwFile f[] = {PMW_USEFN_FILES("use function is_array;\nuse function sprintf;\n")};
     static const PmwExpect want[] = {
@@ -1032,9 +1034,10 @@ TEST(phpmw_aliased_global_use_function_keeps_the_file_unknown) {
 
 /* A `use const X;` beside the project's own `const X = 1;`: the graph has no
  * node for a PHP constant, so nothing it holds can be what the use names, and
- * the file's imports are complete (the typed call is drawn). Pins that the
- * proof claims no more than this; to revisit when constants get nodes. php:
- * X is the project's constant, Db::getTable runs. */
+ * the file's imports are complete: the call's edge goes to the interface's
+ * declaration DatabaseInterface::getTable, drawn by the engine. Pins that
+ * behaviour (it passes with the first commit alone); to revisit when constants
+ * get nodes. php: X is the project's constant. */
 TEST(phpmw_use_const_beside_project_constant) {
     static const PmwFile f[] = {
         PMW_USEFN_FILES("use const X;\n"),

@@ -4117,10 +4117,12 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 static const char php_import_complete[] = "{\"php_imports_complete\":1,";
 
 /* A resolver NULL can also mean unsupported input or a failed lookup. Only
- * the bounded namespace-only path and an unaliased global class `use` with no
- * same-named PHP type anywhere admit an absence proof. A covered-but-missing
- * PSR-4 file, any other global use, or an unavailable namespace map leaves the
- * whole file unknown; already resolved IMPORTS are still written. */
+ * the bounded namespace-only path and an unaliased global `use` (a class, a
+ * function or a constant; php_global_use_known_absent) of a name no PHP node
+ * of a label that use could bind carries admit an absence proof. A
+ * covered-but-missing PSR-4 file, an aliased global use, a global use of a
+ * name such a node carries, or an unavailable namespace map leaves the whole
+ * file unknown; already resolved IMPORTS are still written. */
 /* Whether a node of this label could be what a global `use` of this kind
  * names: a class-like type for a class use, a function for `use function`; a
  * File or Module of the name for any of them. A `use const` can name nothing
