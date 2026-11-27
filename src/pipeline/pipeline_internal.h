@@ -1849,8 +1849,17 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: a config file REFERENCES_FILE the files it names: a Dockerfile's COPY
+ *      and ADD sources {via:copy|add}, a compose service's bind mounts,
+ *      env_file, configs and secrets, a Terraform block's file() family, a
+ *      workflow's local actions and reusable workflows {via:uses}, a
+ *      kustomization's generator files and configurations; and a Make rule
+ *      DEPENDS_ON {via:prerequisite} the rules of its makefile that its
+ *      prerequisites name (pass_docker.c, pass_ci.c, pass_terraform.c,
+ *      pass_k8s.c, pass_shell.c). An index built before has none of these
+ *      edges for its unchanged config files, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
