@@ -1759,6 +1759,53 @@ TEST(probe_mcp_trace_deploy) {
     PASS();
 }
 
+/* trace_path mode=deploy continues from a Make rule to the rules its
+ * prerequisites name (DEPENDS_ON): a CI job runs `make rollout`, and it is
+ * the prerequisite `manifests` whose recipe installs the chart. In from the
+ * chart the trace reaches `manifests`, then `rollout` and the workflow
+ * running it; out from `rollout` it reaches the chart. The call graph mode
+ * does not follow a prerequisite. */
+TEST(probe_mcp_trace_deploy_follows_make_prerequisites) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web-app\nversion: 0.1.0\n"},
+        {"Makefile", "rollout: manifests\n"
+                     "\t@echo done\n\n"
+                     "manifests:\n"
+                     "\thelm upgrade --install web charts/web\n"},
+        {".github/workflows/release.yml", "on: [push]\n"
+                                          "jobs:\n"
+                                          "  ship:\n"
+                                          "    runs-on: ubuntu-latest\n"
+                                          "    steps:\n"
+                                          "      - run: make rollout\n"}};
+    char *r = gpf_tool_on(files, 3, "trace_path",
+                          "{\"function_name\":\"web-app\",\"project\":\"%s\","
+                          "\"direction\":\"inbound\",\"mode\":\"deploy\",\"depth\":4,"
+                          "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"manifests\""));       /* the rule that installs it */
+    ASSERT_NOT_NULL(strstr(r, "\"rollout\""));         /* the rule that needs it first */
+    ASSERT_NOT_NULL(strstr(r, ".github.workflows\"")); /* the workflow's Module: release */
+    ASSERT_NOT_NULL(strstr(r, "\"release\""));
+    free(r);
+    r = gpf_tool_on(files, 3, "trace_path",
+                    "{\"function_name\":\"rollout\",\"project\":\"%s\","
+                    "\"direction\":\"outbound\",\"mode\":\"deploy\",\"depth\":4,"
+                    "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"manifests\"")); /* what it needs first */
+    /* what that rule installs: the Chart node of charts/web */
+    ASSERT_NOT_NULL(strstr(r, ".charts.web.Chart\",\"rows\":[[\"__infra__\""));
+    free(r);
+    r = gpf_tool_on(files, 3, "trace_path",
+                    "{\"function_name\":\"rollout\",\"project\":\"%s\","
+                    "\"direction\":\"outbound\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "\"manifests\""));
+    free(r);
+    PASS();
+}
+
 /* ── DEPLOYS (Phase 3) ──────────────────────────────────────────────── */
 
 /* A Flux Kustomization deploys what its path applies: the outermost
@@ -7814,6 +7861,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_compose_service_files_are_file_references);
     RUN_TEST(probe_compose_service_files_resolve_from_the_compose_directory);
     RUN_TEST(probe_mcp_trace_deploy);
+    RUN_TEST(probe_mcp_trace_deploy_follows_make_prerequisites);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_image_without_registry_host_stays_unknown);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
