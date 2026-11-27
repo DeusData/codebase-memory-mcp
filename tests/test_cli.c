@@ -5555,7 +5555,22 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "15 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "17 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "15 MCP Tools") == NULL);
+    ASSERT(strstr(sk[0].content, "WHERE NOT EXISTS { (f)<-[:CALLS]-() } AND NOT EXISTS { "
+                                 "(f)<-[:CALL_REFERENCE]-() }") != NULL);
+    ASSERT(strstr(sk[0].content, "not natural-language sentences") != NULL);
+    /* Every tool the server registers is named in the installed skill, so the
+     * list cannot drift from the server again (it missed get_file_outline and
+     * compare_graphs). Names are matched with their backticks. */
+    for (int t = 0; t < cbm_mcp_tool_count(); t++) {
+        char quoted[96];
+        snprintf(quoted, sizeof(quoted), "`%s`", cbm_mcp_tool_name(t));
+        if (!strstr(sk[0].content, quoted)) {
+            printf("  installed skill does not name the tool %s\n", quoted);
+        }
+        ASSERT(strstr(sk[0].content, quoted) != NULL);
+    }
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -12608,7 +12623,7 @@ TEST(cli_codex_skill_migrates_every_released_legacy_payload) {
     cbm_cli_set_client_selection_for_testing("codex");
 
     size_t released_count = cbm_cli_released_skill_content_count();
-    bool migrated_all = released_count == 4U;
+    bool migrated_all = released_count == 5U;
     for (size_t i = 0U; migrated_all && i < released_count; i++) {
         const char *released = cbm_cli_released_skill_content_at(i);
         test_mkdirp(legacy_dir);

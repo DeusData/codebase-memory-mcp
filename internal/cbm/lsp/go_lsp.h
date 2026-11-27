@@ -114,6 +114,11 @@ typedef struct {
      * by the registrar against def_module_qn like return_types. NULL = not an
      * identity alias. */
     const char *alias_target;
+    /* Ruby only: singleton-side method (`def self.m`, `class << self`), and a
+     * class/module's mixin macros as "|"-separated "<k>:<Const>" pairs (k = i,
+     * p or e). See CBMDefinition. */
+    bool is_singleton;
+    const char *mixin_refs;
     /* Identities of the type names this def's declared types write, resolved
      * once in the scope of the file that wrote them (src/pipeline/type_scope.h):
      * "spelling=QN|spelling=QN". Read with cbm_type_scope_find (type_rep.h).

@@ -390,6 +390,8 @@ typedef struct {
     char *manifest_rel; /* heap: owning SwiftPM manifest, NULL for other ecosystems */
     char *source_rel;   /* heap: the manifest file that yielded this entry; NULL if hand-built */
     int source_seq;     /* position among that manifest's entries, in the parser's order */
+    /* A registry dependency a package.json declares, named by pkg_name; entry_rel is NULL. */
+    bool npm_dependency;
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -579,6 +581,16 @@ typedef struct {
     cbm_tf_release_t *tf_releases;
     int tf_release_n;
     int tf_release_cap;
+
+    /* The path rule's universe (include_path.h): built from the run's indexed
+     * files with the context, read-only afterwards, freed with it. NULL: no
+     * import is read by the path rule (main's strategies decide). */
+    struct cbm_include_universe *include_universe;
+
+    /* The shared cross-file layer's scope (site_bind.h): built after IMPORTS
+     * on one thread, read only by the resolvers, freed by the route that
+     * built it. NULL: no file of a row language (every site NO_ANSWER). */
+    struct cbm_site_scope *site_scope;
 } cbm_pipeline_ctx_t;
 
 /* The set for cbm_pipeline_ctx_t.indexed_files: every rel_path of `files`
@@ -1432,11 +1444,24 @@ typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
  * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
 bool cbm_ci_path(const char *rel);
 
+/* A local `uses:` of a GitHub workflow or composite action (pass_ci.c): a
+ * path from the repository root ("./..."), which is how GitHub reads it
+ * wherever the file lies. A step's names an action's directory (`path`; ""
+ * is the root), a job's names a reusable workflow file. `line` is 1-based. */
+typedef struct {
+    const char *path;
+    bool job;
+    int line;
+} cbm_ci_use_t;
+typedef void (*cbm_ci_use_fn)(const cbm_ci_use_t *use, void *ud);
+
 /* Hand each command line the CI configuration `rel` (YAML text src) runs to
  * fn: GitHub Actions run: steps for a workflow or composite action, else
- * Prow job containers. Strings live in arena `a`. */
+ * Prow job containers. In the same walk, each local `uses:` of a workflow or
+ * composite action goes to use_fn (NULL: not wanted) with use_ud, in
+ * document order. Strings live in arena `a`. */
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
-                     void *ud);
+                     void *ud, cbm_ci_use_fn use_fn, void *use_ud);
 
 /* An image a build configuration builds from a Dockerfile (pass_ci.c). */
 typedef struct {
@@ -1448,6 +1473,18 @@ typedef struct {
 } cbm_build_site_t;
 typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
 
+/* A repository file a compose service names (pass_ci.c): a path relative to
+ * the compose file's directory, normalised -- a bind mount's host side
+ * ("volume"), an env_file entry ("env_file"), the file of a config or secret
+ * the service lists ("config" / "secret") -- with the 1-based line where the
+ * service names it. The path may be a directory, or a file the index does
+ * not hold. */
+typedef struct {
+    const char *path;
+    const char *via;
+    int line;
+} cbm_compose_file_t;
+
 /* A compose service (pass_ci.c): its image (a reference, variables
  * expanded; NULL: none or unknown), the Dockerfile its build names
  * (repository path; NULL: no build, or unknown), the service names its
@@ -1458,7 +1495,7 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * image_default_of: the variables whose inline default (${X:-d}) named the
  * image; image_override_of: those whose default the project's .env replaced
  * (JSON arrays, NULL: none), and default_image the image those defaults
- * name. */
+ * name. files: the repository paths it names (cbm_compose_file_t). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1472,6 +1509,8 @@ typedef struct {
     const int *env_lines;
     const char **env_hosts;
     int nenv;
+    const cbm_compose_file_t *files;
+    int nfiles;
     int line;
     int end_line;
 } cbm_compose_service_t;
@@ -1674,6 +1713,10 @@ extern _Atomic uint64_t g_importance_store_rows;
 extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
 extern _Atomic uint64_t g_sh_candidates;
+/* Targets, prerequisites and target-prerequisite pairs the Make dependency
+ * drawing looked at (pass_shell.c sh_make_deps): linear in a rule line's
+ * words plus its distinct pairs, however often a name is repeated. */
+extern _Atomic uint64_t g_sh_make_pairs;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
@@ -1698,6 +1741,11 @@ bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *s
 #define CBM_SEMANTIC_INPUT_GIT_CONTEXT CBM_SEMANTIC_INPUT_PREFIX "git-context-v1"
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
+/* The path rule's inventory (include_path.h): the indexed files named like
+ * what a path row's import names; present only when a file of a path-row
+ * language is discovered. A changed set of such names, anywhere, routes the
+ * run to a full index. */
+#define CBM_SEMANTIC_INPUT_INCLUDE_LISTING CBM_SEMANTIC_INPUT_PREFIX "include-listing-v1"
 
 int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
                                          const char *repo_path, const cbm_file_info_t *files,
@@ -2048,6 +2096,67 @@ void cbm_pp_bp_nap_cycles_reset(void);
  * coverage; deterministic and independent of wall-clock timing. */
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
+/* Index lookups made by cbm_pipeline_lsp_index_find since the last reset of
+ * the counter above (the same reset clears both). */
+uint64_t cbm_pp_lsp_index_lookups(void);
+/* Rows read by a per-call scan of a file's engine rows since that reset,
+ * counted inside the scan itself (lsp_resolve.h), whoever called it. */
+uint64_t cbm_pp_lsp_scan_rows(void);
+
+/* One file's engine rows (CBMResolvedCall invocations) by caller, leaf and
+ * span, built and searched by the same code on both resolvers
+ * (pass_parallel.c). cbm_pipeline_lsp_index_find returns what the matcher
+ * cbm_pipeline_find_lsp_resolution_in_graph returns, scanning only where the
+ * index may not hold the answer. */
+typedef struct {
+    uint32_t start;
+    uint32_t end;
+    uint32_t origin;
+    int row; /* position in the file's row array */
+} cbm_pipeline_lsp_site_row_t;
+
+typedef struct {
+    CBMHashTable *exact;  /* caller|leaf|start:end|origin */
+    CBMHashTable *legacy; /* caller|leaf|origin, rows without a span */
+    bool exact_complete;
+    bool legacy_complete;
+    /* Every row with a span, sorted by span, origin and array position: the
+     * rows at one occurrence are neighbours, in array order. Only such a row
+     * ranks for a call that needs the engine, so that call is answered from
+     * these alone; the JVM tail phase reads them for its exact rows. */
+    cbm_pipeline_lsp_site_row_t *site_rows;
+    int site_count;
+    bool site_complete;
+    /* JVM callers only: the rows without a span by the Class.method tail of
+     * their caller (tail|leaf|origin), for the tail phase. Built only when
+     * the index was built for tail matching (tail_indexed). */
+    CBMHashTable *tail_legacy;
+    bool tail_legacy_complete;
+    bool tail_indexed;
+    /* PHP's unindexed-receiver rows (cbm_pipeline_php_unindexed_row), which
+     * lie below the confidence floor and so in neither table above: the first
+     * row of each key in array order. */
+    CBMHashTable *php_exact;  /* caller|leaf|start:end|origin */
+    CBMHashTable *php_legacy; /* caller|leaf|origin, rows without a span */
+    int php_rows;             /* such rows in the file */
+    bool php_complete;
+} cbm_pipeline_lsp_index_t;
+
+void cbm_pipeline_lsp_index_build(cbm_pipeline_lsp_index_t *idx, const CBMResolvedCallArray *arr,
+                                  const cbm_gbuf_t *gbuf, const char *project_name,
+                                  bool allow_tail);
+const CBMResolvedCall *cbm_pipeline_lsp_index_find(const cbm_pipeline_lsp_index_t *idx,
+                                                   const CBMResolvedCallArray *arr,
+                                                   const CBMCall *call, bool allow_tail,
+                                                   const cbm_gbuf_t *gbuf,
+                                                   const char *project_name);
+/* cbm_pipeline_php_receiver_type_unindexed's answer, from the index where the
+ * index holds it and from that scan where it may not. */
+bool cbm_pipeline_lsp_index_php_receiver_unindexed(const cbm_pipeline_lsp_index_t *idx,
+                                                   const CBMResolvedCallArray *arr,
+                                                   const CBMCall *call,
+                                                   const cbm_registry_t *registry);
+void cbm_pipeline_lsp_index_free(cbm_pipeline_lsp_index_t *idx);
 
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Test-only view of the Studio Export range join, so the ",+<N>" truncation

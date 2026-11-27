@@ -1887,6 +1887,42 @@ TEST(registry_receiver_gate_judges_type_roots_at_import_fallback) {
     PASS();
 }
 
+/* Scala: a method declared in the calling file outranks an imported namesake.
+ * Since Scala imports resolve (#2360), Strategy 4 keeps only the
+ * import-reachable candidates, and a method of the calling file itself is
+ * never import-reachable: in typelevel/cats a bare `bimap` in EitherT.scala
+ * bound Bifunctor's syntax class instead of EitherT's own bimap. */
+TEST(registry_scala_same_file_candidate_outranks_imported_namesake) {
+    const char *mod = "proj.core.src.main.scala.data.Pair";
+    const char *own = "proj.core.src.main.scala.data.Pair.Pair.bimap";
+    const char *imported = "proj.core.src.main.scala.other.Bi.Bi.bimap";
+    const char *keys[] = {"Bi"};
+    const char *vals[] = {"proj.core.src.main.scala.other.Bi.Bi"};
+
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "bimap", own, "Method", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "bimap", imported, "Method", CBM_LANG_SCALA, false);
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_lang(r, "bimap", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, own));
+    res = cbm_registry_resolve_call_lang(r, "fab.bimap", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, own));
+    /* A caller with no namesake of its own still binds the imported one. */
+    res = cbm_registry_resolve_call_lang(r, "bimap", "proj.core.src.main.scala.app.Use", keys, vals,
+                                         1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, imported));
+    cbm_registry_free(r);
+
+    /* Scala only: the shared path still keeps the import-reachable pick. */
+    r = cbm_registry_new();
+    cbm_registry_add_lang(r, "bimap", own, "Method", CBM_LANG_KOTLIN, false);
+    cbm_registry_add_lang(r, "bimap", imported, "Method", CBM_LANG_KOTLIN, false);
+    res = cbm_registry_resolve_call_lang(r, "bimap", mod, keys, vals, 1, CBM_LANG_KOTLIN);
+    ASSERT_TRUE(gate_bound(&res, imported));
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(call_onto_field_follows_language_and_shape) {
     /* A call the registry resolved onto a Field node. */
     /* Another language: only the spelling connects them. */
@@ -3702,6 +3738,7 @@ SUITE(registry) {
     RUN_TEST(registry_receiver_gate_judges_value_receivers);
     RUN_TEST(registry_receiver_gate_runs_by_measured_language);
     RUN_TEST(registry_receiver_gate_judges_type_roots_at_import_fallback);
+    RUN_TEST(registry_scala_same_file_candidate_outranks_imported_namesake);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);

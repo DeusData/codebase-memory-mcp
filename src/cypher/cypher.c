@@ -4757,10 +4757,16 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     return found;
 }
 
+static bool binding_has_value(binding_t *b, const char *var, const char *prop);
+
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
         if (!is_aggregate_func(wc->items[ci].func)) {
+            continue;
+        }
+        if (strcmp(wc->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, wc->items[ci].variable, wc->items[ci].property)) {
             continue;
         }
         agg->counts[ci]++;

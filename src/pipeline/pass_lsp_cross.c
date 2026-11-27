@@ -30,6 +30,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
@@ -836,6 +837,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
          * still on hand.  Do not reconstruct it later from leaf names. */
         dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
         dst->is_abstract = src->is_abstract;
+    }
+    if (lang == CBM_LANG_RUBY) {
+        dst->is_singleton = src->is_singleton;
+        dst->mixin_refs = src->mixin_refs ? cbm_arena_strdup(arena, src->mixin_refs) : NULL;
     }
     return 0;
 }
@@ -2357,7 +2362,7 @@ static bool pxc_c_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
         if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
                 w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->reg, f->imp_keys,
                 f->imp_vals, f->imp_count, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW,
-                f->result)) {
+                f->result, f->result->cpp_test_macro_names)) {
             cbm_pipeline_test_owner_error(f->result);
             return false; /* no append and no fallback on an invalid proof */
         }
@@ -2365,7 +2370,7 @@ static bool pxc_c_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
     }
     CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
         w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->reg, f->imp_keys,
-        f->imp_vals, f->imp_count, f->result->cached_tree, w->out);
+        f->imp_vals, f->imp_count, f->result->cached_tree, w->out, f->result->cpp_test_macro_names);
     if (status != CBM_LSP_COMPLETE)
         cbm_c_lsp_record_failure(f->result, status);
     return true;
@@ -2380,15 +2385,16 @@ static bool pxc_c_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     if (f->result->has_test_definition_owners) {
         if (!cbm_run_c_lsp_cross_with_test_owners(
                 w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->defs, w->def_count,
-                NULL, NULL, 0, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW, f->result)) {
+                NULL, NULL, 0, f->result->cached_tree, w->out, CBM_SOURCE_ORIGIN_RAW, f->result,
+                f->result->cpp_test_macro_names)) {
             cbm_pipeline_test_owner_error(f->result);
             return false; /* out may be partial: never append it */
         }
         return true;
     }
-    CBMLSPStatus status = cbm_run_c_lsp_cross_status(w->scratch, f->source, f->source_len,
-                                                     f->module_qn, cpp_mode, w->defs, w->def_count,
-                                                     NULL, NULL, 0, f->result->cached_tree, w->out);
+    CBMLSPStatus status = cbm_run_c_lsp_cross_status(
+        w->scratch, f->source, f->source_len, f->module_qn, cpp_mode, w->defs, w->def_count, NULL,
+        NULL, 0, f->result->cached_tree, w->out, f->result->cpp_test_macro_names);
     if (status != CBM_LSP_COMPLETE)
         cbm_c_lsp_record_failure(f->result, status);
     return true;
@@ -2503,6 +2509,33 @@ static bool pxc_rust_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
     return true;
 }
 
+/* ── Ruby ── */
+
+/* The shared Ruby registry is a CBMRubyCrossRegistry (method registry plus a
+ * hashed class table); its CBMTypeRegistry is the first member, so that is
+ * what the engine slot holds and the walk converts it back. Sealed and
+ * read-only: nothing is built per file, so the overlay the dispatcher chains
+ * to it goes unused. */
+static CBMTypeRegistry *pxc_ruby_build_registry(CBMArena *arena, CBMLSPDef *defs, int def_count) {
+    CBMRubyCrossRegistry *r = cbm_ruby_build_cross_registry(arena, defs, def_count);
+    return r ? &r->reg : NULL;
+}
+
+static bool pxc_ruby_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
+    _Static_assert(offsetof(CBMRubyCrossRegistry, reg) == 0, "engine slot is the registry");
+    cbm_run_ruby_lsp_cross_with_registry(w->scratch, f->source, f->source_len, f->module_qn,
+                                         (const CBMRubyCrossRegistry *)w->shared, f->imp_keys,
+                                         f->imp_vals, f->imp_count, f->result->cached_tree, w->out);
+    return true;
+}
+
+static bool pxc_ruby_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
+    cbm_run_ruby_lsp_cross(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
+                           w->def_count, f->imp_keys, f->imp_vals, f->imp_count,
+                           f->result->cached_tree, w->out);
+    return true;
+}
+
 /* The rows, in the order their shared registries are built. A row's index is
  * its slot in CBMCrossLspRegistries. */
 static const pxc_engine_t pxc_engines[] = {
@@ -2558,6 +2591,16 @@ static const pxc_engine_t pxc_engines[] = {
      .build_registry = cbm_java_build_cross_registry,
      .run_with_registry = pxc_java_run_registry,
      .run_one = pxc_java_run_defs},
+    /* Ruby constants live in one global namespace and Rails/Zeitwerk autoloads
+     * them without require statements, so an own+imports filter would starve
+     * almost all cross-file resolution: the walk always sees the whole project. */
+    {.name = "ruby",
+     .langs = {CBM_LANG_RUBY},
+     .lang_count = 1,
+     .build_registry = pxc_ruby_build_registry,
+     .run_with_registry = pxc_ruby_run_registry,
+     .run_one = pxc_ruby_run_defs,
+     .unfiltered_defs = true},
     {.name = "php", .langs = {CBM_LANG_PHP}, .lang_count = 1, .run_one = pxc_php_run_defs},
     {.name = "kotlin", .langs = {CBM_LANG_KOTLIN}, .lang_count = 1, .run_one = pxc_kotlin_run_defs},
     {.name = "rust",

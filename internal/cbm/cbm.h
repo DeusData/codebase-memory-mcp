@@ -288,6 +288,14 @@ typedef struct {
      * every other definition, and in every language outside
      * cbm_is_c_preprocessor_lang. */
     const char *variants;
+    /* Ruby only: a `def self.m` / `class << self` method, which lives on the
+     * singleton side of its class. False for every instance method and every
+     * other language. */
+    bool is_singleton;
+    /* Ruby only, on a class/module def: the `include`/`prepend`/`extend`
+     * macros of its body as "|"-separated "<k>:<Const>" pairs, k one of i, p,
+     * e, in source order ("i:Auditable|e:Finders"). NULL when none. */
+    const char *mixin_refs;
     /* Callable identity (#2061): offset of the signature suffix inside
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
@@ -782,6 +790,10 @@ enum {
     CBM_SCOPE_REEXPORT = 1u << 4, /* INCLUDE: its names reach this file's includers */
     /* inside a parse error: may or may not hold where a later name is used */
     CBM_SCOPE_CONDITIONAL = 1u << 5,
+    /* QREF: on the way out, the first component names a symbol that is no
+     * type (Protobuf: a method of the enclosing service, a service of the
+     * file): protoc resolves the reference to it and rejects the file */
+    CBM_SCOPE_NOT_A_TYPE = 1u << 6,
 };
 
 typedef struct {
@@ -789,7 +801,10 @@ typedef struct {
     /* DEF: the full name where the row has packages or nesting (Protobuf:
      * package, enclosing messages, name: "a.b.Outer.Inner"). INCLUDE: the
      * importing file's package ("" when none), which its references are
-     * relative to. NULL elsewhere. */
+     * relative to. QREF: the innermost scope around the reference, its first
+     * scope to search (Protobuf: the enclosing message's full name, or the
+     * file's package outside any message); NULL when it is unknown. NULL
+     * elsewhere. */
     const char *qual;
     uint32_t pos;  /* byte offset after which the event is in effect */
     int32_t index; /* into defs (DEF) or imports (INCLUDE); QREF: start byte; else -1 */
@@ -884,7 +899,13 @@ typedef struct {
  *     kind / group / name / ns; `path` is
  *     the patch file (as written, relative to the kustomization), NULL for an
  *     inline patch. kind and name both NULL: the patch file's documents name
- *     them. def_index -1: the kustomization itself is the source. */
+ *     them. def_index -1: the kustomization itself is the source.
+ *   CBM_K8S_FACT_FILE: a kustomization reads the file `path` (as written,
+ *     relative to the kustomization) at `line`, named by `via`: an entry of a
+ *     configMapGenerator's or secretGenerator's `files` (the path after
+ *     `key=`), `envs` or `env`, or of `configurations`. The file is input to
+ *     the build, not a member of it. def_index -1: the kustomization itself
+ *     is the source. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
@@ -893,7 +914,8 @@ typedef enum {
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
     CBM_K8S_FACT_ENV,
-    CBM_K8S_FACT_PATCH
+    CBM_K8S_FACT_PATCH,
+    CBM_K8S_FACT_FILE
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -1105,6 +1127,10 @@ typedef struct CBMFileResult {
     int test_owner_source_len;
     CBMLanguage test_owner_language;
     char test_owner_source_sha256[65]; /* exact raw source; identity, not authentication */
+    /* The def walk named this file's GoogleTest macro heads TEST_Suite_Case
+     * (cbm_cpp_test_macro_names_on): the C/C++ engine, per file and across
+     * files, names the callers in those bodies the same way. */
+    bool cpp_test_macro_names;
 
     /* Doc-comment references of this file's definitions (doclink.h), and the
      * file's doc-link scope: a language-tagged text blob with what OTHER
@@ -1149,6 +1175,40 @@ typedef struct {
 
 // Forward declaration: ObjectScript macro table (defined in macro_table.h).
 typedef struct CBMMacroTable CBMMacroTable;
+
+/* The raw line span of a GoogleTest definition the def walk named with
+ * cbm_cpp_test_macro_name, and its qualified name. */
+typedef struct {
+    uint32_t start_line;
+    uint32_t end_line;
+    const char *qualified_name;
+} CBMTestSpan;
+
+/* A top-level function definition of the preprocessed view (directly in the
+ * translation unit or in a namespace body) by its bytes in that view, and the
+ * raw test span its first and last lines map onto; span -1 when another
+ * top-level definition of the view maps onto the same span. */
+typedef struct {
+    uint32_t start_byte;
+    uint32_t end_byte;
+    int span;
+} CBMTestViewDef;
+
+/* What the preprocessed second view of a C/C++ file needs to name a test body
+ * as the raw view did: the raw test definitions sorted by (start_line,
+ * end_line), the preprocessor's 1-based map from expanded lines to raw lines
+ * (0 = no raw line) with the lines that belong to the file itself, and the
+ * view's top-level definitions that map onto a raw test span, in document
+ * order (cbm_test_span_index_view). */
+typedef struct {
+    const CBMTestSpan *spans;
+    int count;
+    const uint32_t *raw_line_by_line;
+    const uint8_t *in_main_file;
+    int line_count;
+    const CBMTestViewDef *view_defs;
+    int view_def_count;
+} CBMTestSpanMap;
 
 // Method-return-type table for ObjectScript variable type inference. Populated
 // from definition nodes (method QN -> declared return type) so a later
@@ -1237,6 +1297,14 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    /* C++/CUDA raw view: the GoogleTest definitions the def walk named
+     * (CBMTestSpan, in `scratch`), in walk order. */
+    CBMTestSpan *test_spans;
+    int test_span_count;
+    int test_span_cap;
+    /* The preprocessed second view only: the raw view's test definitions and
+     * the line map (cbm_test_span_owner_qn). NULL in every raw view. */
+    const CBMTestSpanMap *pp_test_spans;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1260,6 +1328,46 @@ const char *cbm_test_definition_qn(CBMExtractCtx *ctx, TSNode function);
 bool cbm_test_definition_owners_match(const CBMFileResult *owners, const char *source,
                                       int source_len, bool cpp_mode, const char *module_qn);
 const char *cbm_test_definition_owner_qn(const CBMFileResult *owners, TSNode function);
+
+/* GoogleTest test-case macros (TEST, TEST_F, TEST_P, TYPED_TEST, TYPED_TEST_P)
+ * parse as function definitions named by the bare macro. With the gtest preset
+ * on, a C++/CUDA definition is named <MACRO>_<Suite>_<Case> (#1266), and every
+ * place that names the caller of a call in such a body names it through this
+ * one function: the def walk, the call-scope walk (compute_func_qn),
+ * cbm_enclosing_func_qn_cached and the C/C++ engine (c_process_function).
+ * `func_node` is the function_definition. NULL when `enabled` is false, `name`
+ * is not one of the five macros, or the head carries no argument; the caller
+ * keeps its own name then. */
+char *cbm_cpp_test_macro_name(CBMArena *a, bool enabled, const char *name, TSNode func_node,
+                              const char *source);
+/* The `enabled` argument above for a file of `language`: C++ or CUDA with the
+ * gtest preset on (on when nothing is configured). */
+bool cbm_cpp_test_macro_names_on(CBMLanguage language, const cbm_test_declarations_t *declarations);
+/* The preprocessed view reads a head after macro expansion and without its
+ * comments, so it can spell a test differently from the raw view (a project
+ * macro among the arguments, a project's own TEST macro). A top-level function
+ * definition of that view whose first and last lines map to exactly one raw
+ * test definition's span (CBMTestSpanMap), and the only top-level definition
+ * of the view that does, is that test: its QN. Otherwise NULL and the caller
+ * names the body as usual: a method of a local class, a function written on a
+ * one-line test's line, two raw tests on one line. Used by the call scope, the
+ * enclosing-function helper and the C/C++ engine, the three places that name
+ * a caller. A binary search over the view's indexed definitions. */
+const char *cbm_test_span_owner_qn(const CBMTestSpanMap *map, TSNode function);
+/* Index the preprocessed view's top-level function definitions (directly in
+ * the translation unit, or in namespace, extern-block, template and
+ * conditional bodies; never inside a function or class body) that map onto a
+ * raw test span, into map->view_defs (allocated in `a`). One pass over those
+ * containers plus a binary search per definition. On allocation failure the
+ * index stays empty and no body is named from a span. */
+void cbm_test_span_index_view(CBMTestSpanMap *map, CBMArena *a, TSNode root);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Steps of the test-span searches and the view index walk plus spans indexed,
+ * since reset. */
+void cbm_test_span_test_reset(void);
+uint64_t cbm_test_span_test_work(void);
+void cbm_test_span_test_count(uint64_t work);
+#endif
 
 // --- Public API ---
 
