@@ -5675,6 +5675,81 @@ TEST(incremental_kustomize_file_reference_follows_its_file) {
     PASS();
 }
 
+/* A Make prerequisite's DEPENDS_ON edge lies inside its makefile. Editing
+ * another file keeps it: the makefile is not read again. Editing the makefile
+ * redraws its edges from the new text, each once: a prerequisite a rule gains
+ * is drawn, one it loses is gone. */
+TEST(incremental_make_prerequisite_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_mkdep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    static const char rules[] = "build:\n"
+                                "\techo build\n\n"
+                                "test:\n"
+                                "\techo test\n";
+    char text[512];
+    snprintf(text, sizeof(text), "all: build\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mkdep.db", tmp);
+    static const char deps[] = "SELECT COUNT(*) FROM edges WHERE type='DEPENDS_ON' AND "
+                               "json_extract(properties,'$.via')='prerequisite'";
+    static const char to_build[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='build'";
+    static const char to_test[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='test'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int deps_full = k8s_inc_count(db_path, deps);
+    int build_full = k8s_inc_count(db_path, to_build);
+
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\necho edited\n");
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int deps_other = k8s_inc_count(db_path, deps);
+    int build_other = k8s_inc_count(db_path, to_build);
+
+    snprintf(text, sizeof(text), "all: build test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_gain = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t gain_route = cbm_pipeline_incremental_test_last_route();
+    int deps_gain = k8s_inc_count(db_path, deps);
+    int build_gain = k8s_inc_count(db_path, to_build);
+    int test_gain = k8s_inc_count(db_path, to_test);
+
+    snprintf(text, sizeof(text), "all: test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_lose = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t lose_route = cbm_pipeline_incremental_test_last_route();
+    int deps_lose = k8s_inc_count(db_path, deps);
+    int build_lose = k8s_inc_count(db_path, to_build);
+    int test_lose = k8s_inc_count(db_path, to_test);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(deps_full, 1);
+    ASSERT_EQ(build_full, 1);
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(deps_other, 1);
+    ASSERT_EQ(build_other, 1);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gain, 0);
+    ASSERT_EQ(deps_gain, 2);
+    ASSERT_EQ(build_gain, 1);
+    ASSERT_EQ(test_gain, 1);
+    ASSERT_EQ(gain_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_lose, 0);
+    ASSERT_EQ(deps_lose, 1);
+    ASSERT_EQ(build_lose, 0);
+    ASSERT_EQ(test_lose, 1);
+    ASSERT_EQ(lose_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -38484,6 +38559,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_local_uses_reference_follows_its_file);
     RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
     RUN_TEST(incremental_kustomize_file_reference_follows_its_file);
+    RUN_TEST(incremental_make_prerequisite_follows_edits);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);
