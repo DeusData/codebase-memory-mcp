@@ -53,8 +53,16 @@
  * (the shared member lookup, PHP); a version-5 surface has neither and must be
  * re-extracted. Both are inputs of the def itself, compared like its other
  * fields. In version 6, "ns" of a PHP type is the type's own namespace (a file
- * may hold several), not the file's first one. */
-enum { SURFACE_CODEC_VERSION = 6 };
+ * may hold several), not the file's first one.
+ * 7: Java defs carry their declared types' identities in "ty" (the Java row of
+ * type_scope.c), and "emb" of a Java type whose `extends` or `implements` list
+ * names a type qualified (`extends a.I1`) holds that name (`a.I1`), not the raw
+ * text ("extends a.I1"), which a list of several names lost. A version-6
+ * surface has neither: a dependent re-resolved against it would lose the
+ * engine answers a full index gives through the identities of that file's
+ * Java declarations, and read such a supertype as the raw text or not at all;
+ * it must be re-extracted. */
+enum { SURFACE_CODEC_VERSION = 7 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still

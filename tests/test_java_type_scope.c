@@ -1361,6 +1361,113 @@ TEST(java_type_scope_incremental_import_edit) {
     PASS();
 }
 
+/* One statement on a writable connection; true when it changed exactly one row. */
+static bool jts_exec_one(const char *db_path, const char *sql) {
+    sqlite3 *db = NULL;
+    bool ok = sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK &&
+              sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK && sqlite3_changes(db) == 1;
+    sqlite3_close(db);
+    return ok;
+}
+
+/* The stored surface row of rel (malloc'd), or NULL. */
+static char *jts_surface_row(const char *db_path, const char *rel) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    char *out = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(db,
+                           "SELECT defs_json FROM lsp_surface WHERE project = 'jtsinc' AND "
+                           "rel_path = ?1",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, rel, -1, SQLITE_STATIC) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+        out = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return out;
+}
+
+/* Repo.java's stored surface rewritten as a version-6 binary wrote it: codec
+ * version 6, no "ty" on its defs. Then the edit of the import test, which
+ * re-parses Main.java only. A version-6 surface is not reused: Repo.java's
+ * row afterwards is a full index's, and Main's genericReturn, which needs the
+ * lib2.Item identity of Repo.all()'s List<Item>, keeps its engine answer; the
+ * graph's engine edges are a full index's of the edited tree. Reused, the row
+ * would keep no identity and genericReturn would lose lib2.Item.weigh. */
+TEST(java_type_scope_old_codec_surface_not_reused) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_jtsv_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    char inc_db[512];
+    char full_db[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    jts_write_fixture(repo, 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    bool ok = jts_pipeline(repo, inc_db, NULL);
+    const char *repo_rel = "src/main/java/lib/Repo.java";
+    bool rewritten =
+        ok && jts_exec_one(inc_db,
+                           "UPDATE lsp_surface SET defs_json = json_set(defs_json, '$.v', 6, "
+                           "'$.lsp', json((SELECT json_group_array(json(json_remove(e.value, "
+                           "'$.ty'))) FROM json_each(lsp_surface.defs_json, '$.lsp') AS e))) "
+                           "WHERE project = 'jtsinc' AND rel_path = 'src/main/java/lib/Repo.java' "
+                           "AND instr(defs_json, '\"ty\":') > 0");
+    if (!rewritten) {
+        printf("\n  Repo.java's stored surface was not rewritten\n");
+        ok = false;
+    }
+    char main_path[600];
+    snprintf(main_path, sizeof(main_path), "%s/src/main/java/user/Main.java", repo);
+    char *text = jts_read_file(main_path);
+    const char *old = "import lib.Foo;\n";
+    char *at = text ? strstr(text, old) : NULL;
+    ok = ok && at;
+    if (at) {
+        char edited[8192];
+        snprintf(edited, sizeof(edited), "%.*simport lib.*;\n%s", (int)(at - text), text,
+                 at + strlen(old));
+        th_write_file(main_path, edited);
+    }
+    free(text);
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    ok = ok && jts_pipeline(repo, inc_db, &route) && jts_pipeline(repo, full_db, NULL);
+    printf("  after a version-6 surface: route %d\n", (int)route);
+    char *inc_row = jts_surface_row(inc_db, repo_rel);
+    char *full_row = jts_surface_row(full_db, repo_rel);
+    bool row_same = inc_row && full_row && strcmp(inc_row, full_row) == 0;
+    if (!row_same) {
+        printf("\n  route %d; Repo.java's row:\n  incremental: %s\n  full: %s\n", (int)route,
+               inc_row ? inc_row : "(none)", full_row ? full_row : "(none)");
+    }
+    free(inc_row);
+    free(full_row);
+    jts_index_t inc;
+    jts_index_t full;
+    bool inc_open = jts_open(&inc, inc_db);
+    bool full_open = jts_open(&full, full_db);
+    bool opened = inc_open && full_open;
+    char *a = opened ? jts_engine_edges(&inc) : NULL;
+    char *b = opened ? jts_engine_edges(&full) : NULL;
+    bool same = a && b && strcmp(a, b) == 0;
+    if (!same) {
+        printf("\n  incremental:\n%s\n  full:\n%s\n", a ? a : "(none)", b ? b : "(none)");
+    }
+    ok = ok && row_same && same && opened &&
+         jts_expect_engine(&inc, "genericReturn", "weigh", "lib2.Item.weigh");
+    free(a);
+    free(b);
+    sqlite3_close(inc.db);
+    sqlite3_close(full.db);
+    th_cleanup(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* A one-file edit (`append` added at the end of `rel`) through the
  * incremental route: the repaired graph's engine edges are a fresh full
  * index's of the edited tree, and the inherited project member types still
@@ -2434,6 +2541,7 @@ SUITE(java_type_scope) {
     RUN_TEST(java_type_scope_library_constructor_parallel);
     RUN_TEST(java_type_scope_routes_agree);
     RUN_TEST(java_type_scope_incremental_import_edit);
+    RUN_TEST(java_type_scope_old_codec_surface_not_reused);
     RUN_TEST(java_type_scope_incremental_library_receiver);
     RUN_TEST(java_type_scope_incremental_inherited_member);
     RUN_TEST(java_type_scope_incremental_supertype_edit);
