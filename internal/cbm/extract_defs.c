@@ -10895,6 +10895,13 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 a, params, ctx->source, ctx->language, true, &def.signature_param_count);
         }
 
+        // Return type, as extract_func_def reads it for a free `fn`.
+        TSNode rt = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+        if (!ts_node_is_null(rt)) {
+            def.return_type = cbm_node_text(a, rt, ctx->source);
+            def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
+        }
+
         if (spec->branching_node_types && spec->branching_node_types[0]) {
             set_def_complexity(&def, child, spec);
         }

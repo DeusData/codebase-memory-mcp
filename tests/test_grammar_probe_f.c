@@ -1878,6 +1878,261 @@ static char *gpf_spawns(const GpfFile *files, int nfiles) {
         free(got_);                                                                                \
     } while (0)
 
+/* Every REFERENCES_FILE edge a Dockerfile draws for a COPY / ADD source, as
+ * "source file -> target file (via:line)", sorted, one per line. */
+static char *gpf_copy_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' "
+            "AND json_extract(e.properties,'$.via') IN ('copy','add') ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_COPY_REFS(files, n, want)                                                       \
+    do {                                                                                           \
+        char *got_ = gpf_copy_refs(files, n);                                                      \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "COPY refs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);      \
+            free(got_);                                                                            \
+            FAIL("REFERENCES_FILE edge set");                                                      \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+/* A Dockerfile at the repository root has one context. Each plain source of
+ * a COPY / ADD that is an indexed file is a file the Dockerfile references,
+ * once, at the first instruction naming it. No edge for a directory, a
+ * source of another stage or image (--from), a URL, a glob, a source a
+ * variable supplies (an ARG default can be overridden by the build), a
+ * source no indexed file is, or the Dockerfile itself. */
+TEST(probe_dockerfile_copy_sources_are_file_references) {
+    static const GpfFile files[] = {
+        {"Dockerfile", "ARG CONF=conf/app.yaml\n"
+                       "FROM python:3.12 AS build\n"
+                       "WORKDIR /app\n"
+                       "COPY requirements.txt setup.py ./\n"
+                       "COPY src/ ./src/\n"
+                       "COPY . .\n"
+                       "ADD conf/app.yaml /etc/app.yaml\n"
+                       "ADD https://example.com/tool.tgz /tmp/\n"
+                       "COPY ${CONF} /etc/again.yaml\n"
+                       "COPY *.py /all/\n"
+                       "COPY missing.py /missing.py\n"
+                       "COPY Dockerfile /Dockerfile\n"
+                       "FROM python:3.12-slim\n"
+                       "COPY --from=build /app/setup.py /setup.py\n"
+                       "COPY [\"setup.py\", \"run.sh\", \"/opt/\"]\n"},
+        {"requirements.txt", "flask==3.0.0\n"},
+        {"setup.py", "from setuptools import setup\n\nsetup(name=\"app\")\n"},
+        {"run.sh", "#!/bin/sh\nexec python -m app\n"},
+        {"conf/app.yaml", "name: app\n"},
+        {"src/app.py", "def main():\n    return 0\n"}};
+    GPF_ASSERT_COPY_REFS(files, 6,
+                         "Dockerfile -> conf/app.yaml (add:7)\n"
+                         "Dockerfile -> requirements.txt (copy:4)\n"
+                         "Dockerfile -> run.sh (copy:15)\n"
+                         "Dockerfile -> setup.py (copy:4)");
+    PASS();
+}
+
+/* A Dockerfile below the root can be built with its own directory or with
+ * the repository root as context; the build command decides, and it is not
+ * in the Dockerfile. A source that is a file under exactly one of the two is
+ * that file. A source that is a file under both is no edge, and neither is
+ * one that is a file under one and a directory under the other: with the
+ * other context the instruction copies the directory. */
+TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "FROM alpine:3.20\n"
+                           "COPY entry.sh /entry.sh\n"
+                           "COPY shared/tool.sh /tool.sh\n"
+                           "COPY both.sh /both.sh\n"
+                           "COPY ../outside.sh /outside.sh\n"
+                           "COPY config.yaml /etc/config.yaml\n"},
+        {"svc/entry.sh", "#!/bin/sh\necho entry\n"},
+        {"shared/tool.sh", "#!/bin/sh\necho tool\n"},
+        {"both.sh", "#!/bin/sh\necho root\n"},
+        {"svc/both.sh", "#!/bin/sh\necho svc\n"},
+        {"outside.sh", "#!/bin/sh\necho outside\n"},
+        {"config.yaml", "mode: root\n"},
+        {"svc/config.yaml/part.yaml", "mode: part\n"}};
+    GPF_ASSERT_COPY_REFS(files, 8,
+                         "svc/Dockerfile -> shared/tool.sh (copy:3)\n"
+                         "svc/Dockerfile -> svc/entry.sh (copy:2)");
+    PASS();
+}
+
+/* Every REFERENCES_FILE edge a compose service draws, as
+ * "<service> -> <target file> (via:line)", sorted, one per line. */
+static char *gpf_compose_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.name || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND s.label='Resource' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_COMPOSE_REFS(files, n, want)                                                    \
+    do {                                                                                           \
+        char *got_ = gpf_compose_refs(files, n);                                                   \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "compose refs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);   \
+            free(got_);                                                                            \
+            FAIL("REFERENCES_FILE edge set");                                                      \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+/* A compose service names repository files relative to the compose file's
+ * directory: a bind mount's host side (short and long form), an env_file, the
+ * file of a config or secret it lists. Each indexed file is a file the
+ * service references, once, at the first line naming it. No edge for a
+ * directory, a named or anonymous volume, an absolute or home path, a
+ * short-form host side without a leading dot (compose reads it as a volume's
+ * name), a path out of the repository, a variable without a value, a file the
+ * index does not hold, or a config without a file. */
+TEST(probe_compose_service_files_are_file_references) {
+    static const GpfFile files[] = {
+        {"compose.yaml", "services:\n"
+                         "  web:\n"
+                         "    image: nginx:1.27\n"
+                         "    volumes:\n"
+                         "      - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro\n"
+                         "      - ./src:/app\n"
+                         "      - data:/var/lib/data\n"
+                         "      - /etc/localtime:/etc/localtime:ro\n"
+                         "      - ~/.aws:/root/.aws\n"
+                         "      - ../outside.conf:/outside.conf\n"
+                         "      - ${CONF_DIR:-./conf}/extra.conf:/etc/extra.conf\n"
+                         "      - ${UNSET_DIR}/x.conf:/x.conf\n"
+                         "      - conf/nodot.conf:/etc/nodot.conf\n"
+                         "      - /anonymous\n"
+                         "      - type: bind\n"
+                         "        source: ./conf/long.conf\n"
+                         "        target: /etc/long.conf\n"
+                         "      - type: volume\n"
+                         "        source: data\n"
+                         "        target: /data\n"
+                         "      - ./conf/missing.conf:/etc/missing.conf\n"
+                         "    env_file:\n"
+                         "      - ./conf/web.env\n"
+                         "      - path: ./conf/more.env\n"
+                         "        required: false\n"
+                         "    configs:\n"
+                         "      - app_config\n"
+                         "      - source: other_config\n"
+                         "        target: /etc/other.yaml\n"
+                         "      - external_config\n"
+                         "    secrets:\n"
+                         "      - db_settings\n"
+                         "  worker:\n"
+                         "    image: alpine:3.20\n"
+                         "    volumes:\n"
+                         "      - ./conf/nginx.conf:/a\n"
+                         "      - ./conf/nginx.conf:/b\n"
+                         "    env_file: ./conf/web.env\n"
+                         "configs:\n"
+                         "  app_config:\n"
+                         "    file: ./conf/app.yaml\n"
+                         "  other_config:\n"
+                         "    file: conf/other.yaml\n"
+                         "  external_config:\n"
+                         "    external: true\n"
+                         "secrets:\n"
+                         "  db_settings:\n"
+                         "    file: ./conf/db.ini\n"
+                         "volumes:\n"
+                         "  data: {}\n"},
+        {"conf/nginx.conf", "worker_processes 1;\n"},
+        {"conf/extra.conf", "gzip on;\n"},
+        {"conf/long.conf", "sendfile on;\n"},
+        {"conf/nodot.conf", "tcp_nopush on;\n"},
+        {"conf/web.env", "MODE=web\n"},
+        {"conf/more.env", "EXTRA=1\n"},
+        {"conf/app.yaml", "name: app\n"},
+        {"conf/other.yaml", "name: other\n"},
+        {"conf/db.ini", "[db]\nname = app\n"},
+        {"src/app.py", "def main():\n    return 0\n"}};
+    GPF_ASSERT_COMPOSE_REFS(files, 11,
+                            "Service/web -> conf/app.yaml (config:27)\n"
+                            "Service/web -> conf/db.ini (secret:32)\n"
+                            "Service/web -> conf/extra.conf (volume:11)\n"
+                            "Service/web -> conf/long.conf (volume:16)\n"
+                            "Service/web -> conf/more.env (env_file:24)\n"
+                            "Service/web -> conf/nginx.conf (volume:5)\n"
+                            "Service/web -> conf/other.yaml (config:28)\n"
+                            "Service/web -> conf/web.env (env_file:23)\n"
+                            "Service/worker -> conf/nginx.conf (volume:36)\n"
+                            "Service/worker -> conf/web.env (env_file:38)");
+    PASS();
+}
+
+/* The paths are relative to the compose file's directory, not to the
+ * repository root: a same-named file at the root is not the one, a path may
+ * climb to a sibling directory, and one that leaves the repository or names
+ * the compose file itself is no edge. A long-form bind mount says it is a
+ * path, so its source needs no leading dot. */
+TEST(probe_compose_service_files_resolve_from_the_compose_directory) {
+    static const GpfFile files[] = {
+        {"deploy/compose.yaml", "services:\n"
+                                "  api:\n"
+                                "    image: api:1\n"
+                                "    volumes:\n"
+                                "      - ./app.conf:/etc/app.conf\n"
+                                "      - ../shared/base.conf:/etc/base.conf\n"
+                                "      - ../../out.conf:/etc/out.conf\n"
+                                "      - ./compose.yaml:/self.yaml\n"
+                                "      - type: bind\n"
+                                "        source: more.conf\n"
+                                "        target: /etc/more.conf\n"},
+        {"deploy/app.conf", "name deploy;\n"},
+        {"deploy/more.conf", "name more;\n"},
+        {"app.conf", "name root;\n"},
+        {"more.conf", "name root-more;\n"},
+        {"shared/base.conf", "name base;\n"},
+        {"out.conf", "name out;\n"}};
+    GPF_ASSERT_COMPOSE_REFS(files, 7,
+                            "Service/api -> deploy/app.conf (volume:5)\n"
+                            "Service/api -> deploy/more.conf (volume:10)\n"
+                            "Service/api -> shared/base.conf (volume:6)");
+    PASS();
+}
+
 /* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
  * ci[/job]])", sorted, one per line: top-level code as "@<file>"; a script
  * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>",
@@ -2841,6 +3096,205 @@ TEST(probe_kustomize_helm_charts_deploy_their_chart) {
     PASS();
 }
 
+/* The REFERENCES_FILE edges a kustomization draws for the files it reads, as
+ * "<kustomization> -> <target file> (via:line)", sorted, one per line; then a
+ * line "imports <files>": the targets of the IMPORTS edges leaving
+ * kustomization files. */
+static char *gpf_kustomize_files(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND json_extract(e.properties,'$.via') "
+            "IN ('configMapGenerator','secretGenerator','configurations') ORDER BY x)), '') "
+            "|| char(10) || 'imports ' || coalesce((SELECT group_concat(x, ',') FROM (SELECT "
+            "DISTINCT t.file_path AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='IMPORTS' AND s.file_path LIKE '%kustomization.yaml' "
+            "ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization reads files that are input to its build without being a
+ * member of it: a generator's `files` (a path, or `key=path`) and `envs`, and
+ * its `configurations`. Each indexed file is a file the kustomization
+ * references, once, at the first line naming it -- and never an import: an
+ * import makes a file's objects part of the build. A file the index does not
+ * hold (one that is missing, and config/settings.json, which is on disk but
+ * a name discovery skips), a path out of the repository, an absolute path
+ * (it names a file of the machine, not of the repository, also when the
+ * repository holds a file at that path below its root or below the
+ * kustomization) and a generator's literals are none. */
+TEST(probe_kustomize_generator_files_are_file_references) {
+    static const GpfFile files[] = {
+        {"deploy/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                      "kind: Kustomization\n"
+                                      "resources:\n"
+                                      "  - deployment.yaml\n"
+                                      "configMapGenerator:\n"
+                                      "  - name: app-config\n"
+                                      "    files:\n"
+                                      "      - app.properties\n"
+                                      "      - settings=config/settings.json\n"
+                                      "      - limits=config/limits.json\n"
+                                      "      - missing.properties\n"
+                                      "      - abs=/abs.properties\n"
+                                      "    envs:\n"
+                                      "      - app.env\n"
+                                      "  - name: literal-only\n"
+                                      "    literals:\n"
+                                      "      - A=1\n"
+                                      "secretGenerator:\n"
+                                      "  - name: tokens\n"
+                                      "    files:\n"
+                                      "      - ../../outside.yaml\n"
+                                      "      - ../shared/token.yaml\n"
+                                      "configurations:\n"
+                                      "  - kustomizeconfig.yaml\n"
+                                      "  - app.properties\n"
+                                      "  - /abs.properties\n"},
+        {"deploy/deployment.yaml", "apiVersion: apps/v1\n"
+                                   "kind: Deployment\n"
+                                   "metadata:\n"
+                                   "  name: app\n"
+                                   "spec:\n"
+                                   "  replicas: 1\n"},
+        {"deploy/app.properties", "mode=prod\n"},
+        {"deploy/config/settings.json", "{\"mode\": \"prod\"}\n"},
+        {"deploy/config/limits.json", "{\"max\": 3}\n"},
+        {"deploy/app.env", "MODE=prod\n"},
+        {"deploy/kustomizeconfig.yaml", "nameReference: []\n"},
+        {"deploy/abs.properties", "mode=abs\n"},
+        {"abs.properties", "mode=root\n"},
+        {"shared/token.yaml", "token: placeholder\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kustomize_files(files, n);
+    static const char want[] =
+        "deploy/kustomization.yaml -> deploy/app.env (configMapGenerator:14)\n"
+        "deploy/kustomization.yaml -> deploy/app.properties (configMapGenerator:8)\n"
+        "deploy/kustomization.yaml -> deploy/config/limits.json (configMapGenerator:10)\n"
+        "deploy/kustomization.yaml -> deploy/kustomizeconfig.yaml (configurations:24)\n"
+        "deploy/kustomization.yaml -> shared/token.yaml (secretGenerator:22)\n"
+        "imports deploy/deployment.yaml";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize files got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize file refs");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every REFERENCES_FILE edge a local `uses:` draws, as
+ * "<file> -> <target file> (uses:line)", sorted, one per line. */
+static char *gpf_local_uses(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' "
+            "AND json_extract(e.properties,'$.via')='uses' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A local `uses:` ("./...") is a path from the repository root, wherever the
+ * workflow or action lies. A step's names an action by its directory: the
+ * edge goes to that directory's action.yml or action.yaml, the one it holds.
+ * A job's names a reusable workflow file. Each file once, at the first use.
+ * No edge for an action of another repository, a path with an expression, a
+ * directory with no action file, or one holding both spellings. */
+TEST(probe_github_actions_local_uses_reference_their_files) {
+    static const GpfFile files[] = {
+        {".github/workflows/ci.yml", "name: ci\n"
+                                     "on: [push]\n"
+                                     "jobs:\n"
+                                     "  build:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - uses: actions/checkout@v4\n"
+                                     "      - uses: ./.github/actions/setup\n"
+                                     "      - uses: ./\n"
+                                     "      - uses: ./.github/actions/${{ matrix.kind }}\n"
+                                     "      - uses: ./.github/actions/missing\n"
+                                     "      - uses: ./.github/actions/both\n"
+                                     "      - name: again\n"
+                                     "        uses: ./.github/actions/setup\n"
+                                     "      - run: echo done\n"
+                                     "  call:\n"
+                                     "    uses: ./.github/workflows/reusable.yml\n"
+                                     "  far:\n"
+                                     "    uses: org/repo/.github/workflows/x.yml@main\n"},
+        {".github/workflows/reusable.yml", "on:\n"
+                                           "  workflow_call: {}\n"
+                                           "jobs:\n"
+                                           "  a:\n"
+                                           "    runs-on: ubuntu-latest\n"
+                                           "    steps:\n"
+                                           "      - run: echo a\n"},
+        {".github/actions/setup/action.yml", "name: setup\n"
+                                             "runs:\n"
+                                             "  using: composite\n"
+                                             "  steps:\n"
+                                             "    - uses: ./.github/actions/inner\n"
+                                             "    - run: echo setup\n"
+                                             "      shell: bash\n"},
+        {".github/actions/inner/action.yaml", "name: inner\n"
+                                              "runs:\n"
+                                              "  using: composite\n"
+                                              "  steps:\n"
+                                              "    - run: echo inner\n"
+                                              "      shell: bash\n"},
+        {".github/actions/both/action.yml", "name: both\nruns:\n  using: composite\n  steps: []\n"},
+        {".github/actions/both/action.yaml", "name: both\nruns:\n  using: composite\n  steps: []\n"},
+        {"action.yaml", "name: root\nruns:\n  using: composite\n  steps: []\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_local_uses(files, n);
+    static const char want[] =
+        ".github/actions/setup/action.yml -> .github/actions/inner/action.yaml (uses:5)\n"
+        ".github/workflows/ci.yml -> .github/actions/setup/action.yml (uses:8)\n"
+        ".github/workflows/ci.yml -> .github/workflows/reusable.yml (uses:17)\n"
+        ".github/workflows/ci.yml -> action.yaml (uses:9)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "local uses got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("local uses");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every Terraform reference edge as
  * "<file> <block> -> <file> <block> <type> <ref>:<line>", then a line
  * "other tf edges <n>": USAGE / CALLS edges leaving a .tf file that the
@@ -2925,6 +3379,78 @@ TEST(probe_terraform_refs_resolve_in_their_module) {
         fprintf(stderr, "terraform refs got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
         FAIL("terraform refs");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every REFERENCES_FILE edge a Terraform block draws for a file function, as
+ * "<file> <block> -> <target file> (fn:line)", sorted, one per line. */
+static char *gpf_tf_file_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ' ' || s.name || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND s.file_path LIKE '%.tf' "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A file function whose path begins at ${path.module} reads a file of the
+ * repository: the block holding the call references that file, once, at its
+ * first call. A path without ${path.module} is relative to the directory
+ * Terraform runs in and draws nothing; neither does path.root, a path with
+ * another interpolation, a variable, a directory read by fileset, or a file
+ * the index does not hold. */
+TEST(probe_terraform_file_functions_reference_their_files) {
+    static const GpfFile files[] = {
+        {"infra/main.tf", "variable \"name\" {}\n"
+                          "locals {\n"
+                          "  policy = file(\"${path.module}/policies/read.json\")\n"
+                          "  again  = file(\"${path.module}/policies/read.json\")\n"
+                          "  plain  = file(\"policies/read.json\")\n"
+                          "  rooted = file(\"${path.root}/policies/read.json\")\n"
+                          "  named  = file(\"${path.module}/policies/${var.name}.json\")\n"
+                          "  byvar  = file(var.name)\n"
+                          "  set    = fileset(\"${path.module}/policies\", \"*.json\")\n"
+                          "  gone   = file(\"${path.module}/policies/missing.json\")\n"
+                          "}\n"
+                          "resource \"aws_instance\" \"web\" {\n"
+                          "  user_data = templatefile(\"${path.module}/templates/init.sh\", {\n"
+                          "    name = var.name\n"
+                          "  })\n"
+                          "  hash = filemd5(\"${path.module}/../shared/common.yaml\")\n"
+                          "}\n"},
+        {"infra/policies/read.json", "{\"Version\": \"2012-10-17\"}\n"},
+        {"infra/templates/init.sh", "#!/bin/sh\necho ${name}\n"},
+        {"shared/common.yaml", "name: common\n"},
+        {"policies/read.json", "{\"Version\": \"2012-10-17\"}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_file_refs(files, n);
+    static const char want[] =
+        "infra/main.tf locals -> infra/policies/read.json (file:3)\n"
+        "infra/main.tf resource.aws_instance.web -> infra/templates/init.sh (templatefile:13)\n"
+        "infra/main.tf resource.aws_instance.web -> shared/common.yaml (filemd5:16)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform file refs got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform file refs");
     }
     free(got);
     PASS();
@@ -7171,6 +7697,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_module_node);
     RUN_TEST(probe_kustomize_imports_edges);
     RUN_TEST(probe_kustomize_with_patches);
+    RUN_TEST(probe_kustomize_generator_files_are_file_references);
     RUN_TEST(probe_k8s_manifest_after_leading_comment);
     RUN_TEST(probe_kustomize_imports_after_leading_comment);
     RUN_TEST(probe_k8s_selector_after_leading_separator);
@@ -7219,6 +7746,10 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_topology);
     RUN_TEST(probe_mcp_trace_topology_follows_deploys);
     RUN_TEST(probe_mcp_trace_run);
+    RUN_TEST(probe_dockerfile_copy_sources_are_file_references);
+    RUN_TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference);
+    RUN_TEST(probe_compose_service_files_are_file_references);
+    RUN_TEST(probe_compose_service_files_resolve_from_the_compose_directory);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_image_without_registry_host_stays_unknown);
@@ -7235,6 +7766,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_patches_override_their_base);
     RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
     RUN_TEST(probe_terraform_refs_resolve_in_their_module);
+    RUN_TEST(probe_terraform_file_functions_reference_their_files);
     RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
     RUN_TEST(probe_terraform_module_calls_import_their_source);
     RUN_TEST(probe_terraform_tfvars_override_their_variables);
@@ -7253,6 +7785,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_shell_programs_by_path_spawn);
     RUN_TEST(probe_make_programs_by_path_spawn);
     RUN_TEST(probe_ci_and_scripts_run_scripts);
+    RUN_TEST(probe_github_actions_local_uses_reference_their_files);
     RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_make_rules_have_a_node_per_target);
     RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);

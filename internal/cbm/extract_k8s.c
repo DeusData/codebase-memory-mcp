@@ -515,6 +515,79 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
     }
 }
 
+static const char KUST_CONFIGMAP_GEN[] = "configMapGenerator";
+static const char KUST_SECRET_GEN[] = "secretGenerator";
+static const char KUST_CONFIGURATIONS[] = "configurations";
+
+// A FILE fact: the kustomization reads `path`, named by `via` (one of the
+// static names above) at the row of `at`.
+static void emit_kustomize_file(CBMExtractCtx *ctx, const char *path, const char *via, TSNode at) {
+    if (!path || !path[0]) {
+        return;
+    }
+    CBMK8sFact f = {.fact = CBM_K8S_FACT_FILE,
+                    .def_index = -1,
+                    .via = via,
+                    .path = path,
+                    .line = (int)ts_node_start_point(at).row + TS_LINE_OFFSET};
+    cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, f);
+}
+
+// One FILE fact per scalar item of sequence `seq`. `keyed`: an item may be
+// `key=path` (a generator's `files`), and the path is what follows the `=`.
+static void emit_kustomize_file_items(CBMExtractCtx *ctx, TSNode seq, const char *via, bool keyed) {
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        if (strcmp(ts_node_type(item), "block_sequence_item") != 0) {
+            continue;
+        }
+        k8s_kids_t vals = k8s_kids(item);
+        TSNode val;
+        while (k8s_kid(&vals, false, &val)) {
+            const char *text = get_scalar_text(ctx->arena, val, ctx->source);
+            const char *eq = text && keyed ? strchr(text, '=') : NULL;
+            emit_kustomize_file(ctx, eq ? eq + SKIP_ONE : text, via, val);
+        }
+    }
+}
+
+// The generators of a `configMapGenerator` / `secretGenerator` list: the
+// files each reads -- `files`, `envs`, and the single `env` of older
+// kustomize. Literals name no file.
+static void emit_kustomize_generators(CBMExtractCtx *ctx, TSNode seq, const char *via) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        TSNode map = strcmp(ts_node_type(item), "block_sequence_item") == 0
+                         ? kust_item_mapping(item)
+                         : (TSNode){0};
+        if (ts_node_is_null(map)) {
+            continue;
+        }
+        k8s_kids_t pairs = k8s_kids(map);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+                continue;
+            }
+            const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+            TSNode v = unwrap_pair_value(pair);
+            if (!key || ts_node_is_null(v)) {
+                continue;
+            }
+            bool files = strcmp(key, "files") == 0;
+            if ((files || strcmp(key, "envs") == 0) &&
+                strcmp(ts_node_type(v), "block_sequence") == 0) {
+                emit_kustomize_file_items(ctx, v, via, files);
+            } else if (strcmp(key, "env") == 0) {
+                emit_kustomize_file(ctx, get_scalar_text(a, v, ctx->source), via, v);
+            }
+        }
+    }
+}
+
 // Process a single block_mapping_pair for kustomize list keys.
 static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
@@ -534,6 +607,18 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     }
     if (strcmp(key_text, "helmCharts") == 0) {
         emit_kustomize_charts(ctx, val_node);
+        return;
+    }
+    if (strcmp(key_text, KUST_CONFIGMAP_GEN) == 0) {
+        emit_kustomize_generators(ctx, val_node, KUST_CONFIGMAP_GEN);
+        return;
+    }
+    if (strcmp(key_text, KUST_SECRET_GEN) == 0) {
+        emit_kustomize_generators(ctx, val_node, KUST_SECRET_GEN);
+        return;
+    }
+    if (strcmp(key_text, KUST_CONFIGURATIONS) == 0) {
+        emit_kustomize_file_items(ctx, val_node, KUST_CONFIGURATIONS, false);
         return;
     }
     if (!is_kustomize_list_key(key_text)) {
