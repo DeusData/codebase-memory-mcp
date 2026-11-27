@@ -361,7 +361,477 @@ TEST(include_path_edges_name_only_indexed_files) {
     PASS();
 }
 
+/* ── A path whose dots and slashes are swapped ───────────────────────────── */
+
+/* A File node's name joins a path's segments with dots, so a.b.proto and
+ * a/b.proto share one. protoc reads only the file the path names ("a.b.proto:
+ * File not found." when only a/b.proto exists), GNU make the same ("a.b.mk: No
+ * such file or directory"; `-include` skips it); the other spelling is no
+ * answer, in both directions. Asked with the run's File nodes: the rule takes
+ * existence from the listed path, never from a node found by name. */
+TEST(include_path_swapped_spelling_names_no_file) {
+    static const char *const files[] = {"top.proto", "a/b.proto", "x/y.proto", "r.s.proto",
+                                        "Makefile",  "a/b.mk",    "x/y.mk",    "r.s.mk", NULL};
+    cbm_include_universe_t *u = ip_universe(files);
+    ASSERT_NOT_NULL(u);
+    cbm_gbuf_t *g = cbm_gbuf_new("ipx", "/");
+    ASSERT_NOT_NULL(g);
+    for (int i = 0; files[i]; i++) {
+        char *qn = cbm_pipeline_fqn_compute("ipx", files[i], "__file__");
+        const char *slash = strrchr(files[i], '/');
+        (void)cbm_gbuf_upsert_node(g, "File", slash ? slash + 1 : files[i], qn, files[i], 0, 0,
+                                   "{}");
+        free(qn);
+    }
+    char got[1024];
+    CBMImport imp;
+    memset(&imp, 0, sizeof(imp));
+    static const struct {
+        CBMLanguage lang;
+        const char *rel;
+        const char *path;
+        cbm_include_path_verdict_t want;
+        const char *file;
+    } cases[] = {
+        {CBM_LANG_PROTOBUF, "top.proto", "a.b.proto", CBM_INCLUDE_PATH_NO_FILE, ""},
+        {CBM_LANG_PROTOBUF, "top.proto", "r/s.proto", CBM_INCLUDE_PATH_NO_FILE, ""},
+        {CBM_LANG_PROTOBUF, "top.proto", "x/y.proto", CBM_INCLUDE_PATH_FILE, "x/y.proto"},
+        {CBM_LANG_MAKEFILE, "Makefile", "a.b.mk", CBM_INCLUDE_PATH_NO_FILE, ""},
+        {CBM_LANG_MAKEFILE, "Makefile", "r/s.mk", CBM_INCLUDE_PATH_NO_FILE, ""},
+        {CBM_LANG_MAKEFILE, "Makefile", "x/y.mk", CBM_INCLUDE_PATH_FILE, "x/y.mk"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        imp.module_path = cases[i].path;
+        got[0] = '\0';
+        ASSERT_EQ(cbm_include_path_resolve(u, g, "ipx", cases[i].rel, cases[i].lang, &imp, got,
+                                           sizeof(got)),
+                  cases[i].want);
+        if (cases[i].want == CBM_INCLUDE_PATH_FILE) {
+            ASSERT_STR_EQ(got, cases[i].file);
+        }
+    }
+    cbm_gbuf_free(g);
+    cbm_include_universe_free(u);
+    PASS();
+}
+
+/* Both spellings indexed: they share one node name, so the graph holds one
+ * node for the two, with the smaller path (a.b.mk: '.' sorts before '/').
+ * `include a/b.mk` names a/b.mk: its target is a node of a/b.mk or none, never
+ * the node of a.b.mk; `include a.b.mk` ends at a.b.mk's node. */
+TEST(include_path_target_is_that_file) {
+    static const char *const files[] = {"Makefile", "a.b.mk", "a/b.mk", NULL};
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp/p");
+    ASSERT_NOT_NULL(gb);
+    for (int i = 0; files[i]; i++) {
+        char *qn = cbm_pipeline_fqn_compute("p", files[i], "__file__");
+        const char *slash = strrchr(files[i], '/');
+        (void)cbm_gbuf_upsert_node(gb, "File", slash ? slash + 1 : files[i], qn, files[i], 1, 1,
+                                   "{}");
+        free(qn);
+    }
+    cbm_pipeline_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gbuf = gb;
+    ctx.project_name = "p";
+    ctx.include_universe = ip_universe(files);
+    CBMImport imp;
+    memset(&imp, 0, sizeof(imp));
+    const cbm_gbuf_node_t *out = NULL;
+    imp.module_path = "a/b.mk";
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "Makefile", CBM_LANG_MAKEFILE, &imp, &out));
+    ASSERT_TRUE(out == NULL || (out->file_path && strcmp(out->file_path, "a/b.mk") == 0));
+    imp.module_path = "a.b.mk";
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "Makefile", CBM_LANG_MAKEFILE, &imp, &out));
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out->file_path, "a.b.mk");
+    cbm_include_universe_free(ctx.include_universe);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* How many IMPORTS edges go from a node of the file `src` to a node of the
+ * file `tgt` with the label `label` (tgt or label NULL: any). */
+static int ip_targets(const char *db, const char *src, const char *tgt, const char *label) {
+    sqlite3 *h = NULL;
+    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(h);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (sqlite3_prepare_v2(h,
+                           "SELECT count(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'IMPORTS' "
+                           "AND s.file_path = ?1 AND (?2 IS NULL OR t.file_path = ?2) "
+                           "AND (?3 IS NULL OR t.label = ?3)",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, src, -1, SQLITE_TRANSIENT);
+        if (tgt) {
+            sqlite3_bind_text(st, 2, tgt, -1, SQLITE_TRANSIENT);
+        }
+        if (label) {
+            sqlite3_bind_text(st, 3, label, -1, SQLITE_TRANSIENT);
+        }
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(h);
+    return n;
+}
+
+/* The IMPORTS edges of a stored index, one sorted line each. */
+static char *ip_listing(const char *db_path) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_stmt *st = NULL;
+    char *buf = calloc(1, 1);
+    size_t len = 0;
+    if (buf && sqlite3_prepare_v2(db,
+                                  "SELECT s.file_path||'|'||coalesce(t.file_path,'')||'|'||t.label "
+                                  "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+                                  "t.id=e.target_id WHERE e.type='IMPORTS' ORDER BY 1",
+                                  -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *row = (const char *)sqlite3_column_text(st, 0);
+            size_t n = row ? strlen(row) : 0;
+            char *grown = realloc(buf, len + n + 2);
+            if (!grown) {
+                break;
+            }
+            buf = grown;
+            memcpy(buf + len, row ? row : "", n);
+            buf[len + n] = '\n';
+            len += n + 1;
+            buf[len] = '\0';
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return buf;
+}
+
+/* Index `repo` into `db` (incremental when `db` holds its index). */
+static int ip_run(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "ipswap");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+/* The kept index, indexed again (incremental, *route: the route it took),
+ * holds the IMPORTS edges a fresh index of the tree holds. */
+static bool ip_kept_equals_fresh(const char *tmp, const char *repo, const char *kept, int step,
+                                 cbm_incremental_route_t *route) {
+    char fresh[512];
+    snprintf(fresh, sizeof(fresh), "%s/fresh-%d.db", tmp, step);
+    *route = CBM_INCREMENTAL_ROUTE_NONE;
+    if (ip_run(repo, kept) != 0) {
+        return false;
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    if (ip_run(repo, fresh) != 0) {
+        return false;
+    }
+    char *a = ip_listing(kept);
+    char *b = ip_listing(fresh);
+    bool same = a && b && strcmp(a, b) == 0;
+    if (!same) {
+        fprintf(stderr, "  step %d\n--- incremental ---\n%s--- full ---\n%s", step, a ? a : "",
+                b ? b : "");
+    }
+    free(a);
+    free(b);
+    (void)remove(fresh);
+    return same;
+}
+
+/* The swapped spellings on a real index, on the sequential and the parallel
+ * route (60 more files than the parallel route's floor), then incrementally,
+ * the route each step takes asserted:
+ * 1. another file edited: the delta route (a closure repair); the false edges
+ *    stay gone;
+ * 2. the really named files created and the other spelling moved away: the
+ *    move of a file is indexed in full (the listing key changes); the edges
+ *    move to them;
+ * 3. back again: in full; no edge;
+ * 4. the importers edited: the delta route re-reads them; still no false
+ *    edge, the true ones kept.
+ * Red on main, whose
+ * name lookup drew Makefile -> a/b.mk (File) and, through its own strategies
+ * after the rule's guess, top.proto -> pa/b.proto (Module). */
+static const char *ip_swapped_repo(const char *tmp, bool parallel) {
+    static char repo[512];
+    snprintf(repo, sizeof(repo), "%s/%s", tmp, parallel ? "par" : "seq");
+    char path[600];
+    const char *files[][2] = {
+        {"Makefile", "include a.b.mk\n-include c.d.mk\ninclude r/s.mk\ninclude x/y.mk\n\nall:\n"},
+        {"a/b.mk", "B = 1\n"},
+        {"c/d.mk", "D = 1\n"},
+        {"r.s.mk", "S = 1\n"},
+        {"x/y.mk", "Y = 1\n"},
+        {"top.proto", "syntax = \"proto3\";\nimport \"pa.b.proto\";\nimport \"pr/s.proto\";\n"
+                      "import \"px/y.proto\";\nmessage T { int32 t = 1; }\n"},
+        {"pa/b.proto", "syntax = \"proto3\";\nmessage B { int32 b = 1; }\n"},
+        {"pr.s.proto", "syntax = \"proto3\";\nmessage S { int32 s = 1; }\n"},
+        {"px/y.proto", "syntax = \"proto3\";\nmessage Y { int32 y = 1; }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", repo, files[i][0]);
+        if (th_write_file(path, files[i][1]) != 0) {
+            return NULL;
+        }
+    }
+    for (int i = 0; i < 60; i++) {
+        snprintf(path, sizeof(path), "%s/fill/f%02d.go", repo, i);
+        char body[64];
+        snprintf(body, sizeof(body), "package fill\n\nfunc F%02d() {}\n", i);
+        if (th_write_file(path, body) != 0) {
+            return NULL;
+        }
+    }
+    return repo;
+}
+
+/* Sets CBM_WORKERS / CBM_INDEX_SINGLE_THREAD for one route, or restores them. */
+static void ip_route_env(bool parallel, bool restore) {
+    static char *saved_workers;
+    static char *saved_single;
+    if (restore) {
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+        saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                     : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        free(saved_workers);
+        free(saved_single);
+        saved_workers = saved_single = NULL;
+        return;
+    }
+    const char *w = getenv("CBM_WORKERS");
+    const char *s = getenv("CBM_INDEX_SINGLE_THREAD");
+    saved_workers = w ? strdup(w) : NULL;
+    saved_single = s ? strdup(s) : NULL;
+    if (parallel) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    } else {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    }
+}
+
+#define IP_SWAPPED_ROUTE(parallel)                                                                 \
+    do {                                                                                           \
+        char *made = th_mktempdir("cbm_ip_swap");                                                  \
+        ASSERT_NOT_NULL(made);                                                                     \
+        char tmp[256];                                                                             \
+        snprintf(tmp, sizeof(tmp), "%s", made);                                                    \
+        const char *repo = ip_swapped_repo(tmp, (parallel));                                       \
+        ASSERT_NOT_NULL(repo);                                                                     \
+        char kept[512];                                                                            \
+        snprintf(kept, sizeof(kept), "%s/kept.db", tmp);                                           \
+        ip_route_env((parallel), false);                                                           \
+        cbm_pipeline_worker_count_test_reset();                                                    \
+        int rc = ip_run(repo, kept);                                                               \
+        int workers = cbm_pipeline_worker_count_test_last();                                       \
+        ip_route_env((parallel), true);                                                            \
+        ASSERT_EQ(rc, 0);                                                                          \
+        ASSERT_TRUE((parallel) ? workers > 1 : workers == 1);                                      \
+        ASSERT_EQ(ip_targets(kept, "Makefile", "a/b.mk", NULL), 0);                                \
+        ASSERT_EQ(ip_targets(kept, "Makefile", "c/d.mk", NULL), 0);                                \
+        ASSERT_EQ(ip_targets(kept, "Makefile", "r.s.mk", NULL), 0);                                \
+        ASSERT_EQ(ip_targets(kept, "Makefile", "x/y.mk", "Module"), 1);                            \
+        ASSERT_EQ(ip_targets(kept, "Makefile", NULL, NULL), 1);                                    \
+        ASSERT_EQ(ip_targets(kept, "top.proto", "pa/b.proto", NULL), 0);                           \
+        ASSERT_EQ(ip_targets(kept, "top.proto", "pr.s.proto", NULL), 0);                           \
+        ASSERT_EQ(ip_targets(kept, "top.proto", "px/y.proto", "Module"), 1);                       \
+        ASSERT_EQ(ip_targets(kept, "top.proto", NULL, NULL), 1);                                   \
+        ip_route_env((parallel), false);                                                           \
+        /* 1: another file edited */                                                               \
+        char path[600];                                                                            \
+        snprintf(path, sizeof(path), "%s/fill/f00.go", repo);                                      \
+        cbm_incremental_route_t r1, r2, r3, r4;                                                    \
+        bool same1 = th_write_file(path, "package fill\n\nfunc F00() { F01() }\n") == 0 &&         \
+                     ip_kept_equals_fresh(tmp, repo, kept, 1, &r1);                                \
+        int s1 = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                    \
+                 ip_targets(kept, "top.proto", "pa/b.proto", NULL);                                \
+        /* 2: the really named files created, the other spelling moved away (the two     \
+         * spellings share one node name, so the graph holds one node for both): the    \
+         * edges move to them */                                                                   \
+        snprintf(path, sizeof(path), "%s/a/b.mk", repo);                                           \
+        bool w2 = remove(path) == 0;                                                               \
+        snprintf(path, sizeof(path), "%s/pa/b.proto", repo);                                       \
+        w2 = w2 && remove(path) == 0;                                                              \
+        snprintf(path, sizeof(path), "%s/a.b.mk", repo);                                           \
+        w2 = w2 && th_write_file(path, "AB = 1\n") == 0;                                           \
+        snprintf(path, sizeof(path), "%s/pa.b.proto", repo);                                       \
+        w2 = w2 && th_write_file(path, "syntax = \"proto3\";\nmessage AB { int32 a = 1; }\n") == 0; \
+        bool same2 = w2 && ip_kept_equals_fresh(tmp, repo, kept, 2, &r2);                          \
+        int s2_new = ip_targets(kept, "Makefile", "a.b.mk", NULL) +                                \
+                     ip_targets(kept, "top.proto", "pa.b.proto", NULL);                            \
+        int s2_old = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                \
+                     ip_targets(kept, "top.proto", "pa/b.proto", NULL);                            \
+        /* 3: deleted again, the other spelling back */                                            \
+        snprintf(path, sizeof(path), "%s/a.b.mk", repo);                                           \
+        bool d3 = remove(path) == 0;                                                               \
+        snprintf(path, sizeof(path), "%s/pa.b.proto", repo);                                       \
+        d3 = d3 && remove(path) == 0;                                                              \
+        snprintf(path, sizeof(path), "%s/a/b.mk", repo);                                           \
+        d3 = d3 && th_write_file(path, "B = 1\n") == 0;                                            \
+        snprintf(path, sizeof(path), "%s/pa/b.proto", repo);                                       \
+        d3 = d3 && th_write_file(path, "syntax = \"proto3\";\nmessage B { int32 b = 1; }\n") == 0; \
+        bool same3 = d3 && ip_kept_equals_fresh(tmp, repo, kept, 3, &r3);                          \
+        int s3 = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                    \
+                 ip_targets(kept, "top.proto", "pa/b.proto", NULL) +                               \
+                 ip_targets(kept, "Makefile", "a.b.mk", NULL) +                                    \
+                 ip_targets(kept, "top.proto", "pa.b.proto", NULL);                                \
+        /* 4: the importers edited: the delta route re-reads them */                              \
+        snprintf(path, sizeof(path), "%s/Makefile", repo);                                         \
+        bool e4 = th_write_file(path, "include a.b.mk\n-include c.d.mk\ninclude r/s.mk\n"          \
+                                      "include x/y.mk\n\n# edited\nall:\n") == 0;                  \
+        snprintf(path, sizeof(path), "%s/top.proto", repo);                                        \
+        e4 = e4 && th_write_file(path, "syntax = \"proto3\";\nimport \"pa.b.proto\";\n"           \
+                                       "import \"pr/s.proto\";\nimport \"px/y.proto\";\n"         \
+                                       "message T { int32 t = 2; }\n") == 0;                       \
+        bool same4 = e4 && ip_kept_equals_fresh(tmp, repo, kept, 4, &r4);                          \
+        int s4_false = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                              \
+                       ip_targets(kept, "top.proto", "pa/b.proto", NULL);                          \
+        int s4_true = ip_targets(kept, "Makefile", "x/y.mk", "Module") +                           \
+                      ip_targets(kept, "top.proto", "px/y.proto", "Module");                       \
+        ip_route_env((parallel), true);                                                            \
+        ASSERT_TRUE(same1);                                                                        \
+        ASSERT_EQ(s1, 0);                                                                          \
+        ASSERT_TRUE(same2);                                                                        \
+        ASSERT_EQ(s2_new, 2);                                                                      \
+        ASSERT_EQ(s2_old, 0);                                                                      \
+        ASSERT_TRUE(same3);                                                                        \
+        ASSERT_EQ(s3, 0);                                                                          \
+        ASSERT_EQ(r1, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);                                       \
+        ASSERT_EQ(r2, CBM_INCREMENTAL_ROUTE_FORCED_FULL);                                          \
+        ASSERT_EQ(r3, CBM_INCREMENTAL_ROUTE_FORCED_FULL);                                          \
+        ASSERT_TRUE(same4);                                                                        \
+        ASSERT_EQ(r4, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);                                       \
+        ASSERT_EQ(s4_false, 0);                                                                    \
+        ASSERT_EQ(s4_true, 2);                                                                     \
+        th_cleanup(tmp);                                                                           \
+    } while (0)
+
+TEST(include_path_swapped_spelling_sequential) {
+    IP_SWAPPED_ROUTE(false);
+    PASS();
+}
+
+TEST(include_path_swapped_spelling_parallel) {
+    IP_SWAPPED_ROUTE(true);
+    PASS();
+}
+
+/* The rule does not decide, and main's strategies propose a target: only a node
+ * of the named file is taken (cbm_include_path_accepts). Five shapes, each
+ * drew the dotted name's file before:
+ * - a name the listing does not keep: root Makefile `-include conf.app.env`,
+ *   only conf/app.env (make reads nothing);
+ * - a case variant blocks "no file": `include a.b.mk` with A.B.mk and a/b.mk
+ *   (make reads A.B.mk on a case-insensitive disk, nothing on a case-sensitive
+ *   one: no edge either way);
+ * - a guess below the root: sub/Makefile `include a.b.mk` with sub/a.b.mk and
+ *   a/b.mk (make in sub/ reads sub/a.b.mk, from the root nothing);
+ * - several files end with the path: x/imp.proto `import "p.q.proto"` with
+ *   x/p.q.proto, y/p.q.proto and p/q.proto (protoc reads x/ or y/ by -I, never
+ *   p/q.proto);
+ * - the Protobuf case variant: imp.proto `import "c.d.proto"` with C.D.proto
+ *   and c/d.proto.
+ * On both routes, no edge to the dotted name's file. */
+static const char *ip_fallback_repo(const char *tmp, bool parallel) {
+    static char repo[512];
+    snprintf(repo, sizeof(repo), "%s/%s", tmp, parallel ? "par" : "seq");
+    char path[600];
+    const char *files[][2] = {
+        {"Makefile", "-include conf.app.env\ninclude a.b.mk\n\nall:\n"},
+        {"conf/app.env", "BAZ = 1\n"},
+        {"A.B.mk", "AB = 1\n"},
+        {"a/b.mk", "B = 1\n"},
+        {"sub/Makefile", "include a.b.mk\n\nall:\n"},
+        {"sub/a.b.mk", "SAB = 1\n"},
+        {"x/imp.proto", "syntax = \"proto3\";\nimport \"p.q.proto\";\nmessage I { int32 i = 1; }\n"},
+        {"x/p.q.proto", "syntax = \"proto3\";\nmessage XQ { int32 x = 1; }\n"},
+        {"y/p.q.proto", "syntax = \"proto3\";\nmessage YQ { int32 y = 1; }\n"},
+        {"p/q.proto", "syntax = \"proto3\";\nmessage Q { int32 q = 1; }\n"},
+        {"imp.proto", "syntax = \"proto3\";\nimport \"c.d.proto\";\nmessage J { int32 j = 1; }\n"},
+        {"C.D.proto", "syntax = \"proto3\";\nmessage CD { int32 c = 1; }\n"},
+        {"c/d.proto", "syntax = \"proto3\";\nmessage D { int32 d = 1; }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", repo, files[i][0]);
+        if (th_write_file(path, files[i][1]) != 0) {
+            return NULL;
+        }
+    }
+    for (int i = 0; i < 60; i++) {
+        snprintf(path, sizeof(path), "%s/fill/f%02d.go", repo, i);
+        char body[64];
+        snprintf(body, sizeof(body), "package fill\n\nfunc F%02d() {}\n", i);
+        if (th_write_file(path, body) != 0) {
+            return NULL;
+        }
+    }
+    return repo;
+}
+
+#define IP_FALLBACK_ROUTE(parallel)                                                                \
+    do {                                                                                           \
+        char *made = th_mktempdir("cbm_ip_fall");                                                  \
+        ASSERT_NOT_NULL(made);                                                                     \
+        char tmp[256];                                                                             \
+        snprintf(tmp, sizeof(tmp), "%s", made);                                                    \
+        const char *repo = ip_fallback_repo(tmp, (parallel));                                      \
+        ASSERT_NOT_NULL(repo);                                                                     \
+        char db[512];                                                                              \
+        snprintf(db, sizeof(db), "%s/fall.db", tmp);                                               \
+        ip_route_env((parallel), false);                                                           \
+        cbm_pipeline_worker_count_test_reset();                                                    \
+        int rc = ip_run(repo, db);                                                                 \
+        int workers = cbm_pipeline_worker_count_test_last();                                       \
+        ip_route_env((parallel), true);                                                            \
+        ASSERT_EQ(rc, 0);                                                                          \
+        ASSERT_TRUE((parallel) ? workers > 1 : workers == 1);                                      \
+        /* per shape, in the order above, its edges to the dotted name's file */                   \
+        char got[64];                                                                              \
+        snprintf(got, sizeof(got), "%d %d %d %d %d",                                               \
+                 ip_targets(db, "Makefile", "conf/app.env", NULL),                                 \
+                 ip_targets(db, "Makefile", "a/b.mk", NULL),                                       \
+                 ip_targets(db, "sub/Makefile", "a/b.mk", NULL),                                   \
+                 ip_targets(db, "x/imp.proto", "p/q.proto", NULL),                                 \
+                 ip_targets(db, "imp.proto", "c/d.proto", NULL));                                  \
+        ASSERT_STR_EQ(got, "0 0 0 0 0");                                                           \
+        th_cleanup(tmp);                                                                           \
+    } while (0)
+
+TEST(include_path_fallback_takes_only_the_named_file_sequential) {
+    IP_FALLBACK_ROUTE(false);
+    PASS();
+}
+
+TEST(include_path_fallback_takes_only_the_named_file_parallel) {
+    IP_FALLBACK_ROUTE(true);
+    PASS();
+}
+
 SUITE(include_path) {
+    RUN_TEST(include_path_fallback_takes_only_the_named_file_sequential);
+    RUN_TEST(include_path_fallback_takes_only_the_named_file_parallel);
+    RUN_TEST(include_path_swapped_spelling_names_no_file);
+    RUN_TEST(include_path_target_is_that_file);
+    RUN_TEST(include_path_swapped_spelling_sequential);
+    RUN_TEST(include_path_swapped_spelling_parallel);
     RUN_TEST(include_path_names_no_file_decides_no_target);
     RUN_TEST(include_path_proto_tail_guess_and_ambiguity);
     RUN_TEST(include_path_make_root_decides_below_is_guess);

@@ -3597,17 +3597,33 @@ static const cbm_gbuf_node_t *rust_use_resolve(const cbm_pipeline_ctx_t *ctx,
  * winner is selected, so a non-PHP collision cannot hide a later PHP hit.
  * src_lang is the importing file's language; it gates the name-guess
  * fallbacks (#1934). */
+static const cbm_gbuf_node_t *resolve_import_after_path(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
+    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only,
+    CBMLanguage language, const cbm_scala_index_t *scala_index);
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only,
     CBMLanguage language, const cbm_scala_index_t *scala_index) {
     /* Strategy 0: a language whose imports name files by path (include_path.h):
-     * the path rule decides the target. */
+     * the path rule decides the target. When it does not, the strategies below
+     * propose one, and only a node of the named file is taken (they join a
+     * path's segments with dots: `a.b.mk` would reach a/b.mk). */
     const cbm_gbuf_node_t *by_path = NULL;
     if (cbm_include_path_decides(ctx, source_rel, src_lang, imp, &by_path)) {
         return by_path;
     }
+    const cbm_gbuf_node_t *t =
+        resolve_import_after_path(ctx, source_rel, source_file_qn, imp, namespace_map, src_lang,
+                                  php_only, language, scala_index);
+    return cbm_include_path_accepts(ctx, source_rel, src_lang, imp, t) ? t : NULL;
+}
 
+static const cbm_gbuf_node_t *resolve_import_after_path(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
+    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only,
+    CBMLanguage language, const cbm_scala_index_t *scala_index) {
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
      * No label filter here: directory-module languages (Go/Java packages)
      * legitimately resolve straight to a Folder node -- that's the intended,

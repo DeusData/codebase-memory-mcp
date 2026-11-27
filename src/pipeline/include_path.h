@@ -87,7 +87,9 @@ typedef enum {
 } cbm_include_path_verdict_t;
 
 /* The file the import `imp` of the file `rel` names, written into buf.
- * `graph`/`project`: the run's File nodes, which count as existing. */
+ * `graph`/`project` take no part: a file exists when its exact path is listed
+ * (a File node found by name may be another file's: a.b.proto and a/b.proto
+ * share one name). */
 cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
@@ -97,10 +99,22 @@ cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t
  * the path rule decides it, with *out the target node (the file's Module node
  * when it has one, else its File node) or NULL: no edge (the named file has no
  * node, or no indexed file is named; a symbol is never the target of a
- * statement that names a file). False: main's strategies decide (a guess is
- * not a decision). */
+ * statement that names a file). False: main's strategies propose a target (a
+ * guess is not a decision), which cbm_include_path_accepts judges. */
 bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
                               const CBMImport *imp, const cbm_gbuf_node_t **out);
+
+/* When the path rule does not decide (a guess, several files, a name the
+ * listing does not keep, an incomplete listing), a target main's strategies
+ * propose for an import of a path-row language: true only when its file_path
+ * is the named path or ends with it at a '/' boundary, or is one of the rule's
+ * own candidates (the path from the importer's directory or the root, `.` and
+ * `..` folded). The bytes are compared exactly: a file of another letter case
+ * names the file on a case-insensitive disk only, so it stays no edge. False:
+ * no edge (the dotted name strategies would reach a/b.mk for `a.b.mk`). True
+ * for any other language and for no target. */
+bool cbm_include_path_accepts(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
+                              const CBMImport *imp, const cbm_gbuf_node_t *target);
 
 /* The semantic-manifest key of the universe: every indexed path a row's
  * import can name, sorted, hashed. Reads the list only (no disk). Returns 0,

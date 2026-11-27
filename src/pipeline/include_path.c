@@ -285,13 +285,11 @@ cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, i
 
 enum { IP_EXISTS_NO = 0, IP_EXISTS_YES = 1, IP_EXISTS_UNKNOWN = 2 };
 
-/* A file of the run (a File node), or an indexed one; unknown when the
- * universe is not whole for a name a row keeps. */
-static int ip_exists(const cbm_include_universe_t *u, const cbm_gbuf_t *graph, const char *project,
-                     const char *rel) {
-    if (graph && project && cbm_pipeline_file_node(graph, project, rel)) {
-        return IP_EXISTS_YES;
-    }
+/* An indexed file: the listed path itself; unknown when the universe is not
+ * whole for a name a row keeps. Never a node found by name: a File node's
+ * name joins the path's segments with dots, so a.b.proto and a/b.proto share
+ * one (protoc and make open only the file the path names). */
+static int ip_exists(const cbm_include_universe_t *u, const char *rel) {
     if (cbm_ht_get(u->listed, rel)) {
         return IP_EXISTS_YES;
     }
@@ -303,9 +301,8 @@ static int ip_exists(const cbm_include_universe_t *u, const cbm_gbuf_t *graph, c
 /* Of the candidates, the one that names a file; NULL when none does, when
  * (exactly one required) several do, or when existence is unknown for a
  * candidate that decides the answer. */
-static const char *ip_pick(const cbm_include_universe_t *u, const cbm_gbuf_t *graph,
-                           const char *project, char cands[][IP_PATH_MAX], int n, bool exactly_one,
-                           char *buf, size_t buf_sz) {
+static const char *ip_pick(const cbm_include_universe_t *u, char cands[][IP_PATH_MAX], int n,
+                           bool exactly_one, char *buf, size_t buf_sz) {
     const char *hit = NULL;
     for (int i = 0; i < n; i++) {
         bool dup = false;
@@ -315,7 +312,7 @@ static const char *ip_pick(const cbm_include_universe_t *u, const cbm_gbuf_t *gr
         if (dup) {
             continue;
         }
-        int ex = ip_exists(u, graph, project, cands[i]);
+        int ex = ip_exists(u, cands[i]);
         if (ex == IP_EXISTS_UNKNOWN) {
             return NULL;
         }
@@ -402,6 +399,8 @@ cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t
         return CBM_INCLUDE_PATH_NOT_A_PATH;
     }
     const char *p = imp->module_path;
+    (void)graph; /* existence is the listed path, never a node found by name */
+    (void)project;
     if (row->path_needs_suffix) {
         bool named = false;
         for (const char *const *s = row->suffixes; s && *s; s++) {
@@ -436,7 +435,7 @@ cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t
     if (row->base_root && ip_join(cands[n], sizeof(cands[n]), "", p)) {
         n++;
     }
-    if (ip_pick(u, graph, project, cands, n, row->exactly_one, buf, buf_sz)) {
+    if (ip_pick(u, cands, n, row->exactly_one, buf, buf_sz)) {
         /* A tail row gets here only when several indexed files end with the
          * path: the one beside the importer is an assumption about the include
          * root. Below the root, a base is an assumption about the directory
@@ -450,7 +449,9 @@ cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t
 }
 
 /* The file's Module node (named by its path) when it has one: the node a
- * module-path import named before; else its File node. */
+ * module-path import named before; else its File node. Only a node of that
+ * exact file (a node found by name may be another file's); NULL when the file
+ * has neither. */
 static const cbm_gbuf_node_t *ip_file_target(const cbm_pipeline_ctx_t *ctx, const char *path) {
     const cbm_gbuf_node_t **hits = NULL;
     int n = 0;
@@ -462,7 +463,8 @@ static const cbm_gbuf_node_t *ip_file_target(const cbm_pipeline_ctx_t *ctx, cons
             }
         }
     }
-    return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    const cbm_gbuf_node_t *f = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    return f && f->file_path && strcmp(f->file_path, path) == 0 ? f : NULL;
 }
 
 bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
@@ -482,8 +484,53 @@ bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CB
     }
     /* proven to name no repository file: neither a file nor a symbol of the
      * repository can be its target. Otherwise (not a path, several files,
-     * unknown) main's strategies decide. */
+     * unknown) main's strategies propose the target, and
+     * cbm_include_path_accepts judges it. */
     return v == CBM_INCLUDE_PATH_NO_FILE;
+}
+
+/* `s` ends with `tail` at a '/' boundary (or is it). */
+static bool ip_ends_with_path(const char *s, const char *tail) {
+    size_t n = strlen(s);
+    size_t t = strlen(tail);
+    return t > 0 && n >= t && strcmp(s + n - t, tail) == 0 && (n == t || s[n - t - 1] == '/');
+}
+
+bool cbm_include_path_accepts(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
+                              const CBMImport *imp, const cbm_gbuf_node_t *target) {
+    const cbm_include_path_row_t *row = cbm_include_path_row(lang);
+    if (!row || !target) {
+        return true; /* not a path row, or nothing proposed */
+    }
+    (void)ctx;
+    const char *fp = target->file_path;
+    const char *p = imp ? imp->module_path : NULL;
+    if (!fp || !p || !p[0] || !rel) {
+        return false;
+    }
+    /* the named path itself, or a file that ends with it */
+    if (ip_ends_with_path(fp, p)) {
+        return true;
+    }
+    /* one of the rule's own candidates: the path from the importer's
+     * directory or from the root, `.` and `..` folded */
+    char dir[IP_PATH_MAX];
+    char cand[IP_PATH_MAX];
+    if (ip_dirname(dir, sizeof(dir), rel) && ip_join(cand, sizeof(cand), dir, p) &&
+        strcmp(cand, fp) == 0) {
+        return true;
+    }
+    if (ip_join(cand, sizeof(cand), "", p) && strcmp(cand, fp) == 0) {
+        return true;
+    }
+    /* the path after its leading `./` and `../` segments, as the rule's tail
+     * key reads it, at a '/' boundary */
+    const char *kp = p;
+    while (strncmp(kp, "./", PAIR_LEN) == 0 || strncmp(kp, "../", IP_UP_LEN) == 0) {
+        kp += kp[1] == '.' ? IP_UP_LEN : PAIR_LEN;
+    }
+    char key[IP_PATH_MAX];
+    return ip_join(key, sizeof(key), "", kp) && ip_ends_with_path(fp, key);
 }
 
 static int ip_strcmp_ptr(const void *a, const void *b) {
