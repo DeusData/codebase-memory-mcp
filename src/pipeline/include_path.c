@@ -484,8 +484,53 @@ bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CB
     }
     /* proven to name no repository file: neither a file nor a symbol of the
      * repository can be its target. Otherwise (not a path, several files,
-     * unknown) main's strategies decide. */
+     * unknown) main's strategies propose the target, and
+     * cbm_include_path_accepts judges it. */
     return v == CBM_INCLUDE_PATH_NO_FILE;
+}
+
+/* `s` ends with `tail` at a '/' boundary (or is it). */
+static bool ip_ends_with_path(const char *s, const char *tail) {
+    size_t n = strlen(s);
+    size_t t = strlen(tail);
+    return t > 0 && n >= t && strcmp(s + n - t, tail) == 0 && (n == t || s[n - t - 1] == '/');
+}
+
+bool cbm_include_path_accepts(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
+                              const CBMImport *imp, const cbm_gbuf_node_t *target) {
+    const cbm_include_path_row_t *row = cbm_include_path_row(lang);
+    if (!row || !target) {
+        return true; /* not a path row, or nothing proposed */
+    }
+    (void)ctx;
+    const char *fp = target->file_path;
+    const char *p = imp ? imp->module_path : NULL;
+    if (!fp || !p || !p[0] || !rel) {
+        return false;
+    }
+    /* the named path itself, or a file that ends with it */
+    if (ip_ends_with_path(fp, p)) {
+        return true;
+    }
+    /* one of the rule's own candidates: the path from the importer's
+     * directory or from the root, `.` and `..` folded */
+    char dir[IP_PATH_MAX];
+    char cand[IP_PATH_MAX];
+    if (ip_dirname(dir, sizeof(dir), rel) && ip_join(cand, sizeof(cand), dir, p) &&
+        strcmp(cand, fp) == 0) {
+        return true;
+    }
+    if (ip_join(cand, sizeof(cand), "", p) && strcmp(cand, fp) == 0) {
+        return true;
+    }
+    /* the path after its leading `./` and `../` segments, as the rule's tail
+     * key reads it, at a '/' boundary */
+    const char *kp = p;
+    while (strncmp(kp, "./", PAIR_LEN) == 0 || strncmp(kp, "../", IP_UP_LEN) == 0) {
+        kp += kp[1] == '.' ? IP_UP_LEN : PAIR_LEN;
+    }
+    char key[IP_PATH_MAX];
+    return ip_join(key, sizeof(key), "", kp) && ip_ends_with_path(fp, key);
 }
 
 static int ip_strcmp_ptr(const void *a, const void *b) {

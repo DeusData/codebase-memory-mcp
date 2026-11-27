@@ -734,7 +734,100 @@ TEST(include_path_swapped_spelling_parallel) {
     PASS();
 }
 
+/* The rule does not decide, and main's strategies propose a target: only a node
+ * of the named file is taken (cbm_include_path_accepts). Five shapes, each
+ * drew the dotted name's file before:
+ * - a name the listing does not keep: root Makefile `-include conf.app.env`,
+ *   only conf/app.env (make reads nothing);
+ * - a case variant blocks "no file": `include a.b.mk` with A.B.mk and a/b.mk
+ *   (make reads A.B.mk on a case-insensitive disk, nothing on a case-sensitive
+ *   one: no edge either way);
+ * - a guess below the root: sub/Makefile `include a.b.mk` with sub/a.b.mk and
+ *   a/b.mk (make in sub/ reads sub/a.b.mk, from the root nothing);
+ * - several files end with the path: x/imp.proto `import "p.q.proto"` with
+ *   x/p.q.proto, y/p.q.proto and p/q.proto (protoc reads x/ or y/ by -I, never
+ *   p/q.proto);
+ * - the Protobuf case variant: imp.proto `import "c.d.proto"` with C.D.proto
+ *   and c/d.proto.
+ * On both routes, no edge to the dotted name's file. */
+static const char *ip_fallback_repo(const char *tmp, bool parallel) {
+    static char repo[512];
+    snprintf(repo, sizeof(repo), "%s/%s", tmp, parallel ? "par" : "seq");
+    char path[600];
+    const char *files[][2] = {
+        {"Makefile", "-include conf.app.env\ninclude a.b.mk\n\nall:\n"},
+        {"conf/app.env", "BAZ = 1\n"},
+        {"A.B.mk", "AB = 1\n"},
+        {"a/b.mk", "B = 1\n"},
+        {"sub/Makefile", "include a.b.mk\n\nall:\n"},
+        {"sub/a.b.mk", "SAB = 1\n"},
+        {"x/imp.proto", "syntax = \"proto3\";\nimport \"p.q.proto\";\nmessage I { int32 i = 1; }\n"},
+        {"x/p.q.proto", "syntax = \"proto3\";\nmessage XQ { int32 x = 1; }\n"},
+        {"y/p.q.proto", "syntax = \"proto3\";\nmessage YQ { int32 y = 1; }\n"},
+        {"p/q.proto", "syntax = \"proto3\";\nmessage Q { int32 q = 1; }\n"},
+        {"imp.proto", "syntax = \"proto3\";\nimport \"c.d.proto\";\nmessage J { int32 j = 1; }\n"},
+        {"C.D.proto", "syntax = \"proto3\";\nmessage CD { int32 c = 1; }\n"},
+        {"c/d.proto", "syntax = \"proto3\";\nmessage D { int32 d = 1; }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", repo, files[i][0]);
+        if (th_write_file(path, files[i][1]) != 0) {
+            return NULL;
+        }
+    }
+    for (int i = 0; i < 60; i++) {
+        snprintf(path, sizeof(path), "%s/fill/f%02d.go", repo, i);
+        char body[64];
+        snprintf(body, sizeof(body), "package fill\n\nfunc F%02d() {}\n", i);
+        if (th_write_file(path, body) != 0) {
+            return NULL;
+        }
+    }
+    return repo;
+}
+
+#define IP_FALLBACK_ROUTE(parallel)                                                                \
+    do {                                                                                           \
+        char *made = th_mktempdir("cbm_ip_fall");                                                  \
+        ASSERT_NOT_NULL(made);                                                                     \
+        char tmp[256];                                                                             \
+        snprintf(tmp, sizeof(tmp), "%s", made);                                                    \
+        const char *repo = ip_fallback_repo(tmp, (parallel));                                      \
+        ASSERT_NOT_NULL(repo);                                                                     \
+        char db[512];                                                                              \
+        snprintf(db, sizeof(db), "%s/fall.db", tmp);                                               \
+        ip_route_env((parallel), false);                                                           \
+        cbm_pipeline_worker_count_test_reset();                                                    \
+        int rc = ip_run(repo, db);                                                                 \
+        int workers = cbm_pipeline_worker_count_test_last();                                       \
+        ip_route_env((parallel), true);                                                            \
+        ASSERT_EQ(rc, 0);                                                                          \
+        ASSERT_TRUE((parallel) ? workers > 1 : workers == 1);                                      \
+        /* per shape, in the order above, its edges to the dotted name's file */                   \
+        char got[64];                                                                              \
+        snprintf(got, sizeof(got), "%d %d %d %d %d",                                               \
+                 ip_targets(db, "Makefile", "conf/app.env", NULL),                                 \
+                 ip_targets(db, "Makefile", "a/b.mk", NULL),                                       \
+                 ip_targets(db, "sub/Makefile", "a/b.mk", NULL),                                   \
+                 ip_targets(db, "x/imp.proto", "p/q.proto", NULL),                                 \
+                 ip_targets(db, "imp.proto", "c/d.proto", NULL));                                  \
+        ASSERT_STR_EQ(got, "0 0 0 0 0");                                                           \
+        th_cleanup(tmp);                                                                           \
+    } while (0)
+
+TEST(include_path_fallback_takes_only_the_named_file_sequential) {
+    IP_FALLBACK_ROUTE(false);
+    PASS();
+}
+
+TEST(include_path_fallback_takes_only_the_named_file_parallel) {
+    IP_FALLBACK_ROUTE(true);
+    PASS();
+}
+
 SUITE(include_path) {
+    RUN_TEST(include_path_fallback_takes_only_the_named_file_sequential);
+    RUN_TEST(include_path_fallback_takes_only_the_named_file_parallel);
     RUN_TEST(include_path_swapped_spelling_names_no_file);
     RUN_TEST(include_path_target_is_that_file);
     RUN_TEST(include_path_swapped_spelling_sequential);
