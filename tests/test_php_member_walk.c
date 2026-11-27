@@ -1,5 +1,6 @@
 /*
- * test_php_member_walk.c — PHP on the shared member lookup (lsp/member_walk.h).
+ * test_php_member_walk.c — PHP on the shared member lookup (lsp/member_walk.h),
+ * and the PHP imports the engine reads (slice B4, at the end).
  *
  * Each fixture is indexed through the real pipeline twice: as it is (fewer than
  * 50 files: the sequential resolver) and padded past 50 files (the parallel
@@ -966,6 +967,90 @@ TEST(phpmw_relative_trait_name_through_the_pipeline) {
     PASS();
 }
 
+/* ── The PHP imports the engine reads (slice B4) ────────────────────── */
+
+/* The caller's file of the B4 fixtures: one class import, then the uses
+ * `extra` adds (a global function or constant, which the project does not
+ * declare), then a promoted property typed by the imported interface. */
+#define PMW_USEFN_CALLER(extra)                                                         \
+    "<?php\nnamespace App\\Controllers;\n\nuse App\\Dbal\\DatabaseInterface;\n\n" extra \
+    "\nfinal class ViewController\n{\n"                                                 \
+    "    public function __construct(private DatabaseInterface $dbi) {}\n"              \
+    "    public function run(string $u): void { $this->dbi->getTable($u); }\n}\n"
+#define PMW_USEFN_FILES(extra)                                                            \
+    {"composer.json", "{\"autoload\": {\"psr-4\": {\"App\\\\\": \"src/\"}}}\n"},          \
+    {"src/Dbal/DatabaseInterface.php",                                                    \
+     "<?php\nnamespace App\\Dbal;\n"                                                      \
+     "interface DatabaseInterface { public function getTable(string $t): void; }\n"},     \
+    {"src/Other/Wrong.php",                                                               \
+     "<?php\nnamespace App\\Other;\n"                                                     \
+     "class Wrong { public function getTable(string $t): void {} }\n"},                   \
+    {"src/Controllers/ViewController.php", PMW_USEFN_CALLER(extra)}
+
+/* `use function` beside a class import (phpmyadmin's controllers): the
+ * function is PHP's own, so the file's imports are complete and the class
+ * import reaches the engine as the class. Before, one unresolved global
+ * function use made the whole file's imports unknown, the class import reached
+ * the engine as a File QN, and the typed call was lost. Asserted: the call's
+ * edge goes to the interface's declaration DatabaseInterface::getTable, drawn
+ * by the engine (php, with an implementing class added to the program: the
+ * property's type is App\Dbal\DatabaseInterface and the implementation's
+ * getTable runs). Partner: no edge to the other class's same-named method. */
+TEST(phpmw_use_function_keeps_class_imports) {
+    static const PmwFile f[] = {PMW_USEFN_FILES("use function is_array;\nuse function sprintf;\n")};
+    static const PmwExpect want[] = {
+        {"ViewController.run", "DatabaseInterface.getTable", true, true},
+        {"ViewController.run", "Wrong.getTable", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 4, want, 2), 0);
+    PASS();
+}
+
+/* The same with `use const` (PHP's own constant). php: as above. */
+TEST(phpmw_use_const_keeps_class_imports) {
+    static const PmwFile f[] = {PMW_USEFN_FILES("use const PHP_EOL;\n")};
+    static const PmwExpect want[] = {
+        {"ViewController.run", "DatabaseInterface.getTable", true, true},
+        {"ViewController.run", "Wrong.getTable", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 4, want, 2), 0);
+    PASS();
+}
+
+/* An aliased global function use (`use function sprintf as fmt;`, php: valid,
+ * fmt is the builtin) gets no absence proof, as an aliased class use gets
+ * none: the file's imports stay unknown and the typed call is not drawn by the
+ * engine (the answer of the base). Binds the alias exception: with it removed
+ * the file is complete and the engine draws the call. */
+TEST(phpmw_aliased_global_use_function_keeps_the_file_unknown) {
+    static const PmwFile f[] = {PMW_USEFN_FILES("use function sprintf as fmt;\n")};
+    static const PmwExpect want[] = {
+        {"ViewController.run", "DatabaseInterface.getTable", false, true},
+        {"ViewController.run", "Wrong.getTable", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 4, want, 2), 0);
+    PASS();
+}
+
+/* A `use const X;` beside the project's own `const X = 1;`: the graph has no
+ * node for a PHP constant, so nothing it holds can be what the use names, and
+ * the file's imports are complete: the call's edge goes to the interface's
+ * declaration DatabaseInterface::getTable, drawn by the engine. Pins that
+ * behaviour (it passes with the first commit alone); to revisit when constants
+ * get nodes. php: X is the project's constant. */
+TEST(phpmw_use_const_beside_project_constant) {
+    static const PmwFile f[] = {
+        PMW_USEFN_FILES("use const X;\n"),
+        {"src/consts.php", "<?php\nconst X = 1;\n"},
+    };
+    static const PmwExpect want[] = {
+        {"ViewController.run", "DatabaseInterface.getTable", true, true},
+        {"ViewController.run", "Wrong.getTable", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 5, want, 2), 0);
+    PASS();
+}
+
 SUITE(php_member_walk) {
     RUN_TEST(phpmw_extractor_records_kinds_traits_rules);
     RUN_TEST(phpmw_extractor_qualifies_trait_names);
@@ -986,4 +1071,8 @@ SUITE(php_member_walk) {
     RUN_TEST(phpmw_trait_alias_answers);
     RUN_TEST(phpmw_cross_file_trait_member);
     RUN_TEST(phpmw_trait_abstract_method_is_a_requirement);
+    RUN_TEST(phpmw_use_function_keeps_class_imports);
+    RUN_TEST(phpmw_use_const_keeps_class_imports);
+    RUN_TEST(phpmw_aliased_global_use_function_keeps_the_file_unknown);
+    RUN_TEST(phpmw_use_const_beside_project_constant);
 }
