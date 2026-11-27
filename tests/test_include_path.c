@@ -418,7 +418,7 @@ TEST(include_path_swapped_spelling_names_no_file) {
 /* Both spellings indexed: they share one node name, so the graph holds one
  * node for the two, with the smaller path (a.b.mk: '.' sorts before '/').
  * `include a/b.mk` names a/b.mk: its target is a node of a/b.mk or none, never
- * the node of a.b.mk. */
+ * the node of a.b.mk; `include a.b.mk` ends at a.b.mk's node. */
 TEST(include_path_target_is_that_file) {
     static const char *const files[] = {"Makefile", "a.b.mk", "a/b.mk", NULL};
     cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp/p");
@@ -441,6 +441,10 @@ TEST(include_path_target_is_that_file) {
     imp.module_path = "a/b.mk";
     ASSERT_TRUE(cbm_include_path_decides(&ctx, "Makefile", CBM_LANG_MAKEFILE, &imp, &out));
     ASSERT_TRUE(out == NULL || (out->file_path && strcmp(out->file_path, "a/b.mk") == 0));
+    imp.module_path = "a.b.mk";
+    ASSERT_TRUE(cbm_include_path_decides(&ctx, "Makefile", CBM_LANG_MAKEFILE, &imp, &out));
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out->file_path, "a.b.mk");
     cbm_include_universe_free(ctx.include_universe);
     cbm_gbuf_free(gb);
     PASS();
@@ -525,12 +529,18 @@ static int ip_run(const char *repo, const char *db) {
     return rc;
 }
 
-/* The kept index, indexed again (incremental), holds the IMPORTS edges a fresh
- * index of the tree holds. */
-static bool ip_kept_equals_fresh(const char *tmp, const char *repo, const char *kept, int step) {
+/* The kept index, indexed again (incremental, *route: the route it took),
+ * holds the IMPORTS edges a fresh index of the tree holds. */
+static bool ip_kept_equals_fresh(const char *tmp, const char *repo, const char *kept, int step,
+                                 cbm_incremental_route_t *route) {
     char fresh[512];
     snprintf(fresh, sizeof(fresh), "%s/fresh-%d.db", tmp, step);
-    if (ip_run(repo, kept) != 0 || ip_run(repo, fresh) != 0) {
+    *route = CBM_INCREMENTAL_ROUTE_NONE;
+    if (ip_run(repo, kept) != 0) {
+        return false;
+    }
+    *route = cbm_pipeline_incremental_test_last_route();
+    if (ip_run(repo, fresh) != 0) {
         return false;
     }
     char *a = ip_listing(kept);
@@ -547,10 +557,17 @@ static bool ip_kept_equals_fresh(const char *tmp, const char *repo, const char *
 }
 
 /* The swapped spellings on a real index, on the sequential and the parallel
- * route (60 more files than the parallel route's floor), then incrementally:
- * another file edited (the false edge stays gone); the really named file
- * created and the other spelling moved away (the edge moves to it); then
- * back (no edge). Red on main, whose
+ * route (60 more files than the parallel route's floor), then incrementally,
+ * the route each step takes asserted:
+ * 1. another file edited: the delta route (a closure repair); the false edges
+ *    stay gone;
+ * 2. the really named files created and the other spelling moved away: the
+ *    move of a file is indexed in full (the listing key changes); the edges
+ *    move to them;
+ * 3. back again: in full; no edge;
+ * 4. the importers edited: the delta route re-reads them; still no false
+ *    edge, the true ones kept.
+ * Red on main, whose
  * name lookup drew Makefile -> a/b.mk (File) and, through its own strategies
  * after the rule's guess, top.proto -> pa/b.proto (Module). */
 static const char *ip_swapped_repo(const char *tmp, bool parallel) {
@@ -641,8 +658,9 @@ static void ip_route_env(bool parallel, bool restore) {
         /* 1: another file edited */                                                               \
         char path[600];                                                                            \
         snprintf(path, sizeof(path), "%s/fill/f00.go", repo);                                      \
+        cbm_incremental_route_t r1, r2, r3, r4;                                                    \
         bool same1 = th_write_file(path, "package fill\n\nfunc F00() { F01() }\n") == 0 &&         \
-                     ip_kept_equals_fresh(tmp, repo, kept, 1);                                     \
+                     ip_kept_equals_fresh(tmp, repo, kept, 1, &r1);                                \
         int s1 = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                    \
                  ip_targets(kept, "top.proto", "pa/b.proto", NULL);                                \
         /* 2: the really named files created, the other spelling moved away (the two     \
@@ -656,7 +674,7 @@ static void ip_route_env(bool parallel, bool restore) {
         w2 = w2 && th_write_file(path, "AB = 1\n") == 0;                                           \
         snprintf(path, sizeof(path), "%s/pa.b.proto", repo);                                       \
         w2 = w2 && th_write_file(path, "syntax = \"proto3\";\nmessage AB { int32 a = 1; }\n") == 0; \
-        bool same2 = w2 && ip_kept_equals_fresh(tmp, repo, kept, 2);                               \
+        bool same2 = w2 && ip_kept_equals_fresh(tmp, repo, kept, 2, &r2);                          \
         int s2_new = ip_targets(kept, "Makefile", "a.b.mk", NULL) +                                \
                      ip_targets(kept, "top.proto", "pa.b.proto", NULL);                            \
         int s2_old = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                \
@@ -670,11 +688,24 @@ static void ip_route_env(bool parallel, bool restore) {
         d3 = d3 && th_write_file(path, "B = 1\n") == 0;                                            \
         snprintf(path, sizeof(path), "%s/pa/b.proto", repo);                                       \
         d3 = d3 && th_write_file(path, "syntax = \"proto3\";\nmessage B { int32 b = 1; }\n") == 0; \
-        bool same3 = d3 && ip_kept_equals_fresh(tmp, repo, kept, 3);                               \
+        bool same3 = d3 && ip_kept_equals_fresh(tmp, repo, kept, 3, &r3);                          \
         int s3 = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                                    \
                  ip_targets(kept, "top.proto", "pa/b.proto", NULL) +                               \
                  ip_targets(kept, "Makefile", "a.b.mk", NULL) +                                    \
                  ip_targets(kept, "top.proto", "pa.b.proto", NULL);                                \
+        /* 4: the importers edited: the delta route re-reads them */                              \
+        snprintf(path, sizeof(path), "%s/Makefile", repo);                                         \
+        bool e4 = th_write_file(path, "include a.b.mk\n-include c.d.mk\ninclude r/s.mk\n"          \
+                                      "include x/y.mk\n\n# edited\nall:\n") == 0;                  \
+        snprintf(path, sizeof(path), "%s/top.proto", repo);                                        \
+        e4 = e4 && th_write_file(path, "syntax = \"proto3\";\nimport \"pa.b.proto\";\n"           \
+                                       "import \"pr/s.proto\";\nimport \"px/y.proto\";\n"         \
+                                       "message T { int32 t = 2; }\n") == 0;                       \
+        bool same4 = e4 && ip_kept_equals_fresh(tmp, repo, kept, 4, &r4);                          \
+        int s4_false = ip_targets(kept, "Makefile", "a/b.mk", NULL) +                              \
+                       ip_targets(kept, "top.proto", "pa/b.proto", NULL);                          \
+        int s4_true = ip_targets(kept, "Makefile", "x/y.mk", "Module") +                           \
+                      ip_targets(kept, "top.proto", "px/y.proto", "Module");                       \
         ip_route_env((parallel), true);                                                            \
         ASSERT_TRUE(same1);                                                                        \
         ASSERT_EQ(s1, 0);                                                                          \
@@ -683,6 +714,13 @@ static void ip_route_env(bool parallel, bool restore) {
         ASSERT_EQ(s2_old, 0);                                                                      \
         ASSERT_TRUE(same3);                                                                        \
         ASSERT_EQ(s3, 0);                                                                          \
+        ASSERT_EQ(r1, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);                                       \
+        ASSERT_EQ(r2, CBM_INCREMENTAL_ROUTE_FORCED_FULL);                                          \
+        ASSERT_EQ(r3, CBM_INCREMENTAL_ROUTE_FORCED_FULL);                                          \
+        ASSERT_TRUE(same4);                                                                        \
+        ASSERT_EQ(r4, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);                                       \
+        ASSERT_EQ(s4_false, 0);                                                                    \
+        ASSERT_EQ(s4_true, 2);                                                                     \
         th_cleanup(tmp);                                                                           \
     } while (0)
 
