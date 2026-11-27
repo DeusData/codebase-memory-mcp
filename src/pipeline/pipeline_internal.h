@@ -1858,8 +1858,12 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      prerequisites name (pass_docker.c, pass_ci.c, pass_terraform.c,
  *      pass_k8s.c, pass_shell.c). An index built before has none of these
  *      edges for its unchanged config files, so it rebuilds once on upgrade.
+ *  15: a Scala object with a same-named class, trait or enum beside it is
+ *      <Owner>#object and its members <Owner>#object.<m> (extract_defs.c,
+ *      helpers.c cbm_scala_object_qn). An index built before holds one merged
+ *      node for the type and its companion, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 14 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 15 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
