@@ -5159,6 +5159,301 @@ TEST(incremental_deleted_spawner_drops_its_process) {
     PASS();
 }
 
+/* A Dockerfile below the root reads a COPY source under its own directory or
+ * under the repository root, the one that holds the file; a source both hold
+ * is no REFERENCES_FILE edge. Deleting one file of such a pair leaves a single
+ * candidate, and the edge to it comes from a Dockerfile that did not change:
+ * the planner declines to the full route, and the graph is the fresh index's.
+ * Both directions: the root's file of a pair goes (both.sh), and the
+ * Dockerfile directory's file of a pair goes (svc/twin.sh). Deleting a file
+ * that has no partner stays a repair. */
+TEST(incremental_docker_context_pair_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkpair_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY both.sh /both.sh\n"
+                                           "COPY entry.sh /entry.sh\n"
+                                           "COPY twin.sh /twin.sh\n");
+    write_temp_file(tmp, "svc/entry.sh", "#!/bin/sh\necho entry\n");
+    write_temp_file(tmp, "svc/both.sh", "#!/bin/sh\necho svc\n");
+    write_temp_file(tmp, "both.sh", "#!/bin/sh\necho root\n");
+    write_temp_file(tmp, "svc/twin.sh", "#!/bin/sh\necho svc twin\n");
+    write_temp_file(tmp, "twin.sh", "#!/bin/sh\necho root twin\n");
+    write_temp_file(tmp, "other.sh", "#!/bin/sh\necho other\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkpair.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_svc_both[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='svc/both.sh'";
+    static const char to_root_twin[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='twin.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/other.sh", tmp);
+    (void)remove(path);
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int refs_other = k8s_inc_count(db_path, refs);
+
+    snprintf(path, sizeof(path), "%s/both.sh", tmp);
+    (void)remove(path);
+    int rc_pair = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t pair_route = cbm_pipeline_incremental_test_last_route();
+    int refs_pair = k8s_inc_count(db_path, refs);
+    int svc_both = k8s_inc_count(db_path, to_svc_both);
+
+    snprintf(path, sizeof(path), "%s/svc/twin.sh", tmp);
+    (void)remove(path);
+    int rc_twin = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t twin_route = cbm_pipeline_incremental_test_last_route();
+    int refs_twin = k8s_inc_count(db_path, refs);
+    int root_twin = k8s_inc_count(db_path, to_root_twin);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1); /* entry.sh; both.sh and twin.sh are files under both contexts */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(refs_other, 1);
+    ASSERT_EQ(rc_pair, 0);
+    ASSERT_EQ(refs_pair, 2); /* svc/both.sh is the only candidate now */
+    ASSERT_EQ(svc_both, 1);
+    ASSERT_EQ(pair_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(rc_twin, 0);
+    ASSERT_EQ(refs_twin, 3); /* the root's twin.sh is the only candidate now */
+    ASSERT_EQ(root_twin, 1);
+    ASSERT_EQ(twin_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A source that is a file under one context and a directory under the other
+ * is no edge either: with the other context the instruction copies the
+ * directory. When the directory's last file goes, the file is the single
+ * candidate, and the edge comes from a Dockerfile that did not change: the
+ * planner declines to the full route. Both directions: the directory under
+ * the Dockerfile's own directory (svc/conf.sh/), and the directory under
+ * the root (tool.sh/). Deleting a file with no such partner stays a repair.
+ *
+ * The deletion of a file an image copies takes the full route already (the
+ * env join's rule), and an image copies a directory's files in the context
+ * its sources vote for. So each Dockerfile here has two more sources that
+ * put its image in the OTHER context than the directory's: svc's image is
+ * built from the root (a.sh, b.sh), app's from its own directory (c.sh,
+ * d.sh), and neither holds the file that goes. Shell scripts, so no rule
+ * for YAML sends the deletions to the full route either. */
+TEST(incremental_docker_context_directory_deleted_takes_the_full_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkdir_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "svc/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY conf.sh /etc/conf.sh\n"
+                                           "COPY a.sh /a.sh\n"
+                                           "COPY b.sh /b.sh\n");
+    write_temp_file(tmp, "conf.sh", "#!/bin/sh\necho root\n");
+    write_temp_file(tmp, "a.sh", "#!/bin/sh\necho a\n");
+    write_temp_file(tmp, "b.sh", "#!/bin/sh\necho b\n");
+    write_temp_file(tmp, "svc/conf.sh/part.sh", "#!/bin/sh\necho part\n");
+    write_temp_file(tmp, "app/Dockerfile", "FROM alpine:3.20\n"
+                                           "COPY tool.sh /etc/tool.sh\n"
+                                           "COPY c.sh /c.sh\n"
+                                           "COPY d.sh /d.sh\n");
+    write_temp_file(tmp, "app/tool.sh", "#!/bin/sh\necho app\n");
+    write_temp_file(tmp, "app/c.sh", "#!/bin/sh\necho c\n");
+    write_temp_file(tmp, "app/d.sh", "#!/bin/sh\necho d\n");
+    write_temp_file(tmp, "tool.sh/part.sh", "#!/bin/sh\necho part\n");
+    write_temp_file(tmp, "other.sh", "#!/bin/sh\necho other\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkdir.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_root_conf[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='conf.sh'";
+    static const char to_app_tool[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='app/tool.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+    int conf_full = k8s_inc_count(db_path, to_root_conf);
+    int tool_full = k8s_inc_count(db_path, to_app_tool);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/other.sh", tmp);
+    (void)remove(path);
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int refs_other = k8s_inc_count(db_path, refs);
+
+    snprintf(path, sizeof(path), "%s/svc/conf.sh/part.sh", tmp);
+    (void)remove(path);
+    int rc_svc = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t svc_route = cbm_pipeline_incremental_test_last_route();
+    int refs_svc = k8s_inc_count(db_path, refs);
+    int conf_svc = k8s_inc_count(db_path, to_root_conf);
+
+    snprintf(path, sizeof(path), "%s/tool.sh/part.sh", tmp);
+    (void)remove(path);
+    int rc_root = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t root_route = cbm_pipeline_incremental_test_last_route();
+    int refs_root = k8s_inc_count(db_path, refs);
+    int tool_root = k8s_inc_count(db_path, to_app_tool);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 4); /* a.sh, b.sh, app/c.sh, app/d.sh */
+    ASSERT_EQ(conf_full, 0); /* a directory under the Dockerfile's own directory */
+    ASSERT_EQ(tool_full, 0); /* a directory under the root */
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(refs_other, 4);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_svc, 0);
+    ASSERT_EQ(refs_svc, 5); /* the root's conf.sh is the only candidate now */
+    ASSERT_EQ(conf_svc, 1);
+    ASSERT_EQ(svc_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(rc_root, 0);
+    ASSERT_EQ(refs_root, 6); /* app/tool.sh is the only candidate now */
+    ASSERT_EQ(tool_root, 1);
+    ASSERT_EQ(root_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A COPY source's REFERENCES_FILE edge belongs to the Dockerfile. Editing the
+ * target keeps it: the Dockerfile did not change, and the edge is re-linked to
+ * the target's new node. Editing the Dockerfile redraws its edges from the new
+ * text, each once: a source it gains is drawn, a source it loses is gone. */
+TEST(incremental_docker_copy_reference_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dkedit_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY entry.sh /entry.sh\n");
+    write_temp_file(tmp, "entry.sh", "#!/bin/sh\necho entry\n");
+    write_temp_file(tmp, "tool.sh", "#!/bin/sh\necho tool\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/dkedit.db", tmp);
+    static const char refs[] = "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+                               "json_extract(properties,'$.via')='copy'";
+    static const char to_entry[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='entry.sh'";
+    static const char to_tool[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+        "e.type='REFERENCES_FILE' AND t.file_path='tool.sh'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+
+    write_temp_file(tmp, "entry.sh", "#!/bin/sh\necho entry\necho edited\n");
+    int rc_target = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t target_route = cbm_pipeline_incremental_test_last_route();
+    int refs_target = k8s_inc_count(db_path, refs);
+    int entry_target = k8s_inc_count(db_path, to_entry);
+
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY entry.sh /entry.sh\n"
+                                       "COPY tool.sh /tool.sh\n");
+    int rc_gain = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t gain_route = cbm_pipeline_incremental_test_last_route();
+    int refs_gain = k8s_inc_count(db_path, refs);
+    int entry_gain = k8s_inc_count(db_path, to_entry);
+    int tool_gain = k8s_inc_count(db_path, to_tool);
+
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\n"
+                                       "COPY tool.sh /tool.sh\n");
+    int rc_lose = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t lose_route = cbm_pipeline_incremental_test_last_route();
+    int refs_lose = k8s_inc_count(db_path, refs);
+    int entry_lose = k8s_inc_count(db_path, to_entry);
+    int tool_lose = k8s_inc_count(db_path, to_tool);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 1);
+    ASSERT_EQ(rc_target, 0);
+    ASSERT_EQ(refs_target, 1);
+    ASSERT_EQ(entry_target, 1);
+    ASSERT_EQ(target_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gain, 0);
+    ASSERT_EQ(refs_gain, 2);
+    ASSERT_EQ(entry_gain, 1);
+    ASSERT_EQ(tool_gain, 1);
+    ASSERT_EQ(gain_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_lose, 0);
+    ASSERT_EQ(refs_lose, 1);
+    ASSERT_EQ(entry_lose, 0);
+    ASSERT_EQ(tool_lose, 1);
+    ASSERT_EQ(lose_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    PASS();
+}
+
+/* One referring file `ref_path` (text `ref_text`) names one target file that
+ * does not exist yet. With the referring file untouched: the target appears
+ * (the edge is drawn), is edited (the edge stays), is deleted (the edge is
+ * gone). counts[0..4): the REFERENCES_FILE edges {via: `via`} after the first
+ * index and after each of the three steps. Returns 0, or -1 when a run fails. */
+static int incremental_file_reference_steps(const char *ref_path, const char *ref_text,
+                                            const char *other_path, const char *other_text,
+                                            const char *target, const char *via, int counts[4]) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fileref_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return -1;
+    }
+    write_temp_file(tmp, ref_path, ref_text);
+    if (other_path) {
+        write_temp_file(tmp, other_path, other_text);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fileref.db", tmp);
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id=e.target_id WHERE "
+             "e.type='REFERENCES_FILE' AND json_extract(e.properties,'$.via')='%s' AND "
+             "t.file_path='%s'",
+             via, target);
+    int rc = k8s_inc_index(tmp, db_path);
+    counts[0] = k8s_inc_count(db_path, sql);
+    write_temp_file(tmp, target, "first = 1\n");
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[1] = k8s_inc_count(db_path, sql);
+    write_temp_file(tmp, target, "first = 1\nsecond = 2\n");
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[2] = k8s_inc_count(db_path, sql);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", tmp, target);
+    (void)remove(path);
+    rc |= k8s_inc_index(tmp, db_path);
+    counts[3] = k8s_inc_count(db_path, sql);
+    th_rmtree(tmp);
+    return rc == 0 ? 0 : -1;
+}
+
+/* A Dockerfile's COPY source that appears after the Dockerfile was indexed. */
+TEST(incremental_docker_copy_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("Dockerfile",
+                                              "FROM alpine:3.20\n"
+                                              "COPY late.properties /late.properties\n",
+                                              NULL, NULL, "late.properties", "copy", counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -37958,6 +38253,10 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_ansible_under_deploy_sequential_pass);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_caller_drops_its_route);
+    RUN_TEST(incremental_docker_context_pair_deleted_takes_the_full_route);
+    RUN_TEST(incremental_docker_context_directory_deleted_takes_the_full_route);
+    RUN_TEST(incremental_docker_copy_reference_follows_edits);
+    RUN_TEST(incremental_docker_copy_reference_follows_its_file);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

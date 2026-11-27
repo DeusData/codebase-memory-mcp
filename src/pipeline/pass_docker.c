@@ -38,6 +38,15 @@
  * global EnvVar a program's readers share is not joined: the same name is
  * read by other programs (measured: 23 % of such joins in scope). Values are
  * never read into the graph.
+ *
+ * PHASE 4 P4.6: the repository files a Dockerfile copies. Each context source
+ * of a COPY / ADD written as a plain path -- no --from, no URL, no glob, no
+ * variable -- that is an indexed file under exactly one of the two contexts a
+ * build of this Dockerfile can have (its directory, the repository root) is a
+ * file the Dockerfile REFERENCES_FILE {via: copy | add, line}: File to File,
+ * once per file, at the first instruction naming it. Which context a build
+ * reads is in the build command, not in the Dockerfile, so a source that is a
+ * file under both is no edge; a directory is no edge (it names no one file).
  * Run at the end of the K8s pass.
  */
 #include "foundation/constants.h"
@@ -65,12 +74,15 @@
 enum { DK_MAX_STAGES = 64, DK_MAX_WORDS = 256, DK_MAX_DEPTH = 8 };
 
 typedef struct dk_copy {
-    const char *from;  /* --from= value; NULL: none, or unknown */
-    bool has_from;     /* --from given */
-    const char **srcs; /* NULL entries: unknown */
+    const char *from;   /* --from= value; NULL: none, or unknown */
+    bool has_from;      /* --from given */
+    const char **srcs;  /* NULL entries: unknown */
+    const uint8_t *var; /* per source: written with a variable (`$`) */
     int nsrc;
     const char *dst; /* as written; NULL: unknown */
     const char *workdir;
+    int line;
+    bool add;             /* ADD, not COPY */
     struct dk_copy *next; /* the stage's previous COPY */
 } dk_copy_t;
 
@@ -920,8 +932,9 @@ static char *dk_logical_line(dk_t *d, size_t at) {
     return out;
 }
 
-/* A COPY / ADD in JSON form: its strings, expanded. */
-static int dk_copy_json(dk_t *d, const char *p, const char **out, int max) {
+/* A COPY / ADD in JSON form: its strings, expanded; var[i]: string i was
+ * written with a variable. */
+static int dk_copy_json(dk_t *d, const char *p, const char **out, uint8_t *var, int max) {
     yyjson_doc *doc = yyjson_read(p, strlen(p), YYJSON_READ_STOP_WHEN_DONE);
     yyjson_val *arr = doc ? yyjson_doc_get_root(doc) : NULL;
     int n = 0;
@@ -930,6 +943,7 @@ static int dk_copy_json(dk_t *d, const char *p, const char **out, int max) {
     if (yyjson_is_arr(arr)) {
         for (yyjson_arr_iter_init(arr, &it); n < max && (v = yyjson_arr_iter_next(&it));) {
             const char *s = yyjson_get_str(v);
+            var[n] = s && strchr(s, '$') != NULL;
             out[n++] = s ? dk_expand(d, d->local, cbm_arena_strdup(d->a, s), NULL) : NULL;
         }
     }
@@ -947,13 +961,15 @@ static int dk_copy_json(dk_t *d, const char *p, const char **out, int max) {
 static void dk_copy(dk_t *d, TSNode ins) {
     static const char FROM[] = "--from=";
     const char *words[DK_MAX_WORDS];
+    uint8_t var[DK_MAX_WORDS];
     int nw = 0;
     dk_copy_t *c = cbm_arena_alloc(d->a, sizeof(*c));
     char *p = dk_logical_line(d, ts_node_start_byte(ins));
     if (!c || !p) {
         return;
     }
-    *c = (dk_copy_t){.workdir = d->workdir};
+    *c = (dk_copy_t){
+        .workdir = d->workdir, .line = dk_line(ins), .add = dk_type(ins, "add_instruction")};
     p += strcspn(p, " \t"); /* the keyword */
     for (;;) {
         p += strspn(p, " \t");
@@ -974,10 +990,11 @@ static void dk_copy(dk_t *d, TSNode ins) {
         }
         p += l;
     }
-    bool json = *p == '[' && (nw = dk_copy_json(d, p, words, DK_MAX_WORDS)) > 0;
+    bool json = *p == '[' && (nw = dk_copy_json(d, p, words, var, DK_MAX_WORDS)) > 0;
     while (!json && *p && nw < DK_MAX_WORDS) {
         size_t l = strcspn(p, " \t");
         const char *w = cbm_arena_strndup(d->a, p, l);
+        var[nw] = w && strchr(w, '$') != NULL;
         words[nw++] = w && strncmp(w, "<<", PAIR_LEN) != 0 ? dk_expand(d, d->local, w, NULL) : NULL;
         p += l;
         p += strspn(p, " \t");
@@ -986,10 +1003,13 @@ static void dk_copy(dk_t *d, TSNode ins) {
         return;
     }
     c->srcs = cbm_arena_alloc(d->a, (size_t)(nw - SKIP_ONE) * sizeof(*c->srcs));
-    if (!c->srcs) {
+    uint8_t *cvar = cbm_arena_alloc(d->a, (size_t)(nw - SKIP_ONE));
+    if (!c->srcs || !cvar) {
         return;
     }
     memcpy((void *)c->srcs, words, (size_t)(nw - SKIP_ONE) * sizeof(*c->srcs));
+    memcpy(cvar, var, (size_t)(nw - SKIP_ONE));
+    c->var = cvar;
     c->nsrc = nw - SKIP_ONE;
     c->dst = words[nw - SKIP_ONE];
     c->next = d->st[d->stage].copies;
@@ -1735,6 +1755,104 @@ static void dk_image_set(dk_t *d) {
     }
 }
 
+typedef struct {
+    int line;
+    bool add;
+    const cbm_gbuf_node_t *file;
+} dk_fileref_t;
+
+static int dk_fileref_cmp(const void *x, const void *y) {
+    const dk_fileref_t *a = x;
+    const dk_fileref_t *b = y;
+    if (a->line != b->line) {
+        return a->line < b->line ? -1 : SKIP_ONE;
+    }
+    return strcmp(a->file->file_path, b->file->file_path);
+}
+
+/* True when context source `src`, the file `hit` under one context candidate,
+ * is a directory under the other: the build command decides which of the two
+ * the instruction copies. */
+static bool dk_dir_under_other_context(dk_t *d, const char *src, const char *hit) {
+    const char *ctxs[PAIR_LEN] = {d->dir, ""};
+    int nctx = d->dir[0] ? PAIR_LEN : SKIP_ONE;
+    while (*src == '/') {
+        src++;
+    }
+    for (int i = 0; d->ix->dirs && i < nctx; i++) {
+        const char *p = dk_norm(d, dk_join(d, ctxs[i], src));
+        if (p && strcmp(p, hit) != 0 && cbm_ht_get(d->ix->dirs, p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* P4.6: REFERENCES_FILE from the Dockerfile's File to each repository file a
+ * COPY / ADD of any stage names as a plain context source: no --from, no URL,
+ * no glob, no variable, and a file under exactly one of the two contexts
+ * (dk_repo) that is no directory under the other. Once per file, at the
+ * first instruction naming it. */
+static void dk_copy_refs(dk_t *d) {
+    const cbm_gbuf_node_t *self = d->ix->files ? cbm_ht_get(d->ix->files, d->file) : NULL;
+    if (!self || d->stage < 0) {
+        return;
+    }
+    int cap = 0;
+    for (int s = 0; s <= d->stage && s < DK_MAX_STAGES; s++) {
+        for (const dk_copy_t *c = d->st[s].copies; c; c = c->next) {
+            cap += c->has_from ? 0 : c->nsrc;
+        }
+    }
+    dk_fileref_t *refs = cap ? cbm_arena_alloc(d->a, (size_t)cap * sizeof(*refs)) : NULL;
+    int n = 0;
+    for (int s = 0; refs && s <= d->stage && s < DK_MAX_STAGES; s++) {
+        for (const dk_copy_t *c = d->st[s].copies; c; c = c->next) {
+            for (int k = 0; !c->has_from && k < c->nsrc; k++) {
+                const char *src = c->srcs[k];
+                if (!src || c->var[k] || strstr(src, "://") || dk_glob(src)) {
+                    continue;
+                }
+                /* Docker refuses a source that climbs out of its context,
+                 * whichever context that is. */
+                const char *rel = dk_norm(d, src + strspn(src, "/"));
+                if (!rel || (rel[0] == '.' && rel[SKIP_ONE] == '.' &&
+                             (rel[PAIR_LEN] == '/' || rel[PAIR_LEN] == '\0'))) {
+                    continue;
+                }
+                const char *p = dk_repo(d, src, NULL, DK_WANT_FILE);
+                if (p && dk_dir_under_other_context(d, src, p)) {
+                    continue;
+                }
+                const cbm_gbuf_node_t *file = p ? cbm_ht_get(d->ix->files, p) : NULL;
+                if (file && file != self) {
+                    refs[n++] = (dk_fileref_t){c->line, c->add, file};
+                }
+            }
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    qsort(refs, (size_t)n, sizeof(*refs), dk_fileref_cmp);
+    CBMHashTable *seen = cbm_ht_create(0);
+    for (int i = 0; seen && i < n; i++) {
+        const char *path = refs[i].file->file_path;
+        if (cbm_ht_get(seen, path)) {
+            continue;
+        }
+        cbm_ht_set(seen, path, (void *)path);
+        const char *props = cbm_arena_sprintf(d->a, "{\"via\":\"%s\",\"line\":%d}",
+                                              refs[i].add ? "add" : "copy", refs[i].line);
+        if (props) {
+            cbm_gbuf_insert_edge(d->ctx->gbuf, self->id, refs[i].file->id, "REFERENCES_FILE",
+                                 props);
+            d->edges++;
+        }
+    }
+    cbm_ht_free(seen);
+}
+
 static void dk_file(dk_t *d, TSNode root) {
     for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
         TSNode ins = ts_node_named_child(root, i);
@@ -1761,6 +1879,7 @@ static void dk_file(dk_t *d, TSNode root) {
     dk_spawn(d);
     dk_envs(d);
     dk_image_set(d);
+    dk_copy_refs(d);
 }
 
 /* A build's view of the Dockerfile: only what decides its image references
