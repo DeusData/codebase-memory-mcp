@@ -1980,6 +1980,159 @@ TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference) {
     PASS();
 }
 
+/* Every REFERENCES_FILE edge a compose service draws, as
+ * "<service> -> <target file> (via:line)", sorted, one per line. */
+static char *gpf_compose_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.name || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND s.label='Resource' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+#define GPF_ASSERT_COMPOSE_REFS(files, n, want)                                                    \
+    do {                                                                                           \
+        char *got_ = gpf_compose_refs(files, n);                                                   \
+        if (!got_ || strcmp(got_, want) != 0) {                                                    \
+            fprintf(stderr, "compose refs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);   \
+            free(got_);                                                                            \
+            FAIL("REFERENCES_FILE edge set");                                                      \
+        }                                                                                          \
+        free(got_);                                                                                \
+    } while (0)
+
+/* A compose service names repository files relative to the compose file's
+ * directory: a bind mount's host side (short and long form), an env_file, the
+ * file of a config or secret it lists. Each indexed file is a file the
+ * service references, once, at the first line naming it. No edge for a
+ * directory, a named or anonymous volume, an absolute or home path, a
+ * short-form host side without a leading dot (compose reads it as a volume's
+ * name), a path out of the repository, a variable without a value, a file the
+ * index does not hold, or a config without a file. */
+TEST(probe_compose_service_files_are_file_references) {
+    static const GpfFile files[] = {
+        {"compose.yaml", "services:\n"
+                         "  web:\n"
+                         "    image: nginx:1.27\n"
+                         "    volumes:\n"
+                         "      - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro\n"
+                         "      - ./src:/app\n"
+                         "      - data:/var/lib/data\n"
+                         "      - /etc/localtime:/etc/localtime:ro\n"
+                         "      - ~/.aws:/root/.aws\n"
+                         "      - ../outside.conf:/outside.conf\n"
+                         "      - ${CONF_DIR:-./conf}/extra.conf:/etc/extra.conf\n"
+                         "      - ${UNSET_DIR}/x.conf:/x.conf\n"
+                         "      - conf/nodot.conf:/etc/nodot.conf\n"
+                         "      - /anonymous\n"
+                         "      - type: bind\n"
+                         "        source: ./conf/long.conf\n"
+                         "        target: /etc/long.conf\n"
+                         "      - type: volume\n"
+                         "        source: data\n"
+                         "        target: /data\n"
+                         "      - ./conf/missing.conf:/etc/missing.conf\n"
+                         "    env_file:\n"
+                         "      - ./conf/web.env\n"
+                         "      - path: ./conf/more.env\n"
+                         "        required: false\n"
+                         "    configs:\n"
+                         "      - app_config\n"
+                         "      - source: other_config\n"
+                         "        target: /etc/other.yaml\n"
+                         "      - external_config\n"
+                         "    secrets:\n"
+                         "      - db_settings\n"
+                         "  worker:\n"
+                         "    image: alpine:3.20\n"
+                         "    volumes:\n"
+                         "      - ./conf/nginx.conf:/a\n"
+                         "      - ./conf/nginx.conf:/b\n"
+                         "    env_file: ./conf/web.env\n"
+                         "configs:\n"
+                         "  app_config:\n"
+                         "    file: ./conf/app.yaml\n"
+                         "  other_config:\n"
+                         "    file: conf/other.yaml\n"
+                         "  external_config:\n"
+                         "    external: true\n"
+                         "secrets:\n"
+                         "  db_settings:\n"
+                         "    file: ./conf/db.ini\n"
+                         "volumes:\n"
+                         "  data: {}\n"},
+        {"conf/nginx.conf", "worker_processes 1;\n"},
+        {"conf/extra.conf", "gzip on;\n"},
+        {"conf/long.conf", "sendfile on;\n"},
+        {"conf/nodot.conf", "tcp_nopush on;\n"},
+        {"conf/web.env", "MODE=web\n"},
+        {"conf/more.env", "EXTRA=1\n"},
+        {"conf/app.yaml", "name: app\n"},
+        {"conf/other.yaml", "name: other\n"},
+        {"conf/db.ini", "[db]\nname = app\n"},
+        {"src/app.py", "def main():\n    return 0\n"}};
+    GPF_ASSERT_COMPOSE_REFS(files, 11,
+                            "Service/web -> conf/app.yaml (config:27)\n"
+                            "Service/web -> conf/db.ini (secret:32)\n"
+                            "Service/web -> conf/extra.conf (volume:11)\n"
+                            "Service/web -> conf/long.conf (volume:16)\n"
+                            "Service/web -> conf/more.env (env_file:24)\n"
+                            "Service/web -> conf/nginx.conf (volume:5)\n"
+                            "Service/web -> conf/other.yaml (config:28)\n"
+                            "Service/web -> conf/web.env (env_file:23)\n"
+                            "Service/worker -> conf/nginx.conf (volume:36)\n"
+                            "Service/worker -> conf/web.env (env_file:38)");
+    PASS();
+}
+
+/* The paths are relative to the compose file's directory, not to the
+ * repository root: a same-named file at the root is not the one, a path may
+ * climb to a sibling directory, and one that leaves the repository or names
+ * the compose file itself is no edge. A long-form bind mount says it is a
+ * path, so its source needs no leading dot. */
+TEST(probe_compose_service_files_resolve_from_the_compose_directory) {
+    static const GpfFile files[] = {
+        {"deploy/compose.yaml", "services:\n"
+                                "  api:\n"
+                                "    image: api:1\n"
+                                "    volumes:\n"
+                                "      - ./app.conf:/etc/app.conf\n"
+                                "      - ../shared/base.conf:/etc/base.conf\n"
+                                "      - ../../out.conf:/etc/out.conf\n"
+                                "      - ./compose.yaml:/self.yaml\n"
+                                "      - type: bind\n"
+                                "        source: more.conf\n"
+                                "        target: /etc/more.conf\n"},
+        {"deploy/app.conf", "name deploy;\n"},
+        {"deploy/more.conf", "name more;\n"},
+        {"app.conf", "name root;\n"},
+        {"more.conf", "name root-more;\n"},
+        {"shared/base.conf", "name base;\n"},
+        {"out.conf", "name out;\n"}};
+    GPF_ASSERT_COMPOSE_REFS(files, 7,
+                            "Service/api -> deploy/app.conf (volume:5)\n"
+                            "Service/api -> deploy/more.conf (volume:10)\n"
+                            "Service/api -> shared/base.conf (volume:6)");
+    PASS();
+}
+
 /* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
  * ci[/job]])", sorted, one per line: top-level code as "@<file>"; a script
  * as "script:<path>", a Process as "proc:<name>", a Chart as "chart:<name>",
@@ -7323,6 +7476,8 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_run);
     RUN_TEST(probe_dockerfile_copy_sources_are_file_references);
     RUN_TEST(probe_dockerfile_copy_source_under_two_contexts_is_no_reference);
+    RUN_TEST(probe_compose_service_files_are_file_references);
+    RUN_TEST(probe_compose_service_files_resolve_from_the_compose_directory);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
     RUN_TEST(probe_image_without_registry_host_stays_unknown);

@@ -1460,6 +1460,18 @@ typedef struct {
 } cbm_build_site_t;
 typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
 
+/* A repository file a compose service names (pass_ci.c): a path relative to
+ * the compose file's directory, normalised -- a bind mount's host side
+ * ("volume"), an env_file entry ("env_file"), the file of a config or secret
+ * the service lists ("config" / "secret") -- with the 1-based line where the
+ * service names it. The path may be a directory, or a file the index does
+ * not hold. */
+typedef struct {
+    const char *path;
+    const char *via;
+    int line;
+} cbm_compose_file_t;
+
 /* A compose service (pass_ci.c): its image (a reference, variables
  * expanded; NULL: none or unknown), the Dockerfile its build names
  * (repository path; NULL: no build, or unknown), the service names its
@@ -1470,7 +1482,7 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * image_default_of: the variables whose inline default (${X:-d}) named the
  * image; image_override_of: those whose default the project's .env replaced
  * (JSON arrays, NULL: none), and default_image the image those defaults
- * name. */
+ * name. files: the repository paths it names (cbm_compose_file_t). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1484,6 +1496,8 @@ typedef struct {
     const int *env_lines;
     const char **env_hosts;
     int nenv;
+    const cbm_compose_file_t *files;
+    int nfiles;
     int line;
     int end_line;
 } cbm_compose_service_t;
