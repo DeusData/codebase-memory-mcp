@@ -2784,6 +2784,67 @@ TEST(resolve_scala_companion_owner_matches_class_name) {
     PASS();
 }
 
+/* The class and its companion object both declare the member (cats Chain: the
+ * class's `concat(c)`, the object's `concat(c, c2)`). A call written on the
+ * name, `Chain.concat(a, b)`, is the object's even from inside the class: the
+ * term `Chain` is the object. import_map and same_module try Owner#object.m
+ * before Owner.m, and the qualified tail takes the object's twin instead of
+ * calling the pair ambiguous. */
+TEST(resolve_scala_companion_object_member_beats_class_twin) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Chain", "proj.data.Chain.Chain", "Class", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "Chain", "proj.data.Chain.Chain#object", "Class", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.data.Chain.Chain.concat", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.data.Chain.Chain#object.concat", "Method",
+                          CBM_LANG_SCALA, false);
+
+    const char *keys[] = {"Chain"};
+    const char *vals[] = {"proj.data.Chain.Chain"};
+    cbm_resolution_t res = cbm_registry_resolve(r, "Chain.concat", "proj.app.Main", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    res = cbm_registry_resolve(r, "Chain.concat", "proj.data.Chain", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "same_module");
+
+    res = cbm_registry_resolve(r, "Chain.concat", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The fence's '#' sorts before '.', so a plain strcmp tie-break would let any
+ * member nested in a companion object outrank its unfenced rivals. Ties order
+ * as if the fence were absent: `ev.abs` keeps the trait's abs over the abs of
+ * a trait nested in the companion (cats Signed, as before the fence existed),
+ * and of two twins (X.m, X#object.m) a call through a value takes the class
+ * member. */
+TEST(resolve_scala_object_fence_does_not_reorder_ties) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Signed", "proj.ring.Signed.Signed", "Class", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "Signed", "proj.ring.Signed.Signed#object", "Class", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "abs", "proj.ring.Signed.Signed.abs", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "abs", "proj.ring.Signed.Signed#object.forGroup.abs", "Method",
+                          CBM_LANG_SCALA, false);
+    cbm_resolution_t res = cbm_registry_resolve(r, "ev.abs", "proj.laws.OrderLaws", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.ring.Signed.Signed.abs");
+
+    cbm_registry_add_lang(r, "concat", "proj.ring.Chain.Chain.concat", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.ring.Chain.Chain#object.concat", "Method",
+                          CBM_LANG_SCALA, false);
+    res = cbm_registry_resolve(r, "xs.concat", "proj.laws.OrderLaws", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.ring.Chain.Chain.concat");
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* `$` is not special: it is a legal identifier character in Java and JS/TS
  * (`user$` streams, `Foo$` helper classes), so a class `Foo$` next to `Foo` is
  * an ordinary sibling there, and only the Scala object fence (`#object`)
@@ -3771,6 +3832,8 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_scala_companion_owner_matches_class_name);
+    RUN_TEST(resolve_scala_companion_object_member_beats_class_twin);
+    RUN_TEST(resolve_scala_object_fence_does_not_reorder_ties);
     RUN_TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged);
     RUN_TEST(swift_receiver_resolution_is_independent_of_registration_order);
     RUN_TEST(swift_manifest_root_targets_respect_nested_package_boundaries);

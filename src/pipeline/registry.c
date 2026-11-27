@@ -190,6 +190,51 @@ static size_t seg_len_without_object_fence(const char *seg, size_t len) {
     return len;
 }
 
+/* Length of the object fence at `s` when one ends a segment there (followed by
+ * '.' or the end of the QN), else 0. */
+static size_t object_fence_at(const char *s) {
+    return strncmp(s, CBM_SCALA_OBJECT_QN_SUFFIX, OBJECT_FENCE_LEN) == 0 &&
+                   (s[OBJECT_FENCE_LEN] == '.' || s[OBJECT_FENCE_LEN] == '\0')
+               ? OBJECT_FENCE_LEN
+               : 0;
+}
+
+/* Order two QNs as if no segment carried an object fence, so the fence's '#'
+ * (which sorts before '.') does not reorder a tie between unrelated
+ * candidates: `Signed.abs` still precedes
+ * `Signed#object.forAdditiveCommutativeGroup.abs`, as `Signed.abs` preceded
+ * `Signed.forAdditiveCommutativeGroup.abs` before the fence existed. Two QNs
+ * equal without their fences (`X.m`, `X#object.m`) order by fence count, the
+ * class member first: a call through a value reaches instance members. */
+static int qn_cmp_without_object_fence(const char *a, const char *b) {
+    int fences_a = 0;
+    int fences_b = 0;
+    for (;;) {
+        size_t fa = object_fence_at(a);
+        size_t fb = object_fence_at(b);
+        if (fa) {
+            a += fa;
+            fences_a++;
+        }
+        if (fb) {
+            b += fb;
+            fences_b++;
+        }
+        if (fa || fb) {
+            continue;
+        }
+        if (*a != *b || *a == '\0') {
+            break;
+        }
+        a++;
+        b++;
+    }
+    if (*a != *b) {
+        return (unsigned char)*a < (unsigned char)*b ? -1 : 1;
+    }
+    return fences_a - fences_b;
+}
+
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
 /* Count common dot-separated prefix segments. One pass over the shared prefix:
@@ -344,6 +389,12 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
     bool bs = csharp_reference_stub(best, best_lang);
     if (cs != bs) {
         return !cs;
+    }
+    if (r->scala_object_fences) {
+        int order = qn_cmp_without_object_fence(candidate, best);
+        if (order != 0) {
+            return order < 0;
+        }
     }
     return strcmp(candidate, best) < 0;
 }
@@ -2224,18 +2275,11 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         }
     }
     char candidate[CBM_SZ_512];
-    if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
-    } else {
-        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
-    }
-    /* Use cbm_ht_get_key to get the persistent heap-owned key string */
-    const char *stored_key = cbm_ht_get_key(r->exact, candidate);
-    if (stored_key) {
-        return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
-    }
+    const char *stored_key = NULL;
     /* Scala: an import binds the class, but `Owner.m()` on the class's name is
-     * a call into its companion object, Owner#object. */
+     * a call into its companion object, Owner#object -- tried first, because
+     * the term `Owner` is the object even where the class has a same-named
+     * member (cats `Chain.concat(a, b)` is the object's, not Chain#concat). */
     if (r->scala_object_fences && suffix && suffix[0]) {
         int n = snprintf(candidate, sizeof(candidate), "%s" CBM_SCALA_OBJECT_QN_SUFFIX ".%s",
                          resolved, suffix);
@@ -2244,6 +2288,16 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         if (stored_key) {
             return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
         }
+    }
+    if (suffix && suffix[0]) {
+        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
+    } else {
+        snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
+    }
+    /* Use cbm_ht_get_key to get the persistent heap-owned key string */
+    stored_key = cbm_ht_get_key(r->exact, candidate);
+    if (stored_key) {
+        return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
     }
 
     /* import_map_suffix fallback: find a QN starting with resolved+"." and
@@ -2316,14 +2370,13 @@ static const char *same_module_candidate(const cbm_registry_t *r, const char *mo
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
                                             const char *suffix, const char *module_qn,
                                             size_t scope_len) {
-    const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
-    if (!stored_key && suffix && suffix[0])
-        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
-    if (stored_key)
-        return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     /* Scala `Owner.m` in the declaring file: the member may live under the
-     * companion object, Owner#object.m. Each owner segment is tried once; a
-     * name too long for the buffer is skipped. */
+     * companion object, Owner#object.m. Tried before the plain name, because
+     * the term `Owner` is the object even where the class declares a
+     * same-named member (cats `As.compose(that, this)` inside class As is the
+     * object's compose). Each owner segment is tried once; a name too long for
+     * the buffer is skipped. */
+    const char *stored_key = NULL;
     for (const char *dot = r->scala_object_fences && callee_name ? strchr(callee_name, '.') : NULL;
          dot; dot = strchr(dot + SKIP_ONE, '.')) {
         char fenced[CBM_SZ_512];
@@ -2335,6 +2388,11 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
         if (stored_key)
             return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     }
+    stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
+    if (!stored_key && suffix && suffix[0])
+        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
+    if (stored_key)
+        return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     return empty_result();
 }
 
@@ -2433,6 +2491,20 @@ static bool object_fenced_tail_matches(const char *qn, size_t qlen, const char *
  * both reduce to "run", so the bare-name scorer would route every caller to a
  * single winner. Language agnostic: callees with no separator return NULL and
  * leave behavior unchanged. */
+/* True when `fenced` is `plain`'s companion-object twin: plain is `X.m` and
+ * fenced is `X#object.m` (CBM_SCALA_OBJECT_QN_SUFFIX before the last segment). */
+static bool object_twin_of(const char *fenced, const char *plain) {
+    const char *last_dot = strrchr(plain, '.');
+    if (!last_dot) {
+        return false;
+    }
+    size_t owner_len = (size_t)(last_dot - plain);
+    return strlen(fenced) == strlen(plain) + OBJECT_FENCE_LEN &&
+           strncmp(fenced, plain, owner_len) == 0 &&
+           memcmp(fenced + owner_len, CBM_SCALA_OBJECT_QN_SUFFIX, OBJECT_FENCE_LEN) == 0 &&
+           strcmp(fenced + owner_len + OBJECT_FENCE_LEN, last_dot) == 0;
+}
+
 static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CBM_SZ_512];
@@ -2452,6 +2524,7 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         return NULL;
     }
     const char *match = NULL;
+    const char *second = NULL;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
         size_t qlen = strlen(qn);
@@ -2461,12 +2534,29 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
             !(strchr(qn, '#') && object_fenced_tail_matches(qn, qlen, dotted, w))) {
             continue;
         }
-        if (match) {
-            return NULL; /* ambiguous — more than one qualified tail matches */
+        if (second) {
+            return NULL; /* ambiguous — more than two qualified tails match */
         }
-        match = qn;
+        if (match) {
+            second = qn;
+        } else {
+            match = qn;
+        }
     }
-    return match;
+    if (!second) {
+        return match;
+    }
+    /* Two matches are ambiguous unless they are a Scala class member and its
+     * companion object's twin (X.m and X#object.m): a callee written `X.m`
+     * names the object, so the object's member answers it (cats
+     * `Free.compile(fk)` is object Free's compile, not Free#compile). */
+    if (object_twin_of(second, match)) {
+        return second;
+    }
+    if (object_twin_of(match, second)) {
+        return match;
+    }
+    return NULL; /* ambiguous — more than one qualified tail matches */
 }
 
 /* True when the first segment of the dotted chain `dotted` is one of C#'s
