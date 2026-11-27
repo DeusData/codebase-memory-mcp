@@ -1015,17 +1015,30 @@ TEST(phpmw_use_const_keeps_class_imports) {
     PASS();
 }
 
-/* Partner: with a project function of the same name (here a namespaced
- * Lib\sprintf), the import resolver binds the use to it by name, so the file's
- * imports were complete before as well, and the typed call keeps the answer of
- * the base. (php: `use function sprintf;` binds the global builtin, not
- * Lib\sprintf; that by-name binding is the resolver's, recorded, not changed
- * here.) Partner as above. */
-TEST(phpmw_use_function_beside_same_named_project_function_keeps_todays_answer) {
+/* An aliased global function use (`use function sprintf as fmt;`, php: valid,
+ * fmt is the builtin) gets no absence proof, as an aliased class use gets
+ * none: the file's imports stay unknown and the typed call is not drawn by the
+ * engine (the answer of the base). Binds the alias exception: with it removed
+ * the file is complete and the engine draws the call. */
+TEST(phpmw_aliased_global_use_function_keeps_the_file_unknown) {
+    static const PmwFile f[] = {PMW_USEFN_FILES("use function sprintf as fmt;\n")};
+    static const PmwExpect want[] = {
+        {"ViewController.run", "DatabaseInterface.getTable", false, true},
+        {"ViewController.run", "Wrong.getTable", false, false},
+    };
+    ASSERT_EQ(pmw_check(f, 4, want, 2), 0);
+    PASS();
+}
+
+/* A `use const X;` beside the project's own `const X = 1;`: the graph has no
+ * node for a PHP constant, so nothing it holds can be what the use names, and
+ * the file's imports are complete (the typed call is drawn). Pins that the
+ * proof claims no more than this; to revisit when constants get nodes. php:
+ * X is the project's constant, Db::getTable runs. */
+TEST(phpmw_use_const_beside_project_constant) {
     static const PmwFile f[] = {
-        PMW_USEFN_FILES("use function sprintf;\n"),
-        {"src/Lib/functions.php",
-         "<?php\nnamespace Lib;\nfunction sprintf(...$a) { return 'Lib\\\\sprintf'; }\n"},
+        PMW_USEFN_FILES("use const X;\n"),
+        {"src/consts.php", "<?php\nconst X = 1;\n"},
     };
     static const PmwExpect want[] = {
         {"ViewController.run", "DatabaseInterface.getTable", true, true},
@@ -1057,5 +1070,6 @@ SUITE(php_member_walk) {
     RUN_TEST(phpmw_trait_abstract_method_is_a_requirement);
     RUN_TEST(phpmw_use_function_keeps_class_imports);
     RUN_TEST(phpmw_use_const_keeps_class_imports);
-    RUN_TEST(phpmw_use_function_beside_same_named_project_function_keeps_todays_answer);
+    RUN_TEST(phpmw_aliased_global_use_function_keeps_the_file_unknown);
+    RUN_TEST(phpmw_use_const_beside_project_constant);
 }
