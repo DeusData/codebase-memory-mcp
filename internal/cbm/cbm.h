@@ -899,7 +899,13 @@ typedef struct {
  *     kind / group / name / ns; `path` is
  *     the patch file (as written, relative to the kustomization), NULL for an
  *     inline patch. kind and name both NULL: the patch file's documents name
- *     them. def_index -1: the kustomization itself is the source. */
+ *     them. def_index -1: the kustomization itself is the source.
+ *   CBM_K8S_FACT_FILE: a kustomization reads the file `path` (as written,
+ *     relative to the kustomization) at `line`, named by `via`: an entry of a
+ *     configMapGenerator's or secretGenerator's `files` (the path after
+ *     `key=`), `envs` or `env`, or of `configurations`. The file is input to
+ *     the build, not a member of it. def_index -1: the kustomization itself
+ *     is the source. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
@@ -908,7 +914,8 @@ typedef enum {
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
     CBM_K8S_FACT_ENV,
-    CBM_K8S_FACT_PATCH
+    CBM_K8S_FACT_PATCH,
+    CBM_K8S_FACT_FILE
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;

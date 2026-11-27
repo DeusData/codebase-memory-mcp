@@ -5645,6 +5645,36 @@ TEST(incremental_local_action_pair_deleted_takes_the_full_route) {
     PASS();
 }
 
+/* A kustomization's generator file that appears after the kustomization was
+ * indexed. */
+TEST(incremental_kustomize_file_reference_follows_its_file) {
+    int counts[4] = {-1, -1, -1, -1};
+    int rc = incremental_file_reference_steps("deploy/kustomization.yaml",
+                                              "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                              "kind: Kustomization\n"
+                                              "resources:\n"
+                                              "  - deployment.yaml\n"
+                                              "configMapGenerator:\n"
+                                              "  - name: app-config\n"
+                                              "    files:\n"
+                                              "      - late.properties\n",
+                                              "deploy/deployment.yaml",
+                                              "apiVersion: apps/v1\n"
+                                              "kind: Deployment\n"
+                                              "metadata:\n"
+                                              "  name: app\n"
+                                              "spec:\n"
+                                              "  replicas: 1\n",
+                                              "deploy/late.properties", "configMapGenerator",
+                                              counts);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(counts[0], 0);
+    ASSERT_EQ(counts[1], 1);
+    ASSERT_EQ(counts[2], 1);
+    ASSERT_EQ(counts[3], 0);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -38453,6 +38483,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_terraform_file_reference_follows_its_file);
     RUN_TEST(incremental_local_uses_reference_follows_its_file);
     RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
+    RUN_TEST(incremental_kustomize_file_reference_follows_its_file);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

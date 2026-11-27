@@ -3096,6 +3096,111 @@ TEST(probe_kustomize_helm_charts_deploy_their_chart) {
     PASS();
 }
 
+/* The REFERENCES_FILE edges a kustomization draws for the files it reads, as
+ * "<kustomization> -> <target file> (via:line)", sorted, one per line; then a
+ * line "imports <files>": the targets of the IMPORTS edges leaving
+ * kustomization files. */
+static char *gpf_kustomize_files(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT "
+            "s.file_path || ' -> ' || t.file_path || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') "
+            "|| ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='REFERENCES_FILE' AND json_extract(e.properties,'$.via') "
+            "IN ('configMapGenerator','secretGenerator','configurations') ORDER BY x)), '') "
+            "|| char(10) || 'imports ' || coalesce((SELECT group_concat(x, ',') FROM (SELECT "
+            "DISTINCT t.file_path AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='IMPORTS' AND s.file_path LIKE '%kustomization.yaml' "
+            "ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization reads files that are input to its build without being a
+ * member of it: a generator's `files` (a path, or `key=path`) and `envs`, and
+ * its `configurations`. Each indexed file is a file the kustomization
+ * references, once, at the first line naming it -- and never an import: an
+ * import makes a file's objects part of the build. A file the index does not
+ * hold (one that is missing, and config/settings.json, which is on disk but
+ * a name discovery skips), a path out of the repository, an absolute path
+ * (it names a file of the machine, not of the repository, also when the
+ * repository holds a file at that path below its root or below the
+ * kustomization) and a generator's literals are none. */
+TEST(probe_kustomize_generator_files_are_file_references) {
+    static const GpfFile files[] = {
+        {"deploy/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                      "kind: Kustomization\n"
+                                      "resources:\n"
+                                      "  - deployment.yaml\n"
+                                      "configMapGenerator:\n"
+                                      "  - name: app-config\n"
+                                      "    files:\n"
+                                      "      - app.properties\n"
+                                      "      - settings=config/settings.json\n"
+                                      "      - limits=config/limits.json\n"
+                                      "      - missing.properties\n"
+                                      "      - abs=/abs.properties\n"
+                                      "    envs:\n"
+                                      "      - app.env\n"
+                                      "  - name: literal-only\n"
+                                      "    literals:\n"
+                                      "      - A=1\n"
+                                      "secretGenerator:\n"
+                                      "  - name: tokens\n"
+                                      "    files:\n"
+                                      "      - ../../outside.yaml\n"
+                                      "      - ../shared/token.yaml\n"
+                                      "configurations:\n"
+                                      "  - kustomizeconfig.yaml\n"
+                                      "  - app.properties\n"
+                                      "  - /abs.properties\n"},
+        {"deploy/deployment.yaml", "apiVersion: apps/v1\n"
+                                   "kind: Deployment\n"
+                                   "metadata:\n"
+                                   "  name: app\n"
+                                   "spec:\n"
+                                   "  replicas: 1\n"},
+        {"deploy/app.properties", "mode=prod\n"},
+        {"deploy/config/settings.json", "{\"mode\": \"prod\"}\n"},
+        {"deploy/config/limits.json", "{\"max\": 3}\n"},
+        {"deploy/app.env", "MODE=prod\n"},
+        {"deploy/kustomizeconfig.yaml", "nameReference: []\n"},
+        {"deploy/abs.properties", "mode=abs\n"},
+        {"abs.properties", "mode=root\n"},
+        {"shared/token.yaml", "token: placeholder\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kustomize_files(files, n);
+    static const char want[] =
+        "deploy/kustomization.yaml -> deploy/app.env (configMapGenerator:14)\n"
+        "deploy/kustomization.yaml -> deploy/app.properties (configMapGenerator:8)\n"
+        "deploy/kustomization.yaml -> deploy/config/limits.json (configMapGenerator:10)\n"
+        "deploy/kustomization.yaml -> deploy/kustomizeconfig.yaml (configurations:24)\n"
+        "deploy/kustomization.yaml -> shared/token.yaml (secretGenerator:22)\n"
+        "imports deploy/deployment.yaml";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize files got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize file refs");
+    }
+    free(got);
+    PASS();
+}
+
 /* Every REFERENCES_FILE edge a local `uses:` draws, as
  * "<file> -> <target file> (uses:line)", sorted, one per line. */
 static char *gpf_local_uses(const GpfFile *files, int nfiles) {
@@ -7592,6 +7697,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_kustomize_module_node);
     RUN_TEST(probe_kustomize_imports_edges);
     RUN_TEST(probe_kustomize_with_patches);
+    RUN_TEST(probe_kustomize_generator_files_are_file_references);
     RUN_TEST(probe_k8s_manifest_after_leading_comment);
     RUN_TEST(probe_kustomize_imports_after_leading_comment);
     RUN_TEST(probe_k8s_selector_after_leading_separator);
