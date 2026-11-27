@@ -227,6 +227,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                            const char *kind, char *name);
+static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang);
 static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused);
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
@@ -8505,7 +8506,10 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Return type — use func_node (inner function for templates)
     static const char *rt_fields[] = {"result", "return_type", "type", NULL};
-    for (const char **f = rt_fields; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
+    // tree-sitter-c-sharp names a method's return type `returns`.
+    static const char *cs_rt_fields[] = {"returns", "type", NULL};
+    const char **rt_list = ctx->language == CBM_LANG_CSHARP ? cs_rt_fields : rt_fields;
+    for (const char **f = rt_list; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
             def.return_type = c_declared_return_type(ctx, func_node, rt);
@@ -10375,6 +10379,16 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     } else {
         class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     }
+    /* Scala: a companion object shares its class's source name; it is
+     * Owner#object (CBM_SCALA_OBJECT_QN_SUFFIX), so neither owner nor its
+     * members overwrite the other's. Members, fields and nested types follow
+     * from class_qn; `name` stays Owner. The body is read ahead here, before
+     * the walk reaches its nested objects, so each of them is answered in O(1). */
+    if (ctx->language == CBM_LANG_SCALA) {
+        TSNode no_scope = {0};
+        class_qn = cbm_scala_object_qn(ctx, node, no_scope, class_qn);
+        cbm_scala_prime_scope(ctx, find_class_member_body(node, ctx->language));
+    }
     const char *label = class_label_for_kind(kind);
 
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
@@ -11029,7 +11043,9 @@ static void push_method_def_named(CBMExtractCtx *ctx, TSNode child, TSNode class
     // Return type (same fields as extract_func_def)
     {
         static const char *rt_fields[] = {"result", "return_type", "type", NULL};
-        for (const char **f = rt_fields; *f; f++) {
+        static const char *cs_rt_fields[] = {"returns", "type", NULL};
+        const char **rt_list = ctx->language == CBM_LANG_CSHARP ? cs_rt_fields : rt_fields;
+        for (const char **f = rt_list; *f; f++) {
             TSNode rt = ts_node_child_by_field_name(child, *f, (uint32_t)strlen(*f));
             if (!ts_node_is_null(rt)) {
                 def.return_type = c_declared_return_type(ctx, child, rt);
@@ -14965,13 +14981,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
+            TSNode no_scope = {0}; /* Scala: a companion is Owner#object (emit_class_def) */
             if (saved_enclosing) {
-                return cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
+                return cbm_scala_object_qn(
+                    ctx, node, no_scope,
+                    cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname));
             }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
-            return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
-                                               ctx->language);
+            return cbm_scala_object_qn(ctx, node, no_scope,
+                                       cbm_fqn_compute_source_lang(ctx->arena, ctx->project,
+                                                                   ctx->rel_path, cname,
+                                                                   ctx->language));
         }
     }
     return saved_enclosing;

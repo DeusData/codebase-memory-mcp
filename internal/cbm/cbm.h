@@ -420,6 +420,16 @@ typedef struct {
  * definition is the target, and the macro only when no definition is visible. */
 #define CBM_MACRO_QN_SUFFIX "#macro"
 
+/* The qualified name of a Scala companion object -- an `object` with a
+ * same-named class, trait or enum in the same scope -- is `<Owner QN>#object`,
+ * and its members are `<Owner QN>#object.<member>`. The class and its companion
+ * share one source name; the fence gives the object an identity of its own, and
+ * the plain `<Owner QN>` always belongs to the type. An object without such a
+ * type beside it keeps its plain QN. `name` stays Owner. A plain Scala
+ * identifier never ends in `#object` (operator characters such as '#' do not
+ * mix with letters outside backquotes), so no other definition spells it. */
+#define CBM_SCALA_OBJECT_QN_SUFFIX "#object"
+
 /* Byte offsets are meaningful only within the source buffer that produced
  * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
  * buffers can contain unrelated occurrences at the same numeric span. */
@@ -1311,6 +1321,11 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    /* Scala: the companion-object answers (helpers.c cbm_scala_is_companion_object),
+     * NULL until the first object asks; allocated in `scratch` (or `arena`) and
+     * tied to the `source` it was built for, so a copy of this context with
+     * another source builds its own. Nothing in a CBMFileResult points at it. */
+    void *scala_companions;
     /* C++/CUDA raw view: the GoogleTest definitions the def walk named
      * (CBMTestSpan, in `scratch`), in walk order. */
     CBMTestSpan *test_spans;

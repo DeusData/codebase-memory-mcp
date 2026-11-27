@@ -5750,6 +5750,148 @@ TEST(incremental_make_prerequisite_follows_edits) {
     PASS();
 }
 
+/* Version 14 of the semantic index: an index built before the config
+ * references holds none of them for its unchanged files. One tree with every
+ * kind: a Dockerfile's COPY source, a compose bind mount, a Terraform file(),
+ * a workflow's local action, a kustomization's generator file and a Make
+ * prerequisite. The published index is put back to what version 13 wrote (its
+ * stamp, and none of those edges); with nothing in the tree changed the next
+ * index rebuilds in full, draws them all again and stamps the current
+ * version, and the one after it is a no-op. */
+TEST(pipeline_config_references_semantic_upgrade) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cfgup_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "Dockerfile", "FROM alpine:3.20\nCOPY entry.sh /entry.sh\n");
+    write_temp_file(tmp, "entry.sh", "#!/bin/sh\necho entry\n");
+    write_temp_file(tmp, "compose.yaml", "services:\n"
+                                         "  web:\n"
+                                         "    image: nginx:1.27\n"
+                                         "    volumes:\n"
+                                         "      - ./nginx.conf:/etc/nginx/nginx.conf\n");
+    write_temp_file(tmp, "nginx.conf", "worker_processes 1;\n");
+    write_temp_file(tmp, "infra/main.tf",
+                    "locals {\n"
+                    "  settings = file(\"${path.module}/settings.properties\")\n"
+                    "}\n");
+    write_temp_file(tmp, "infra/settings.properties", "first = 1\n");
+    write_temp_file(tmp, ".github/workflows/ci.yml", "name: ci\n"
+                                                     "on: [push]\n"
+                                                     "jobs:\n"
+                                                     "  build:\n"
+                                                     "    runs-on: ubuntu-latest\n"
+                                                     "    steps:\n"
+                                                     "      - uses: ./.github/actions/setup\n");
+    write_temp_file(tmp, ".github/actions/setup/action.yml",
+                    "name: setup\nruns:\n  using: composite\n  steps: []\n");
+    write_temp_file(tmp, "deploy/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                    "kind: Kustomization\n"
+                    "resources:\n"
+                    "  - deployment.yaml\n"
+                    "configMapGenerator:\n"
+                    "  - name: app-config\n"
+                    "    files:\n"
+                    "      - app.properties\n");
+    write_temp_file(tmp, "deploy/deployment.yaml", "apiVersion: apps/v1\n"
+                                                   "kind: Deployment\n"
+                                                   "metadata:\n"
+                                                   "  name: app\n"
+                                                   "spec:\n"
+                                                   "  replicas: 1\n");
+    write_temp_file(tmp, "deploy/app.properties", "first = 1\n");
+    write_temp_file(tmp, "Makefile", "all: build\n\techo all\n\nbuild:\n\techo build\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cfgup.db", tmp);
+    static const char refs[] =
+        "SELECT COUNT(*) FROM edges WHERE type='REFERENCES_FILE' AND "
+        "json_extract(properties,'$.via') IN ('copy','volume','file','uses','configMapGenerator')";
+    static const char kinds[] =
+        "SELECT COUNT(DISTINCT json_extract(properties,'$.via')) FROM edges WHERE "
+        "type='REFERENCES_FILE' AND json_extract(properties,'$.via') IN "
+        "('copy','volume','file','uses','configMapGenerator')";
+    static const char deps[] = "SELECT COUNT(*) FROM edges WHERE type='DEPENDS_ON' AND "
+                               "json_extract(properties,'$.via')='prerequisite'";
+    static const char all_nodes[] = "SELECT COUNT(*) FROM nodes";
+    static const char all_edges[] = "SELECT COUNT(*) FROM edges";
+
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int refs_full = k8s_inc_count(db_path, refs);
+    int kinds_full = k8s_inc_count(db_path, kinds);
+    int deps_full = k8s_inc_count(db_path, deps);
+    int nodes_full = k8s_inc_count(db_path, all_nodes);
+    int edges_full = k8s_inc_count(db_path, all_edges);
+
+    /* Put the published index back to what version 13 wrote. */
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, "k8sinc", &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "k8sinc", &meta), CBM_STORE_OK);
+    cbm_coverage_meta_t old_meta = meta;
+    old_meta.coverage_version = 13;
+    ASSERT_EQ(
+        cbm_store_coverage_replace_ex(store, "k8sinc", coverage_rows, coverage_count, &old_meta),
+        CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&meta);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "DELETE FROM edges WHERE (type='REFERENCES_FILE' AND "
+                             "json_extract(properties,'$.via') IN "
+                             "('copy','volume','file','uses','configMapGenerator')) OR "
+                             "(type='DEPENDS_ON' AND "
+                             "json_extract(properties,'$.via')='prerequisite');"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+    int refs_13 = k8s_inc_count(db_path, refs);
+    int deps_13 = k8s_inc_count(db_path, deps);
+
+    /* Nothing in the tree changed: only the version says the index is stale. */
+    int rc_upgrade = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t upgrade_route = cbm_pipeline_incremental_test_last_route();
+    int refs_upgrade = k8s_inc_count(db_path, refs);
+    int kinds_upgrade = k8s_inc_count(db_path, kinds);
+    int deps_upgrade = k8s_inc_count(db_path, deps);
+    int nodes_upgrade = k8s_inc_count(db_path, all_nodes);
+    int edges_upgrade = k8s_inc_count(db_path, all_edges);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t new_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "k8sinc", &new_meta), CBM_STORE_OK);
+    int stored_version = new_meta.coverage_version;
+    cbm_store_coverage_meta_clear(&new_meta);
+    cbm_store_close(store);
+    int rc_again = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t again_route = cbm_pipeline_incremental_test_last_route();
+    int refs_again = k8s_inc_count(db_path, refs);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(refs_full, 5);
+    ASSERT_EQ(kinds_full, 5); /* one of each kind */
+    ASSERT_EQ(deps_full, 1);
+    ASSERT_EQ(refs_13, 0);
+    ASSERT_EQ(deps_13, 0);
+    ASSERT_EQ(rc_upgrade, 0);
+    ASSERT_EQ(upgrade_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(refs_upgrade, 5);
+    ASSERT_EQ(kinds_upgrade, 5);
+    ASSERT_EQ(deps_upgrade, 1);
+    ASSERT_EQ(nodes_upgrade, nodes_full);
+    ASSERT_EQ(edges_upgrade, edges_full);
+    ASSERT_EQ(stored_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_EQ(rc_again, 0);
+    ASSERT_EQ(again_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(refs_again, 5);
+    ASSERT_GTE(CBM_SEMANTIC_INDEX_VERSION, 14);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -15935,6 +16077,104 @@ TEST(pipeline_scala_index_built_only_for_scala_importers) {
     cbm_pipeline_import_maps_free(namespace_map, scala_index);
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+static void write_scala_companion_fixture(const char *tmp) {
+    write_temp_file(
+        tmp, "rational.scala",
+        "package numeric\n"
+        "class Rational(n: Int, d: Int) { def reciprocal: Rational = Rational.make(d, n) }\n"
+        "object Rational {\n"
+        "  def make(n: Int, d: Int): Rational = new Rational(n, d)\n"
+        "  def fromInt(n: Int): Rational = make(n, 1)\n"
+        "}\n");
+    write_temp_file(tmp, "factory_user.scala",
+                    "package app\n"
+                    "import numeric.Rational\n"
+                    "object FactoryUser { def half: Rational = Rational.make(1, 2) }\n");
+    write_temp_file(tmp, "member_user.scala",
+                    "package app\n"
+                    "import numeric.Rational.fromInt\n"
+                    "object MemberUser { def two: Rational = fromInt(2) }\n");
+}
+
+static bool scala_companion_edges_are_exact(cbm_store_t *s, const char *project) {
+    return cross_file_call_to_owner_has_strategy(s, project, "half", "make",
+                                                 "Rational#object.make", "import_map") &&
+           cross_file_call_to_owner_has_strategy(s, project, "two", "fromInt",
+                                                 "Rational#object.fromInt", "import_map") &&
+           cross_file_call_to_owner_has_strategy(s, project, "fromInt", "make",
+                                                 "Rational#object.make", "");
+}
+
+/* A class with a companion object is one importable name. `import pkg.Foo`
+ * must not fail closed as ambiguous now that class and companion have
+ * distinct QNs, `Foo.factory()` must bind into the companion (`Foo#object`),
+ * `import pkg.Foo.member` must bind the companion member, and a bare call
+ * between two members of the object stays inside it. */
+TEST(pipeline_scala_companion_import_and_factory_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_companion_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_companion.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_companion_edges_are_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* The parallel route registers definitions through its own serial registry
+ * build; the companion owner must be recorded there too, or `Rational.make`
+ * falls back to the class on a 4-worker index. */
+TEST(pipeline_scala_companion_parallel_import_and_factory_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_companion_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "companion_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object CompanionFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_companion_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_companion_edges_are_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -38165,6 +38405,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
     RUN_TEST(pipeline_scala_member_import_in_split_package_binds_owner_member);
     RUN_TEST(pipeline_scala_index_built_only_for_scala_importers);
+    RUN_TEST(pipeline_scala_companion_import_and_factory_call);
+    RUN_TEST(pipeline_scala_companion_parallel_import_and_factory_call);
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_scala_wildcard_import_binds_no_operator_call);
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
@@ -38560,6 +38802,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
     RUN_TEST(incremental_kustomize_file_reference_follows_its_file);
     RUN_TEST(incremental_make_prerequisite_follows_edits);
+    RUN_TEST(pipeline_config_references_semantic_upgrade);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

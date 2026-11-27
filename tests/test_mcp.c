@@ -11880,6 +11880,49 @@ TEST(tool_get_architecture_behavior_evidence_cache_isolation) {
     PASS();
 }
 
+/* A path that is not valid UTF-8 (a directory named in Latin-1) reaches the
+ * projection through file_path and qualified_name. system_structure must still
+ * return the projection, not a "ready" reply without a result. */
+TEST(tool_get_architecture_system_structure_non_utf8_path) {
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-arch-utf8-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "arch-utf8";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+    cbm_node_t entry = {.project = project,
+                        .label = "Function",
+                        .name = "main",
+                        .qualified_name = "arch-utf8.src.caf\xE9.main.main",
+                        .file_path = "src/caf\xE9/main.c",
+                        .start_line = 1,
+                        .end_line = 3,
+                        .properties_json = "{\"is_entry_point\":true}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &entry), 0);
+
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"aspects\":[\"system_structure\"]}",
+             project);
+    char *text = architecture_wait_for_result(srv, args);
+    ASSERT_NOT_NULL(text);
+    ASSERT_TRUE(response_contains_json_fragment(text, "\"status\":\"ready\""));
+    ASSERT_NOT_NULL(strstr(text, "\"result\""));
+    ASSERT_NOT_NULL(strstr(text, "src/caf\xEF\xBF\xBD/main.c"));
+    free(text);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    PASS();
+}
+
 /* Regression for #281: handle_get_architecture must actually call
  * cbm_store_get_architecture and surface its sections. Before the fix
  * only label/edge histograms were emitted regardless of which aspects
@@ -28972,6 +29015,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_behavior_evidence_validation);
     RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
+    RUN_TEST(tool_get_architecture_system_structure_non_utf8_path);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);

@@ -52,13 +52,29 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 // a GoogleTest macro head is named as the def walk names it
 // (cbm_cpp_test_macro_name; cbm_cpp_test_macro_names_on gives the value).
 // pp_test_spans: the preprocessed view's map to the raw tests
-// (cbm_test_span_owner_qn), NULL in a raw view.
+// (cbm_test_span_owner_qn), NULL in a raw view. scala_ctx: the extraction
+// context whose companion answers fence a Scala companion object in the class
+// chain (Owner#object.m, as the def walk names it); NULL names bare chains.
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn,
-                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans);
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans,
+                                  CBMExtractCtx *scala_ctx);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
+
+// Scala: true for an object_definition with a class, trait or enum of the same
+// name in the same scope (its companion). `scope` is the node's parent when the
+// caller holds it, else a null node. An answered object costs O(1): a scope's
+// children are read once, with a cursor, and every object among them answered
+// (the first query reads ctx->root; cbm_scala_prime_scope reads others ahead).
+bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node, TSNode scope);
+void cbm_scala_prime_scope(CBMExtractCtx *ctx, TSNode scope);
+
+// Scala: `plain_qn` + CBM_SCALA_OBJECT_QN_SUFFIX for a companion object, else
+// `plain_qn` unchanged (every other node and language).
+const char *cbm_scala_object_qn(CBMExtractCtx *ctx, TSNode node, TSNode scope,
+                                const char *plain_qn);
 
 // Max declarator-chain descent depth for C/C++/CUDA/GLSL function-name
 // resolution. Single source of truth — extract_defs.c's DECLARATOR_DEPTH_LIMIT
