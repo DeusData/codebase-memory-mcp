@@ -73,10 +73,16 @@ typedef struct {
      * Zero via memset. */
     int walk_depth;
 
-    /* Receiver -> registered-method index used while traits are flattened
-     * (php_lsp.c, php_trait_index_t). Owned by the class-field pass, NULL
-     * outside it. Zero via memset. */
-    struct php_trait_index *trait_index;
+    /* The shared member lookup (member_walk.h) over this file's registry:
+     * orders, walker and their scratch (php_lsp.c php_members_begin). NULL
+     * until the registry is complete; zero via memset. */
+    struct php_members *members;
+
+    /* The registry's types by the name PHP gives them (namespace and short
+     * name, lower case, '.'-separated) -> QN, from the namespace of the file
+     * that declares each; a name two types share maps to "" (ambiguous).
+     * Trait uses resolve here only (php_settle_trait). NULL until built. */
+    struct CBMHashTable *type_fqns;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
@@ -95,8 +101,14 @@ void php_lsp_add_use(PHPLSPContext *ctx, const char *local_name, const char *tar
 void php_lsp_process_file(PHPLSPContext *ctx, TSNode root);
 
 /* Refine an already-populated registry from local class ASTs: declared and
- * PHPDoc returns, trait flattening, and typed fields. */
+ * PHPDoc returns, the supertypes and trait rules of the file's own classes,
+ * and typed fields. */
 void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root);
+
+/* Attach the shared member lookup to ctx over its (complete) registry, and
+ * release it. Lookups before begin find only a receiver's own members. */
+void php_members_begin(PHPLSPContext *ctx, CBMTypeRegistry *reg);
+void php_members_end(PHPLSPContext *ctx);
 
 /* Evaluate a PHP expression's type. May return NULL / CBM_TYPE_UNKNOWN. */
 const CBMType *php_eval_expr_type(PHPLSPContext *ctx, TSNode node);
@@ -107,9 +119,12 @@ const CBMType *php_parse_type_node(PHPLSPContext *ctx, TSNode node);
 /* Resolve a class name (bare or qualified) using current namespace + use map. */
 const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name);
 
-/* Look up a method on a class, walking parent chain (registry-based). */
-const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class_qn,
-                                            const char *method_name);
+/* The method PHP calls for `method_name` on class_qn, found by the shared
+ * member lookup (own members, traits, parent chain, interfaces); NULL when
+ * the lookup finds none or does not know. A trait's method is reported as a
+ * member of the class that uses the trait. */
+const CBMRegisteredFunc *php_find_method(PHPLSPContext *ctx, const char *class_qn,
+                                         const char *method_name);
 
 /* Entry point: build registry from file defs + stdlib + composer (if present),
  * then run resolution. Called from cbm_extract_file(). */

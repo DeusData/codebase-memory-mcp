@@ -17,7 +17,11 @@ const VERSION = require('./package.json').version;
 const BIN_DIR = path.join(__dirname, 'bin');
 const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
-const CANDIDATE_TIMEOUT_MS = 15_000;
+// How long a downloaded or cached binary may take to answer --version. A slow
+// host (antivirus scan, emulation, first page-in) can need far more than a few
+// seconds, but a candidate that never answers must not hang the start forever.
+// Keep in sync with the Go wrapper (candidateVerifyBound) and the PyPI wrapper.
+const CANDIDATE_TIMEOUT_MS = 300_000;
 // Entry-count guard for the zip namespace check. Keep in sync with the Go
 // wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper.
 const MAX_ARCHIVE_MEMBERS = 64;
@@ -840,6 +844,7 @@ if (require.main === module || module.parent == null) {
 }
 
 module.exports = {
+  CANDIDATE_TIMEOUT_MS,
   UNIX_ARCHIVE_NAMES,
   WINDOWS_ARCHIVE_NAMES,
   WINDOWS_BINARY_NAME,

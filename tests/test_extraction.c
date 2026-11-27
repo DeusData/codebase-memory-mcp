@@ -1803,6 +1803,31 @@ static const char *def_return_type(CBMFileResult *r, const char *name) {
     return NULL;
 }
 
+/* Methods in an `impl` block publish their declared return type like a free
+ * `fn` does; a method without `->` has none. */
+TEST(rust_impl_method_return_type) {
+    CBMFileResult *r = extract("struct Matcher;\n"
+                               "pub fn free() -> u8 { 0 }\n"
+                               "impl Matcher {\n"
+                               "    pub fn build(&self, p: &str) -> Result<Matcher, Error> { todo!() }\n"
+                               "    fn name(&self) -> &'static str { \"m\" }\n"
+                               "    fn reset(&mut self) {}\n"
+                               "}\n"
+                               "impl Clone for Matcher {\n"
+                               "    fn clone(&self) -> Self { Matcher }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "matcher.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "free"), "u8");
+    ASSERT_STR_EQ(def_return_type(r, "build"), "Result<Matcher, Error>");
+    ASSERT_STR_EQ(def_return_type(r, "name"), "&'static str");
+    ASSERT_STR_EQ(def_return_type(r, "clone"), "Self");
+    ASSERT_NULL(def_return_type(r, "reset"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A member's name is the identifier at the bottom of its declarator, and its
  * type is everything around that identifier, in the canonical spelling of the
  * function return types below. Taking the first declarator's first child as
@@ -16653,6 +16678,7 @@ SUITE(extraction) {
     /* Systems */
     RUN_TEST(rust_function);
     RUN_TEST(rust_struct);
+    RUN_TEST(rust_impl_method_return_type);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
