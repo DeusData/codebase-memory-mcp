@@ -1677,6 +1677,7 @@ extern void suite_path_alias(void);
 extern void suite_site_bind(void);
 extern void suite_scope_facts(void);
 extern void suite_include_path(void);
+extern void suite_scope_closure(void);
 extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
@@ -1686,6 +1687,8 @@ extern void suite_sqlite_writer(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
 extern void suite_php_lsp(void);
+extern void suite_member_walk(void);
+extern void suite_php_member_walk(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
 extern void suite_perl_lsp(void);
@@ -2545,6 +2548,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(site_bind);
     RUN_SELECTED_SUITE(scope_facts);
     RUN_SELECTED_SUITE(include_path);
+    RUN_SELECTED_SUITE(scope_closure);
 
     /* Watcher (M10) */
     RUN_SELECTED_SUITE(svn_state);
@@ -2564,6 +2568,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(go_lsp);
     RUN_SELECTED_SUITE(c_lsp);
     RUN_SELECTED_SUITE(php_lsp);
+    RUN_SELECTED_SUITE(member_walk);
+    RUN_SELECTED_SUITE(php_member_walk);
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE_PERF(cs_lsp_bench);
     RUN_SELECTED_SUITE(perl_lsp);

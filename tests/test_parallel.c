@@ -268,6 +268,9 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross_and_mutator(
     cbm_pipeline_pass_calls(&ctx, files, file_count);
     cbm_pipeline_pass_usages(&ctx, files, file_count);
     cbm_pipeline_pass_semantic(&ctx, files, file_count);
+    /* pass_calls builds the return-type table once any Method carries a
+     * return type; the C# fixtures do since methods read the `returns` field. */
+    harness_ctx_free_tables(&ctx);
 
     for (int i = 0; i < file_count; i++) {
         cbm_free_result(cache[i]);

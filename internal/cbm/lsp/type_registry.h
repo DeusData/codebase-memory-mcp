@@ -78,7 +78,87 @@ typedef struct {
     // so this is the only way to bind a short name through `using` directives and
     // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
     const char *namespace_qn;
+
+    // --- Member lookup (member_walk.h), every object-oriented engine ---
+    // The type's ancestry as data: one entry per supertype, in source order.
+    // The language's lineariser turns it into the lookup order. NULL/0 = no
+    // ancestry recorded (the order then ends unknown, never "not found").
+    const struct CBMSupertype *supertypes;
+    int supertype_count;
+    // CBM_MEMBERS_*: where the type's members are not all listed.
+    uint32_t member_flags;
+    // Renames the type applies to its mixins' members (PHP `insteadof` / `as`).
+    const struct CBMMemberRename *renames;
+    int rename_count;
 } CBMRegisteredType;
+
+/* One entry of a type's ancestry (16 bytes). type_qn is the registered type's
+ * qualified name when state is KNOWN, else the spelling as written. */
+typedef enum {
+    CBM_SUPER_EXTENDS = 1, /* superclass (Java, PHP, Python bases, an interface's parents) */
+    CBM_SUPER_IMPLEMENTS,  /* an interface a class implements */
+    CBM_SUPER_INCLUDE,     /* Ruby include */
+    CBM_SUPER_PREPEND,     /* Ruby prepend */
+    CBM_SUPER_EXTEND,      /* Ruby extend (class side) */
+    CBM_SUPER_EMBED,       /* Go struct embedding */
+    CBM_SUPER_TRAIT,       /* PHP trait use, Rust trait impl, Scala mixin */
+    CBM_SUPER_DELEGATE,    /* Kotlin `by` delegation */
+} CBMSupertypeKind;
+
+typedef enum {
+    CBM_SUPER_KNOWN = 0,  /* a registered type: its order is known */
+    CBM_SUPER_EXTERNAL,   /* outside the project (vendor, JDK, node_modules) */
+    CBM_SUPER_UNRESOLVED, /* the spelling names no registered type */
+    CBM_SUPER_DISPUTED,   /* the sources name different types */
+} CBMSupertypeState;
+
+typedef enum {
+    CBM_SUPER_IN_BODY = 0, /* written in the type's own declaration */
+    CBM_SUPER_OUTSIDE,     /* written elsewhere (Ruby `K.include M` in another file) */
+    CBM_SUPER_UNRECORDED,  /* applied by code the extractor does not read */
+} CBMSupertypeWhere;
+
+typedef struct CBMSupertype {
+    const char *type_qn;
+    uint8_t kind;  /* CBMSupertypeKind */
+    uint8_t state; /* CBMSupertypeState */
+    uint8_t where; /* CBMSupertypeWhere */
+    uint8_t side;  /* the side of the type it adds to (Ruby: instance or class) */
+} CBMSupertype;
+
+/* CBMRegisteredType.member_flags. Each makes some lookups answer "unknown". */
+enum {
+    /* Names nobody declares are dispatched at run time (PHP __call /
+     * __callStatic, Ruby method_missing, Python __getattr__, Perl AUTOLOAD, a
+     * PHP enum's built-in cases/from/tryFrom): a lookup that finds nothing
+     * declared anywhere in the order is unknown, never absent. */
+    CBM_MEMBERS_OPEN = 1u << 0,
+    /* Members are defined by code nobody evaluates (Ruby define_method):
+     * unknown right after the type's own members. */
+    CBM_MEMBERS_COMPUTED = 1u << 1,
+    /* The project reopens a type from outside it (a Ruby core class): its
+     * listed members are only the project's. */
+    CBM_MEMBERS_REOPENED_EXTERNAL = 1u << 2,
+    /* Two declarations of the type disagree on its ancestry. */
+    CBM_MEMBERS_DECLS_DISAGREE = 1u << 3,
+};
+
+/* A rename a type applies to the members its mixins bring in. */
+typedef enum {
+    /* `name` is another name for from_type's member from_name (PHP
+     * `T::m as a`); from_type NULL = whichever mixin declares from_name. */
+    CBM_RENAME_ALIAS = 1,
+    /* from_type's member `name` does not reach this type (PHP
+     * `S::m insteadof T` excludes T's m). */
+    CBM_RENAME_EXCLUDE,
+} CBMMemberRenameKind;
+
+typedef struct CBMMemberRename {
+    const char *name;
+    const char *from_type; /* a registered type QN (or NULL, see ALIAS) */
+    const char *from_name; /* ALIAS only */
+    uint8_t kind;          /* CBMMemberRenameKind */
+} CBMMemberRename;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.
 typedef struct {
@@ -213,6 +293,11 @@ typedef struct CBMTypeRegistry {
     const char **export_keys;
     const char **export_targets;
     int export_count;
+
+    /* Member-lookup orders per type (member_walk.h CBMMemberOrders), or NULL.
+     * A shared registry's builder fills and seals them before the seal of
+     * the registry; a per-file registry's owner attaches its own. */
+    struct CBMMemberOrders *member_orders;
 } CBMTypeRegistry;
 
 // Initialize a registry.

@@ -8,6 +8,10 @@ const fs = require('fs');
 const { spawnSync } = require('child_process');
 
 const isWindows = process.platform === 'win32';
+// How long the cached binary may take to answer --version: the same bound as
+// CANDIDATE_TIMEOUT_MS in install.js (test/candidate-bound.test.js keeps the two
+// equal; the launcher stays self-contained and does not load the installer).
+const CANDIDATE_TIMEOUT_MS = 300_000;
 // npm is a portable one-shot wrapper. Every platform ships exactly ONE binary,
 // so the cached file is the executed file — there is no launcher pair to keep
 // in sync and no adjacent payload to validate.
@@ -22,7 +26,7 @@ const cacheReady = () => {
   // A cached Windows binary that cannot report its own version is not usable.
   const probe = spawnSync(binPath, ['--version'], {
     stdio: 'ignore',
-    timeout: 15_000,
+    timeout: CANDIDATE_TIMEOUT_MS,
     windowsHide: true,
   });
   return !probe.error && probe.status === 0;

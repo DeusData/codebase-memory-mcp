@@ -288,6 +288,14 @@ typedef struct {
      * every other definition, and in every language outside
      * cbm_is_c_preprocessor_lang. */
     const char *variants;
+    /* Ruby only: a `def self.m` / `class << self` method, which lives on the
+     * singleton side of its class. False for every instance method and every
+     * other language. */
+    bool is_singleton;
+    /* Ruby only, on a class/module def: the `include`/`prepend`/`extend`
+     * macros of its body as "|"-separated "<k>:<Const>" pairs, k one of i, p,
+     * e, in source order ("i:Auditable|e:Finders"). NULL when none. */
+    const char *mixin_refs;
     /* Callable identity (#2061): offset of the signature suffix inside
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
@@ -328,7 +336,7 @@ typedef struct {
      * for a defined type `type A B` (its method set is its own) and in every
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
-    /* Go and Python only: the facts the declared-type scope step and the
+    /* Go, Python and PHP only: the facts the declared-type scope step and the
      * cross-file registrars read (CBMDefTypeFacts), in the result arena; NULL
      * for a definition without one and in every other language. One pointer,
      * so the other languages pay 8 bytes per definition. Tail field:
@@ -336,9 +344,10 @@ typedef struct {
     const struct CBMDefTypeFacts *type_facts;
 } CBMDefinition;
 
-/* Facts of one Go or Python definition that no graph property carries; only
- * the cross-file step reads them (src/pipeline/type_scope.h, the Go and
- * Python cross registrars). Every field is NULL when absent. */
+/* Facts of one Go, Python or PHP definition that no graph property carries;
+ * only the cross-file step reads them (src/pipeline/type_scope.h, the Go,
+ * Python and PHP cross registrars, the member lookup lsp/member_walk.h).
+ * Every field is NULL when absent. */
 typedef struct CBMDefTypeFacts {
     /* The names its type parameter lists declare, '|'-joined: Python PEP 695
      * (`def f[T, *Ts, **P]`, `class C[T]`), Go (`func F[K, V any]`, a generic
@@ -364,6 +373,18 @@ typedef struct CBMDefTypeFacts {
      * binds, '|'-joined. The body rebinds them in the module, so no
      * annotation of the file names them through the module's other binding. */
     const char *global_names;
+    /* PHP class, interface, trait or enum (the member lookup): one kind letter
+     * per base_classes entry ('e' extends, 'i' implements), plus a trailing
+     * '+' when bases past the extractor's cap were not recorded; NULL = the
+     * kinds are unknown. */
+    const char *base_kinds;
+    /* PHP: the traits the body uses, as written (they stay out of
+     * base_classes, which makes INHERITS edges), one kind letter each ('t'),
+     * and the rules those uses apply to their members (`insteadof` / `as`,
+     * encoded by extract_defs.c extract_php_member_bases). */
+    const char **mixins;
+    const char *mixin_kinds;
+    const char *member_rules;
 } CBMDefTypeFacts;
 
 /* extra_props key of a generated member, one the compiler writes and the
@@ -397,6 +418,16 @@ typedef struct {
  * Tie rule for anything that resolves a NAME or a plain QN to a node: the
  * definition is the target, and the macro only when no definition is visible. */
 #define CBM_MACRO_QN_SUFFIX "#macro"
+
+/* The qualified name of a Scala companion object -- an `object` with a
+ * same-named class, trait or enum in the same scope -- is `<Owner QN>#object`,
+ * and its members are `<Owner QN>#object.<member>`. The class and its companion
+ * share one source name; the fence gives the object an identity of its own, and
+ * the plain `<Owner QN>` always belongs to the type. An object without such a
+ * type beside it keeps its plain QN. `name` stays Owner. A plain Scala
+ * identifier never ends in `#object` (operator characters such as '#' do not
+ * mix with letters outside backquotes), so no other definition spells it. */
+#define CBM_SCALA_OBJECT_QN_SUFFIX "#object"
 
 /* Byte offsets are meaningful only within the source buffer that produced
  * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
@@ -782,6 +813,10 @@ enum {
     CBM_SCOPE_REEXPORT = 1u << 4, /* INCLUDE: its names reach this file's includers */
     /* inside a parse error: may or may not hold where a later name is used */
     CBM_SCOPE_CONDITIONAL = 1u << 5,
+    /* QREF: on the way out, the first component names a symbol that is no
+     * type (Protobuf: a method of the enclosing service, a service of the
+     * file): protoc resolves the reference to it and rejects the file */
+    CBM_SCOPE_NOT_A_TYPE = 1u << 6,
 };
 
 typedef struct {
@@ -789,7 +824,10 @@ typedef struct {
     /* DEF: the full name where the row has packages or nesting (Protobuf:
      * package, enclosing messages, name: "a.b.Outer.Inner"). INCLUDE: the
      * importing file's package ("" when none), which its references are
-     * relative to. NULL elsewhere. */
+     * relative to. QREF: the innermost scope around the reference, its first
+     * scope to search (Protobuf: the enclosing message's full name, or the
+     * file's package outside any message); NULL when it is unknown. NULL
+     * elsewhere. */
     const char *qual;
     uint32_t pos;  /* byte offset after which the event is in effect */
     int32_t index; /* into defs (DEF) or imports (INCLUDE); QREF: start byte; else -1 */
@@ -884,7 +922,13 @@ typedef struct {
  *     kind / group / name / ns; `path` is
  *     the patch file (as written, relative to the kustomization), NULL for an
  *     inline patch. kind and name both NULL: the patch file's documents name
- *     them. def_index -1: the kustomization itself is the source. */
+ *     them. def_index -1: the kustomization itself is the source.
+ *   CBM_K8S_FACT_FILE: a kustomization reads the file `path` (as written,
+ *     relative to the kustomization) at `line`, named by `via`: an entry of a
+ *     configMapGenerator's or secretGenerator's `files` (the path after
+ *     `key=`), `envs` or `env`, or of `configurations`. The file is input to
+ *     the build, not a member of it. def_index -1: the kustomization itself
+ *     is the source. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
@@ -893,7 +937,8 @@ typedef enum {
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
     CBM_K8S_FACT_ENV,
-    CBM_K8S_FACT_PATCH
+    CBM_K8S_FACT_PATCH,
+    CBM_K8S_FACT_FILE
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -1275,6 +1320,11 @@ typedef struct {
     /* Go: what each block's statements bind (extract_calls.c), NULL until a route call asks;
      * allocated in `scratch`. */
     void *go_block_bindings;
+    /* Scala: the companion-object answers (helpers.c cbm_scala_is_companion_object),
+     * NULL until the first object asks; allocated in `scratch` (or `arena`) and
+     * tied to the `source` it was built for, so a copy of this context with
+     * another source builds its own. Nothing in a CBMFileResult points at it. */
+    void *scala_companions;
     /* C++/CUDA raw view: the GoogleTest definitions the def walk named
      * (CBMTestSpan, in `scratch`), in walk order. */
     CBMTestSpan *test_spans;
@@ -1283,6 +1333,11 @@ typedef struct {
     /* The preprocessed second view only: the raw view's test definitions and
      * the line map (cbm_test_span_owner_qn). NULL in every raw view. */
     const CBMTestSpanMap *pp_test_spans;
+    /* PHP: the file's namespace changes and class `use` aliases in byte order,
+     * and how far a class's trait names have been qualified with them
+     * (extract_defs.c php_names_at); NULL until a class uses a trait;
+     * allocated in `scratch`. */
+    void *php_names;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */

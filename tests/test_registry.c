@@ -1887,6 +1887,42 @@ TEST(registry_receiver_gate_judges_type_roots_at_import_fallback) {
     PASS();
 }
 
+/* Scala: a method declared in the calling file outranks an imported namesake.
+ * Since Scala imports resolve (#2360), Strategy 4 keeps only the
+ * import-reachable candidates, and a method of the calling file itself is
+ * never import-reachable: in typelevel/cats a bare `bimap` in EitherT.scala
+ * bound Bifunctor's syntax class instead of EitherT's own bimap. */
+TEST(registry_scala_same_file_candidate_outranks_imported_namesake) {
+    const char *mod = "proj.core.src.main.scala.data.Pair";
+    const char *own = "proj.core.src.main.scala.data.Pair.Pair.bimap";
+    const char *imported = "proj.core.src.main.scala.other.Bi.Bi.bimap";
+    const char *keys[] = {"Bi"};
+    const char *vals[] = {"proj.core.src.main.scala.other.Bi.Bi"};
+
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "bimap", own, "Method", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "bimap", imported, "Method", CBM_LANG_SCALA, false);
+    cbm_resolution_t res =
+        cbm_registry_resolve_call_lang(r, "bimap", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, own));
+    res = cbm_registry_resolve_call_lang(r, "fab.bimap", mod, keys, vals, 1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, own));
+    /* A caller with no namesake of its own still binds the imported one. */
+    res = cbm_registry_resolve_call_lang(r, "bimap", "proj.core.src.main.scala.app.Use", keys, vals,
+                                         1, CBM_LANG_SCALA);
+    ASSERT_TRUE(gate_bound(&res, imported));
+    cbm_registry_free(r);
+
+    /* Scala only: the shared path still keeps the import-reachable pick. */
+    r = cbm_registry_new();
+    cbm_registry_add_lang(r, "bimap", own, "Method", CBM_LANG_KOTLIN, false);
+    cbm_registry_add_lang(r, "bimap", imported, "Method", CBM_LANG_KOTLIN, false);
+    res = cbm_registry_resolve_call_lang(r, "bimap", mod, keys, vals, 1, CBM_LANG_KOTLIN);
+    ASSERT_TRUE(gate_bound(&res, imported));
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(call_onto_field_follows_language_and_shape) {
     /* A call the registry resolved onto a Field node. */
     /* Another language: only the spelling connects them. */
@@ -2702,6 +2738,157 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
     ASSERT_STR_EQ(res.strategy, "import_map");
     cbm_registry_free(r);
+    PASS();
+}
+
+/* A Scala companion object is Owner#object (CBM_SCALA_OBJECT_QN_SUFFIX). A
+ * call written on the class name (`Rational.make`) must reach the companion
+ * member through every strategy that compares owner segments: import_map,
+ * same_module and the qualified-tail disambiguator. Unfenced QNs are matched
+ * exactly as before. */
+TEST(resolve_scala_companion_owner_matches_class_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Rational", "proj.num.Rational.Rational", "Class", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "Rational", "proj.num.Rational.Rational#object", "Class",
+                          CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "make", "proj.num.Rational.Rational#object.make", "Method",
+                          CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "make", "proj.other.Builder.Builder.make", "Method", CBM_LANG_SCALA,
+                          false);
+
+    /* import_map: the import binds the class; the method lives in Rational#object */
+    const char *keys[] = {"Rational"};
+    const char *vals[] = {"proj.num.Rational.Rational"};
+    cbm_resolution_t res = cbm_registry_resolve(r, "Rational.make", "proj.app.Main", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    /* same_module: called from the declaring file */
+    res = cbm_registry_resolve(r, "Rational.make", "proj.num.Rational", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
+    ASSERT_STR_EQ(res.strategy, "same_module");
+
+    /* qualified_suffix: two `make` candidates, the owner segment picks the object */
+    res = cbm_registry_resolve(r, "Rational.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational#object.make");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+
+    /* A plain owner does not match an unfenced candidate any more loosely. */
+    res = cbm_registry_resolve(r, "Builder.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.other.Builder.Builder.make");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+    res = cbm_registry_resolve(r, "Other.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT(res.strategy == NULL || strcmp(res.strategy, "qualified_suffix") != 0);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The class and its companion object both declare the member (cats Chain: the
+ * class's `concat(c)`, the object's `concat(c, c2)`). A call written on the
+ * name, `Chain.concat(a, b)`, is the object's even from inside the class: the
+ * term `Chain` is the object. import_map and same_module try Owner#object.m
+ * before Owner.m, and the qualified tail takes the object's twin instead of
+ * calling the pair ambiguous. */
+TEST(resolve_scala_companion_object_member_beats_class_twin) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Chain", "proj.data.Chain.Chain", "Class", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "Chain", "proj.data.Chain.Chain#object", "Class", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.data.Chain.Chain.concat", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.data.Chain.Chain#object.concat", "Method",
+                          CBM_LANG_SCALA, false);
+
+    const char *keys[] = {"Chain"};
+    const char *vals[] = {"proj.data.Chain.Chain"};
+    cbm_resolution_t res = cbm_registry_resolve(r, "Chain.concat", "proj.app.Main", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    res = cbm_registry_resolve(r, "Chain.concat", "proj.data.Chain", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "same_module");
+
+    res = cbm_registry_resolve(r, "Chain.concat", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.data.Chain.Chain#object.concat");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The fence's '#' sorts before '.', so a plain strcmp tie-break would let any
+ * member nested in a companion object outrank its unfenced rivals. Ties order
+ * as if the fence were absent: `ev.abs` keeps the trait's abs over the abs of
+ * a trait nested in the companion (cats Signed, as before the fence existed),
+ * and of two twins (X.m, X#object.m) a call through a value takes the class
+ * member. */
+TEST(resolve_scala_object_fence_does_not_reorder_ties) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "Signed", "proj.ring.Signed.Signed", "Class", CBM_LANG_SCALA, false);
+    cbm_registry_add_lang(r, "Signed", "proj.ring.Signed.Signed#object", "Class", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "abs", "proj.ring.Signed.Signed.abs", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "abs", "proj.ring.Signed.Signed#object.forGroup.abs", "Method",
+                          CBM_LANG_SCALA, false);
+    cbm_resolution_t res = cbm_registry_resolve(r, "ev.abs", "proj.laws.OrderLaws", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.ring.Signed.Signed.abs");
+
+    cbm_registry_add_lang(r, "concat", "proj.ring.Chain.Chain.concat", "Method", CBM_LANG_SCALA,
+                          false);
+    cbm_registry_add_lang(r, "concat", "proj.ring.Chain.Chain#object.concat", "Method",
+                          CBM_LANG_SCALA, false);
+    res = cbm_registry_resolve(r, "xs.concat", "proj.laws.OrderLaws", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.ring.Chain.Chain.concat");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* `$` is not special: it is a legal identifier character in Java and JS/TS
+ * (`user$` streams, `Foo$` helper classes), so a class `Foo$` next to `Foo` is
+ * an ordinary sibling there, and only the Scala object fence (`#object`)
+ * makes `Foo.m` read as a companion member. With both registered from a Java
+ * or a TypeScript file, `Foo.m` resolves exactly as it does on a registry
+ * without any companion rule: import_map, same_module and the qualified tail
+ * never reach the `$` owner's member, and the receiver chain does not admit it
+ * as a unique-name hit. */
+TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged) {
+    const CBMLanguage langs[] = {CBM_LANG_JAVA, CBM_LANG_TYPESCRIPT};
+    for (size_t li = 0; li < sizeof(langs) / sizeof(langs[0]); li++) {
+        CBMLanguage lang = langs[li];
+        cbm_registry_t *r = cbm_registry_new();
+        cbm_registry_add_lang(r, "Foo", "proj.a.Foo", "Class", lang, false);
+        cbm_registry_add_lang(r, "Foo$", "proj.a.Foo$", "Class", lang, false);
+        cbm_registry_add_lang(r, "m", "proj.a.Foo$.m", "Method", lang, false);
+        cbm_registry_add_lang(r, "m", "proj.b.Bar.m", "Method", CBM_LANG_JAVA, false);
+
+        const char *keys[] = {"Foo"};
+        const char *vals[] = {"proj.a.Foo"};
+        /* Without companion rules the import path gives up and the bare-name
+         * scorer picks the import-nearest candidate at suffix_match confidence;
+         * that verdict must stay exactly as it is. */
+        cbm_resolution_t res = cbm_registry_resolve(r, "Foo.m", "proj.app.Main", keys, vals, 1);
+        ASSERT_STR_EQ(res.strategy, "suffix_match");
+        ASSERT_STR_EQ(res.qualified_name, "proj.a.Foo$.m");
+
+        res = cbm_registry_resolve(r, "Foo.m", "proj.a", NULL, NULL, 0);
+        ASSERT_NULL(res.strategy);
+
+        res = cbm_registry_resolve(r, "Foo.m", "proj.elsewhere.X", NULL, NULL, 0);
+        ASSERT_NULL(res.strategy);
+        cbm_registry_free(r);
+
+        /* Unique candidate: the receiver chain `Foo` must not be read as the
+         * ancestor `Foo$`. */
+        r = cbm_registry_new();
+        cbm_registry_add_lang(r, "Foo", "proj.a.Foo", "Class", lang, false);
+        cbm_registry_add_lang(r, "Foo$", "proj.a.Foo$", "Class", lang, false);
+        cbm_registry_add_lang(r, "m", "proj.a.Foo$.m", "Method", lang, false);
+        res = cbm_registry_resolve(r, "Foo.m", "proj.elsewhere.X", NULL, NULL, 0);
+        ASSERT_NULL(res.strategy);
+        cbm_registry_free(r);
+    }
     PASS();
 }
 
@@ -3644,6 +3831,10 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
+    RUN_TEST(resolve_scala_companion_owner_matches_class_name);
+    RUN_TEST(resolve_scala_companion_object_member_beats_class_twin);
+    RUN_TEST(resolve_scala_object_fence_does_not_reorder_ties);
+    RUN_TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged);
     RUN_TEST(swift_receiver_resolution_is_independent_of_registration_order);
     RUN_TEST(swift_manifest_root_targets_respect_nested_package_boundaries);
     RUN_TEST(swift_overload_labels_defaults_and_trailing_closure);
@@ -3702,6 +3893,7 @@ SUITE(registry) {
     RUN_TEST(registry_receiver_gate_judges_value_receivers);
     RUN_TEST(registry_receiver_gate_runs_by_measured_language);
     RUN_TEST(registry_receiver_gate_judges_type_roots_at_import_fallback);
+    RUN_TEST(registry_scala_same_file_candidate_outranks_imported_namesake);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);

@@ -25,6 +25,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pass_ensemble_routing.h"
+#include "pipeline/site_bind.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
@@ -2630,14 +2631,17 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                             census_len(def->client_route_path) + census_len(def->impl_trait) +
                             census_len(def->http_base_url) + census_list(def->extra_props) +
                             census_len(def->decl_namespace) + census_len(def->variant_key) +
-                            census_len(def->alias_target);
+                            census_len(def->alias_target) + census_len(def->mixin_refs);
             if (def->type_facts) {
-                str_def_misc += sizeof(*def->type_facts) +
-                                census_len(def->type_facts->type_params) +
-                                census_len(def->type_facts->value_type) +
-                                census_len(def->type_facts->go_embedded) +
-                                census_len(def->type_facts->class_bindings) +
-                                census_len(def->type_facts->global_names);
+                str_def_misc +=
+                    sizeof(*def->type_facts) + census_len(def->type_facts->type_params) +
+                    census_len(def->type_facts->value_type) +
+                    census_len(def->type_facts->go_embedded) +
+                    census_len(def->type_facts->class_bindings) +
+                    census_len(def->type_facts->global_names) +
+                    census_len(def->type_facts->base_kinds) + census_list(def->type_facts->mixins) +
+                    census_len(def->type_facts->mixin_kinds) +
+                    census_len(def->type_facts->member_rules);
             }
         }
         for (int c = 0; c < r->calls.count; c++) {
@@ -2938,6 +2942,10 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             rc = CBM_NOT_FOUND;
         }
     }
+    /* The definitions pass built the shared layer's scope; the resolvers
+     * are done with it. */
+    cbm_pipeline_site_scope_free(ctx->site_scope);
+    ctx->site_scope = NULL;
     /* Consume infra bindings (YAML/HCL topic/queue/scheduler → endpoint) so
      * INFRA_MAPS edges also form on the sequential path, not just the parallel
      * one. process_one_infra_binding self-creates the topic Route node when no
@@ -3057,6 +3065,16 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (registry_next_id > atomic_load(&shared_ids)) {
         atomic_store(&shared_ids, registry_next_id);
     }
+    /* The shared layer's scope (site_bind.h): every file is extracted and
+     * its IMPORTS made; built once, sealed before the resolve workers start,
+     * freed after them. Mirrors pass_definitions.c on the sequential route. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    ctx->site_scope =
+        cbm_pipeline_site_scope_build(ctx, files, file_count, cache, NULL, 0, NULL, 0);
+    if (ctx->site_scope) {
+        cbm_log_info("pass.timing", "pass", "site_scope", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(*t)));
+    }
     /* Cross-file LSP precondition: build a project-wide CBMLSPDef[]
      * once. The fused resolve_worker invokes cbm_pxc_run_one(_ts) per
      * file using these defs + the file's IMPORTS map, so cross-file
@@ -3166,6 +3184,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
     cbm_doclinks_end(ctx);
+    cbm_pipeline_site_scope_free(ctx->site_scope);
+    ctx->site_scope = NULL;
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("parallel_resolve");
