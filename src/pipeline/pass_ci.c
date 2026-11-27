@@ -14,6 +14,9 @@
  *    unknown one. In the text, `${{ github.workspace }}` is
  *    $GITHUB_WORKSPACE, `${{ github.action_path }}` $GITHUB_ACTION_PATH, any
  *    other `${{ }}` an unknown variable (its line breaks kept).
+ *    A local `uses:` ("./...", a path from the repository root) is handed on
+ *    as well: a step's names an action directory, a job's a reusable
+ *    workflow file; one with `${{` in it is none.
  *  - Prow: a file with a top-level presubmits / postsubmits / periodics key
  *    (in-repo job config). A job container's command + args is exec'd, no
  *    shell: the words are literal, a kubelet `$(VAR)` unknown; `bash -c TEXT`
@@ -53,6 +56,8 @@ typedef struct {
     const char *src;
     const char *rel;
     cbm_ci_cmd_fn fn;
+    cbm_ci_use_fn use_fn;              /* local `uses:`; NULL: not wanted */
+    void *use_ud;                      /* use_fn's own userdata */
     cbm_build_site_fn site_fn;         /* a build-site walk's callback */
     cbm_compose_service_fn service_fn; /* a compose walk's callback */
     void *ud;
@@ -451,10 +456,29 @@ static const char *ci_run_default(const ci_t *c, TSNode m, const char *key) {
     return ci_get_str(c, ci_get(c, ci_get(c, m, "defaults"), "run"), key);
 }
 
+static const char *ci_repo_path(CBMArena *a, const char *base, const char *rel);
+
+/* The `uses:` of step or job `owner` when it names something of this
+ * repository: "./dir", "./.github/workflows/x.yml". One with an expression in
+ * it, or leaving the repository, is none. */
+static void ci_local_use(const ci_t *c, TSNode owner, bool job) {
+    int row = 0;
+    const char *uses = c->use_fn ? ci_scalar(c, ci_get(c, owner, "uses"), &row) : NULL;
+    if (!uses || uses[0] != '.' || uses[SKIP_ONE] != '/' || strstr(uses, CI_EXPR_OPEN)) {
+        return;
+    }
+    const char *path = ci_repo_path(c->a, "", uses);
+    if (path) {
+        cbm_ci_use_t use = {.path = path, .job = job, .line = row + SKIP_ONE};
+        c->use_fn(&use, c->use_ud);
+    }
+}
+
 static void ci_gha_steps(const ci_t *c, TSNode steps, const char *job, const ci_scope_t *sc) {
     int n = 0;
     TSNode *items = ci_items(c, steps, &n);
     for (int i = 0; i < n; i++) {
+        ci_local_use(c, items[i], false);
         int row = 0;
         const char *run = ci_scalar(c, ci_get(c, items[i], "run"), &row);
         if (!run) {
@@ -500,6 +524,7 @@ static void ci_workflow(const ci_t *c, TSNode root) {
     ci_pair_t *jobs = ci_pairs(c, ci_get(c, root, "jobs"), &n);
     for (int i = 0; i < n; i++) {
         TSNode j = jobs[i].value;
+        ci_local_use(c, j, true);
         const char *wd = ci_run_default(c, j, "working-directory");
         const char *sh = ci_run_default(c, j, "shell");
         ci_scope_t sc = {.env = ci_env_add(c, &wenv, ci_get(c, j, "env")),
@@ -1129,10 +1154,131 @@ static const char *ci_compose_build_args(const ci_t *c, TSNode build, const ci_e
     return json ? cbm_arena_sprintf(c->a, "%s}", json) : NULL;
 }
 
+/* ── Files a compose service reads (PHASE 4 P4.7) ─────────────────────
+ * The repository paths a service names, relative to the compose file's
+ * directory (its project directory):
+ *  - volumes: a bind mount's host side -- the short form `./host:/ctr[:mode]`
+ *    whose host side begins with `.` (compose reads one without it as a
+ *    volume's name), and the long form {type: bind, source: host}, where
+ *    the type says it is a path;
+ *  - env_file: a path, a list of paths, a list of {path: ...};
+ *  - configs / secrets: the top-level entry a service's list names (a name,
+ *    or {source: name}), by that entry's `file:`.
+ * Variables are interpolated from the project's .env. A variable without a
+ * value, an absolute or home path and a path out of the repository are none.
+ * Whether a path is a file the index holds is the caller's to decide. */
+typedef struct {
+    cbm_compose_file_t *v;
+    int n;
+    int cap;
+} ci_files_t;
+
+/* `p` (interpolated already; NULL: none) as a repository path into `l`. */
+static void ci_files_add(const ci_t *c, ci_files_t *l, const char *dir, const char *p,
+                         const char *via, int row, bool dot_only) {
+    if (!p || !p[0] || p[0] == '~' || (dot_only && p[0] != '.') || l->n >= l->cap) {
+        return;
+    }
+    const char *path = ci_repo_path(c->a, dir, p);
+    if (path && path[0]) {
+        l->v[l->n++] = (cbm_compose_file_t){.path = path, .via = via, .line = row + SKIP_ONE};
+    }
+}
+
+static bool ci_is_mapping(TSNode n) {
+    return ci_type(n, "block_mapping") || ci_type(n, "flow_mapping");
+}
+
+/* name -> `file:` text (as written) of the entries of the top-level `key`
+ * mapping that have one; NULL: none. The caller frees the table. */
+static CBMHashTable *ci_compose_named_files(const ci_t *c, TSNode root, const char *key) {
+    int n = 0;
+    ci_pair_t *defs = ci_pairs(c, ci_get(c, root, key), &n);
+    CBMHashTable *by_name = n > 0 ? cbm_ht_create((uint32_t)n) : NULL;
+    for (int i = 0; by_name && i < n; i++) {
+        const char *file = ci_get_str(c, defs[i].value, "file");
+        if (file && !cbm_ht_get(by_name, defs[i].key)) {
+            cbm_ht_set(by_name, defs[i].key, (void *)file);
+        }
+    }
+    return by_name;
+}
+
+/* The files service `svc` names; `named`: the top-level configs and secrets
+ * by name (ci_compose_named_files; either may be NULL). */
+static int ci_compose_files(const ci_t *c, TSNode svc, const char *dir, const ci_env_t *env,
+                            CBMHashTable *const named[PAIR_LEN], const cbm_compose_file_t **out) {
+    static const char *const KEY[PAIR_LEN] = {"configs", "secrets"};
+    static const char *const VIA[PAIR_LEN] = {"config", "secret"};
+    int nv = 0;
+    int ne = 0;
+    int nn[PAIR_LEN] = {0};
+    TSNode *vols = ci_items(c, ci_get(c, svc, "volumes"), &nv);
+    TSNode env_file = ci_get(c, svc, "env_file");
+    TSNode *envs = ci_items(c, env_file, &ne);
+    TSNode *refs[PAIR_LEN] = {NULL, NULL};
+    for (int k = 0; k < PAIR_LEN; k++) {
+        refs[k] = named[k] ? ci_items(c, ci_get(c, svc, KEY[k]), &nn[k]) : NULL;
+    }
+    ci_files_t l = {.cap = nv + ne + nn[0] + nn[SKIP_ONE] + SKIP_ONE};
+    l.v = cbm_arena_alloc(c->a, (size_t)l.cap * sizeof(*l.v));
+    *out = l.v;
+    if (!l.v) {
+        return 0;
+    }
+    for (int i = 0; i < nv; i++) {
+        int row = 0;
+        if (ci_is_mapping(vols[i])) {
+            const char *type = ci_get_str(c, vols[i], "type");
+            const char *source = type && strcmp(type, "bind") == 0
+                                     ? ci_scalar(c, ci_get(c, vols[i], "source"), &row)
+                                     : NULL;
+            ci_files_add(c, &l, dir, source ? ci_interp(c->a, source, env) : NULL, "volume", row,
+                         false);
+            continue;
+        }
+        /* interpolate first: a default (`${D:-./conf}`) holds a colon of its own */
+        const char *raw = ci_scalar(c, vols[i], &row);
+        const char *s = raw ? ci_interp(c->a, raw, env) : NULL;
+        const char *colon = s ? strchr(s, ':') : NULL;
+        if (colon) { /* without one: an anonymous volume's container path */
+            ci_files_add(c, &l, dir, cbm_arena_strndup(c->a, s, (size_t)(colon - s)), "volume", row,
+                         true);
+        }
+    }
+    if (!envs) { /* a single path */
+        int row = 0;
+        const char *raw = ci_scalar(c, env_file, &row);
+        ci_files_add(c, &l, dir, raw ? ci_interp(c->a, raw, env) : NULL, "env_file", row, false);
+    }
+    for (int i = 0; i < ne; i++) {
+        int row = 0;
+        const char *raw = ci_is_mapping(envs[i]) ? ci_scalar(c, ci_get(c, envs[i], "path"), &row)
+                                                 : ci_scalar(c, envs[i], &row);
+        ci_files_add(c, &l, dir, raw ? ci_interp(c->a, raw, env) : NULL, "env_file", row, false);
+    }
+    for (int k = 0; k < PAIR_LEN; k++) {
+        for (int i = 0; i < nn[k]; i++) {
+            int row = 0;
+            const char *name = ci_is_mapping(refs[k][i])
+                                   ? ci_scalar(c, ci_get(c, refs[k][i], "source"), &row)
+                                   : ci_scalar(c, refs[k][i], &row);
+            const char *raw = name ? cbm_ht_get(named[k], name) : NULL;
+            ci_files_add(c, &l, dir, raw ? ci_interp(c->a, raw, env) : NULL, VIA[k], row, false);
+        }
+    }
+    return l.n;
+}
+
 static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
     static const ci_env_t no_env = {0};
     int ns = 0;
     ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
+    CBMHashTable *named[PAIR_LEN] = {NULL, NULL};
+    if (c->service_fn) {
+        named[0] = ci_compose_named_files(c, root, "configs");
+        named[SKIP_ONE] = ci_compose_named_files(c, root, "secrets");
+    }
     for (int i = 0; i < ns; i++) {
         TSNode svc = ci_content(svcs[i].value);
         if (!ci_type(svc, "block_mapping") && !ci_type(svc, "flow_mapping")) {
@@ -1166,7 +1312,13 @@ static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env
                                        .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
             s.ndeps = ci_compose_deps(c, svc, &s.deps);
             s.nenv = ci_compose_env(c, svc, env, &s.env, &s.env_lines, &s.env_hosts);
+            s.nfiles = ci_compose_files(c, svc, dir, env, named, &s.files);
             c->service_fn(&s, c->ud);
+        }
+    }
+    for (int k = 0; k < PAIR_LEN; k++) {
+        if (named[k]) {
+            cbm_ht_free(named[k]);
         }
     }
 }
@@ -1265,7 +1417,7 @@ bool cbm_ci_path(const char *rel) {
 }
 
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
-                     void *ud) {
+                     void *ud, cbm_ci_use_fn use_fn, void *use_ud) {
     if (!ci_yaml_ext(rel)) {
         return;
     }
@@ -1278,7 +1430,8 @@ void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, 
         tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)len);
     }
     if (tree) {
-        ci_t c = {.a = a, .src = src, .rel = rel, .fn = fn, .ud = ud};
+        ci_t c = {
+            .a = a, .src = src, .rel = rel, .fn = fn, .ud = ud, .use_fn = use_fn, .use_ud = use_ud};
         TSNode stream = ts_tree_root_node(tree);
         for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++) {
             TSNode doc = ts_node_named_child(stream, i);
