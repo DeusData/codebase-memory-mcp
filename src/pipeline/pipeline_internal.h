@@ -1444,11 +1444,24 @@ typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
  * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
 bool cbm_ci_path(const char *rel);
 
+/* A local `uses:` of a GitHub workflow or composite action (pass_ci.c): a
+ * path from the repository root ("./..."), which is how GitHub reads it
+ * wherever the file lies. A step's names an action's directory (`path`; ""
+ * is the root), a job's names a reusable workflow file. `line` is 1-based. */
+typedef struct {
+    const char *path;
+    bool job;
+    int line;
+} cbm_ci_use_t;
+typedef void (*cbm_ci_use_fn)(const cbm_ci_use_t *use, void *ud);
+
 /* Hand each command line the CI configuration `rel` (YAML text src) runs to
  * fn: GitHub Actions run: steps for a workflow or composite action, else
- * Prow job containers. Strings live in arena `a`. */
+ * Prow job containers. In the same walk, each local `uses:` of a workflow or
+ * composite action goes to use_fn (NULL: not wanted) with use_ud, in
+ * document order. Strings live in arena `a`. */
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
-                     void *ud);
+                     void *ud, cbm_ci_use_fn use_fn, void *use_ud);
 
 /* An image a build configuration builds from a Dockerfile (pass_ci.c). */
 typedef struct {
