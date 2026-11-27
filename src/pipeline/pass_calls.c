@@ -1608,9 +1608,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int resolved = 0;
     int unresolved = 0;
     int errors = 0;
+    /* the shared layer's memo for this pass (site_bind.h) */
+    cbm_site_memo_t *site_memo = NULL;
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_NOT_FOUND;
         }
 
@@ -1619,6 +1622,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
             if (atomic_load(&ctx->test_declarations_failed)) {
+                cbm_pipeline_site_memo_free(site_memo);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
             errors++;
@@ -1629,6 +1633,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             if (result_owned) {
                 cbm_free_result(result);
             }
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
@@ -1671,7 +1676,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_external_import_index_t ext_imports = {0};
         cbm_spawn_file_begin(result->imports.items, result->imports.count);
         cbm_site_file_t site;
-        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result);
+        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result,
+                                     &site_memo, evidence);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1703,6 +1709,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
 
+    cbm_pipeline_site_memo_free(site_memo);
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));

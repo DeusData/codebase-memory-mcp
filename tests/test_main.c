@@ -1677,6 +1677,7 @@ extern void suite_path_alias(void);
 extern void suite_site_bind(void);
 extern void suite_scope_facts(void);
 extern void suite_include_path(void);
+extern void suite_scope_closure(void);
 extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
@@ -2545,6 +2546,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(site_bind);
     RUN_SELECTED_SUITE(scope_facts);
     RUN_SELECTED_SUITE(include_path);
+    RUN_SELECTED_SUITE(scope_closure);
 
     /* Watcher (M10) */
     RUN_SELECTED_SUITE(svn_state);

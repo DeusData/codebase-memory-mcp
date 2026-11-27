@@ -791,6 +791,10 @@ enum {
     CBM_SCOPE_REEXPORT = 1u << 4, /* INCLUDE: its names reach this file's includers */
     /* inside a parse error: may or may not hold where a later name is used */
     CBM_SCOPE_CONDITIONAL = 1u << 5,
+    /* QREF: on the way out, the first component names a symbol that is no
+     * type (Protobuf: a method of the enclosing service, a service of the
+     * file): protoc resolves the reference to it and rejects the file */
+    CBM_SCOPE_NOT_A_TYPE = 1u << 6,
 };
 
 typedef struct {
@@ -798,7 +802,10 @@ typedef struct {
     /* DEF: the full name where the row has packages or nesting (Protobuf:
      * package, enclosing messages, name: "a.b.Outer.Inner"). INCLUDE: the
      * importing file's package ("" when none), which its references are
-     * relative to. NULL elsewhere. */
+     * relative to. QREF: the innermost scope around the reference, its first
+     * scope to search (Protobuf: the enclosing message's full name, or the
+     * file's package outside any message); NULL when it is unknown. NULL
+     * elsewhere. */
     const char *qual;
     uint32_t pos;  /* byte offset after which the event is in effect */
     int32_t index; /* into defs (DEF) or imports (INCLUDE); QREF: start byte; else -1 */
