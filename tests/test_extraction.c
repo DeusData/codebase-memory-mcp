@@ -1803,6 +1803,27 @@ static const char *def_return_type(CBMFileResult *r, const char *name) {
     return NULL;
 }
 
+/* tree-sitter-c-sharp names a method's return type `returns`, not `type`. */
+TEST(csharp_method_return_type) {
+    CBMFileResult *r = extract("using System.Threading.Tasks;\n"
+                               "namespace App { public class Basket {\n"
+                               "  public async Task<Basket> AddItem(int id) { return this; }\n"
+                               "  public decimal Total() { return 0m; }\n"
+                               "  public void Clear() {}\n"
+                               "  public string[] Names() => new string[0];\n"
+                               "  public Basket() {}\n"
+                               "} }",
+                               CBM_LANG_CSHARP, "t", "Basket.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "AddItem"), "Task<Basket>");
+    ASSERT_STR_EQ(def_return_type(r, "Total"), "decimal");
+    ASSERT_STR_EQ(def_return_type(r, "Clear"), "void");
+    ASSERT_STR_EQ(def_return_type(r, "Names"), "string[]");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Methods in an `impl` block publish their declared return type like a free
  * `fn` does; a method without `->` has none. */
 TEST(rust_impl_method_return_type) {
@@ -16660,6 +16681,7 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
+    RUN_TEST(csharp_method_return_type);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
     RUN_TEST(csharp_constructor_of_type_named_extension);
