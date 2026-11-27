@@ -43,11 +43,12 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 #define CBM_INDEX_WORKER_MEMORY_BUDGET_ARG "--index-worker-memory-budget-bytes"
 #define CBM_INDEX_WORKER_BUILD_ARG "--index-worker-build"
 #define CBM_INDEX_WORKER_PUBLISH_FENCE_ARG "--index-worker-publish-fence"
+#define CBM_INDEX_WORKER_STAGE_TOKEN_ARG "--index-worker-stage-token"
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH 64U
 #define CBM_INDEX_WORKER_BUILD_FINGERPRINT_SIZE 65U
 void cbm_index_set_worker_role_options(bool is_worker, const char *response_out, bool single_thread,
                                        const char *marker_file, const char *quarantine_file,
-                                       size_t memory_budget_bytes);
+                                       size_t memory_budget_bytes, const char *stage_token);
 bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 size_t cbm_index_worker_memory_budget_bytes(void);
@@ -124,6 +125,7 @@ typedef struct {
     const char *quarantine_file;
     size_t memory_budget_bytes;
     const char *publish_fence_file;
+    const char *stage_token;
 } cbm_index_worker_invocation_t;
 
 typedef enum {
@@ -222,6 +224,13 @@ int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budg
                                        bool single_thread, const char *marker_file,
                                        const char *quarantine_file, uint64_t duration_origin_ms,
                                        cbm_index_worker_handle_t **handle_out);
+int cbm_index_worker_start_with_storage_policy(const char *args_json, size_t memory_budget_bytes,
+                                               const cbm_index_resource_policy_t *resource_policy,
+                                               const char *task_db_path, bool single_thread,
+                                               const char *marker_file, const char *quarantine_file,
+                                               cbm_proc_log_cb log_callback, void *log_context,
+                                               uint64_t duration_origin_ms,
+                                               cbm_index_worker_handle_t **handle_out);
 
 /* Policy plus the request-scoped log callback. The daemon default start path
  * needs both: a missing policy fails closed, and worker diagnostics still
@@ -305,6 +314,12 @@ int cbm_index_spawn_worker_with_policy_log_cancel(
     const char *marker_file, const char *quarantine_file, cbm_proc_log_cb log_callback,
     void *log_context, const atomic_int *cancel_requested, uint64_t duration_origin_ms,
     cbm_index_worker_result_t *result);
+int cbm_index_spawn_worker_with_storage_policy_log_cancel(
+    const char *args_json, const cbm_index_resource_policy_t *resource_policy,
+    const char *task_db_path, bool single_thread, const char *marker_file,
+    const char *quarantine_file, cbm_proc_log_cb log_callback, void *log_context,
+    const atomic_int *cancel_requested, uint64_t duration_origin_ms,
+    cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 
@@ -320,6 +335,12 @@ void cbm_index_supervisor_reset_resource_hooks_for_testing(void);
 /* Borrowed fence path of an attempt; NULL when it has no fence. */
 const char *cbm_index_worker_publish_fence_path_for_testing(
     const cbm_index_worker_handle_t *handle);
+typedef bool (*cbm_index_supervisor_task_temp_fn)(const char *final_db_path, const char *log_path,
+                                                  const char *response_path, uint64_t *bytes_out,
+                                                  void *context);
+void cbm_index_supervisor_set_task_temp_hook_for_testing(
+    cbm_index_supervisor_task_temp_fn task_temp_fn, void *context);
+void cbm_index_supervisor_reset_task_temp_hook_for_testing(void);
 #endif
 
 #endif /* CBM_INDEX_SUPERVISOR_H */
