@@ -69,6 +69,9 @@
 
 /* Candidate paths a target lookup scanned (complexity guard counter). */
 _Atomic uint64_t g_sh_candidates = 0;
+/* Targets, prerequisites and target-prerequisite pairs the Make dependency
+ * drawing looked at (complexity guard counter). */
+_Atomic uint64_t g_sh_make_pairs = 0;
 
 enum {
     SH_GROW_MIN = 16,
@@ -384,12 +387,32 @@ typedef struct {
     const char *default_of; /* pass-arena, build: JSON array of the ${X:-d} defaults naming `ext` */
 } sh_hit_t;
 
+/* A prerequisite a makefile rule states as one plain word. */
+typedef struct {
+    const char *name; /* pass-arena */
+    int line;
+    bool order_only; /* after the rule's `|` */
+} sh_mkpre_t;
+
+/* A makefile rule with plain prerequisites (sh_make_deps). */
+typedef struct {
+    const char *file;     /* pass-arena: the makefile */
+    const char **targets; /* pass-arena: the rule's targets, as written */
+    int ntargets;
+    sh_mkpre_t *pres; /* pass-arena */
+    int npres;
+    uint32_t pos; /* the rule's source byte: the order make reads them in */
+} sh_mkrule_t;
+
 typedef struct {
     sh_hit_t *items;
     int count;
     int cap;
     CBMArena arena;
     CBMHashTable *declarers; /* files running a container build: path -> path */
+    sh_mkrule_t *mkrules;
+    int nmkrules;
+    int cap_mkrules;
 } sh_hits_t;
 
 typedef struct {
@@ -3037,6 +3060,9 @@ struct mk {
     int cap_lines;
     mk_include_fn on_include; /* NULL: includes are not followed */
     void *ud;
+    sh_hits_t *deps; /* NULL: the rules' prerequisites are not recorded */
+    const char *rel; /* with `deps`: the makefile */
+    int in_error;    /* depth of the regions the grammar could not parse */
 };
 
 static const char MK_UNKNOWN[] = "${__cbm_unknown}";
@@ -3292,6 +3318,91 @@ static int mk_cmp_line(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* A prerequisite make reads as written: one word that is no pattern (%), no
+ * glob and holds no variable. */
+static bool mk_plain_word(TSNode w, const char *src) {
+    if (strcmp(ts_node_type(w), "word") != 0) {
+        return false;
+    }
+    uint32_t b = ts_node_start_byte(w);
+    uint32_t e = ts_node_end_byte(w);
+    for (uint32_t i = b; i < e; i++) {
+        if (src[i] == '\0' || strchr("%*?[$=", src[i])) {
+            return false;
+        }
+    }
+    return e > b;
+}
+
+static bool mk_is_prerequisites(TSNode n) {
+    return ts_node_is_named(n) && strcmp(ts_node_type(n), "prerequisites") == 0;
+}
+
+/* The plain prerequisites a rule states, with its targets: what sh_make_deps
+ * matches against the makefile's rule nodes. Read from the rule's
+ * `prerequisites` only, so a static pattern rule (`a.o: %.o: %.c`) yields
+ * none. A target-specific variable the grammar took for a rule
+ * (`t: override X = v`) shows as an ERROR in the rule line: none either. */
+static void mk_rule_deps(mk_t *m, TSNode rule) {
+    sh_hits_t *h = m->deps;
+    TSNode targets = rule;
+    uint32_t nc = ts_node_child_count(rule);
+    uint32_t nt = 0;
+    int np = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(rule, i);
+        if (strcmp(ts_node_type(c), "ERROR") == 0 ||
+            (mk_is_prerequisites(c) && ts_node_has_error(c))) {
+            return;
+        }
+        if (nt == 0 && strcmp(ts_node_type(c), "targets") == 0) {
+            targets = c;
+            nt = ts_node_named_child_count(c);
+        }
+        for (uint32_t k = 0; mk_is_prerequisites(c) && k < ts_node_named_child_count(c); k++) {
+            np += mk_plain_word(ts_node_named_child(c, k), m->src);
+        }
+    }
+    if (nt == 0 || np == 0 ||
+        !sh_grow((void **)&h->mkrules, &h->cap_mkrules, h->nmkrules, sizeof(*h->mkrules))) {
+        return;
+    }
+    sh_mkrule_t r = {.file = cbm_arena_strdup(&h->arena, m->rel),
+                     .targets = cbm_arena_alloc(&h->arena, nt * sizeof(*r.targets)),
+                     .pres = cbm_arena_alloc(&h->arena, (size_t)np * sizeof(*r.pres)),
+                     .pos = ts_node_start_byte(rule)};
+    if (!r.file || !r.targets || !r.pres) {
+        return;
+    }
+    for (uint32_t i = 0; i < nt; i++) {
+        TSNode t = ts_node_named_child(targets, i);
+        uint32_t tb = ts_node_start_byte(t);
+        const char *name = cbm_arena_strndup(&h->arena, m->src + tb, ts_node_end_byte(t) - tb);
+        if (name && name[0]) {
+            r.targets[r.ntargets++] = name;
+        }
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(rule, i);
+        bool order_only = sh_eq(ts_node_field_name_for_child(rule, i), "order_only");
+        for (uint32_t k = 0; mk_is_prerequisites(c) && k < ts_node_named_child_count(c); k++) {
+            TSNode w = ts_node_named_child(c, k);
+            uint32_t wb = ts_node_start_byte(w);
+            const char *name =
+                mk_plain_word(w, m->src)
+                    ? cbm_arena_strndup(&h->arena, m->src + wb, ts_node_end_byte(w) - wb)
+                    : NULL;
+            if (name && r.npres < np) {
+                r.pres[r.npres++] =
+                    (sh_mkpre_t){name, (int)ts_node_start_point(w).row + SKIP_ONE, order_only};
+            }
+        }
+    }
+    if (r.ntargets > 0 && r.npres > 0) {
+        h->mkrules[h->nmkrules++] = r;
+    }
+}
+
 static void mk_collect(mk_t *m, TSNode n, bool cond);
 static void mk_collect_error(mk_t *m, TSNode err, bool cond);
 
@@ -3302,6 +3413,9 @@ static void mk_collect_one(mk_t *m, TSNode c, bool cond) {
     } else if (strcmp(t, "recipe_line") == 0) {
         mk_split_lines(m, c);
     } else if (strcmp(t, "rule") == 0 || strcmp(t, "recipe") == 0) {
+        if (m->deps && m->in_error == 0 && strcmp(t, "rule") == 0) {
+            mk_rule_deps(m, c);
+        }
         mk_collect(m, c, cond);
     } else if (strcmp(t, "ERROR") == 0) {
         mk_collect_error(m, c, cond);
@@ -3367,6 +3481,7 @@ static void mk_collect_error(mk_t *m, TSNode err, bool cond) {
     uint32_t scan = ts_node_start_byte(err);
     uint32_t end = ts_node_end_byte(err);
     int depth = 0;
+    m->in_error++;
     for (uint32_t i = 0; i < ts_node_named_child_count(err); i++) {
         TSNode c = ts_node_named_child(err, i);
         uint32_t cb = ts_node_start_byte(c);
@@ -3379,8 +3494,16 @@ static void mk_collect_error(mk_t *m, TSNode err, bool cond) {
             depth = depth < 0 ? 0 : depth;
             scan = le + SKIP_ONE;
         }
+        /* The grammar resumed before a rule that stands at the start of its
+         * line: its prerequisites are read as written. Anything else in the
+         * region (an indented rule, one nested in another node) is not. */
+        if (m->deps && m->in_error == SKIP_ONE && strcmp(ts_node_type(c), "rule") == 0 &&
+            ts_node_start_point(c).column == 0) {
+            mk_rule_deps(m, c);
+        }
         mk_collect_one(m, c, cond || depth > 0);
     }
+    m->in_error--;
 }
 
 static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t len) {
@@ -3398,7 +3521,9 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
               .src = src,
               .vars = cbm_ht_create(0),
               .makefile = strcmp(base, "Makefile") == 0 || strcmp(base, "GNUmakefile") == 0 ||
-                          strcmp(base, "makefile") == 0};
+                          strcmp(base, "makefile") == 0,
+              .deps = p->hits,
+              .rel = rel};
     if (m.vars) {
         mk_collect(&m, ts_tree_root_node(tree), false);
     }
@@ -3537,6 +3662,168 @@ static const char *mk_rule_key(CBMArena *a, const char *file, const char *name) 
     return cbm_arena_sprintf(a, "%s\x1f%s", file, name);
 }
 
+/* Into `rules` (file \x1f name -> node): the rule nodes of the files in
+ * `want`, the first rule of a name in a file. */
+static void mk_rule_nodes(cbm_pipeline_ctx_t *ctx, CBMArena *a, CBMHashTable *want,
+                          CBMHashTable *rules) {
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_ht_count(want) == 0 ||
+        cbm_gbuf_find_by_label(ctx->gbuf, "Function", &nodes, &count) != 0) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        const char *fp = nodes[i]->file_path;
+        if (!fp || !nodes[i]->name || !cbm_ht_get(want, fp)) {
+            continue;
+        }
+        const char *key = mk_rule_key(a, fp, nodes[i]->name);
+        const cbm_gbuf_node_t *old = key ? cbm_ht_get(rules, key) : NULL;
+        if (key && (!old || nodes[i]->start_line < old->start_line)) {
+            cbm_ht_set(rules, key, (void *)nodes[i]);
+        }
+    }
+}
+
+static int mk_cmp_rule(const void *a, const void *b) {
+    const sh_mkrule_t *x = a;
+    const sh_mkrule_t *y = b;
+    int c = strcmp(x->file, y->file);
+    return c ? c : (x->pos > y->pos) - (x->pos < y->pos);
+}
+
+/* One prerequisite edge to draw (sh_make_deps). */
+typedef struct {
+    int64_t src;
+    int64_t dep;
+    int line;
+    bool order_only;
+} sh_mkedge_t;
+
+/* True the first time rule `rule` names node `id` in role `role` (a target,
+ * a normal prerequisite, an order-only one); a repeat on the same rule line
+ * is skipped, so the line costs its words plus its distinct pairs, not the
+ * product of its repeats. Sets *failed when the key cannot be kept. */
+static bool mk_first_in_rule(CBMArena *a, CBMHashTable *once, bool *failed, int rule, char role,
+                             int64_t id) {
+    const char *key = cbm_arena_sprintf(a, "%d%c%lld", rule, role, (long long)id);
+    if (!key) {
+        *failed = true;
+        return false;
+    }
+    if (cbm_ht_get(once, key)) {
+        return false;
+    }
+    cbm_ht_set(once, key, (void *)key);
+    return true;
+}
+
+/* A rule's prerequisite that names a rule of the same makefile: DEPENDS_ON
+ * {via: prerequisite, line} from each of the rule's targets to that rule's
+ * node -- once per pair, at the first line stating it, as make merges the
+ * prerequisites of a target's rules; an order-only one (after `|`) says so.
+ * A pair listed both ways is a normal prerequisite to make, at the first
+ * line listing it as one. The prerequisite is a plain word (mk_rule_deps):
+ * one with a variable, a pattern or a glob, one naming a file or a rule of
+ * another makefile, and a target naming itself draw nothing. */
+static void sh_make_deps(cbm_pipeline_ctx_t *ctx, sh_hits_t *h) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMHashTable *want = cbm_ht_create(0);
+    CBMHashTable *rules = cbm_ht_create(0);
+    CBMHashTable *seen = cbm_ht_create(0); /* "<source id>><target id>" -> index in edges + 1 */
+    CBMHashTable *once = cbm_ht_create(0); /* a rule's own repeats (mk_first_in_rule) */
+    sh_mkedge_t *edges = NULL;
+    int nedges = 0;
+    int cap_edges = 0;
+    /* What cannot be kept draws nothing: half the statements of a pair could
+     * leave it order-only, or at a later line, than the makefile says. */
+    bool failed = !want || !rules || !seen || !once;
+    for (int i = 0; !failed && i < h->nmkrules; i++) {
+        cbm_ht_set(want, h->mkrules[i].file, (void *)h->mkrules[i].file);
+    }
+    if (!failed) {
+        mk_rule_nodes(ctx, &a, want, rules);
+        qsort(h->mkrules, (size_t)h->nmkrules, sizeof(*h->mkrules), mk_cmp_rule);
+    }
+    for (int i = 0; !failed && i < h->nmkrules; i++) {
+        const sh_mkrule_t *r = &h->mkrules[i];
+        if (r->ntargets <= 0 || r->npres <= 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t **srcs = cbm_arena_alloc(&a, (size_t)r->ntargets * sizeof(*srcs));
+        int nsrc = 0;
+        failed = !srcs;
+        for (int t = 0; !failed && t < r->ntargets; t++) {
+            atomic_fetch_add_explicit(&g_sh_make_pairs, SKIP_ONE, memory_order_relaxed);
+            const char *key = mk_rule_key(&a, r->file, r->targets[t]);
+            const cbm_gbuf_node_t *src = key ? cbm_ht_get(rules, key) : NULL;
+            failed = !key;
+            if (src && mk_first_in_rule(&a, once, &failed, i, 't', src->id)) {
+                srcs[nsrc++] = src;
+            }
+        }
+        for (int k = 0; !failed && nsrc > 0 && k < r->npres; k++) {
+            atomic_fetch_add_explicit(&g_sh_make_pairs, SKIP_ONE, memory_order_relaxed);
+            const char *key = mk_rule_key(&a, r->file, r->pres[k].name);
+            const cbm_gbuf_node_t *dep = key ? cbm_ht_get(rules, key) : NULL;
+            failed = !key;
+            if (!dep || !mk_first_in_rule(&a, once, &failed, i, r->pres[k].order_only ? 'o' : 'p',
+                                          dep->id)) {
+                continue;
+            }
+            for (int t = 0; !failed && t < nsrc; t++) {
+                atomic_fetch_add_explicit(&g_sh_make_pairs, SKIP_ONE, memory_order_relaxed);
+                if (srcs[t] == dep) {
+                    continue;
+                }
+                const char *pair =
+                    cbm_arena_sprintf(&a, "%lld>%lld", (long long)srcs[t]->id, (long long)dep->id);
+                if (!pair) {
+                    failed = true;
+                    break;
+                }
+                intptr_t at = (intptr_t)cbm_ht_get(seen, pair);
+                if (at > 0) {
+                    sh_mkedge_t *e = &edges[at - SKIP_ONE];
+                    if (e->order_only && !r->pres[k].order_only) {
+                        e->order_only = false;
+                        e->line = r->pres[k].line;
+                    }
+                    continue;
+                }
+                if (!sh_grow((void **)&edges, &cap_edges, nedges, sizeof(*edges))) {
+                    failed = true;
+                    break;
+                }
+                edges[nedges++] =
+                    (sh_mkedge_t){srcs[t]->id, dep->id, r->pres[k].line, r->pres[k].order_only};
+                cbm_ht_set(seen, pair, (void *)(intptr_t)nedges);
+            }
+        }
+    }
+    for (int i = 0; !failed && i < nedges; i++) {
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"via\":\"prerequisite\",\"line\":%d%s}", edges[i].line,
+                 edges[i].order_only ? ",\"order_only\":true" : "");
+        cbm_gbuf_insert_edge(ctx->gbuf, edges[i].src, edges[i].dep, "DEPENDS_ON", props);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, edges);
+    if (want) {
+        cbm_ht_free(want);
+    }
+    if (rules) {
+        cbm_ht_free(rules);
+    }
+    if (seen) {
+        cbm_ht_free(seen);
+    }
+    if (once) {
+        cbm_ht_free(once);
+    }
+    cbm_arena_destroy(&a);
+}
+
 /* Each make hit's target: the rule node of that name in the makefile, else
  * in the files it includes, in reading order (the first rule of a file).
  * Read here, when linking, so an unchanged makefile is read too. */
@@ -3570,21 +3857,8 @@ static void sh_make_resolve(sh_pass_t *p, cbm_pipeline_ctx_t *ctx, sh_hits_t *h)
         }
         cbm_ht_set(closures, x->path, cl);
     }
-    const cbm_gbuf_node_t **nodes = NULL;
-    int count = 0;
-    if (rules && want && cbm_ht_count(want) > 0 &&
-        cbm_gbuf_find_by_label(ctx->gbuf, "Function", &nodes, &count) == 0) {
-        for (int i = 0; i < count; i++) {
-            const char *fp = nodes[i]->file_path;
-            if (!fp || !nodes[i]->name || !cbm_ht_get(want, fp)) {
-                continue;
-            }
-            const char *key = mk_rule_key(&a, fp, nodes[i]->name);
-            const cbm_gbuf_node_t *old = key ? cbm_ht_get(rules, key) : NULL;
-            if (key && (!old || nodes[i]->start_line < old->start_line)) {
-                cbm_ht_set(rules, key, (void *)nodes[i]);
-            }
-        }
+    if (rules && want) {
+        mk_rule_nodes(ctx, &a, want, rules);
     }
     for (int i = 0; rules && closures && i < h->count; i++) {
         sh_hit_t *x = &h->items[i];
@@ -4193,6 +4467,10 @@ void cbm_pipeline_pass_shell(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
     if (hits.count > 0 && p.ix_ok && p.parser) {
         sh_make_resolve(&p, ctx, &hits);
     }
+    if (hits.nmkrules > 0) {
+        sh_make_deps(ctx, &hits);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, hits.mkrules);
     int edges = hits.count > 0 ? sh_link(ctx, &hits) : 0;
     if (hits.declarers) {
         sh_mark_declarers(ctx, hits.declarers);

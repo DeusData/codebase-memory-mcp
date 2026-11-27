@@ -5675,6 +5675,81 @@ TEST(incremental_kustomize_file_reference_follows_its_file) {
     PASS();
 }
 
+/* A Make prerequisite's DEPENDS_ON edge lies inside its makefile. Editing
+ * another file keeps it: the makefile is not read again. Editing the makefile
+ * redraws its edges from the new text, each once: a prerequisite a rule gains
+ * is drawn, one it loses is gone. */
+TEST(incremental_make_prerequisite_follows_edits) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_mkdep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    static const char rules[] = "build:\n"
+                                "\techo build\n\n"
+                                "test:\n"
+                                "\techo test\n";
+    char text[512];
+    snprintf(text, sizeof(text), "all: build\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mkdep.db", tmp);
+    static const char deps[] = "SELECT COUNT(*) FROM edges WHERE type='DEPENDS_ON' AND "
+                               "json_extract(properties,'$.via')='prerequisite'";
+    static const char to_build[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='build'";
+    static const char to_test[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='DEPENDS_ON' AND s.name='all' AND t.name='test'";
+    int rc_full = k8s_inc_index(tmp, db_path);
+    int deps_full = k8s_inc_count(db_path, deps);
+    int build_full = k8s_inc_count(db_path, to_build);
+
+    write_temp_file(tmp, "hack/x.sh", "#!/bin/sh\necho x\necho edited\n");
+    int rc_other = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t other_route = cbm_pipeline_incremental_test_last_route();
+    int deps_other = k8s_inc_count(db_path, deps);
+    int build_other = k8s_inc_count(db_path, to_build);
+
+    snprintf(text, sizeof(text), "all: build test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_gain = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t gain_route = cbm_pipeline_incremental_test_last_route();
+    int deps_gain = k8s_inc_count(db_path, deps);
+    int build_gain = k8s_inc_count(db_path, to_build);
+    int test_gain = k8s_inc_count(db_path, to_test);
+
+    snprintf(text, sizeof(text), "all: test\n\techo all\n\n%s", rules);
+    write_temp_file(tmp, "Makefile", text);
+    int rc_lose = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t lose_route = cbm_pipeline_incremental_test_last_route();
+    int deps_lose = k8s_inc_count(db_path, deps);
+    int build_lose = k8s_inc_count(db_path, to_build);
+    int test_lose = k8s_inc_count(db_path, to_test);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc_full, 0);
+    ASSERT_EQ(deps_full, 1);
+    ASSERT_EQ(build_full, 1);
+    ASSERT_EQ(rc_other, 0);
+    ASSERT_EQ(deps_other, 1);
+    ASSERT_EQ(build_other, 1);
+    ASSERT_EQ(other_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_gain, 0);
+    ASSERT_EQ(deps_gain, 2);
+    ASSERT_EQ(build_gain, 1);
+    ASSERT_EQ(test_gain, 1);
+    ASSERT_EQ(gain_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(rc_lose, 0);
+    ASSERT_EQ(deps_lose, 1);
+    ASSERT_EQ(build_lose, 0);
+    ASSERT_EQ(test_lose, 1);
+    ASSERT_EQ(lose_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    PASS();
+}
+
 /* Deleting the only script requesting a URL leaves no Route behind -- a full
  * index never makes one without an edge; the Route a kept script requests
  * stays. `legacy`: through the full-load route, else closure repair. Returns
@@ -33366,7 +33441,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":5,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":6,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -33497,24 +33572,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"v\":5,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"v\":6,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -33534,7 +33609,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":5,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":6,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -33562,7 +33637,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":5,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":6,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -33652,10 +33727,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope (codec version 4) with
+            /* The row is the versioned codec envelope (codec version 6) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":5") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":6") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -38484,6 +38559,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_local_uses_reference_follows_its_file);
     RUN_TEST(incremental_local_action_pair_deleted_takes_the_full_route);
     RUN_TEST(incremental_kustomize_file_reference_follows_its_file);
+    RUN_TEST(incremental_make_prerequisite_follows_edits);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

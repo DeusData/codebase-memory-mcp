@@ -941,10 +941,20 @@ TEST(repro_lsp_ordered_signatures_php_trait_self_refinement) {
     php_lsp_init(&ctx, &arena, source, (int)strlen(source), &registry, module_qn, &out);
     cbm_php_refine_lsp_registry(&ctx, &registry, root);
 
+    /* The trait's method as the class that uses it reports it (the member
+     * lookup, php_find_method): the copy PHP makes, its `self` the class. */
+    php_members_begin(&ctx, &registry);
+    const CBMRegisteredFunc *tap = php_find_method(&ctx, consumer_qn, "tap");
+    CBMTypeRegistry seen;
+    cbm_registry_init(&seen, &arena);
+    if (tap) {
+        cbm_registry_add_func(&seen, *tap);
+    }
+    php_members_end(&ctx);
     const char *expected[] = {"int", "Thing", "int"};
-    int failures = check_signature(&registry, "cbm.ordered.php.trait.Consumer.tap",
+    int failures = check_signature(&seen, "cbm.ordered.php.trait.Consumer.tap",
                                    "php-trait-self-refinement", expected, 3);
-    failures += check_single_return(&registry, "cbm.ordered.php.trait.Consumer.tap",
+    failures += check_single_return(&seen, "cbm.ordered.php.trait.Consumer.tap",
                                     "php-trait-self-refinement", "Consumer");
 
     ts_tree_delete(tree);

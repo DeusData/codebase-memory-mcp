@@ -37,6 +37,8 @@
 #include <foundation/log.h>
 #include <sqlite3.h>
 
+#include <stdatomic.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -4746,6 +4748,225 @@ TEST(probe_make_rules_have_a_node_per_target) {
     PASS();
 }
 
+/* Every DEPENDS_ON edge a Make prerequisite draws, as
+ * "<file>:<target> -> <file>:<rule> (prerequisite:<line>[ order-only])",
+ * sorted, one per line. */
+static char *gpf_make_prerequisites(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
+            "s.file_path || ':' || s.name || ' -> ' || t.file_path || ':' || t.name || ' (' || "
+            "json_extract(e.properties,'$.via') || ':' || json_extract(e.properties,'$.line') || "
+            "CASE WHEN json_extract(e.properties,'$.order_only') IS NULL THEN '' ELSE "
+            "' order-only' END || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type='DEPENDS_ON' AND s.label='Function' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A prerequisite that names a rule of the same makefile is a dependency of
+ * each of the rule's targets on that rule: once per pair, at the first line
+ * stating it (make merges the prerequisites of a target's rules), an
+ * order-only one marked -- unless another rule of the target lists it as a
+ * normal one: make then treats it as normal, and the edge carries that
+ * line. A rule under a conditional, a pattern rule and a
+ * rule whose target is a variable have their prerequisites like any other.
+ * No edge for a prerequisite with a variable, a pattern or a glob, one that
+ * names a file or a rule of another makefile (an included one too), a target
+ * naming itself, a special target's list (.PHONY), a target-specific
+ * variable in any spelling, or a static pattern rule. */
+TEST(probe_make_prerequisites_depend_on_their_rules) {
+    static const GpfFile files[] = {
+        {"Makefile", "include mk/tools.mk\n"
+                     "BIN := bin\n"
+                     "TOOL := $(BIN)/tool\n\n"
+                     "ifeq ($(OS),linux)\n"
+                     "install: build\n"
+                     "\tcp bin/tool /usr/local/bin\n"
+                     "endif\n\n"
+                     ".PHONY: all build test\n"
+                     "all: build test\n\n"
+                     "build: generate | dirs\n"
+                     "\tgo build ./...\n\n"
+                     "test lint: build $(TOOL) tool\n"
+                     "\tgo test ./...\n\n"
+                     "generate: \\\n"
+                     "    proto \\\n"
+                     "    docs\n"
+                     "\techo gen\n\n"
+                     "proto docs dirs:\n"
+                     "\techo $@\n\n"
+                     "$(TOOL): go.mod dirs\n"
+                     "\tgo build -o $@ ./cmd/tool\n\n"
+                     "build: MODE = docs\n"
+                     "build: export KIND := proto\n"
+                     "lint: override FAST = dirs\n\n"
+                     "%.o: %.c generate\n"
+                     "\tcc -c $<\n\n"
+                     "objs: a.o b.o c.o\n\n"
+                     "a.o b.o: %.o: %.c dirs\n"
+                     "\tcc -c $<\n\n"
+                     "release:: build\n"
+                     "\techo one\n"
+                     "release:: test build\n"
+                     "\techo two\n\n"
+                     "deploy: build-$(ENV) *.yaml deploy all\n"
+                     "\techo deploy\n\n"
+                     "stamp: | dirs\n"
+                     "stamp: dirs\n"
+                     "mark: dirs\n"
+                     "mark: | dirs\n"},
+        {"mk/tools.mk", "tool: build\n"
+                        "\techo tool\n\n"
+                        "tools: tool\n"},
+        {"go.mod", "module example.com/x\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_make_prerequisites(files, n);
+    static const char want[] = "Makefile:$(TOOL) -> Makefile:dirs (prerequisite:27)\n"
+                               "Makefile:%.o -> Makefile:generate (prerequisite:34)\n"
+                               "Makefile:all -> Makefile:build (prerequisite:11)\n"
+                               "Makefile:all -> Makefile:test (prerequisite:11)\n"
+                               "Makefile:build -> Makefile:dirs (prerequisite:13 order-only)\n"
+                               "Makefile:build -> Makefile:generate (prerequisite:13)\n"
+                               "Makefile:deploy -> Makefile:all (prerequisite:47)\n"
+                               "Makefile:generate -> Makefile:docs (prerequisite:21)\n"
+                               "Makefile:generate -> Makefile:proto (prerequisite:20)\n"
+                               "Makefile:install -> Makefile:build (prerequisite:6)\n"
+                               "Makefile:lint -> Makefile:build (prerequisite:16)\n"
+                               "Makefile:mark -> Makefile:dirs (prerequisite:52)\n"
+                               "Makefile:objs -> Makefile:a.o (prerequisite:37)\n"
+                               "Makefile:objs -> Makefile:b.o (prerequisite:37)\n"
+                               "Makefile:release -> Makefile:build (prerequisite:42)\n"
+                               "Makefile:release -> Makefile:test (prerequisite:44)\n"
+                               "Makefile:stamp -> Makefile:dirs (prerequisite:51)\n"
+                               "Makefile:test -> Makefile:build (prerequisite:16)\n"
+                               "mk/tools.mk:tools -> mk/tools.mk:tool (prerequisite:4)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "make prerequisites got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("make prerequisites");
+    }
+    free(got);
+    PASS();
+}
+
+/* Complexity guard counter of the Make dependency drawing (pass_shell.c). */
+extern _Atomic uint64_t g_sh_make_pairs;
+
+/* A rule line that repeats a target or a prerequisite states each pair once:
+ * the drawing looks at the line's words and at its distinct pairs, not at
+ * the product of the repeats. One rule with n copies of one target and n
+ * copies of one prerequisite, counted at 1x, 4x and 16x: one edge each time,
+ * and work that grows with n. */
+TEST(probe_make_repeated_names_cost_linear_work) {
+    static const int sizes[] = {50, 200, 800};
+    uint64_t work[3] = {0, 0, 0};
+    for (int s = 0; s < 3; s++) {
+        size_t cap = (size_t)sizes[s] * 4 + 64;
+        char *mk = malloc(cap);
+        if (!mk) {
+            FAIL("alloc");
+        }
+        size_t n = 0;
+        for (int i = 0; i < sizes[s]; i++) {
+            n += (size_t)snprintf(mk + n, cap - n, "t ");
+        }
+        n += (size_t)snprintf(mk + n, cap - n, ":");
+        for (int i = 0; i < sizes[s]; i++) {
+            n += (size_t)snprintf(mk + n, cap - n, " d");
+        }
+        (void)snprintf(mk + n, cap - n, "\n\t@true\n\nd:\n\t@true\n");
+        const GpfFile files[] = {{"Makefile", mk}};
+        uint64_t before = atomic_load_explicit(&g_sh_make_pairs, memory_order_relaxed);
+        char *got = gpf_make_prerequisites(files, 1);
+        work[s] = atomic_load_explicit(&g_sh_make_pairs, memory_order_relaxed) - before;
+        bool one = got && strcmp(got, "Makefile:t -> Makefile:d (prerequisite:1)") == 0;
+        if (!one) {
+            fprintf(stderr, "repeated names at n=%d got:\n%s\n", sizes[s], got ? got : "(null)");
+        }
+        free(got);
+        free(mk);
+        if (!one) {
+            FAIL("a repeated pair is one edge");
+        }
+    }
+    if (work[0] == 0 || work[2] > work[0] * 20) {
+        fprintf(stderr, "make pair work at 50 / 200 / 800: %llu / %llu / %llu\n",
+                (unsigned long long)work[0], (unsigned long long)work[1],
+                (unsigned long long)work[2]);
+        FAIL("the work of a repeated rule line grows linearly");
+    }
+    PASS();
+}
+
+/* The Make grammar cannot parse a nested conditional indented with tabs
+ * inside an indented one (`envs` below): everything from there to the end of
+ * the file is one error region. The rules after it are still rules, and
+ * each has its node. A rule standing at the start of its line there has its
+ * prerequisites like any other. No edge for what the grammar read
+ * differently inside the region: a rule line indented with spaces, a rule
+ * under a conditional that follows a recipe; and none for what is no rule
+ * line at all: a define body, a recipe's continuation line. */
+TEST(probe_make_prerequisites_after_a_region_the_grammar_cannot_parse) {
+    static const GpfFile files[] = {{"Makefile", "all: build pack\n\n"
+                                                 "envs:\n"
+                                                 "  ifeq ($(A),)\n"
+                                                 " \t\texport A := 1\n"
+                                                 " \telse\n"
+                                                 "\t\tifeq ($(B),)\n"
+                                                 "\t\t\texport A := 2\n"
+                                                 "\t\telse\n"
+                                                 "\t\t\texport A := 3\n"
+                                                 "\t\tendif\n"
+                                                 " \tendif\n\n"
+                                                 "build: envs\n"
+                                                 "\techo build\n\n"
+                                                 "pack: build\n"
+                                                 "\tdocker run \\\n"
+                                                 "-v out:/out build\n\n"
+                                                 "define HELP\n"
+                                                 "usage: build\n"
+                                                 "endef\n\n"
+                                                 "  check: build\n"
+                                                 "\techo check\n\n"
+                                                 "ifeq ($(C),)\n"
+                                                 "late: pack\n"
+                                                 "\techo late\n"
+                                                 "endif\n\n"
+                                                 "usage:\n"
+                                                 "\techo \"$(HELP)\"\n\n"
+                                                 "lint: build | envs\n"
+                                                 "\techo lint\n"}};
+    char *got = gpf_make_prerequisites(files, 1);
+    static const char want[] = "Makefile:all -> Makefile:build (prerequisite:1)\n"
+                               "Makefile:all -> Makefile:pack (prerequisite:1)\n"
+                               "Makefile:build -> Makefile:envs (prerequisite:14)\n"
+                               "Makefile:lint -> Makefile:build (prerequisite:36)\n"
+                               "Makefile:lint -> Makefile:envs (prerequisite:36 order-only)\n"
+                               "Makefile:pack -> Makefile:build (prerequisite:17)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "make prerequisites in an error region got:\n%s\nwant:\n%s\n",
+                got ? got : "(null)", want);
+        free(got);
+        FAIL("make prerequisites in an error region");
+    }
+    free(got);
+    PASS();
+}
+
 /* make TARGET SPAWNS the rule of TARGET the makefile reads: the
  * directory's Makefile (-C, --directory=), a -f file, a rule of a file it
  * includes; from scripts, CI steps and recipes ($(MAKE)), on the line of
@@ -7788,6 +8009,9 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_github_actions_local_uses_reference_their_files);
     RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_make_rules_have_a_node_per_target);
+    RUN_TEST(probe_make_prerequisites_depend_on_their_rules);
+    RUN_TEST(probe_make_repeated_names_cost_linear_work);
+    RUN_TEST(probe_make_prerequisites_after_a_region_the_grammar_cannot_parse);
     RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
