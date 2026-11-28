@@ -99,6 +99,11 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"cpp", CBM_LANG_CPP},
     {"c#", CBM_LANG_CSHARP},
     {"csharp", CBM_LANG_CSHARP},
+    /* `vb` and `visualbasic` mean VB.NET; VB6 keeps a name of its own. */
+    {"vb.net", CBM_LANG_VISUALBASIC},
+    {"vbnet", CBM_LANG_VISUALBASIC},
+    {"visualbasic", CBM_LANG_VISUALBASIC},
+    {"vb", CBM_LANG_VISUALBASIC},
     {"php", CBM_LANG_PHP},
     {"lua", CBM_LANG_LUA},
     {"scala", CBM_LANG_SCALA},

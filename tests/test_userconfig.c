@@ -55,6 +55,31 @@ TEST(userconfig_project_basic) {
     PASS();
 }
 
+/* `vb` and `visualbasic` name VB.NET (VB6 keeps its own name), as do the
+ * language's own spellings; names match regardless of case. */
+TEST(userconfig_visualbasic_aliases) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/uctest_vb_aliases", cbm_tmpdir());
+    cbm_mkdir_p(dir, 0755);
+
+    char proj[512];
+    snprintf(proj, sizeof(proj), "%s/.codebase-memory.json", dir);
+    ASSERT_EQ(write_json(proj, "{\"extra_extensions\":{\".vbx1\":\"vb\",\".vbx2\":\"visualbasic\","
+                               "\".vbx3\":\"VB.NET\",\".vbx4\":\"vbnet\"}}"),
+              0);
+
+    cbm_userconfig_t *cfg = cbm_userconfig_load(dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".vbx1"), CBM_LANG_VISUALBASIC);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".vbx2"), CBM_LANG_VISUALBASIC);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".vbx3"), CBM_LANG_VISUALBASIC);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".vbx4"), CBM_LANG_VISUALBASIC);
+
+    cbm_userconfig_free(cfg);
+    remove(proj);
+    PASS();
+}
+
 /* ── Tests: global config ────────────────────────────────────────── */
 
 TEST(userconfig_global_via_env) {
@@ -406,6 +431,7 @@ SUITE(userconfig) {
     RUN_TEST(userconfig_source_unavailable_clears_views);
 
     RUN_TEST(userconfig_project_basic);
+    RUN_TEST(userconfig_visualbasic_aliases);
     RUN_TEST(userconfig_global_via_env);
     RUN_TEST(userconfig_project_wins_over_global);
     RUN_TEST(userconfig_unknown_lang_skipped);

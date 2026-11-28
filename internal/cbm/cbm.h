@@ -206,15 +206,16 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
-    CBM_LANG_ARKTS,    // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
-    CBM_LANG_PLSQL,    // Oracle PL/SQL
-    CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
-    CBM_LANG_PDF,      // PDF documents: the text layer, read without a grammar (doc_pdf.c)
-    CBM_LANG_ASCIIDOC, // AsciiDoc documents, read without a grammar (doc_adoc.c)
-    CBM_LANG_OPENAPI,  // openapi.json / swagger.json: the JSON grammar, no node per key; their
-                       // operations are Routes (openapi.c)
-    CBM_LANG_DIAGRAM,  // diagram files (PlantUML, DOT, D2, draw.io, Excalidraw), read
-                       // without a grammar (diagram.c)
+    CBM_LANG_ARKTS,       // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
+    CBM_LANG_PLSQL,       // Oracle PL/SQL
+    CBM_LANG_CHIALISP,    // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
+    CBM_LANG_PDF,         // PDF documents: the text layer, read without a grammar (doc_pdf.c)
+    CBM_LANG_ASCIIDOC,    // AsciiDoc documents, read without a grammar (doc_adoc.c)
+    CBM_LANG_OPENAPI,     // openapi.json / swagger.json: the JSON grammar, no node per key; their
+                          // operations are Routes (openapi.c)
+    CBM_LANG_DIAGRAM,     // diagram files (PlantUML, DOT, D2, draw.io, Excalidraw), read
+                          // without a grammar (diagram.c)
+    CBM_LANG_VISUALBASIC, // VB.NET (.vb — WinForms, class libraries)
     CBM_LANG_COUNT
 } CBMLanguage;
 

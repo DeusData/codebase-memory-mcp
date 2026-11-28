@@ -59,10 +59,10 @@ typedef struct {
 } CallNodeManifestEntry;
 
 enum {
-    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 225,
-    EXPECTED_ACTIVE_PRIMARY_TOTAL = 195,
-    EXPECTED_DIRECT_CALLS = 159,
-    EXPECTED_CONSTRUCTOR_CALLS = 22,
+    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 228,
+    EXPECTED_ACTIVE_PRIMARY_TOTAL = 198,
+    EXPECTED_DIRECT_CALLS = 161,
+    EXPECTED_CONSTRUCTOR_CALLS = 23,
     EXPECTED_OPERATOR_CALLS = 12,
     EXPECTED_IMPLICIT_CALLS = 2,
     EXPECTED_DSL_INVOCATIONS = 14,
@@ -70,7 +70,7 @@ enum {
     EXPECTED_CALLEE_WRAPPERS = 8,
     EXPECTED_ARGUMENT_WRAPPERS = 1,
     EXPECTED_CONTROL_OR_DOCUMENT_NONCALLS = 6,
-    EXPECTED_PRIMARY_OWNERS = 195,
+    EXPECTED_PRIMARY_OWNERS = 198,
     EXPECTED_SYNTHETIC_OWNERS = 10,
     EXPECTED_NO_CALL_EDGE_OWNERS = 20,
     EXPECTED_PRIMARY_OPERATOR_CALLS = 4,
@@ -320,6 +320,14 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
     ENTRY(CBM_LANG_ARKTS, "call_expression", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_ARKTS, "new_expression", CONSTRUCTOR_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_PLSQL, "ref_call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    /* VB.NET writes calls and indexing alike: `F()` parses as
+     * invocation_expression, `F(x)` as array_access_expression. */
+    ENTRY(CBM_LANG_VISUALBASIC, "invocation_expression", DIRECT_CALL, PRIMARY_EXTRACTOR, true,
+          true),
+    ENTRY(CBM_LANG_VISUALBASIC, "array_access_expression", DIRECT_CALL, PRIMARY_EXTRACTOR, true,
+          true),
+    ENTRY(CBM_LANG_VISUALBASIC, "object_creation_expression", CONSTRUCTOR_CALL, PRIMARY_EXTRACTOR,
+          true, true),
 };
 
 #undef ENTRY
@@ -327,7 +335,7 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
 #define MANIFEST_COUNT (sizeof(CALL_NODE_MANIFEST) / sizeof(CALL_NODE_MANIFEST[0]))
 
 _Static_assert(MANIFEST_COUNT == EXPECTED_HISTORICAL_CALL_NODE_TOTAL,
-               "call-node manifest must contain exactly 222 entries");
+               "call-node manifest must contain exactly 229 entries");
 _Static_assert(EXPECTED_DIRECT_CALLS + EXPECTED_CONSTRUCTOR_CALLS + EXPECTED_OPERATOR_CALLS +
                        EXPECTED_IMPLICIT_CALLS + EXPECTED_DSL_INVOCATIONS +
                        EXPECTED_BUILD_DEPENDENCIES + EXPECTED_CALLEE_WRAPPERS +
