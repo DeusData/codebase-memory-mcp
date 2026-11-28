@@ -21096,6 +21096,146 @@ TEST(pipeline_arg_url_wrapper_call_typed_with_verb_issue2768) {
     PASS();
 }
 
+/* HTTP_CALLS edges out of the function `source_name` whose properties
+ * contain `prop`. */
+static int http_calls_with_prop(cbm_store_t *s, const char *project, const char *source_name,
+                                const char *prop) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+            source.name && strcmp(source.name, source_name) == 0 && edges[i].properties_json &&
+            strstr(edges[i].properties_json, prop)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* #3115: a Rust client that joins each path onto a runtime base URL names the
+ * path only in an allowlisted helper's argument (`self.make_url("v2/x")?`).
+ * The folded path reaches the arg-URL heuristic, so the call gets an
+ * HTTP_CALLS edge typed with the client's verb, or a method-less one inside a
+ * call no HTTP pattern knows (a pagination constructor). The folded value
+ * never reaches the route-registration reader (#3114): no CALLS edge to a
+ * Route. The pad files select the parallel resolver, the only one with the
+ * arg-URL heuristic (#2848). */
+TEST(pipeline_rust_url_helper_mints_http_call_issue3115) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_url_helper_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(
+        tmp, "src/lib.rs",
+        "pub struct Zitadel { pub client: reqwest::Client, pub domain: url::Url }\n"
+        "\n"
+        "pub struct PaginationHandler { client: Zitadel, url: url::Url }\n"
+        "\n"
+        "impl PaginationHandler {\n"
+        "    pub fn new(client: Zitadel, url: url::Url) -> Self {\n"
+        "        PaginationHandler { client, url }\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "impl Zitadel {\n"
+        "    fn make_url(&self, endpoint: &str) -> Result<url::Url, Error> {\n"
+        "        Ok(self.domain.join(endpoint)?)\n"
+        "    }\n"
+        "    pub fn create_target(&self) -> Result<(), Error> {\n"
+        "        let _r = self.client.post(self.make_url(\"v2/actions/targets\")?).build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn lock_user(&self, user_id: &str) -> Result<(), Error> {\n"
+        "        let _r = self.client.post(self.make_url(&format!(\"v2/users/{user_id}/lock\"))?)"
+        ".build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn list_users(&self) -> Result<PaginationHandler, Error> {\n"
+        "        Ok(PaginationHandler::new(self.clone(), self.make_url(\"v2/users\")?))\n"
+        "    }\n"
+        "}\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, 52, "rust_url_helper.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    static const struct {
+        const char *caller;
+        const char *route;
+    } calls[] = {{"create_target", "__route__POST__/v2/actions/targets"},
+                 {"lock_user", "__route__POST__/v2/users/{}/lock"},
+                 {"list_users", "__route__ANY__/v2/users"}};
+    for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+        ASSERT_EQ(http_calls_to_route(s, project, calls[i].caller, calls[i].route), 1);
+        /* The call site's only HTTP_CALLS edge, and no route registration. */
+        ASSERT_EQ(http_calls_to_route(s, project, calls[i].caller, "__route__"), 1);
+        ASSERT_EQ(calls_into_route_count(s, project, calls[i].caller), 0);
+    }
+    ASSERT_EQ(http_calls_with_prop(s, project, "create_target", "\"via\":\"arg_url\""), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Same issue, no fabrication: a filesystem-like helper argument is not an
+ * HTTP route, a helper that is not allowlisted is never folded, and Rust
+ * constants stay unrecorded, so a const URL handed to an unknown helper gets
+ * no edge, as before. */
+TEST(pipeline_rust_url_helper_no_fabrication_issue3115) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_url_reject_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/lib.rs",
+                    "const USERS: &str = \"/v2/users\";\n"
+                    "\n"
+                    "pub struct C { pub client: reqwest::Client }\n"
+                    "\n"
+                    "impl C {\n"
+                    "    pub fn config(&self) -> Result<(), Error> {\n"
+                    "        let _r = self.client.get(self.make_url(\"docker/config.yaml\")?)"
+                    ".build()?;\n"
+                    "        Ok(())\n"
+                    "    }\n"
+                    "    pub fn users(&self) -> Result<(), Error> {\n"
+                    "        let _r = self.client.get(self.find_path(\"v2/users\")?).build()?;\n"
+                    "        Ok(())\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "pub fn list_users() -> Result<(), Error> {\n"
+                    "    fetch_json(USERS)?;\n"
+                    "    Ok(())\n"
+                    "}\n");
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *s = rust_fixture_run(tmp, 52, "rust_url_reject.db", &p);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(http_calls_to_route(s, project, "config", "__route__"), 0);
+    ASSERT_EQ(http_calls_to_route(s, project, "users", "__route__"), 0);
+    ASSERT_EQ(http_calls_to_route(s, project, "list_users", "__route__"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* #706 / #1147 end to end: a URL composed from module constants reaches the
  * HTTP classifier, so the client call forms an HTTP_CALLS edge. Python
  * `API_URL = API_BASE_URL + "/orders/create"` (env-derived base, literal path
@@ -38457,6 +38597,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_angular_http_client_typed_parallel);
     RUN_TEST(pipeline_angular_http_client_typed_sequential);
     RUN_TEST(pipeline_arg_url_wrapper_call_typed_with_verb_issue2768);
+    RUN_TEST(pipeline_rust_url_helper_mints_http_call_issue3115);
+    RUN_TEST(pipeline_rust_url_helper_no_fabrication_issue3115);
     RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
     RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
     RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);

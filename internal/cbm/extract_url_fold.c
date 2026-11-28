@@ -1,7 +1,8 @@
 /* URL constant folding for HTTP client calls (issues #706, #1147).
  * See extract_url_fold.h for the contract. */
 #include "extract_url_fold.h"
-#include "arena.h" // cbm_arena_strndup, cbm_arena_sprintf
+#include "cbm.h"              // CBMLanguage
+#include "foundation/arena.h" // cbm_arena_strdup, cbm_arena_strndup, cbm_arena_sprintf
 #include "helpers.h"
 #include "foundation/constants.h"
 #include <ctype.h>
@@ -424,7 +425,151 @@ static bool is_foldable_arg(TSNode arg) {
            is_transparent_wrapper(k);
 }
 
+/* The literal path after an unresolvable base, never the base: a rooted
+ * path that names something literal, or a relative one read from the root.
+ * `rest` must live in the arena; a rooted one is returned as is. */
+static const char *path_after_unknown_base(CBMExtractCtx *ctx, const char *rest) {
+    if (rest[0] == '/') {
+        return cbm_url_has_literal_path(rest) ? rest : NULL;
+    }
+    if (relative_path_shaped(rest)) {
+        return cbm_arena_sprintf(ctx->arena, "/%s", rest);
+    }
+    return NULL;
+}
+
+/* --- Rust URL helpers (#3115) ----------------------------------------- */
+
+/* A Rust client that joins each path onto a runtime base URL
+ * (`self.client.post(self.make_url("v2/users")?)`) names the path only in the
+ * helper's argument. The list is short on purpose: folding any call's first
+ * argument would turn `client.get(find_path("a/b"))` into an HTTP call, and
+ * generic names such as `path_for` or `url_for` also build asset and file
+ * paths, which would mint routes that do not exist. */
+static const char *const k_url_builders[] = {"make_url", "build_url", NULL};
+
+static bool is_url_builder_call(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    const char *fk = ts_node_type(fn);
+    if (strcmp(fk, "field_expression") == 0) { /* self.make_url */
+        fn = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+    } else if (strcmp(fk, "scoped_identifier") == 0) { /* urls::make_url */
+        fn = ts_node_child_by_field_name(fn, TS_FIELD("name"));
+    } else if (strcmp(fk, "identifier") != 0) { /* make_url */
+        return false;
+    }
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    /* Compared in place: this runs for every Rust call argument. */
+    const char *name = ctx->source + ts_node_start_byte(fn);
+    size_t len = ts_node_end_byte(fn) - ts_node_start_byte(fn);
+    for (int i = 0; k_url_builders[i]; i++) {
+        if (strlen(k_url_builders[i]) == len && memcmp(name, k_url_builders[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The literal a URL helper receives, behind at most one `&`: a string literal,
+ * or the literal format string of `format!("...", ..)` (*is_format set).
+ * Anything else is a null node. */
+static TSNode helper_literal(CBMExtractCtx *ctx, TSNode arg, bool *is_format) {
+    *is_format = false;
+    if (strcmp(ts_node_type(arg), "reference_expression") == 0) {
+        arg = ts_node_child_by_field_name(arg, TS_FIELD("value"));
+        if (ts_node_is_null(arg)) {
+            return arg;
+        }
+    }
+    const char *k = ts_node_type(arg);
+    if (strcmp(k, "string_literal") == 0 || strcmp(k, "raw_string_literal") == 0) {
+        return arg;
+    }
+    if (strcmp(k, "macro_invocation") == 0) {
+        TSNode mac = ts_node_child_by_field_name(arg, TS_FIELD("macro"));
+        TSNode tt = cbm_find_child_by_kind(arg, "token_tree");
+        const char *m = ts_node_is_null(mac) ? NULL : cbm_node_text(ctx->arena, mac, ctx->source);
+        TSNode first = ts_node_is_null(tt) ? tt : ts_node_named_child(tt, 0);
+        if (m && strcmp(m, "format") == 0 && !ts_node_is_null(first) &&
+            strcmp(ts_node_type(first), "string_literal") == 0) {
+            *is_format = true;
+            return first;
+        }
+    }
+    return (TSNode){0};
+}
+
+/* A format string with every `{..}` argument as "{}" and `{{` / `}}` as one
+ * literal brace. False on an unbalanced brace or overflow. */
+static bool flatten_format(const char *raw, char *out, size_t cap) {
+    size_t n = 0;
+    for (const char *p = raw; *p; p++) {
+        const char *piece = p;
+        size_t len = SKIP_ONE;
+        if ((p[0] == '{' || p[0] == '}') && p[SKIP_ONE] == p[0]) {
+            p++;
+        } else if (p[0] == '{') {
+            const char *close = strchr(p, '}');
+            if (!close) {
+                return false;
+            }
+            piece = k_unknown;
+            len = PAIR_LEN;
+            p = close;
+        } else if (p[0] == '}') {
+            return false;
+        }
+        if (n + len >= cap) {
+            return false;
+        }
+        memcpy(out + n, piece, len);
+        n += len;
+    }
+    out[n] = '\0';
+    return true;
+}
+
+/* The URL a Rust argument carries: only an allowlisted helper call, behind any
+ * `?` or parentheses. The helper joins its literal onto a base that is never
+ * known, so the literal is the path after an unknown base. Rust has no
+ * exact or raw fold: the path must never reach CBMCallArg.value or
+ * first_string_arg, where the route-registration reader would take it
+ * (#3114). */
+static const char *rust_helper_url(CBMExtractCtx *ctx, TSNode arg) {
+    for (int i = 0; i < FOLD_MAX_DEPTH && ts_node_named_child_count(arg) > 0 &&
+                    (strcmp(ts_node_type(arg), "try_expression") == 0 ||
+                     strcmp(ts_node_type(arg), "parenthesized_expression") == 0);
+         i++) {
+        arg = ts_node_named_child(arg, 0);
+    }
+    TSNode args = is_url_builder_call(ctx, arg)
+                      ? ts_node_child_by_field_name(arg, TS_FIELD("arguments"))
+                      : (TSNode){0};
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return NULL;
+    }
+    bool is_format;
+    TSNode lit = helper_literal(ctx, ts_node_named_child(args, 0), &is_format);
+    const char *raw = ts_node_is_null(lit) ? NULL : fold_string_like(ctx, lit, 0, false);
+    if (raw && is_format) {
+        char flat[FOLD_BUF];
+        raw = flatten_format(raw, flat, sizeof(flat)) ? cbm_arena_strdup(ctx->arena, flat) : NULL;
+    }
+    return raw ? path_after_unknown_base(ctx, raw) : NULL;
+}
+
 const char *cbm_url_fold_call_url(CBMExtractCtx *ctx, TSNode arg) {
+    if (ctx->language == CBM_LANG_RUST && !ts_node_is_null(arg)) {
+        return rust_helper_url(ctx, arg);
+    }
     if (!cbm_url_fold_lang(ctx->language) || ts_node_is_null(arg) || !is_foldable_arg(arg)) {
         return NULL;
     }
@@ -436,14 +581,7 @@ const char *cbm_url_fold_call_url(CBMExtractCtx *ctx, TSNode arg) {
         return has_literal_text(s) ? s : NULL;
     }
     /* Unresolvable base: keep the literal path after it, never the base. */
-    const char *rest = s + PAIR_LEN;
-    if (rest[0] == '/') {
-        return cbm_url_has_literal_path(rest) ? rest : NULL;
-    }
-    if (relative_path_shaped(rest)) {
-        return cbm_arena_sprintf(ctx->arena, "/%s", rest);
-    }
-    return NULL;
+    return path_after_unknown_base(ctx, s + PAIR_LEN);
 }
 
 const char *cbm_url_fold_exact(CBMExtractCtx *ctx, TSNode arg) {

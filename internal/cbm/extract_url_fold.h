@@ -9,7 +9,8 @@
  * such an expression into one string: string literals and module-level string
  * constants (including members of an object-literal constant) inline, and a
  * part that cannot be resolved becomes the canonical "{}" placeholder. Python
- * and the JS/TS family only. */
+ * and the JS/TS family only; for Rust, cbm_url_fold_call_url alone reads an
+ * allowlisted URL-helper call (`self.make_url("v2/users")?`, #3115). */
 
 #include "cbm.h"
 #include "tree_sitter/api.h"
