@@ -463,6 +463,10 @@ void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
  * HELLO path has computed in this process. */
 void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force);
 uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void);
+/* Fail the post-hash identity re-check of every fingerprinting image
+ * acquisition after its digest was computed (the in-process peer's re-check
+ * otherwise always holds). */
+void cbm_daemon_runtime_fail_image_recheck_after_hash_for_testing(bool fail);
 /* Abandoned-request containment seams (2026-08-29 zombie incident). The
  * timeout override shrinks the join ceiling to test scale; zero restores the
  * production constant. The hook replaces the terminal containment stop with a
