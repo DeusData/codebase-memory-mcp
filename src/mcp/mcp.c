@@ -9403,9 +9403,12 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     static const char *mode_topology[] = {"INFRA_MAPS", "USAGE",   "DEPENDS_ON", "HANDLES",
                                           "DEFINES",    "DEPLOYS", "CONNECTS_TO"};
     /* deploy: what a CI job, script or Make rule starts (SPAWNS: scripts,
-     * make targets, programs), calls (CALLS: shell functions) and puts on a
-     * cluster (DEPLOYS) -- outbound from the job, inbound from a chart */
-    static const char *mode_deploy[] = {"DEPLOYS", "SPAWNS", "CALLS"};
+     * make targets, programs), calls (CALLS: shell functions), needs first
+     * (DEPENDS_ON: the rules a Make rule's prerequisites name; like every
+     * edge of the type also a chart's dependencies, compose and Terraform
+     * depends_on, a Dockerfile's base image) and puts on a cluster (DEPLOYS)
+     * -- outbound from the job, inbound from a chart */
+    static const char *mode_deploy[] = {"DEPLOYS", "SPAWNS", "CALLS", "DEPENDS_ON"};
     /* run: what a Service or workload runs -- traffic to the workload
      * (INFRA_MAPS), the Image its container runs (USAGE), the Dockerfile
      * that builds it and what that builds on (DEPENDS_ON), the program the
