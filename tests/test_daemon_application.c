@@ -1730,6 +1730,7 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     atomic_init(&worker->cancelled, false);
     worker->result.exit_code = -1;
     if (worker->attempt < APP_FAKE_MAX_ATTEMPTS) {
+        worker->result.resource_violation = context->resource_violations[worker->attempt];
         (void)snprintf(context->args_json[worker->attempt], APP_FAKE_ARGS_CAP, "%s",
                        args_json ? args_json : "");
         atomic_store(&context->args_captured[worker->attempt], true);
@@ -1763,8 +1764,8 @@ static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected);
 
 static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, int attempt,
                                           const char *max_files, const char *max_source_mb,
-                                          const char *max_rss_mb,
-                                          const char *max_duration_seconds) {
+                                          const char *max_rss_mb, const char *max_duration_seconds,
+                                          const char *cache_max_mb, const char *min_free_disk_mb) {
     if (!context || attempt < 0 || attempt >= APP_FAKE_MAX_ATTEMPTS) {
         return false;
     }
@@ -1787,12 +1788,21 @@ static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, in
     yyjson_val *duration = policy && yyjson_is_obj(policy)
                                ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS)
                                : NULL;
-    bool equal = files && bytes && rss && duration && yyjson_is_str(files) &&
+    yyjson_val *cache = policy && yyjson_is_obj(policy)
+                            ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_CACHE_MAX_MB)
+                            : NULL;
+    yyjson_val *free_disk = policy && yyjson_is_obj(policy)
+                                ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB)
+                                : NULL;
+    bool equal = files && bytes && rss && duration && cache && free_disk && yyjson_is_str(files) &&
                  yyjson_is_str(bytes) && yyjson_is_str(rss) && yyjson_is_str(duration) &&
+                 yyjson_is_str(cache) && yyjson_is_str(free_disk) &&
                  strcmp(yyjson_get_str(files), max_files) == 0 &&
                  strcmp(yyjson_get_str(bytes), max_source_mb) == 0 &&
                  strcmp(yyjson_get_str(rss), max_rss_mb) == 0 &&
-                 strcmp(yyjson_get_str(duration), max_duration_seconds) == 0;
+                 strcmp(yyjson_get_str(duration), max_duration_seconds) == 0 &&
+                 strcmp(yyjson_get_str(cache), cache_max_mb) == 0 &&
+                 strcmp(yyjson_get_str(free_disk), min_free_disk_mb) == 0;
     yyjson_doc_free(document);
     return equal;
 }
@@ -2461,10 +2471,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool config_ready =
         stored_config && cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
         cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0;
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_RESOURCE_PROFILE, "strict") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2483,6 +2490,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
         .config = stored_config,
         .worker_ops = &worker_ops,
         .update_ops = &update_ops,
+        .aggregate_memory_budget_bytes = UINT64_C(64) * CBM_INDEX_MIB_BYTES,
     };
     cbm_daemon_application_t *application =
         config_ready ? cbm_daemon_application_new(&config) : NULL;
@@ -2510,7 +2518,41 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
                        app_wait_for_subscribers(application, project, 1) &&
                        app_wait_for_atomic_int(&fake.starts, 1);
     bool auto_policy_propagated =
-        first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4", "64", "7");
+        first_owned &&
+        app_fake_worker_policy_equals(&fake, 0, "100000", "4096", "64", "3600", "32768", "4096");
+    char explicit_args[APP_TEST_PATH_CAP + 64];
+    (void)snprintf(explicit_args, sizeof(explicit_args), "{\"repo_path\":\"%s\"}", root);
+    uint8_t *explicit_tool = NULL;
+    uint32_t explicit_tool_length = 0;
+    bool explicit_encoded = app_test_tool_request("index_repository", explicit_args, &explicit_tool,
+                                                  &explicit_tool_length);
+    app_request_thread_t explicit_request = {
+        .callbacks = callbacks,
+        .session = sessions[3],
+        .request = explicit_tool,
+        .request_length = explicit_tool_length,
+    };
+    cbm_thread_t explicit_thread;
+    bool explicit_started =
+        explicit_encoded &&
+        cbm_thread_create(&explicit_thread, 0, app_request_thread, &explicit_request) == 0;
+    bool explicit_coalesced = explicit_started && project &&
+                              app_wait_for_subscribers(application, project, 2) &&
+                              atomic_load(&fake.starts) == 1;
+    if (sessions[3]) {
+        callbacks.session_cancel(callbacks.context, sessions[3]);
+    }
+    if (explicit_started) {
+        (void)cbm_thread_join(&explicit_thread);
+    }
+    free(explicit_request.response);
+    free(explicit_tool);
+    if (sessions[3]) {
+        callbacks.session_close(callbacks.context, sessions[3]);
+        sessions[3] = NULL;
+    }
+    bool explicit_detached =
+        explicit_coalesced && project && app_wait_for_subscribers(application, project, 1);
     bool second_initialized = app_test_initialize_profile(&callbacks, sessions[1], root,
                                                           CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
     bool coalesced = first_owned && second_initialized && project &&
@@ -2574,6 +2616,8 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(first_owned);
     ASSERT_TRUE(auto_policy_propagated);
     ASSERT_TRUE(fake.background_requests[0]);
+    ASSERT_TRUE(explicit_coalesced);
+    ASSERT_TRUE(explicit_detached);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -2976,7 +3020,9 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
         stored_config && cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "5") == 0 &&
         cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "6") == 0 &&
         cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_RSS_MB, "64") == 0 &&
-        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0;
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "7") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_CACHE_MAX_MB, "8") == 0 &&
+        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MIN_FREE_DISK_MB, "9") == 0;
 
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -2997,7 +3043,7 @@ TEST(daemon_application_programmatic_index_injects_resource_policy) {
     int index_rc =
         application ? cbm_daemon_application_index(application, "policy-programmatic", root) : -1;
     bool policy_propagated =
-        index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6", "64", "7");
+        index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6", "64", "7", "8", "9");
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
 
     cbm_daemon_application_free(application);
@@ -3163,6 +3209,40 @@ TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried) {
     PASS();
 }
 
+TEST(daemon_application_worker_storage_resource_failure_is_structured_and_not_retried) {
+    app_watch_race_fixture_t fixture;
+    bool ready = app_watch_race_fixture_init(&fixture, 77);
+    atomic_store(&fixture.fake.scripted, true);
+    fixture.fake.outcomes[0] = CBM_PROC_KILLED;
+    fixture.fake.resource_violations[0] = (cbm_index_resource_violation_t){
+        .resource = CBM_INDEX_RESOURCE_TASK_TEMP_BYTES, .observed = 2048, .limit = 1024};
+
+    char args[APP_TEST_PATH_CAP + 32];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", fixture.root);
+    uint8_t *request = NULL;
+    uint32_t request_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool encoded =
+        ready && app_test_tool_request("index_repository", args, &request, &request_length);
+    bool completed = encoded && app_test_request(&fixture.callbacks, fixture.session, request,
+                                                 request_length, &response, &response_length) ==
+                                    CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    bool structured =
+        completed && response && strstr((char *)response, "resource_limit_exceeded") &&
+        strstr((char *)response, "task_temp_bytes") && strstr((char *)response, "storage");
+    int starts = atomic_load(&fixture.fake.starts);
+    free(request);
+    free(response);
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(structured);
+    ASSERT_EQ(starts, 1);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
 
 /* #1818: the daemon.autoindex.skipped warning must name the effective limit,
  * like the MCP autoindex.skip event does (#1466). The warning is emitted on the
@@ -8232,6 +8312,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
     RUN_TEST(daemon_application_programmatic_index_forwards_set_doc_candidates);
     RUN_TEST(daemon_application_worker_resource_failure_is_structured_and_not_retried);
+    RUN_TEST(daemon_application_worker_storage_resource_failure_is_structured_and_not_retried);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

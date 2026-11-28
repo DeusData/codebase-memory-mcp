@@ -62,6 +62,7 @@ bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                       const cbm_index_resource_policy_t *policy);
 bool cbm_mcp_index_policy_from_internal_args(const char *args, cbm_index_resource_policy_t *policy,
                                              char *error, size_t error_size);
+bool cbm_mcp_index_task_db_path(const char *args, char *path_out, size_t path_size);
 
 /* Request-scoped facts a worker resource failure is reported against. One
  * supervised request can run several worker attempts (crash/hang recovery), and
