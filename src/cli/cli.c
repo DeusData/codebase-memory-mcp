@@ -1,4 +1,4 @@
-/*
+﻿/*
  * cli.c — CLI subcommand handlers for install, uninstall, update, version.
  *
  * Port of Go cmd/codebase-memory-mcp/ install/update logic.
@@ -10294,15 +10294,6 @@ static void print_detected_registry_agents(const char *home, bool *any) {
     }
 }
 
-static void cbm_agent_installed_binary_path(const char *home, char *binary_path,
-                                            size_t binary_path_size) {
-#ifdef _WIN32
-    snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp.exe", home);
-#else
-    snprintf(binary_path, binary_path_size, "%s/.local/bin/codebase-memory-mcp", home);
-#endif
-}
-
 static void install_managed_agent_instructions(const char *label, const char *instructions_path,
                                                bool dry_run) {
     if (g_install_plan) {
@@ -13007,14 +12998,12 @@ typedef struct {
     const char *config_path;
     const char *instr_path;
 } mcp_uninstall_args_t;
-static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
-                                      int (*remove_fn)(const char *, const char *)) {
+static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, const char *installed_binary,
+                                      bool dry_run, int (*remove_fn)(const char *, const char *)) {
     const char *name = paths.name;
     const char *instr_path = paths.instr_path;
     if (!dry_run) {
-        char binary_path[CLI_BUF_1K];
-        cbm_agent_installed_binary_path(cbm_get_home_dir(), binary_path, sizeof(binary_path));
-        int remove_result = remove_fn(binary_path, paths.config_path);
+        int remove_result = remove_fn(installed_binary, paths.config_path);
         if (remove_result < CLI_OK) {
             record_agent_config_error(true, name, "mcp_uninstall", paths.config_path);
         } else if (remove_result > CLI_OK) {
@@ -13082,18 +13071,17 @@ static void uninstall_codex_skills(const char *home, const char *config_dir, boo
     printf("  Codex CLI skills: %d removed\n", removed);
 }
 
-static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
+static void uninstall_copilot_durable_context(const char *home, const char *installed_binary,
+                                              bool dry_run) {
     char config_dir[CLI_BUF_1K];
     char hook_path[CLI_BUF_1K];
     char skills_dir[CLI_BUF_1K];
     char agent_path[CLI_BUF_1K];
-    char binary_path[CLI_BUF_1K];
     cbm_copilot_config_dir(home, config_dir, sizeof(config_dir));
     snprintf(hook_path, sizeof(hook_path), "%s/hooks/codebase-memory-mcp.json", config_dir);
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.agent.md", config_dir);
-    cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
-    if (!dry_run && cbm_remove_copilot_hooks(hook_path, binary_path) != CLI_OK) {
+    if (!dry_run && cbm_remove_copilot_hooks(hook_path, installed_binary) != CLI_OK) {
         record_agent_config_error(true, "Copilot", "lifecycle_hook_uninstall", hook_path);
     }
     uninstall_agent_skill("Copilot", skills_dir, dry_run);
@@ -13101,7 +13089,7 @@ static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
         (cbm_tiered_profile_set_t){
             .label = "Copilot",
             .verify_path = agent_path,
-            .binary_path = binary_path,
+            .binary_path = installed_binary,
             .legacy_verify_content = legacy_copilot_verify_agent_content,
             .dialect = CBM_GRAPH_DIALECT_COPILOT,
         },
@@ -13390,11 +13378,10 @@ static void uninstall_omp_durable_context(const cbm_agent_registry_context_t *re
         dry_run);
 }
 
-static void uninstall_agent_client_registry(const char *home, bool dry_run) {
+static void uninstall_agent_client_registry(const char *home, const char *binary_path,
+                                            bool dry_run) {
     cbm_agent_registry_context_t registry;
     cbm_init_agent_registry_context(home, &registry);
-    char binary_path[CLI_BUF_1K];
-    cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
         if (!profile || !cbm_agent_client_cleanup_candidate(profile->id, &registry.options)) {
@@ -13461,9 +13448,7 @@ static void uninstall_agent_client_registry(const char *home, bool dry_run) {
 
 /* Remove CLI agent configs (Codex, Gemini, OpenCode, Antigravity, Aider). */
 /* Uninstall Gemini CLI config + hooks. */
-static void uninstall_gemini_config(const char *home, bool dry_run) {
-    char installed_binary[CLI_BUF_1K];
-    cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+static void uninstall_gemini_config(const char *home, const char *installed_binary, bool dry_run) {
     char cp[CLI_BUF_1K];
     char ip[CLI_BUF_1K];
     char ap[CLI_BUF_1K];
@@ -13502,19 +13487,17 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
 }
 
 static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char *home,
-                                 bool dry_run) {
+                                 const char *installed_binary, bool dry_run) {
     if (agents->codex) {
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
         char ap[CLI_BUF_1K];
-        char installed_binary[CLI_BUF_1K];
         cbm_codex_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.toml", config_dir);
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         bool pointer_removed = uninstall_codex_activation_pointer(ip, dry_run);
-        cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
         char hook_command[CLI_BUF_8K];
         char hook_command_windows[CLI_BUF_8K];
         bool hook_command_ok = cbm_build_augment_command(installed_binary, hook_command,
@@ -13537,8 +13520,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             report_codex_activation_pointer_uninstall(ip, pointer_removed);
             goto codex_toml_done;
         }
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, NULL}, dry_run,
-                                  cbm_remove_codex_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_codex_mcp_owned);
         report_codex_activation_pointer_uninstall(ip, pointer_removed);
         if (!dry_run &&
             cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
@@ -13568,7 +13551,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         }
     }
     if (agents->gemini) {
-        uninstall_gemini_config(home, dry_run);
+        uninstall_gemini_config(home, installed_binary, dry_run);
     }
     if (agents->opencode) {
         char cp[CLI_BUF_1K];
@@ -13579,8 +13562,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.config/opencode/skills", home);
         snprintf(ap, sizeof(ap), "%s/.config/opencode/agents/codebase-memory.md", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenCode", cp, ip}, dry_run,
-                                  cbm_remove_opencode_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenCode", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_opencode_mcp_owned);
         uninstall_agent_skill("OpenCode", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -13600,8 +13583,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.gemini/config/mcp_config.json", home);
         snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Antigravity", cp, ip}, dry_run,
-                                  cbm_remove_antigravity_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Antigravity", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_antigravity_mcp_owned);
         if (!dry_run) {
             char sp[CLI_BUF_1K];
             snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
@@ -13629,9 +13612,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
 
 /* Remove editor agent configs (Zed, KiloCode, VS Code, OpenClaw). */
 static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const char *home,
-                                    bool dry_run) {
-    char installed_binary[CLI_BUF_1K];
-    cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+                                    const char *installed_binary, bool dry_run) {
     if (agents->zed) {
         char config_dir[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
@@ -13641,7 +13622,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         cbm_zed_instructions_path(home, ip, sizeof(ip));
         snprintf(cp, sizeof(cp), "%s/settings.json", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Zed", cp, ip}, dry_run,
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Zed", cp, ip}, installed_binary, dry_run,
                                   cbm_remove_zed_mcp_owned);
         uninstall_agent_skill("Zed", skills_dir, dry_run);
     }
@@ -13710,8 +13691,8 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(code_user, sizeof(code_user), "%s/Code/User", cbm_app_config_dir());
 #endif
         snprintf(cp, sizeof(cp), "%s/mcp.json", code_user);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"VS Code", cp, NULL}, dry_run,
-                                  cbm_remove_vscode_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"VS Code", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_vscode_mcp_owned);
         uninstall_vscode_profile_configs(code_user, installed_binary, dry_run);
     }
     if (agents->cursor) {
@@ -13721,8 +13702,8 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.cursor/skills", home);
         snprintf(ap, sizeof(ap), "%s/.cursor/agents/codebase-memory.md", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cursor", cp, NULL}, dry_run,
-                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cursor", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_editor_mcp_owned);
         uninstall_agent_skill("Cursor", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -13738,16 +13719,16 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.codeium/windsurf/mcp_config.json", home);
         snprintf(ip, sizeof(ip), "%s/.codeium/windsurf/memories/global_rules.md", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Windsurf", cp, ip}, dry_run,
-                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Windsurf", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_editor_mcp_owned);
     }
     if (agents->openclaw) {
         char cp[CLI_BUF_1K];
         if (cbm_openclaw_config_path(home, cp, sizeof(cp))) {
             char workspace[CLI_BUF_1K];
             bool workspace_ok = cbm_openclaw_workspace_path(home, cp, workspace, sizeof(workspace));
-            uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL}, dry_run,
-                                      cbm_remove_openclaw_mcp_owned);
+            uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL},
+                                      installed_binary, dry_run, cbm_remove_openclaw_mcp_owned);
             if (!dry_run && cbm_remove_openclaw_compaction(cp) != CLI_OK) {
                 record_agent_config_error(true, "OpenClaw", "compaction_uninstall", cp);
             }
@@ -13783,7 +13764,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(ip, sizeof(ip), "%s/steering/codebase-memory.md", kiro_home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", kiro_home);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.json", kiro_home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, ip}, dry_run,
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, ip}, installed_binary, dry_run,
                                   cbm_remove_editor_mcp_owned);
         uninstall_agent_skill("Kiro", skills_dir, dry_run);
         char *legacy_agent_content = cbm_build_legacy_kiro_verify_agent_content(installed_binary);
@@ -13808,8 +13789,8 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.junie/skills", home);
         snprintf(agent_path, sizeof(agent_path), "%s/.junie/agents/codebase-memory.md", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Junie", cp, NULL}, dry_run,
-                                  cbm_remove_junie_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Junie", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_junie_mcp_owned);
         uninstall_agent_skill("Junie", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -13823,20 +13804,16 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
 }
 
 static void uninstall_additional_agents(const cbm_detected_agents_t *agents, const char *home,
-                                        bool dry_run) {
-    char installed_binary[CLI_BUF_1K];
-    cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+                                        const char *installed_binary, bool dry_run) {
     if (agents->hermes) {
         char hermes_home[CLI_BUF_1K];
         char cp[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
-        char binary_path[CLI_BUF_1K];
         cbm_hermes_home_dir(home, hermes_home, sizeof(hermes_home));
         snprintf(cp, sizeof(cp), "%s/config.yaml", hermes_home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", hermes_home);
-        cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
-        int hook_result =
-            dry_run ? CBM_YAML_IDENTITY_EDIT_OK : cbm_remove_hermes_context_hook(cp, binary_path);
+        int hook_result = dry_run ? CBM_YAML_IDENTITY_EDIT_OK
+                                  : cbm_remove_hermes_context_hook(cp, installed_binary);
         if (hook_result == CBM_YAML_IDENTITY_EDIT_FOREIGN) {
             printf("  hook: preserved modified pre_llm_call entry\n");
         } else if (hook_result != CBM_YAML_IDENTITY_EDIT_OK) {
@@ -13844,8 +13821,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         } else {
             printf("  hook: removed canonical pre_llm_call entry\n");
         }
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Hermes", cp, NULL}, dry_run,
-                                  cbm_remove_hermes_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Hermes", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_hermes_mcp_owned);
         uninstall_agent_skill("Hermes", skills_dir, dry_run);
     }
     if (agents->openhands) {
@@ -13857,8 +13834,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
         snprintf(settings_path, sizeof(settings_path), "%s/.openhands/settings.json", home);
         snprintf(profiles_dir, sizeof(profiles_dir), "%s/.openhands/agent-profiles", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenHands", cp, NULL}, dry_run,
-                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenHands", cp, NULL}, installed_binary,
+                                  dry_run, cbm_remove_editor_mcp_owned);
         printf("  removed %d skill(s)\n", cbm_remove_skills(skills_dir, dry_run));
         /* #1826 counterpart: undo the settings.json registration and every
          * agent profile's mcp_server_refs entry the install above added. */
@@ -13873,7 +13850,6 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         char ap[CLI_BUF_1K];
         char session_hp[CLI_BUF_1K];
         char coverage_hp[CLI_BUF_1K];
-        char binary_path[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.augment/settings.json", home);
         snprintf(ip, sizeof(ip), "%s/.augment/rules/codebase-memory.md", home);
         snprintf(ap, sizeof(ap), "%s/.augment/agents/codebase-memory.md", home);
@@ -13884,14 +13860,13 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         /* The owned-document match must rebuild the scripts with the exact
          * binary path the install embedded — the managed canonical plain form
          * on Windows, not a hand-assembled default. */
-        cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Augment/Auggie", cp, ip}, dry_run,
-                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Augment/Auggie", cp, ip},
+                                  installed_binary, dry_run, cbm_remove_editor_mcp_owned);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
                 .label = "Augment/Auggie",
                 .verify_path = ap,
-                .binary_path = binary_path,
+                .binary_path = installed_binary,
                 .legacy_verify_content = legacy_augment_verify_agent_content,
                 .dialect = CBM_GRAPH_DIALECT_AUGMENT,
             },
@@ -13903,7 +13878,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
             if (cbm_remove_augment_coverage_hook(cp, coverage_hp) != CLI_OK) {
                 record_agent_config_error(true, "Augment/Auggie", "coverage_hook_uninstall", cp);
             }
-            remove_augment_owned_hook_scripts(binary_path, session_hp, coverage_hp, true);
+            remove_augment_owned_hook_scripts(installed_binary, session_hp, coverage_hp, true);
         }
         printf("  removed SessionStart + PostToolUse hooks + dedicated subagent\n");
     }
@@ -13920,10 +13895,10 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(ide_cp, sizeof(ide_cp), "%s/settings/cline_mcp_settings.json", cline_data);
         snprintf(ip, sizeof(ip), "%s/rules/codebase-memory-mcp.md", cline_root);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", cline_root);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cline", cli_cp, ip}, dry_run,
-                                  cbm_remove_cline_mcp_owned);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cline IDE", ide_cp, NULL}, dry_run,
-                                  cbm_remove_cline_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cline", cli_cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_cline_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cline IDE", ide_cp, NULL},
+                                  installed_binary, dry_run, cbm_remove_cline_mcp_owned);
         uninstall_agent_skill("Cline", skills_dir, dry_run);
         (void)remove_cline_context_hooks(cline_root, installed_binary, dry_run, true);
     }
@@ -13943,8 +13918,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(ip, sizeof(ip), "%s/QWEN.md", qwen_home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", qwen_home);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.md", qwen_home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Qwen Code", cp, ip}, dry_run,
-                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Qwen Code", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_editor_mcp_owned);
         if (!dry_run) {
 #ifdef _WIN32
             bool windows = true;
@@ -13972,11 +13947,11 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         cbm_copilot_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/mcp-config.json", config_dir);
         snprintf(ip, sizeof(ip), "%s/copilot-instructions.md", config_dir);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Copilot CLI", cp, ip}, dry_run,
-                                  cbm_remove_copilot_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Copilot CLI", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_copilot_mcp_owned);
     }
     if (agents->vscode || agents->copilot_cli) {
-        uninstall_copilot_durable_context(home, dry_run);
+        uninstall_copilot_durable_context(home, installed_binary, dry_run);
     }
     if (agents->factory_droid) {
         char cp[CLI_BUF_1K];
@@ -13989,8 +13964,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(hp, sizeof(hp), "%s/.factory/hooks.json", home);
         snprintf(ap, sizeof(ap), "%s/.factory/droids/codebase-memory.md", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.factory/skills", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Factory Droid", cp, ip}, dry_run,
-                                  cbm_remove_factory_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Factory Droid", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_factory_mcp_owned);
         if (!dry_run && cbm_remove_factory_hooks(hp, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Factory Droid", "context_hook_uninstall", hp);
         }
@@ -14013,8 +13988,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         if (!dry_run && cbm_remove_crush_context_path(cp, ip) != CLI_OK) {
             record_agent_config_error(true, "Crush", "context_reference_uninstall", cp);
         }
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Crush", cp, ip}, dry_run,
-                                  cbm_remove_crush_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Crush", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_crush_mcp_owned);
         char legacy_ip[CLI_BUF_1K];
         snprintf(legacy_ip, sizeof(legacy_ip), "%s/.config/crush/CRUSH.md", home);
         if (!dry_run && cbm_file_exists(legacy_ip) &&
@@ -14029,8 +14004,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         cbm_goose_config_dir(home, config_dir, sizeof(config_dir));
         snprintf(cp, sizeof(cp), "%s/config.yaml", config_dir);
         snprintf(ip, sizeof(ip), "%s/.config/goose/.goosehints", home);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Goose", cp, ip}, dry_run,
-                                  cbm_remove_goose_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Goose", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_goose_mcp_owned);
     }
     if (agents->mistral_vibe) {
         char config_dir[CLI_BUF_1K];
@@ -14045,8 +14020,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
         snprintf(prompt_path, sizeof(prompt_path), "%s/prompts/codebase-memory.md", config_dir);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Mistral Vibe", cp, ip}, dry_run,
-                                  cbm_remove_vibe_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Mistral Vibe", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_vibe_mcp_owned);
         uninstall_agent_skill("Mistral Vibe", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -14070,8 +14045,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(ip, sizeof(ip), "%s/rules/codebase-memory.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.md", config_dir);
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Grok Build", cp, ip}, dry_run,
-                                  cbm_remove_grok_mcp_owned);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Grok Build", cp, ip}, installed_binary,
+                                  dry_run, cbm_remove_grok_mcp_owned);
         uninstall_agent_skill("Grok Build", skills_dir, dry_run);
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -14157,10 +14132,13 @@ static int cli_uninstall_activate(void *opaque) {
     if (activation->agents.claude_code) {
         uninstall_claude_code(activation->home, activation->bin_path, activation->dry_run);
     }
-    uninstall_cli_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_editor_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_additional_agents(&activation->agents, activation->home, activation->dry_run);
-    uninstall_agent_client_registry(activation->home, activation->dry_run);
+    uninstall_cli_agents(&activation->agents, activation->home, activation->bin_path,
+                         activation->dry_run);
+    uninstall_editor_agents(&activation->agents, activation->home, activation->bin_path,
+                            activation->dry_run);
+    uninstall_additional_agents(&activation->agents, activation->home, activation->bin_path,
+                                activation->dry_run);
+    uninstall_agent_client_registry(activation->home, activation->bin_path, activation->dry_run);
     cbm_config_edit_path_follow_clear();
 
     /* Agent-config failures are collected, never a gate: an entry the editors
