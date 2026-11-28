@@ -304,6 +304,8 @@ static const char *cfscript_import_types[] = {"import_statement", "import", NULL
 static const char *cfml_func_types[] = {"cf_function_tag", "function_declaration",
                                         "function_expression", NULL};
 static const char *cfml_call_types[] = {"call_expression", NULL};
+static const char *cfml_import_types[] = {"cf_selfclose_tag", "cf_start_tag",
+                                          "cf_start_tag_with_selfclose", NULL};
 static const char *cfml_branch_types[] = {
     "cf_if_tag",     "cf_elseif_tag",   "cf_else_tag",      "if_statement",
     "for_statement", "while_statement", "switch_statement", NULL};
@@ -2187,9 +2189,9 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_CFML
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
-                       cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
-                       empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       cfml_embedded_imports},
+                       cfml_call_types, cfml_import_types, empty_types, cfml_branch_types,
+                       empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                       tree_sitter_cfml, cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,

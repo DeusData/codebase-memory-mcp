@@ -53,6 +53,9 @@ static const cbm_include_path_row_t IP_ROWS[] = {
      .base_file_dir = true,
      .base_root = true,
      .exactly_one = true},
+    /* CFML reads relative templates beside the includer. A leading slash
+     * uses a server mapping, so use Protobuf's unique whole-path tail rule. */
+    {.lang = CBM_LANG_CFML, .base_file_dir = true, .whole_path_tail = true},
 };
 
 const cbm_include_path_row_t *cbm_include_path_row(CBMLanguage lang) {
@@ -173,8 +176,18 @@ struct cbm_include_universe {
     /* false when an indexed path did not fit the rule's buffers: then no
      * uniqueness and no absence is proven */
     bool complete;
+    bool all_paths;      /* CFML templates can name any indexed file */
     uint64_t tail_steps; /* suffix keys made while building */
 };
+
+static bool ip_has_cfml(const cbm_file_info_t *files, int count) {
+    for (int i = 0; files && i < count; i++) {
+        if (files[i].language == CBM_LANG_CFML) {
+            return true;
+        }
+    }
+    return false;
+}
 
 void cbm_include_universe_free(cbm_include_universe_t *u) {
     if (!u) {
@@ -211,20 +224,27 @@ static bool ip_fold_into(char *out, size_t sz, const char *p) {
 }
 
 /* One indexed path: into the set and the suffix indexes (building only). */
-static bool ip_list_add(cbm_include_universe_t *u, const char *path) {
+static bool ip_list_add(cbm_include_universe_t *u, const char *path, bool listed_name) {
     const char *rel = cbm_arena_strdup(&u->arena, path);
-    char fold[IP_PATH_MAX];
-    if (!rel || !ip_fold_into(fold, sizeof(fold), rel)) {
+    if (!rel) {
         return false;
     }
-    const char *folded = cbm_arena_strdup(&u->arena, fold);
-    if (!folded) {
-        return false;
-    }
-    for (const char *p = folded; p;) {
-        cbm_ht_set(u->ftails, p, (void *)folded);
-        const char *slash = strchr(p, '/');
-        p = slash ? slash + SKIP_ONE : NULL;
+    /* The older rows use case-folded tails to prove absence. CFML only
+     * consults the exact index, so keep its additional paths out of that proof. */
+    if (listed_name) {
+        char fold[IP_PATH_MAX];
+        if (!ip_fold_into(fold, sizeof(fold), rel)) {
+            return false;
+        }
+        const char *folded = cbm_arena_strdup(&u->arena, fold);
+        if (!folded) {
+            return false;
+        }
+        for (const char *p = folded; p;) {
+            cbm_ht_set(u->ftails, p, (void *)folded);
+            const char *slash = strchr(p, '/');
+            p = slash ? slash + SKIP_ONE : NULL;
+        }
     }
     cbm_ht_set(u->listed, rel, (void *)rel);
     for (const char *p = rel; p;) {
@@ -260,7 +280,10 @@ cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, i
         cbm_include_universe_free(u);
         return NULL;
     }
+    /* Keep the usual name-filtered inventory in repos without CFML. */
+    bool has_cfml = ip_has_cfml(files, count);
     u->complete = true;
+    u->all_paths = has_cfml;
     for (int i = 0; files && i < count; i++) {
         const char *rel = files[i].rel_path;
         if (!rel || !rel[0]) {
@@ -268,14 +291,19 @@ cbm_include_universe_t *cbm_include_universe_new(const cbm_file_info_t *files, i
         }
         const char *base = strrchr(rel, '/');
         base = base ? base + SKIP_ONE : rel;
-        if (!cbm_include_path_listed_name(base) || cbm_ht_get(u->listed, rel)) {
+        bool listed_name = cbm_include_path_listed_name(base);
+        if ((!has_cfml && !listed_name) || cbm_ht_get(u->listed, rel)) {
             continue; /* a name no row's import names, or listed already */
         }
         if (strlen(rel) >= IP_PATH_MAX) {
-            u->complete = false; /* a path the rule cannot hold */
-            continue;
+            u->complete = u->complete && !listed_name;
+            if (!has_cfml) {
+                continue;
+            }
+            /* CFML still counts long paths when checking tail uniqueness. */
+            listed_name = false;
         }
-        if (!ip_list_add(u, rel)) {
+        if (!ip_list_add(u, rel, listed_name)) {
             cbm_include_universe_free(u);
             return NULL;
         }
@@ -288,16 +316,19 @@ enum { IP_EXISTS_NO = 0, IP_EXISTS_YES = 1, IP_EXISTS_UNKNOWN = 2 };
 /* A file of the run (a File node), or an indexed one; unknown when the
  * universe is not whole for a name a row keeps. */
 static int ip_exists(const cbm_include_universe_t *u, const cbm_gbuf_t *graph, const char *project,
-                     const char *rel) {
+                     const char *rel, bool template) {
     if (graph && project && cbm_pipeline_file_node(graph, project, rel)) {
-        return IP_EXISTS_YES;
-    }
-    if (cbm_ht_get(u->listed, rel)) {
         return IP_EXISTS_YES;
     }
     const char *base = strrchr(rel, '/');
     base = base ? base + SKIP_ONE : rel;
-    return u->complete || !cbm_include_path_listed_name(base) ? IP_EXISTS_NO : IP_EXISTS_UNKNOWN;
+    if (!template && !cbm_include_path_listed_name(base)) {
+        return IP_EXISTS_NO;
+    }
+    if (cbm_ht_get(u->listed, rel)) {
+        return IP_EXISTS_YES;
+    }
+    return (template ? u->all_paths : u->complete) ? IP_EXISTS_NO : IP_EXISTS_UNKNOWN;
 }
 
 /* Of the candidates, the one that names a file; NULL when none does, when
@@ -315,7 +346,7 @@ static const char *ip_pick(const cbm_include_universe_t *u, const cbm_gbuf_t *gr
         if (dup) {
             continue;
         }
-        int ex = ip_exists(u, graph, project, cands[i]);
+        int ex = ip_exists(u, graph, project, cands[i], false);
         if (ex == IP_EXISTS_UNKNOWN) {
             return NULL;
         }
@@ -344,7 +375,9 @@ static const char *ip_unique_tail(const cbm_include_universe_t *u,
                                   size_t buf_sz) {
     const char *base = strrchr(key, '/');
     base = base ? base + SKIP_ONE : key;
-    if (!base[0] || !ip_row_names(row, base) || !u->complete) {
+    bool complete =
+        row->lang == CBM_LANG_CFML ? u->all_paths : u->complete && ip_row_names(row, base);
+    if (!base[0] || !complete) {
         return NULL; /* a name the universe does not keep, or not whole */
     }
     const ip_tail_t *e = cbm_ht_get(u->tails, key);
@@ -392,6 +425,44 @@ static bool ip_virtual_ok(const char *p) {
     return true;
 }
 
+/* A doubled hash spells a literal hash. Any other hash can start an
+ * expression, which the index cannot evaluate. */
+static bool ip_cfml_literal(char *out, size_t size, const char *raw) {
+    size_t n = 0;
+    for (; *raw && n + 1 < size; raw++) {
+        if (*raw == '#' && *++raw != '#') {
+            return false;
+        }
+        out[n++] = *raw;
+    }
+    out[n] = '\0';
+    return !*raw && n > 0;
+}
+
+static cbm_include_path_verdict_t ip_cfml_resolve(const cbm_include_universe_t *u,
+                                                  const cbm_gbuf_t *graph, const char *project,
+                                                  const cbm_include_path_row_t *row,
+                                                  const char *rel, const char *raw, char *buf,
+                                                  size_t buf_sz) {
+    char path[IP_PATH_MAX];
+    char key[IP_PATH_MAX];
+    if (!u || !ip_cfml_literal(path, sizeof(path), raw)) {
+        return CBM_INCLUDE_PATH_NONE;
+    }
+    if (path[0] == '/' && row->whole_path_tail) {
+        const char *target = ip_unique_tail(u, row, path + SKIP_ONE, buf, buf_sz);
+        return target ? CBM_INCLUDE_PATH_FILE : CBM_INCLUDE_PATH_NO_FILE;
+    }
+    char dir[IP_PATH_MAX];
+    if (row->base_file_dir && ip_dirname(dir, sizeof(dir), rel) &&
+        ip_join(key, sizeof(key), dir, path) &&
+        ip_exists(u, graph, project, key, true) == IP_EXISTS_YES && strlen(key) < buf_sz) {
+        memcpy(buf, key, strlen(key) + SKIP_ONE);
+        return CBM_INCLUDE_PATH_FILE;
+    }
+    return CBM_INCLUDE_PATH_NO_FILE;
+}
+
 cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t *u,
                                                     const cbm_gbuf_t *graph, const char *project,
                                                     const char *rel, CBMLanguage lang,
@@ -402,6 +473,11 @@ cbm_include_path_verdict_t cbm_include_path_resolve(const cbm_include_universe_t
         return CBM_INCLUDE_PATH_NOT_A_PATH;
     }
     const char *p = imp->module_path;
+    if (lang == CBM_LANG_CFML) {
+        return imp->kind == CBM_IMPORT_KIND_TEMPLATE
+                   ? ip_cfml_resolve(u, graph, project, row, rel, p, buf, buf_sz)
+                   : CBM_INCLUDE_PATH_NOT_A_PATH;
+    }
     if (row->path_needs_suffix) {
         bool named = false;
         for (const char *const *s = row->suffixes; s && *s; s++) {
@@ -468,7 +544,8 @@ static const cbm_gbuf_node_t *ip_file_target(const cbm_pipeline_ctx_t *ctx, cons
 bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CBMLanguage lang,
                               const CBMImport *imp, const cbm_gbuf_node_t **out) {
     *out = NULL;
-    if (!ctx || !ctx->include_universe || !cbm_include_path_row(lang)) {
+    bool template = imp && lang == CBM_LANG_CFML && imp->kind == CBM_IMPORT_KIND_TEMPLATE;
+    if (!ctx || (!ctx->include_universe && !template) || !cbm_include_path_row(lang)) {
         return false;
     }
     char buf[IP_PATH_MAX];
@@ -483,7 +560,8 @@ bool cbm_include_path_decides(const cbm_pipeline_ctx_t *ctx, const char *rel, CB
     /* proven to name no repository file: neither a file nor a symbol of the
      * repository can be its target. Otherwise (not a path, several files,
      * unknown) main's strategies decide. */
-    return v == CBM_INCLUDE_PATH_NO_FILE;
+    /* Template paths never fall through to the symbol strategies. */
+    return template || v == CBM_INCLUDE_PATH_NO_FILE;
 }
 
 static int ip_strcmp_ptr(const void *a, const void *b) {
@@ -498,11 +576,12 @@ int cbm_include_path_inventory_digest(const cbm_file_info_t *files, int count,
         return CBM_NOT_FOUND;
     }
     size_t n = 0;
+    bool has_cfml = ip_has_cfml(files, count);
     for (int i = 0; i < count; i++) {
         const char *rel = files[i].rel_path;
         const char *base = rel ? strrchr(rel, '/') : NULL;
         base = base ? base + SKIP_ONE : rel;
-        if (rel && rel[0] && cbm_include_path_listed_name(base)) {
+        if (rel && rel[0] && (has_cfml || cbm_include_path_listed_name(base))) {
             sorted[n++] = rel;
         }
     }

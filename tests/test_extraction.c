@@ -723,6 +723,33 @@ TEST(extract_cfml_tag_issue38) {
     PASS();
 }
 
+TEST(extract_cfml_template_imports) {
+    CBMFileResult *r = extract("<!--- <cfinclude template='comment.cfm'> --->\n"
+                               "<cfinclude template=\"local.cfm\">\n"
+                               "<cfif true>\n"
+                               "    <CFMODULE Name='ignored' TEMPLATE='/views/panel.cfm' />\n"
+                               "<cfelse>\n"
+                               "    <CFINCLUDE TEMPLATE='partials/#var#.cfm' />\n"
+                               "</cfif>\n"
+                               "<cfsetting template='unrelated.cfm'>\n"
+                               "<cfmodule name='tags.only'>\n"
+        "<cfinclude template=missing.cfm />\n"
+        "<cfinclude template='o''brien.cfm' />\n"
+        "<cfinclude template=\"a\"\"b.cfm\" />\n",
+                               CBM_LANG_CFML, "app", "index.cfm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 6);
+    const char *const paths[] = {"local.cfm", "/views/panel.cfm", "partials/#var#.cfm",
+                                 "missing.cfm", "o'brien.cfm", "a\"b.cfm"};
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        ASSERT_STR_EQ(imp->module_path, paths[i]);
+        ASSERT_EQ(imp->kind, CBM_IMPORT_KIND_TEMPLATE);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- CFML tag dialect: script functions inside a <cfscript> block of a tag
  * component. The HTML-derived cfml grammar keeps the <cfscript> body as an
  * opaque cf_script_content token, so these functions only surface once the
@@ -733,16 +760,17 @@ TEST(extract_cfml_tag_issue38) {
  * the cfml grammar) does not prevent recovery of the functions. --- */
 TEST(extract_cfml_embedded_cfscript_defs) {
     /* Source layout (1-based lines): 1 <cfcomponent>, 2 <cfsetting>, 3 <cfscript>,
-     * 4 greet(), 7 addTwo(), 10 </cfscript>, 11 <cffunction tagPing>, 14 close. */
+     * 4 greet(), 7 addTwo(), 10 import, 11 </cfscript>, 12 <cffunction tagPing>. */
     CBMFileResult *r = extract("<cfcomponent>\n"
                                "<cfsetting requesttimeout=\"10\">\n"
                                "<cfscript>\n"
                                "    public string function greet(string who) {\n"
-                               "        return \"hi \" & who;\n"
+                               "        return createObject(\"component\", who);\n"
                                "    }\n"
                                "    private numeric function addTwo(numeric a) {\n"
                                "        return a + 2;\n"
                                "    }\n"
+                               "    import services.Greeter;\n"
                                "</cfscript>\n"
                                "<cffunction name=\"tagPing\" returntype=\"string\">\n"
                                "    <cfreturn \"pong\">\n"
@@ -753,6 +781,10 @@ TEST(extract_cfml_embedded_cfscript_defs) {
     /* Script functions inside <cfscript> are recovered ... */
     ASSERT(has_def(r, "Function", "greet"));
     ASSERT(has_def(r, "Function", "addTwo"));
+    ASSERT(has_call(r, "createObject"));
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_STR_EQ(r->imports.items[0].module_path, "services.Greeter");
+    ASSERT_EQ(r->imports.items[0].kind, CBM_IMPORT_KIND_DEFAULT);
     /* ... alongside the tag-dialect <cffunction> in the same component. */
     ASSERT(has_def(r, "Function", "tagPing"));
     /* Line numbers are remapped from block-relative back to host-file lines. */
@@ -17088,6 +17120,7 @@ SUITE(extraction) {
     RUN_TEST(extract_qml_issue42);
     RUN_TEST(extract_cfscript_issue38);
     RUN_TEST(extract_cfml_tag_issue38);
+    RUN_TEST(extract_cfml_template_imports);
     RUN_TEST(extract_cfml_embedded_cfscript_defs);
     RUN_TEST(extract_helm_templates_issue338);
     RUN_TEST(extract_helm_values_toplevel_issue338);

@@ -3290,6 +3290,181 @@ static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock 
     ts_parser_delete(parser);
 }
 
+/* The void-tag production hides its name in the bytes after <cf. */
+static bool cfml_template_prefix(CBMExtractCtx *ctx, TSNode prefix, uint32_t limit) {
+    if (ts_node_is_null(prefix) || ts_node_is_missing(prefix) ||
+        strcmp(ts_node_type(prefix), "<cf") != 0) {
+        return false;
+    }
+    uint32_t start = ts_node_end_byte(prefix);
+    uint32_t end = start;
+    while (end < limit && !isspace((unsigned char)ctx->source[end]) && ctx->source[end] != '/' &&
+           ctx->source[end] != '>') {
+        end++;
+    }
+    if (end - start != sizeof("include") - 1 && end - start != sizeof("module") - 1) {
+        return false;
+    }
+    const char *text = cbm_arena_strndup(ctx->arena, ctx->source + start, end - start);
+    return ascii_trimmed_equals(text, "include") || ascii_trimmed_equals(text, "module");
+}
+
+static bool cfml_template_tag(CBMExtractCtx *ctx, TSNode node) {
+    TSNode name = cbm_find_child_by_kind(node, "cf_tag_name");
+    if (!ts_node_is_null(name)) {
+        const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+        return ascii_trimmed_equals(text, "include") || ascii_trimmed_equals(text, "module");
+    }
+    return cfml_template_prefix(ctx, ts_node_child(node, 0), ts_node_end_byte(node));
+}
+
+/* The grammar splits an escaped single quote across the value boundary.
+ * Continue after the split pair, stopping at the surrounding markup. */
+static uint32_t cfml_single_quote_end(const char *source, uint32_t end, uint32_t limit) {
+    for (uint32_t i = end + SKIP_ONE; i < limit; i++) {
+        if (source[i] == '<' || source[i] == '>') {
+            break;
+        }
+        if (source[i] == '\'') {
+            if (i + SKIP_ONE < limit && source[i + SKIP_ONE] == '\'') {
+                i++;
+                continue;
+            }
+            uint32_t next = i + SKIP_ONE;
+            if (next < limit && (isspace((unsigned char)source[next]) || source[next] == '/' ||
+                                 source[next] == '>')) {
+                return next;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+/* CFML doubles the surrounding quote to spell a literal quote. Leave
+ * interpolated values intact for the path rule to decline. */
+static char *cfml_template_path(CBMExtractCtx *ctx, TSNode value, bool recover_only) {
+    if (strcmp(ts_node_type(value), "quoted_cf_attribute_value") != 0) {
+        return recover_only ? NULL : cbm_node_text(ctx->arena, value, ctx->source);
+    }
+    uint32_t start = ts_node_start_byte(value);
+    uint32_t end = ts_node_end_byte(value);
+    uint32_t limit = (uint32_t)ctx->source_len;
+    if (end - start < PAIR_LEN || end > limit) {
+        return NULL;
+    }
+    char quote = ctx->source[start];
+    if (quote == '\'' && end < limit && ctx->source[end] == '\'' &&
+        ctx->source[end - SKIP_ONE] == '\'') {
+        end = cfml_single_quote_end(ctx->source, end, limit);
+        if (end == 0) {
+            return NULL;
+        }
+    } else if (recover_only) {
+        return NULL;
+    }
+    if ((quote != '\'' && quote != '"') || ctx->source[end - SKIP_ONE] != quote) {
+        return NULL;
+    }
+    char *path =
+        cbm_arena_strndup(ctx->arena, ctx->source + start + SKIP_ONE, end - start - PAIR_LEN);
+    if (!path) {
+        return NULL;
+    }
+    if (!ts_node_is_null(cbm_find_child_by_kind(value, "hash_expression"))) {
+        return path;
+    }
+    char *out = path;
+    for (const char *in = path; *in; in++) {
+        if (*in == quote && in[1] == quote) {
+            in++;
+        }
+        *out++ = *in;
+    }
+    *out = '\0';
+    return path;
+}
+
+/* Like extract_cfml_function_tag, find the value through the attribute name.
+ * Keep the entire value so interpolated templates reach the path rule too. */
+static bool cfml_record_template_attribute(CBMExtractCtx *ctx, TSNode attr, uint32_t tag_start,
+                                           bool recover_only) {
+    TSNode name = cbm_find_child_by_kind(attr, "cf_attribute_name");
+    if (ts_node_is_null(name) ||
+        !ascii_trimmed_equals(cbm_node_text(ctx->arena, name, ctx->source), "template")) {
+        return false;
+    }
+    TSNode value = cbm_find_child_by_kind(attr, "quoted_cf_attribute_value");
+    if (ts_node_is_null(value)) {
+        value = cbm_find_child_by_kind(attr, "cf_attribute_value");
+    }
+    if (!ts_node_is_null(value)) {
+        const char *path = cfml_template_path(ctx, value, recover_only);
+        if (path && path[0]) {
+            CBMImport imp = {
+                .module_path = path, .start_byte = tag_start, .kind = CBM_IMPORT_KIND_TEMPLATE};
+            cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+        }
+    }
+    return true;
+}
+
+static void cfml_record_template(CBMExtractCtx *ctx, TSNode tag) {
+    uint32_t count = ts_node_named_child_count(tag);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode attr = ts_node_named_child(tag, i);
+        const char *kind = ts_node_type(attr);
+        /* A generic start tag wraps each attribute separately. */
+        if (strcmp(kind, "cf_tag_attributes") == 0) {
+            attr = cbm_find_child_by_kind(attr, "cf_attribute");
+        } else if (strcmp(kind, "cf_attribute") != 0) {
+            continue;
+        }
+        if (!ts_node_is_null(attr) &&
+            cfml_record_template_attribute(ctx, attr, ts_node_start_byte(tag), false)) {
+            return;
+        }
+    }
+}
+
+/* A void include with the split quote can leave its attributes in ERROR.
+ * Use only a template attribute directly following its own tag prefix. */
+static void cfml_recover_template(CBMExtractCtx *ctx, TSNode attr) {
+    TSNode prefix = ts_node_prev_sibling(attr);
+    while (!ts_node_is_null(prefix) && strcmp(ts_node_type(prefix), "cf_attribute") == 0) {
+        prefix = ts_node_prev_sibling(prefix);
+    }
+    if (cfml_template_prefix(ctx, prefix, ts_node_start_byte(attr))) {
+        cfml_record_template_attribute(ctx, attr, ts_node_start_byte(prefix), true);
+    }
+}
+
+/* Includes in conditional and custom-tag bodies are imports too, so walk
+ * the whole tree rather than the root children used by parse_spec_imports. */
+static void parse_cfml_imports(CBMExtractCtx *ctx) {
+    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (spec_type_matches(spec->import_node_types, ts_node_type(node)) &&
+            cfml_template_tag(ctx, node)) {
+            cfml_record_template(ctx, node);
+        } else if (strcmp(ts_node_type(node), "cf_attribute") == 0 &&
+                   ts_node_is_error(ts_node_parent(node))) {
+            cfml_recover_template(ctx, node);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return;
+            }
+        }
+    }
+}
+
 static void parse_embedded_imports(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec || !spec->embedded_imports) {
@@ -4928,10 +5103,13 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_SVELTE:
     case CBM_LANG_VUE:
     case CBM_LANG_ASTRO:
+        parse_embedded_imports(ctx);
+        break;
     /* Tag-dialect CFML: <cfscript> bodies are opaque cf_script_content to the
      * cfml grammar; the embedded spec re-parses them as CFSCRIPT (#1412). */
     case CBM_LANG_CFML:
         parse_embedded_imports(ctx);
+        parse_cfml_imports(ctx);
         break;
     default:
         // Grammar-only languages with no dedicated parser: consume the

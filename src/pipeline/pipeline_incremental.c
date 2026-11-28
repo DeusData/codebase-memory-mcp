@@ -325,6 +325,28 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
     return 0;
 }
 
+/* A changed set of indexed include targets can affect unchanged importers.
+ * Both manifest routes use the discovered list for this dependency. */
+static int semantic_manifest_add_include_listing(semantic_manifest_builder_t *builder,
+                                                 const char *project, const cbm_file_info_t *files,
+                                                 int file_count) {
+    for (int i = 0; i < file_count; i++) {
+        if (cbm_pipeline_frozen_checkpoint(builder->frozen)) {
+            return CBM_NOT_FOUND;
+        }
+        if (cbm_include_path_row(files[i].language)) {
+            char digest[CBM_SHA256_HEX_LEN + 1];
+            int rc = cbm_include_path_inventory_digest(files, file_count, digest);
+            if (rc != 0 || cbm_pipeline_frozen_checkpoint(builder->frozen)) {
+                return CBM_NOT_FOUND;
+            }
+            return semantic_manifest_add_digest(builder, project,
+                                                CBM_SEMANTIC_INPUT_INCLUDE_LISTING, digest, 0, 0);
+        }
+    }
+    return 0;
+}
+
 static int semantic_manifest_add(semantic_manifest_builder_t *builder, const char *project,
                                  const char *rel_path, const char *abs_path) {
     if (cbm_pipeline_frozen_checkpoint(builder->frozen))
@@ -572,22 +594,8 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
     }
-    /* The path rule's universe (include_path.h), only where a file of a path
-     * row is discovered: a changed set of the indexed names a row's import
-     * can name (one added, removed or renamed) changes which file an import
-     * names in files that did not change, so it routes to a full index. A key
-     * of the discovered list: nothing is walked. */
-    bool path_row_file = false;
-    for (int i = 0; i < file_count && !path_row_file; i++) {
-        path_row_file = cbm_include_path_row(files[i].language) != NULL;
-    }
-    if (rc == 0 && path_row_file) {
-        char listing_digest[CBM_SHA256_HEX_LEN + 1];
-        rc = cbm_include_path_inventory_digest(files, file_count, listing_digest);
-        if (rc == 0) {
-            rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_INCLUDE_LISTING,
-                                              listing_digest, 0, 0);
-        }
+    if (rc == 0) {
+        rc = semantic_manifest_add_include_listing(&builder, project, files, file_count);
     }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
@@ -828,6 +836,9 @@ int cbm_pipeline_build_frozen_manifest(cbm_pipeline_t *p, const cbm_file_info_t 
     int rc = cbm_pipeline_frozen_checkpoint(p);
     if (rc == 0)
         rc = frozen_manifest_seed(&builder, p);
+    if (rc == 0)
+        rc = semantic_manifest_add_include_listing(&builder, cbm_pipeline_project_name(p), files,
+                                                   file_count);
     if (rc == 0 && file_count > 0)
         cbm_pipeline_frozen_manifest_dispatch(p);
     for (int i = 0; rc == 0 && i < file_count; i++) {
