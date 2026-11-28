@@ -172,4 +172,48 @@ fi
     exit 1
 }
 
-echo "PASS: native stripped/unstripped candidates derive from one linker output and publish atomically"
+# A6 glibc floor (check-binary-composition.sh), on the STRIPPED candidate: the
+# loader's version-needs table must survive the strongest strip. A malformed
+# floor is a usage error everywhere. On glibc Linux the stub requires some
+# GLIBC_2.x, so no glibc predates floor 1.0 (must FAIL) and none reaches 999.0
+# (must PASS; the C stub needs no GLIBCXX_*). Mach-O / PE report n/a. A
+# non-glibc Linux (musl) cannot prove a glibc floor and must fail closed.
+GATE="$ROOT/scripts/ci/check-binary-composition.sh"
+FLOOR_OUT="$FIX/floor.out"
+if CBM_GLIBC_FLOOR=2.x bash "$GATE" "$STRIPPED" >"$FLOOR_OUT" 2>&1; then
+    echo "FAIL: a malformed CBM_GLIBC_FLOOR was accepted" >&2
+    exit 1
+elif [[ $? -ne 2 ]]; then
+    echo "FAIL: a malformed CBM_GLIBC_FLOOR must be a usage error (exit 2)" >&2
+    exit 1
+fi
+floor_status=0
+CBM_GLIBC_FLOOR=1.0 bash "$GATE" "$STRIPPED" >"$FLOOR_OUT" 2>&1 || floor_status=$?
+if [[ "$GOOS" != linux ]]; then
+    [[ $floor_status -eq 0 ]] && grep -q '^n/a  A6-glibc-floor' "$FLOOR_OUT" || {
+        echo "FAIL: A6-glibc-floor must be reported n/a for a $GOOS binary" >&2
+        cat "$FLOOR_OUT" >&2
+        exit 1
+    }
+elif getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+    [[ $floor_status -eq 1 ]] && grep -q '^FAIL A6-glibc-floor .*newer than floor 1.0' "$FLOOR_OUT" || {
+        echo "FAIL: floor 1.0 must fail a glibc-linked binary (A6-glibc-floor)" >&2
+        cat "$FLOOR_OUT" >&2
+        exit 1
+    }
+    CBM_GLIBC_FLOOR=999.0 CBM_GLIBCXX_FLOOR=999.0 bash "$GATE" "$STRIPPED" >"$FLOOR_OUT" 2>&1 &&
+        grep -q '^PASS A6-glibc-floor .*GLIBC_.* <= floor 999.0' "$FLOOR_OUT" &&
+        grep -q '^PASS A6-glibc-floor .*no GLIBCXX_\* version required' "$FLOOR_OUT" || {
+        echo "FAIL: floor 999.0 must pass a glibc-linked C binary (A6-glibc-floor)" >&2
+        cat "$FLOOR_OUT" >&2
+        exit 1
+    }
+else
+    [[ $floor_status -eq 1 ]] && grep -q '^FAIL A6-glibc-floor .*requires no GLIBC_' "$FLOOR_OUT" || {
+        echo "FAIL: a non-glibc Linux binary must fail a declared glibc floor closed" >&2
+        cat "$FLOOR_OUT" >&2
+        exit 1
+    }
+fi
+
+echo "PASS: native stripped/unstripped candidates derive from one linker output and publish atomically; the glibc floor binds on the stripped candidate"

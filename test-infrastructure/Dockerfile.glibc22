@@ -3,9 +3,11 @@
 # Mirrors CI's broad-matrix ubuntu-22.04 legs: the OLDEST userland we claim
 # the portable (musl-static) binary runs on. Two assertions live here:
 #   1. the portable binary passes the full canonical smoke on glibc 2.35;
-#   2. the DYNAMIC binary refuses to start (its glibc 2.38+ floor is by
-#      design — old-glibc coverage is the portable binary's job, and a
-#      dynamic binary that silently ran here would mask a floor regression).
+#   2. the LOCAL dynamic binary (built in the noble test image, glibc 2.39)
+#      refuses to start — proof that this venue really is an older userland
+#      than the build image. The RELEASE dynamic binary is built in a pinned
+#      ubuntu:22.04 container instead and does start on 2.35; its floor is
+#      asserted on the built bytes by check-binary-composition.sh (A6).
 # Pinned by digest like every other venue image: a floating tag means the
 # glibc-FLOOR assertion silently drifts to whatever ubuntu:22.04 points at, and
 # a floor that moves is not a floor. (Scorecard PinnedDependenciesID #76 — this

@@ -172,7 +172,7 @@ def workflow_jobs(source):
 
 build_jobs = workflow_jobs(build_text)
 select = build_jobs.get("select-package", "")
-native_jobs = ["build-unix", "build-windows", "build-windows-arm64",
+native_jobs = ["build-unix", "build-linux", "build-windows", "build-windows-arm64",
                "build-linux-portable"]
 
 if not re.search(r"(?m)^      scan_candidates:\s*\n(?:        [^\n]*\n)*?        default:\s*true\s*$",

@@ -15,8 +15,8 @@ class CodebaseMemoryMcp < Formula
     end
   end
 
-  # The static -portable build: the dynamic one needs glibc 2.38, which
-  # Ubuntu 22.04, Debian 12 and RHEL 9 do not have.
+  # The static -portable build: the dynamic one is built on Ubuntu 22.04 and
+  # needs glibc 2.35, which Debian 11, RHEL 8/9 and Ubuntu 20.04 do not have.
   on_linux do
     on_arm do
       url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-linux-arm64-portable.tar.gz"

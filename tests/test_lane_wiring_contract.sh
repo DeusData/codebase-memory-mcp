@@ -8,8 +8,9 @@
 #      before lane selection. Only pr.yml asks for the PR shard profile.
 #   2. pr.yml feeds the selector's lanes to every reusable workflow, runs the
 #      T0a/T0b contracts job, and hands ci-ok both the selection and the
-#      run's job list (actions: read) -- ci-ok needs `contracts` but never the
-#      report-only memwaste / shadow jobs, and the shadow is continue-on-error.
+#      run's job list (actions: read) -- ci-ok needs `contracts` and the
+#      gating `glibc-floor` but never the report-only memwaste / shadow jobs,
+#      and the shadow is continue-on-error.
 #   3. every lane of scripts/ci/select-lanes.sh --list-lanes is served by a
 #      job: matrix lanes as a "lane":"<name>" tag in the leg data (the tag
 #      ci-ok reads back from the job name), single lanes by an `if:` that
@@ -102,10 +103,14 @@ require("scripts/test.sh --contracts-only" in pr.get("contracts", ""),
 ci_ok = pr.get("ci-ok", "")
 needs = re.search(r"needs: \[([^\]]*)\]", ci_ok)
 needs = {n.strip() for n in needs.group(1).split(",")} if needs else set()
-require({"changes", "security", "lint", "test", "pr-smoke", "contracts"} <= needs,
-        f"ci-ok must need every gating stage incl. contracts, has {sorted(needs)}")
+require({"changes", "security", "lint", "test", "pr-smoke", "contracts", "glibc-floor"} <= needs,
+        f"ci-ok must need every gating stage incl. contracts and glibc-floor, has {sorted(needs)}")
 require(not needs & {"memwaste", "test-impact-shadow"},
         "ci-ok must not need the report-only memwaste / shadow jobs")
+# glibc-floor gates (user decision R103, #2887): no continue-on-error may turn
+# the release-container build back into a report.
+require("continue-on-error" not in pr.get("glibc-floor", "continue-on-error"),
+        "pr.yml glibc-floor must exist and gate: no continue-on-error")
 for needle, why in (("LANES: ${{ needs.changes.outputs.lanes }}", "the selection"),
                     ("JOBS: ", "the run's job list"),
                     ("actions: read", "actions: read to list jobs"),
@@ -192,7 +197,8 @@ SINGLE = {"lint": ("_lint.yml", "lint"), "lint-mem": ("_lint.yml", "lint-mem"),
           "diag": ("_test.yml", "test-diag"), "msan": ("_test.yml", "test-msan"),
           "lsan-macos": ("_test.yml", "test-lsan-macos"),
           "windows-guards": ("_test.yml", "test-windows-guards"),
-          "memwaste": ("pr.yml", "memwaste"), "contracts": ("pr.yml", "contracts")}
+          "memwaste": ("pr.yml", "memwaste"), "contracts": ("pr.yml", "contracts"),
+          "glibc-floor": ("pr.yml", "glibc-floor")}
 ALWAYS = {"security-static": ("_security.yml", "security-static"),
           "shard-completeness": ("_test.yml", "shard-completeness")}
 for lane in lanes:
