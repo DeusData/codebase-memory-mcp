@@ -69,7 +69,8 @@ module.exports = grammar({
   extras: $ => [
     $.comment,
     $.preprocessor_directive,
-    /[ \t\v\f\uFEFF]+/,
+    // Generated code indents some lines with U+00A0 no-break spaces.
+    /[ \t\v\f\u00A0\uFEFF]+/,
     /\r?\n/,
     /_[ \t]*\r?\n/,
   ],
@@ -179,12 +180,18 @@ module.exports = grammar({
         $._terminator
       ),
 
+    // VB gives each attribute in an assembly/module-level block its own
+    // optional target prefix: generated code writes
+    // `<Assembly: A(...), _\n Assembly: B(...)>`, one bracket pair with the
+    // target repeated per attribute. The first attribute keeps its target
+    // required — that is what sets the section apart from an attribute_list.
     global_attribute_section: ($) =>
       seq(
         "<",
-        field("target", $.attribute_target),
-        ":",
-        commaSep1($.attribute),
+        seq(field("target", $.attribute_target), ":", $.attribute),
+        repeat(
+          seq(",", optional(seq(field("target", $.attribute_target), ":")), $.attribute)
+        ),
         ">",
         $._terminator
       ),
@@ -250,6 +257,7 @@ module.exports = grammar({
         ci("Partial"),
         ci("Async"),
         ci("Iterator"),
+        ci("Default"),
         ci("Dim"),
         ci("Const")
       )),
@@ -285,8 +293,10 @@ module.exports = grammar({
 
     _attribute_argument: ($) => choice($._expression, $.named_argument),
 
+    // VB lexes colon-equals as two tokens, so whitespace between them is
+    // legal: `argName: = value` appears in generated code.
     named_argument: ($) =>
-      seq(field("name", $.identifier), ":=", field("value", $._expression)),
+      seq(field("name", $.identifier), ":", "=", field("value", $._expression)),
 
     // Expressions
     _expression: ($) =>
@@ -343,9 +353,9 @@ module.exports = grammar({
     tuple_expression: ($) =>
       seq(
         "(",
-        choice($._expression, seq(field("name", $.identifier), ":=", $._expression)),
+        choice($._expression, seq(field("name", $.identifier), ":", "=", $._expression)),
         ",",
-        commaSep1(choice($._expression, seq(field("name", $.identifier), ":=", $._expression))),
+        commaSep1(choice($._expression, seq(field("name", $.identifier), ":", "=", $._expression))),
         ")"
       ),
 
@@ -457,7 +467,18 @@ module.exports = grammar({
           field("left", $._expression),
           field(
             "operator",
-            choice("=", "+=", "-=", "*=", "/=", "\\=", "^=", "&=", "<<=", ">>=")
+            choice(
+              "=",
+              seq("+", "="),
+              seq("-", "="),
+              seq("*", "="),
+              seq("/", "="),
+              seq("\\", "="),
+              seq("^", "="),
+              seq("&", "="),
+              seq("<<", "="),
+              seq(">>", "=")
+            )
           ),
           field("right", $._expression)
         )
@@ -633,6 +654,9 @@ module.exports = grammar({
           "=",
           field("value", $._expression)
         ),
+        // Inferred-name Key member: `Key i.Year` names the member after the
+        // property it projects.
+        seq(ci("Key"), field("value", $._expression)),
         $._expression
       ),
     typeof_expression: ($) =>
@@ -747,7 +771,7 @@ module.exports = grammar({
       ),
     boolean_literal: ($) => choice(ci("True"), ci("False")),
     nothing_literal: ($) => ci("Nothing"),
-    date_literal: ($) => seq("#", /[^#]+/, "#"),
+    date_literal: ($) => token(prec(2, /#[ \t]*\d[^#\r\n]*#/)),
 
     // Names and types
     _name_reference: ($) =>
@@ -826,6 +850,8 @@ module.exports = grammar({
     as_clause: ($) =>
       seq(
         ci("As"),
+        // Attributes may qualify the declared type: `As <Attr(...)> Type`.
+        repeat(field("attributes", $.attribute_list)),
         choice(
           $.object_creation_expression,
           field("declared_type", $._type)
@@ -1069,8 +1095,8 @@ module.exports = grammar({
           $._terminator, // Auto-implemented property
           seq(
             $._block_terminator,
-            optional($.property_getter),
-            optional($.property_setter),
+            // Get and Set blocks appear in either order in generated code.
+            repeat(choice($.property_getter, $.property_setter)),
             ci("End"),
             ci("Property"),
             $._terminator
@@ -1389,7 +1415,18 @@ module.exports = grammar({
           )),
           field(
             "operator",
-            choice("=", "+=", "-=", "*=", "/=", "\\=", "^=", "&=", "<<=", ">>=")
+            choice(
+              "=",
+              seq("+", "="),
+              seq("-", "="),
+              seq("*", "="),
+              seq("/", "="),
+              seq("\\", "="),
+              seq("^", "="),
+              seq("&", "="),
+              seq("<<", "="),
+              seq(">>", "=")
+            )
           ),
           field("right", $._expression)
         )
@@ -1433,7 +1470,18 @@ module.exports = grammar({
           )),
           field(
             "operator",
-            choice("=", "+=", "-=", "*=", "/=", "\\=", "^=", "&=", "<<=", ">>=")
+            choice(
+              "=",
+              seq("+", "="),
+              seq("-", "="),
+              seq("*", "="),
+              seq("/", "="),
+              seq("\\", "="),
+              seq("^", "="),
+              seq("&", "="),
+              seq("<<", "="),
+              seq(">>", "=")
+            )
           ),
           field("right", $._expression),
           $._terminator
@@ -1540,9 +1588,11 @@ module.exports = grammar({
         )
       ),
 
+    // Generated code also writes the two-word form `Else If`, which VB
+    // accepts alongside `ElseIf`.
     elseif_clause: ($) =>
       seq(
-        ci("ElseIf"),
+        choice(ci("ElseIf"), seq(ci("Else"), ci("If"))),
         field("condition", $._expression),
         optional(ci("Then")),
         $._block_terminator,
@@ -1550,11 +1600,19 @@ module.exports = grammar({
       ),
 
     else_clause: ($) =>
-      seq(ci("Else"), $._block_terminator, field("body", repeat($._statement))),
+      seq(
+        ci("Else"),
+        choice(
+          // `Else stmt` — a single inline statement on the same line.
+          seq(field("statement", $._inline_statement), $._terminator),
+          seq($._block_terminator, field("body", repeat($._statement)))
+        )
+      ),
 
     select_statement: $ => prec(2, seq(
       ci('Select'),
-      ci('Case'),
+      // Generated code also writes `Select expr` without the Case keyword.
+      optional(ci('Case')),
       field('expression', $._expression),
       $._block_terminator,
       repeat($.case_clause),
@@ -1578,6 +1636,11 @@ module.exports = grammar({
         seq(field("from", $._expression), ci("To"), field("to", $._expression)),
         seq(
           ci("Is"),
+          field("operator", choice("<", ">", "<=", ">=", "=", "<>")),
+          field("value", $._expression)
+        ),
+        // `Case = value` — the Is keyword may be omitted.
+        seq(
           field("operator", choice("<", ">", "<=", ">=", "=", "<>")),
           field("value", $._expression)
         )

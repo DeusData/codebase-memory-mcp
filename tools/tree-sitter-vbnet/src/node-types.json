@@ -1001,6 +1001,16 @@
     "type": "as_clause",
     "named": true,
     "fields": {
+      "attributes": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "attribute_list",
+            "named": true
+          }
+        ]
+      },
       "declared_type": {
         "multiple": false,
         "required": false,
@@ -1038,31 +1048,31 @@
         ]
       },
       "operator": {
-        "multiple": false,
+        "multiple": true,
         "required": true,
         "types": [
           {
-            "type": "&=",
+            "type": "&",
             "named": false
           },
           {
-            "type": "*=",
+            "type": "*",
             "named": false
           },
           {
-            "type": "+=",
+            "type": "+",
             "named": false
           },
           {
-            "type": "-=",
+            "type": "-",
             "named": false
           },
           {
-            "type": "/=",
+            "type": "/",
             "named": false
           },
           {
-            "type": "<<=",
+            "type": "<<",
             "named": false
           },
           {
@@ -1070,15 +1080,15 @@
             "named": false
           },
           {
-            "type": ">>=",
+            "type": ">>",
             "named": false
           },
           {
-            "type": "\\=",
+            "type": "\\",
             "named": false
           },
           {
-            "type": "^=",
+            "type": "^",
             "named": false
           }
         ]
@@ -1118,31 +1128,31 @@
         ]
       },
       "operator": {
-        "multiple": false,
+        "multiple": true,
         "required": true,
         "types": [
           {
-            "type": "&=",
+            "type": "&",
             "named": false
           },
           {
-            "type": "*=",
+            "type": "*",
             "named": false
           },
           {
-            "type": "+=",
+            "type": "+",
             "named": false
           },
           {
-            "type": "-=",
+            "type": "-",
             "named": false
           },
           {
-            "type": "/=",
+            "type": "/",
             "named": false
           },
           {
-            "type": "<<=",
+            "type": "<<",
             "named": false
           },
           {
@@ -1150,15 +1160,15 @@
             "named": false
           },
           {
-            "type": ">>=",
+            "type": ">>",
             "named": false
           },
           {
-            "type": "\\=",
+            "type": "\\",
             "named": false
           },
           {
-            "type": "^=",
+            "type": "^",
             "named": false
           }
         ]
@@ -1877,11 +1887,6 @@
     }
   },
   {
-    "type": "date_literal",
-    "named": true,
-    "fields": {}
-  },
-  {
     "type": "declaration_statement",
     "named": true,
     "fields": {
@@ -2029,6 +2034,52 @@
         "types": [
           {
             "type": "_statement",
+            "named": true
+          }
+        ]
+      },
+      "statement": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "assignment_statement",
+            "named": true
+          },
+          {
+            "type": "call_statement",
+            "named": true
+          },
+          {
+            "type": "continue_statement",
+            "named": true
+          },
+          {
+            "type": "exit_statement",
+            "named": true
+          },
+          {
+            "type": "expression_statement",
+            "named": true
+          },
+          {
+            "type": "goto_statement",
+            "named": true
+          },
+          {
+            "type": "if_statement",
+            "named": true
+          },
+          {
+            "type": "raiseevent_statement",
+            "named": true
+          },
+          {
+            "type": "return_statement",
+            "named": true
+          },
+          {
+            "type": "throw_statement",
             "named": true
           }
         ]
@@ -2699,7 +2750,7 @@
     "named": true,
     "fields": {
       "target": {
-        "multiple": false,
+        "multiple": true,
         "required": true,
         "types": [
           {
@@ -5432,10 +5483,6 @@
     "named": false
   },
   {
-    "type": "#",
-    "named": false
-  },
-  {
     "type": "$",
     "named": false
   },
@@ -5445,10 +5492,6 @@
   },
   {
     "type": "&",
-    "named": false
-  },
-  {
-    "type": "&=",
     "named": false
   },
   {
@@ -5464,15 +5507,7 @@
     "named": false
   },
   {
-    "type": "*=",
-    "named": false
-  },
-  {
     "type": "+",
-    "named": false
-  },
-  {
-    "type": "+=",
     "named": false
   },
   {
@@ -5484,19 +5519,11 @@
     "named": false
   },
   {
-    "type": "-=",
-    "named": false
-  },
-  {
     "type": ".",
     "named": false
   },
   {
     "type": "/",
-    "named": false
-  },
-  {
-    "type": "/=",
     "named": false
   },
   {
@@ -5508,19 +5535,11 @@
     "named": false
   },
   {
-    "type": ":=",
-    "named": false
-  },
-  {
     "type": "<",
     "named": false
   },
   {
     "type": "<<",
-    "named": false
-  },
-  {
-    "type": "<<=",
     "named": false
   },
   {
@@ -5548,10 +5567,6 @@
     "named": false
   },
   {
-    "type": ">>=",
-    "named": false
-  },
-  {
     "type": "?",
     "named": false
   },
@@ -5568,19 +5583,11 @@
     "named": false
   },
   {
-    "type": "\\=",
-    "named": false
-  },
-  {
     "type": "]",
     "named": false
   },
   {
     "type": "^",
-    "named": false
-  },
-  {
-    "type": "^=",
     "named": false
   },
   {
@@ -5591,6 +5598,10 @@
     "type": "comment",
     "named": true,
     "extra": true
+  },
+  {
+    "type": "date_literal",
+    "named": true
   },
   {
     "type": "distinct_clause",
