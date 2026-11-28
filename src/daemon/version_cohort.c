@@ -446,18 +446,28 @@ static cbm_version_cohort_status_t version_cohort_claim_new(
                                   CBM_PRIVATE_FILE_LOCK_SH, deadline_ms, &lease->lifetime));
 }
 
+/* adopt_build: NULL for a normal acquire; for join_active, receives the
+ * active build and switches off claiming and takeover. */
 static cbm_version_cohort_status_t version_cohort_acquire_once(
     cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
     uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
-    cbm_daemon_conflict_t *conflict_out) {
+    cbm_daemon_conflict_t *conflict_out, char *adopt_build) {
     if (lease_out) {
         *lease_out = NULL;
     }
     if (conflict_out) {
         memset(conflict_out, 0, sizeof(*conflict_out));
     }
+    /* A joining participant has no build of its own yet: validate every other
+     * field against a well-formed placeholder build. */
+    static const char placeholder_build[] =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    cbm_daemon_build_identity_t requested = identity ? *identity : (cbm_daemon_build_identity_t){0};
+    if (adopt_build) {
+        requested.build_fingerprint = placeholder_build;
+    }
     if (!manager || !identity || !lease_out || !conflict_out ||
-        !version_cohort_identity_valid(identity)) {
+        !version_cohort_identity_valid(&requested)) {
         return CBM_VERSION_COHORT_UNSAFE;
     }
     cbm_version_cohort_lease_t *lease = version_cohort_lease_new(manager);
@@ -498,9 +508,15 @@ static cbm_version_cohort_status_t version_cohort_acquire_once(
          * stale-claim anomaly and derailed the 2026-08-29 zombie diagnosis,
          * when the record actually marks the HEALTHY fresh-claim path that
          * every normal start logs. */
-        cbm_log_info("version_cohort.claimed_fresh", "prior_holder", "none", "build",
-                     identity->build_fingerprint ? identity->build_fingerprint : "<null>");
-        status = version_cohort_claim_new(lease, identity, deadline_ms);
+        if (adopt_build) {
+            /* A joiner never claims: its build is unproven, and the record it
+             * wrote would become the identity everyone else is held to. */
+            status = CBM_VERSION_COHORT_ABSENT;
+        } else {
+            cbm_log_info("version_cohort.claimed_fresh", "prior_holder", "none", "build",
+                         identity->build_fingerprint ? identity->build_fingerprint : "<null>");
+            status = version_cohort_claim_new(lease, identity, deadline_ms);
+        }
     } else if (status == CBM_VERSION_COHORT_BUSY) {
         lock_status =
             cbm_private_file_lock_try_acquire(manager->directory, VERSION_COHORT_LIFETIME_FILE,
@@ -530,8 +546,11 @@ static cbm_version_cohort_status_t version_cohort_acquire_once(
                              "bytes", len_text);
                 status = CBM_VERSION_COHORT_UNSAFE;
             } else {
+                if (adopt_build) {
+                    requested.build_fingerprint = active.build_fingerprint;
+                }
                 cbm_daemon_hello_status_t comparison =
-                    cbm_daemon_hello_compare(&active, identity, conflict_out);
+                    cbm_daemon_hello_compare(&active, &requested, conflict_out);
                 if (comparison == CBM_DAEMON_HELLO_INVALID) {
                     /* The record decoded but hello_compare rejected an identity
                      * field as invalid (empty version/fingerprint/cache). Name
@@ -560,8 +579,14 @@ static cbm_version_cohort_status_t version_cohort_acquire_once(
                 }
                 if (comparison == CBM_DAEMON_HELLO_COMPATIBLE) {
                     status = CBM_VERSION_COHORT_OK;
+                    if (adopt_build) {
+                        (void)snprintf(adopt_build, CBM_DAEMON_BUILD_FINGERPRINT_SIZE, "%s",
+                                       active.build_fingerprint);
+                    }
                 } else if (comparison == CBM_DAEMON_HELLO_INVALID) {
                     status = CBM_VERSION_COHORT_UNSAFE;
+                } else if (adopt_build) {
+                    status = CBM_VERSION_COHORT_CONFLICT; /* never take over */
                 } else {
                     cbm_private_file_lock_status_t release_status =
                         cbm_private_file_lock_release(&lease->lifetime);
@@ -647,15 +672,14 @@ static const char *version_cohort_conflict_kind(const cbm_daemon_conflict_t *con
  * wait. On deadline the last observed conflict is reported exactly as before;
  * an indefinite deadline keeps failing fast because a mismatched holder may
  * never leave. */
-cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
-                                                       const cbm_daemon_build_identity_t *identity,
-                                                       uint64_t deadline_ms,
-                                                       cbm_version_cohort_lease_t **lease_out,
-                                                       cbm_daemon_conflict_t *conflict_out) {
+static cbm_version_cohort_status_t version_cohort_acquire_until(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out, char *adopt_build) {
     bool retry_logged = false;
     for (;;) {
-        cbm_version_cohort_status_t status =
-            version_cohort_acquire_once(manager, identity, deadline_ms, lease_out, conflict_out);
+        cbm_version_cohort_status_t status = version_cohort_acquire_once(
+            manager, identity, deadline_ms, lease_out, conflict_out, adopt_build);
         if (status != CBM_VERSION_COHORT_CONFLICT || deadline_ms == UINT64_MAX ||
             cbm_now_ms() >= deadline_ms) {
             return status;
@@ -669,6 +693,30 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
         version_cohort_note_conflict_retry();
         version_cohort_retry_sleep();
     }
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
+                                                       const cbm_daemon_build_identity_t *identity,
+                                                       uint64_t deadline_ms,
+                                                       cbm_version_cohort_lease_t **lease_out,
+                                                       cbm_daemon_conflict_t *conflict_out) {
+    return version_cohort_acquire_until(manager, identity, deadline_ms, lease_out, conflict_out,
+                                        NULL);
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_join_active(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out, char build_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
+    if (!build_out) {
+        if (lease_out) {
+            *lease_out = NULL;
+        }
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    build_out[0] = '\0';
+    return version_cohort_acquire_until(manager, identity, deadline_ms, lease_out, conflict_out,
+                                        build_out);
 }
 
 static cbm_version_cohort_status_t version_cohort_reserve_for_mutation_internal(

@@ -534,6 +534,11 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 echo "=== Step 5c: worker error-response transport regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.sh"
 
+# Step 5c2 (#2683): a hook client is admitted without hashing its own image;
+# asserted on the bytes-hashed count the seam-bearing binary reports.
+echo "=== Step 5c2: hook client hashes no executable image (#2683) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_hook_no_self_hash.sh"
+
 # Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
 # tests/test_hook_conflict_notice.sh for the full what-was-tried record.
 # Summary: the test forces a client/daemon build mismatch via the

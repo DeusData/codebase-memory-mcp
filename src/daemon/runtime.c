@@ -212,7 +212,8 @@ _Static_assert(CBM_DAEMON_RENDEZVOUS_MESSAGE_CAP == CBM_DAEMON_CONFLICT_MESSAGE_
                "service message capacity requires a new rendezvous strategy");
 _Static_assert(CBM_DAEMON_RUNTIME_CONNECT_ERROR == 0 && CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED == 1 &&
                    CBM_DAEMON_RUNTIME_CONNECT_CONFLICT == 2 &&
-                   CBM_DAEMON_RUNTIME_CONNECT_REJECTED == 3,
+                   CBM_DAEMON_RUNTIME_CONNECT_REJECTED == 3 &&
+                   CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED == 4,
                "rendezvous connect status values changed");
 _Static_assert(CBM_DAEMON_HELLO_INVALID == 0 && CBM_DAEMON_HELLO_COMPATIBLE == 1 &&
                    CBM_DAEMON_HELLO_VERSION_CONFLICT == 2 && CBM_DAEMON_HELLO_BUILD_CONFLICT == 3 &&
@@ -1510,7 +1511,8 @@ static bool runtime_hello_response_decode(
                cbm_daemon_conflict_format(&result->conflict, expected, sizeof(expected)) &&
                strcmp(result->message, expected) == 0;
     }
-    return result->status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+    return (result->status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED ||
+            result->status == CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED) &&
            result->hello_status == CBM_DAEMON_HELLO_INVALID &&
            result->conflict.status == CBM_DAEMON_HELLO_INVALID &&
            result->client_id == CBM_DAEMON_CLIENT_ID_INVALID &&
@@ -2387,7 +2389,10 @@ static void *runtime_connection_worker(void *opaque) {
         free(payload);
         return NULL;
     }
-    if (frame.flags != CBM_DAEMON_RUNTIME_OP_HELLO ||
+    /* #2683: an unproven claim was adopted from the cohort, not hashed by the
+     * client; admission then rests on this daemon proving the peer image. */
+    bool claim_unproven = frame.flags == CBM_DAEMON_RUNTIME_OP_HELLO_UNPROVEN;
+    if ((frame.flags != CBM_DAEMON_RUNTIME_OP_HELLO && !claim_unproven) ||
         frame.length != CBM_DAEMON_RENDEZVOUS_REQUEST_SIZE ||
         !runtime_rendezvous_request_decode(payload, requested_version, requested_build)) {
         free(payload);
@@ -2451,6 +2456,16 @@ static void *runtime_connection_worker(void *opaque) {
      *     top of that traded a real compatibility proof for an unavailable one,
      *     and made `npx codebase-memory-mcp` unusable with the daemon. Admit,
      *     and say so out loud so the weaker check is never invisible. */
+    if (!peer_image_verified && !peer_image_fingerprinted && claim_unproven) {
+        /* Nothing but the image can back an adopted claim: ask the client to
+         * prove its build itself rather than admitting it unexamined. */
+        cbm_log_warn("daemon.client_image_proof_required", "reason", "image_unverifiable");
+        runtime_result_rejected(&hello_result, "CBM daemon could not examine this client's image");
+        hello_result.status = CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED;
+        (void)runtime_send_hello_response(worker->connection, &hello_result);
+        runtime_worker_finish(worker);
+        return NULL;
+    }
     if (!peer_image_verified && !peer_image_fingerprinted) {
         cbm_log_warn("daemon.client_image_unverifiable_admitted", "reason", "image_unverifiable",
                      "basis", "rendezvous_hello_verified");
@@ -3429,9 +3444,29 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
     return true;
 }
 
+static cbm_daemon_runtime_client_t *runtime_client_connect_op(
+    const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
+    uint32_t timeout_ms, cbm_daemon_runtime_operation_t hello_op,
+    cbm_daemon_runtime_connect_result_t *result_out);
+
 cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
     const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
     uint32_t timeout_ms, cbm_daemon_runtime_connect_result_t *result_out) {
+    return runtime_client_connect_op(endpoint, identity, timeout_ms, CBM_DAEMON_RUNTIME_OP_HELLO,
+                                     result_out);
+}
+
+cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect_unproven(
+    const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
+    uint32_t timeout_ms, cbm_daemon_runtime_connect_result_t *result_out) {
+    return runtime_client_connect_op(endpoint, identity, timeout_ms,
+                                     CBM_DAEMON_RUNTIME_OP_HELLO_UNPROVEN, result_out);
+}
+
+static cbm_daemon_runtime_client_t *runtime_client_connect_op(
+    const cbm_daemon_ipc_endpoint_t *endpoint, const cbm_daemon_build_identity_t *identity,
+    uint32_t timeout_ms, cbm_daemon_runtime_operation_t hello_op,
+    cbm_daemon_runtime_connect_result_t *result_out) {
     if (result_out) {
         memset(result_out, 0, sizeof(*result_out));
     }
@@ -3446,8 +3481,8 @@ cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
     }
     RUNTIME_HELLO_POINT(CLIENT_CONNECTED);
     bool hello_sent =
-        cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, CBM_DAEMON_RUNTIME_OP_HELLO,
-                                  request, (uint32_t)sizeof(request));
+        cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, (uint16_t)hello_op, request,
+                                  (uint32_t)sizeof(request));
     RUNTIME_HELLO_POINT(CLIENT_SENT);
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;

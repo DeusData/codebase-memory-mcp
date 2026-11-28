@@ -17,6 +17,8 @@ typedef enum {
     CBM_VERSION_COHORT_BUSY = 2,
     CBM_VERSION_COHORT_UNSAFE = 3,
     CBM_VERSION_COHORT_IO = 4,
+    /* cbm_version_cohort_join_active only: no participant holds the cohort. */
+    CBM_VERSION_COHORT_ABSENT = 5,
 } cbm_version_cohort_status_t;
 
 typedef enum {
@@ -71,6 +73,18 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
                                                        uint64_t deadline_ms,
                                                        cbm_version_cohort_lease_t **lease_out,
                                                        cbm_daemon_conflict_t *conflict_out);
+
+/* #2683: as cbm_version_cohort_acquire for a participant that has not hashed
+ * its own image. identity->build_fingerprint is ignored; the active record's
+ * build is adopted (written to build_out) and every other identity field is
+ * compared as usual. It never claims an unheld cohort: with no live holder
+ * it returns ABSENT and holds nothing, and a mismatched holder is never
+ * taken over. The adopted build is a claim only; the daemon must prove the
+ * caller's image (cbm_daemon_runtime_client_connect_unproven). */
+cbm_version_cohort_status_t cbm_version_cohort_join_active(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out, char build_out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
 /* Binary activation takes the lifetime file EX. It therefore refuses while
  * any CLI/bootstrap/daemon participant is active and blocks new admissions

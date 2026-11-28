@@ -298,6 +298,63 @@ static bool version_cohort_wait_for_retries_above(uint64_t baseline, uint64_t de
  * arrive once that budget is spent, and must carry the same detail as before.
  * The lower bound is the contract under test, not a timing guess: the holder
  * is released only after the call returns. */
+/* #2683: a hook joins without hashing its own image. It adopts the holder's
+ * build, never claims an empty cohort (its build is unproven), and never takes
+ * over a mismatched holder. */
+TEST(version_cohort_join_active_adopts_the_holder_build_and_never_claims) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "join"));
+    cbm_version_cohort_manager_t *holder = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *joiner = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(holder);
+    ASSERT_NOT_NULL(joiner);
+
+    cbm_daemon_build_identity_t active = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_build_identity_t unproven = version_cohort_identity("2.4.0", NULL);
+    cbm_daemon_build_identity_t other_version = version_cohort_identity("2.5.0", NULL);
+    cbm_version_cohort_lease_t *holder_lease = NULL;
+    cbm_version_cohort_lease_t *join_lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    char adopted[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+
+    /* Nobody holds the cohort: ABSENT, nothing held, nothing recorded. */
+    ASSERT_EQ(cbm_version_cohort_join_active(joiner, &unproven, cbm_now_ms(), &join_lease,
+                                             &conflict, adopted),
+              CBM_VERSION_COHORT_ABSENT);
+    ASSERT_NULL(join_lease);
+    ASSERT_STR_EQ(adopted, "");
+    /* The joiner left no record behind: a different build still claims fresh. */
+    cbm_daemon_build_identity_t build_b = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_B);
+    ASSERT_EQ(cbm_version_cohort_acquire(holder, &build_b, UINT64_MAX, &holder_lease, &conflict),
+              CBM_VERSION_COHORT_OK);
+    version_cohort_release(&holder_lease);
+
+    ASSERT_EQ(cbm_version_cohort_acquire(holder, &active, UINT64_MAX, &holder_lease, &conflict),
+              CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(cbm_version_cohort_join_active(joiner, &unproven, UINT64_MAX, &join_lease, &conflict,
+                                             adopted),
+              CBM_VERSION_COHORT_OK);
+    ASSERT_NOT_NULL(join_lease);
+    ASSERT_STR_EQ(adopted, VERSION_COHORT_BUILD_A);
+    version_cohort_release(&join_lease);
+
+    /* Every field but the build is still compared, and the holder stays. */
+    ASSERT_EQ(cbm_version_cohort_join_active(joiner, &other_version, cbm_now_ms(), &join_lease,
+                                             &conflict, adopted),
+              CBM_VERSION_COHORT_CONFLICT);
+    ASSERT_NULL(join_lease);
+    ASSERT_EQ(conflict.status, CBM_DAEMON_HELLO_VERSION_CONFLICT);
+    ASSERT_EQ(cbm_version_cohort_acquire(joiner, &active, cbm_now_ms(), &join_lease, &conflict),
+              CBM_VERSION_COHORT_OK);
+    version_cohort_release(&join_lease);
+
+    version_cohort_release(&holder_lease);
+    version_cohort_manager_close(&joiner);
+    version_cohort_manager_close(&holder);
+    version_cohort_fixture_finish(&fixture);
+    PASS();
+}
+
 TEST(version_cohort_conflict_is_retried_until_the_deadline) {
     version_cohort_fixture_t fixture;
     ASSERT_TRUE(version_cohort_fixture_start(&fixture, "conflict-deadline"));
@@ -1087,6 +1144,7 @@ SUITE(version_cohort) {
     RUN_TEST(version_cohort_rejects_same_hash_with_different_abi);
     RUN_TEST(version_cohort_rejects_missing_cache_fingerprint);
     RUN_TEST(version_cohort_rejects_exact_build_with_different_cache_root);
+    RUN_TEST(version_cohort_join_active_adopts_the_holder_build_and_never_claims);
     RUN_TEST(version_cohort_conflict_is_retried_until_the_deadline);
     RUN_TEST(version_cohort_conflict_waiter_is_admitted_when_the_holder_leaves);
     RUN_TEST(version_cohort_exclusive_activation_blocks_and_is_blocked_by_participants);

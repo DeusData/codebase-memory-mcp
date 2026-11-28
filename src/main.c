@@ -1469,16 +1469,23 @@ static const char *main_build_identity_status_name(main_build_identity_status_t 
     return "identity-unknown";
 }
 
-static main_build_identity_status_t main_build_identity(cbm_daemon_build_identity_t *identity) {
+/* capture_image false (hook clients, #2683) leaves build_fingerprint NULL:
+ * the caller adopts the active cohort's build and the daemon proves the
+ * image, so the process never hashes its own executable. */
+static main_build_identity_status_t main_build_identity_ex(cbm_daemon_build_identity_t *identity,
+                                                           bool capture_image) {
     if (!identity) {
         return MAIN_BUILD_IDENTITY_INVALID_OUTPUT;
     }
-    if (!cbm_index_supervisor_capture_build_fingerprint()) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
-    }
-    const char *fingerprint = cbm_index_supervisor_build_fingerprint();
-    if (!fingerprint) {
-        return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
+    const char *fingerprint = NULL;
+    if (capture_image) {
+        if (!cbm_index_supervisor_capture_build_fingerprint()) {
+            return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
+        }
+        fingerprint = cbm_index_supervisor_build_fingerprint();
+        if (!fingerprint) {
+            return MAIN_BUILD_IDENTITY_PROCESS_FINGERPRINT;
+        }
     }
     const char *cache = cbm_resolve_cache_dir();
     char canonical_cache[MAIN_PATH_CAP];
@@ -1527,6 +1534,10 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
         .feature_abi = 1,
     };
     return MAIN_BUILD_IDENTITY_OK;
+}
+
+static main_build_identity_status_t main_build_identity(cbm_daemon_build_identity_t *identity) {
+    return main_build_identity_ex(identity, true);
 }
 
 static uint64_t main_deadline_after(uint32_t timeout_ms) {
@@ -2028,6 +2039,26 @@ static bool main_hook_absent_notice_due(void) {
     }
     return true;
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #2683 test seam: at exit a hook client writes how many executable-image
+ * bytes it hashed and whether a daemon admitted it, so a process-level test
+ * asserts the work count instead of timing the hook. */
+static bool main_hook_admitted_seam;
+static void main_hook_report_image_work(void) {
+    char path[MAIN_PATH_CAP] = {0};
+    if (!cbm_safe_getenv("CBM_TEST_HOOK_IMAGE_WORK_FILE", path, sizeof(path), NULL) || !path[0]) {
+        return;
+    }
+    FILE *report = cbm_fopen(path, "wb");
+    if (report) {
+        (void)fprintf(report, "bytes=%llu admitted=%d\n",
+                      (unsigned long long)cbm_daemon_image_bytes_hashed_for_testing(),
+                      main_hook_admitted_seam ? 1 : 0);
+        (void)fclose(report);
+    }
+}
+#endif
 
 static void main_hook_report_absent_daemon(const char *hook_dialect) {
     if (!main_hook_absent_notice_due()) {
@@ -2908,6 +2939,9 @@ int main(int argc, char **argv) {
      * session or `daemon start` already brought up. Arm the deadline before
      * hashing and IPC. */
     if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+        (void)atexit(main_hook_report_image_work);
+#endif
 #ifndef _WIN32
         cbm_hook_augment_arm_deadline();
 #endif
@@ -3122,7 +3156,8 @@ int main(int argc, char **argv) {
                       "(executable-path)\n");
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
-    main_build_identity_status_t identity_status = main_build_identity(&identity);
+    main_build_identity_status_t identity_status =
+        main_build_identity_ex(&identity, role != CBM_DAEMON_PROCESS_HOOK_CLIENT);
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
         const char *validation_detail = cbm_daemon_ipc_validation_detail();
         (void)fprintf(stderr,
@@ -3329,17 +3364,39 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* #2683: a hook without a self-computed build joins the active cohort,
+     * adopts its build as an unproven claim, and leaves the proof to the
+     * daemon (HELLO_UNPROVEN). It never claims a cohort by itself. */
+    static char hook_adopted_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool hook_build_unproven =
+        role == CBM_DAEMON_PROCESS_HOOK_CLIENT && identity.build_fingerprint == NULL;
     cbm_version_cohort_manager_t *client_cohort_manager = cbm_version_cohort_manager_new(endpoint);
     cbm_version_cohort_lease_t *client_cohort_lease = NULL;
     cbm_daemon_conflict_t client_cohort_conflict;
-    cbm_version_cohort_status_t client_cohort_status =
-        client_cohort_manager
-            ? cbm_version_cohort_acquire(client_cohort_manager, &identity,
-                                         main_deadline_after(role == CBM_DAEMON_PROCESS_HOOK_CLIENT
-                                                                 ? MAIN_HOOK_REQUEST_TIMEOUT_MS
-                                                                 : main_startup_timeout_ms()),
-                                         &client_cohort_lease, &client_cohort_conflict)
-            : CBM_VERSION_COHORT_IO;
+    uint64_t client_cohort_deadline =
+        main_deadline_after(role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? MAIN_HOOK_REQUEST_TIMEOUT_MS
+                                                                   : main_startup_timeout_ms());
+    cbm_version_cohort_status_t client_cohort_status = CBM_VERSION_COHORT_IO;
+    if (client_cohort_manager && hook_build_unproven) {
+        client_cohort_status = cbm_version_cohort_join_active(
+            client_cohort_manager, &identity, client_cohort_deadline, &client_cohort_lease,
+            &client_cohort_conflict, hook_adopted_build);
+        if (client_cohort_status == CBM_VERSION_COHORT_OK) {
+            identity.build_fingerprint = hook_adopted_build;
+        }
+    } else if (client_cohort_manager) {
+        client_cohort_status =
+            cbm_version_cohort_acquire(client_cohort_manager, &identity, client_cohort_deadline,
+                                       &client_cohort_lease, &client_cohort_conflict);
+    }
+    if (client_cohort_status == CBM_VERSION_COHORT_ABSENT) {
+        /* Nothing holds the cohort, so no daemon is serving: same as a
+         * connect that finds no daemon. */
+        main_hook_report_absent_daemon(hook_dialect);
+        (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        return EXIT_SUCCESS;
+    }
     if (client_cohort_status != CBM_VERSION_COHORT_OK) {
         char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
         bool formatted =
@@ -3368,9 +3425,26 @@ int main(int argc, char **argv) {
     if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
         /* Connect-only: recycle an active daemon or fail open fast. */
         cbm_daemon_runtime_connect_result_t hook_connect;
-        cbm_daemon_runtime_client_t *hook_client = cbm_daemon_runtime_client_connect(
-            endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
+        cbm_daemon_runtime_client_t *hook_client =
+            hook_build_unproven
+                ? cbm_daemon_runtime_client_connect_unproven(
+                      endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect)
+                : cbm_daemon_runtime_client_connect(endpoint, &identity,
+                                                    MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
+        if (!hook_client && hook_build_unproven &&
+            hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_PROOF_REQUIRED &&
+            cbm_index_supervisor_capture_build_fingerprint()) {
+            /* The daemon could not examine this image (sandbox, ptrace
+             * policy, ephemeral path): prove the build the old way. A
+             * different build then meets the normal conflict below. */
+            identity.build_fingerprint = cbm_index_supervisor_build_fingerprint();
+            hook_client = cbm_daemon_runtime_client_connect(
+                endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
+        }
         cbm_daemon_ipc_endpoint_free(endpoint);
+#ifdef CBM_ENABLE_TEST_SEAMS
+        main_hook_admitted_seam = hook_client != NULL;
+#endif
         if (!hook_client) {
             if (hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT) {
                 char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];

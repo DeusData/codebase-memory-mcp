@@ -17,6 +17,23 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+#include <stdatomic.h>
+/* #2683 work counter: bytes this process has hashed as an executable image.
+ * A hook client must leave it at zero; asserted on the count, not on time. */
+static atomic_uint_fast64_t service_image_bytes_hashed_seam;
+uint64_t cbm_daemon_image_bytes_hashed_for_testing(void) {
+    return (uint64_t)atomic_load(&service_image_bytes_hashed_seam);
+}
+static void service_note_image_bytes_hashed(uint64_t bytes) {
+    (void)atomic_fetch_add(&service_image_bytes_hashed_seam, bytes);
+}
+#else
+static void service_note_image_bytes_hashed(uint64_t bytes) {
+    (void)bytes;
+}
+#endif
+
 enum {
     DAEMON_SERVICE_PATH_CAP = 4096,
     DAEMON_SERVICE_IO_CAP = 64 * 1024,
@@ -394,6 +411,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
     ok = ok && fstat(fd, &after) == 0 && before.st_dev == after.st_dev &&
          before.st_ino == after.st_ino && before.st_size == after.st_size &&
          offset == after.st_size;
+    service_note_image_bytes_hashed((uint64_t)offset);
     if (!ok) {
         return false;
     }
@@ -718,6 +736,7 @@ bool cbm_daemon_build_fingerprint_native_file(uintptr_t native_file,
          GetFileInformationByHandle(file, &after_info) != 0 &&
          windows_same_file_identity(&info, &after_info) && before.QuadPart == after.QuadPart &&
          total == (uint64_t)after.QuadPart;
+    service_note_image_bytes_hashed(total);
     if (file != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(file);
     }
