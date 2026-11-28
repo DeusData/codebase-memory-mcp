@@ -235,7 +235,7 @@ jobs:
         if: matrix.os == 'macos-15'
         run: command -v ccache >/dev/null 2>&1 || brew install ccache
 
-      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
         if: matrix.os == 'windows-latest'
         with:
           msystem: CLANG64
