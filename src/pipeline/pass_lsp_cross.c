@@ -34,10 +34,13 @@
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
+#include "discover/discover.h" /* cbm_language_for_filename (stored namespaces) */
+#include "helpers.h"           /* cbm_fqn_module_source_lang */
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/profile.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h" /* CBM_TLS */
 
@@ -639,6 +642,758 @@ static const char *pxc_infer_jvm_namespace(CBMArena *arena, const char *rel_path
     return ns;
 }
 
+/* ── The run's package table (cbm_pxc_packages_t) ─────────────────────
+ *
+ * One (package, module) pair per file of the run that declares a namespace:
+ * the re-extracted files and, on an incremental route, the stored namespaces
+ * of the others (ctx->stored_namespaces), so every route sees every package.
+ * The module is the one the collector gives the file's defs (def_modules).
+ * Two sorted copies: by package (a package's modules) and by module (a
+ * module's packages). With them, the type index: one (package, name, module)
+ * triple per project type in a module of the table (`name` the type's QN
+ * after its module: `T`, `Outer.Inner`), sorted, so the modules of a package
+ * that define a name are one binary search, however many directories declare
+ * the package. Built once, in the collector's arena, before any def is
+ * collected; never written afterwards. */
+
+typedef struct {
+    const char *package;
+    const char *module;
+} pxc_pkg_pair_t;
+
+typedef struct {
+    const char *package;
+    const char *name;
+    const char *module;
+} pxc_pkg_type_t;
+
+typedef struct {
+    uint32_t hash;
+    int first; /* the run's first index into types */
+    int count; /* its length (the modules); 0 = an empty slot */
+} pxc_type_slot_t;
+
+struct cbm_pxc_packages {
+    pxc_pkg_pair_t *by_package; /* sorted by (package, module), distinct */
+    const char **modules;       /* by_package's modules, parallel (the lookup's array) */
+    pxc_pkg_pair_t *by_module;  /* the same pairs sorted by (module, package) */
+    int count;
+    pxc_pkg_type_t *types; /* sorted by (package, name, module), distinct */
+    int type_count;
+    pxc_type_slot_t *slots; /* (package, name) -> its run of `types`, open addressing */
+    unsigned slot_mask;
+};
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t g_pxc_pkg_work;
+uint64_t cbm_pxc_packages_test_work(void) {
+    return atomic_load_explicit(&g_pxc_pkg_work, memory_order_relaxed);
+}
+#define PXC_PKG_WORK(n) \
+    atomic_fetch_add_explicit(&g_pxc_pkg_work, (uint64_t)(n), memory_order_relaxed)
+#else
+#define PXC_PKG_WORK(n) ((void)0)
+#endif
+
+/* strcmp of `s` against the first `len` bytes of `key` as a string. */
+static int pxc_cmp_n(const char *s, const char *key, size_t len) {
+    int c = strncmp(s, key, len);
+    return c ? c : (s[len] ? 1 : 0);
+}
+
+static int pxc_pair_by_package(const void *a, const void *b) {
+    const pxc_pkg_pair_t *x = (const pxc_pkg_pair_t *)a;
+    const pxc_pkg_pair_t *y = (const pxc_pkg_pair_t *)b;
+    PXC_PKG_WORK(1);
+    int c = strcmp(x->package, y->package);
+    return c ? c : strcmp(x->module, y->module);
+}
+
+static int pxc_pair_by_module(const void *a, const void *b) {
+    const pxc_pkg_pair_t *x = (const pxc_pkg_pair_t *)a;
+    const pxc_pkg_pair_t *y = (const pxc_pkg_pair_t *)b;
+    PXC_PKG_WORK(1);
+    int c = strcmp(x->module, y->module);
+    return c ? c : strcmp(x->package, y->package);
+}
+
+/* Sort and dedupe `n` pairs (arena-owned) into a table. */
+static const cbm_pxc_packages_t *pxc_packages_seal(CBMArena *arena, pxc_pkg_pair_t *pairs, int n) {
+    cbm_pxc_packages_t *t = (cbm_pxc_packages_t *)cbm_arena_alloc(arena, sizeof(*t));
+    if (!t) {
+        return NULL;
+    }
+    memset(t, 0, sizeof(*t));
+    if (n <= 0 || !pairs) {
+        return t;
+    }
+    qsort(pairs, (size_t)n, sizeof(*pairs), pxc_pair_by_package);
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (kept == 0 || pxc_pair_by_package(&pairs[kept - 1], &pairs[i]) != 0) {
+            pairs[kept++] = pairs[i];
+        }
+    }
+    t->by_package = pairs;
+    t->count = kept;
+    t->modules = (const char **)cbm_arena_alloc(arena, (size_t)kept * sizeof(*t->modules));
+    t->by_module = (pxc_pkg_pair_t *)cbm_arena_alloc(arena, (size_t)kept * sizeof(*t->by_module));
+    if (!t->modules || !t->by_module) {
+        memset(t, 0, sizeof(*t));
+        return t;
+    }
+    for (int i = 0; i < kept; i++) {
+        t->modules[i] = pairs[i].module;
+    }
+    memcpy(t->by_module, pairs, (size_t)kept * sizeof(*pairs));
+    qsort(t->by_module, (size_t)kept, sizeof(*pairs), pxc_pair_by_module);
+    return t;
+}
+
+/* The type index (see above). */
+
+static int pxc_type_cmp(const void *a, const void *b) {
+    const pxc_pkg_type_t *x = (const pxc_pkg_type_t *)a;
+    const pxc_pkg_type_t *y = (const pxc_pkg_type_t *)b;
+    PXC_PKG_WORK(1);
+    int c = strcmp(x->package, y->package);
+    c = c ? c : strcmp(x->name, y->name);
+    return c ? c : strcmp(x->module, y->module);
+}
+
+typedef struct {
+    const cbm_pxc_packages_t *t;
+    const cbm_registry_t *reg; /* NULL: every QN given is a type */
+    const char *const *labels; /* the row's type labels */
+    CBMArena *arena;
+    pxc_pkg_type_t *items;
+    int count;
+    int cap;
+} pxc_type_index_build_t;
+
+static bool pxc_type_index_grow(pxc_type_index_build_t *b, int need) {
+    if (b->count + need <= b->cap) {
+        return true;
+    }
+    int cap = b->cap ? b->cap * 2 : CBM_SZ_256;
+    while (cap < b->count + need) {
+        cap *= 2;
+    }
+    pxc_pkg_type_t *items =
+        (pxc_pkg_type_t *)cbm_arena_alloc(b->arena, (size_t)cap * sizeof(*items));
+    if (!items) {
+        return false;
+    }
+    if (b->count) {
+        memcpy(items, b->items, (size_t)b->count * sizeof(*items));
+    }
+    b->items = items;
+    b->cap = cap;
+    return true;
+}
+
+/* One project type: its longest QN prefix that is a table module, and one
+ * triple per package that module declares. */
+static void pxc_type_index_add(pxc_type_index_build_t *b, const char *qn, const char *label) {
+    if (!qn || !label) {
+        return;
+    }
+    bool type = false;
+    for (const char *const *l = b->labels; l && *l && !type; l++) {
+        type = strcmp(*l, label) == 0;
+    }
+    if (!type) {
+        return;
+    }
+    const cbm_pxc_packages_t *t = b->t;
+    for (size_t cut = strlen(qn); cut > 0; cut--) {
+        if (qn[cut] != '.') {
+            continue;
+        }
+        int lo = 0;
+        int hi = t->count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            PXC_PKG_WORK(1);
+            if (pxc_cmp_n(t->by_module[mid].module, qn, cut) < 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= t->count || pxc_cmp_n(t->by_module[lo].module, qn, cut) != 0) {
+            continue; /* not a module: a shorter prefix may be */
+        }
+        const char *name = cbm_arena_strdup(b->arena, qn + cut + 1);
+        for (int i = lo; name && i < t->count && pxc_cmp_n(t->by_module[i].module, qn, cut) == 0;
+             i++) {
+            PXC_PKG_WORK(1);
+            if (pxc_type_index_grow(b, 1)) {
+                b->items[b->count++] =
+                    (pxc_pkg_type_t){t->by_module[i].package, name, t->by_module[i].module};
+            }
+        }
+        return;
+    }
+}
+
+static void pxc_type_index_node(const cbm_gbuf_node_t *node, void *ud) {
+    pxc_type_index_build_t *b = (pxc_type_index_build_t *)ud;
+    const char *qn = node ? node->qualified_name : NULL;
+    bool type = false;
+    for (const char *const *l = b->labels; qn && node->label && l && *l && !type; l++) {
+        type = strcmp(*l, node->label) == 0;
+    }
+    /* Then the registry's label, as the step's targets read it (type_scope.c). */
+    pxc_type_index_add(b, qn, type && b->reg ? cbm_registry_label_of(b->reg, qn) : NULL);
+}
+
+/* FNV-1a over `package` (pkg_len bytes), a separator and `name`. */
+static uint32_t pxc_type_hash(const char *package, size_t pkg_len, const char *name) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < pkg_len; i++) {
+        h = (h ^ (unsigned char)package[i]) * 16777619u;
+    }
+    h = (h ^ 0x1fu) * 16777619u;
+    for (const char *p = name; *p; p++) {
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    }
+    return h;
+}
+
+/* Sort and dedupe the built triples into the table, then hash each run of
+ * one (package, name), at most half the slots filled. */
+static void pxc_type_index_seal(cbm_pxc_packages_t *t, pxc_type_index_build_t *b) {
+    if (b->count == 0) {
+        return;
+    }
+    qsort(b->items, (size_t)b->count, sizeof(*b->items), pxc_type_cmp);
+    int kept = 0;
+    int runs = 0;
+    for (int i = 0; i < b->count; i++) {
+        if (kept == 0 || pxc_type_cmp(&b->items[kept - 1], &b->items[i]) != 0) {
+            runs += kept == 0 || strcmp(b->items[kept - 1].package, b->items[i].package) != 0 ||
+                    strcmp(b->items[kept - 1].name, b->items[i].name) != 0;
+            b->items[kept++] = b->items[i];
+        }
+    }
+    unsigned slots = CBM_SZ_16;
+    while (slots < (unsigned)runs * 2) {
+        slots *= 2;
+    }
+    pxc_type_slot_t *table =
+        (pxc_type_slot_t *)cbm_arena_alloc(b->arena, (size_t)slots * sizeof(*table));
+    if (!table) {
+        return; /* no index: no type answers through it */
+    }
+    memset(table, 0, (size_t)slots * sizeof(*table));
+    for (int i = 0; i < kept;) {
+        int end = i + 1;
+        while (end < kept && strcmp(b->items[end].package, b->items[i].package) == 0 &&
+               strcmp(b->items[end].name, b->items[i].name) == 0) {
+            end++;
+        }
+        uint32_t h =
+            pxc_type_hash(b->items[i].package, strlen(b->items[i].package), b->items[i].name);
+        unsigned at = h & (slots - 1);
+        while (table[at].count) {
+            PXC_PKG_WORK(1);
+            at = (at + 1) & (slots - 1);
+        }
+        table[at] = (pxc_type_slot_t){h, i, end - i};
+        i = end;
+    }
+    t->types = b->items;
+    t->type_count = kept;
+    t->slots = table;
+    t->slot_mask = slots - 1;
+}
+
+/* The modules of `package` (pkg_len bytes) that define the type `name`: their
+ * count, *first the index of the first triple. One hash probe sequence. */
+static int pxc_package_type_modules(const cbm_pxc_packages_t *t, const char *package,
+                                    size_t pkg_len, const char *name, int *first) {
+    *first = 0;
+    if (!t || !t->slots || !package || !name) {
+        return 0;
+    }
+    uint32_t h = pxc_type_hash(package, pkg_len, name);
+    for (unsigned at = h & t->slot_mask;; at = (at + 1) & t->slot_mask) {
+        const pxc_type_slot_t *slot = &t->slots[at];
+        PXC_PKG_WORK(1);
+        if (!slot->count) {
+            return 0;
+        }
+        const pxc_pkg_type_t *e = &t->types[slot->first];
+        if (slot->hash == h && pxc_cmp_n(e->package, package, pkg_len) == 0 &&
+            strcmp(e->name, name) == 0) {
+            *first = slot->first;
+            return slot->count;
+        }
+    }
+}
+
+/* The one QN `<module>.<name>` a module of `package` defines (in `scratch`),
+ * else NULL; *two when several do. */
+static const char *pxc_package_type(const cbm_pxc_packages_t *t, CBMArena *scratch,
+                                    const char *package, size_t pkg_len, const char *name,
+                                    bool *two) {
+    int first = 0;
+    int n = pxc_package_type_modules(t, package, pkg_len, name, &first);
+    *two = n > 1;
+    return n == 1 ? cbm_arena_sprintf(scratch, "%s.%s", t->types[first].module, name) : NULL;
+}
+
+/* A namespace as a dotted key ('\', ':' and '/' become '.'; the namespace
+ * map's normalisation), in `arena`. */
+static const char *pxc_package_key(CBMArena *arena, const char *ns) {
+    char *key = cbm_arena_strdup(arena, ns);
+    for (char *p = key; p && *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    return key;
+}
+
+/* The module QN of a file, in `arena`: the extraction side's spelling
+ * (helpers.h), the one its definitions' QNs carry and def_modules agrees with. */
+static const char *pxc_file_module(CBMArena *arena, const char *project_name, const char *rel,
+                                   CBMLanguage lang) {
+    return cbm_fqn_module_source_lang(arena, project_name, rel, lang);
+}
+
+static const char *pxc_rel_basename(const char *rel) {
+    const char *base = rel;
+    for (const char *p = rel; p && *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
+/* Every file of the run that declares a namespace, re-extracted (cache or
+ * spill) or stored. */
+static const cbm_pxc_packages_t *pxc_packages_build(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                                    CBMFileResult **cache,
+                                                    const cbm_file_info_t *files, int file_count,
+                                                    const char *project_name,
+                                                    const char *const *labels) {
+    int stored = ctx->stored_namespaces ? ctx->stored_namespace_count : 0;
+    int cap = file_count + stored;
+    pxc_pkg_pair_t *pairs =
+        cap > 0 ? (pxc_pkg_pair_t *)cbm_arena_alloc(arena, (size_t)cap * sizeof(*pairs)) : NULL;
+    int n = 0;
+    for (int i = 0; pairs && i < file_count; i++) {
+        const char *ns = cache[i] ? cache[i]->namespace_name
+                         : ctx->spill && cbm_result_spill_has(ctx->spill, i)
+                             ? cbm_result_spill_namespace(ctx->spill, i)
+                             : NULL;
+        const char *mod =
+            ns && ns[0] && files[i].rel_path
+                ? pxc_file_module(arena, project_name, files[i].rel_path, files[i].language)
+                : NULL;
+        if (mod) {
+            pairs[n++] = (pxc_pkg_pair_t){pxc_package_key(arena, ns), mod};
+        }
+    }
+    for (int i = 0; pairs && i < stored; i++) {
+        const cbm_file_namespace_t *s = &ctx->stored_namespaces[i];
+        const char *mod =
+            s->namespace_name && s->namespace_name[0] && s->rel_path
+                ? pxc_file_module(arena, project_name, s->rel_path,
+                                  cbm_language_for_filename(pxc_rel_basename(s->rel_path)))
+                : NULL;
+        if (mod) {
+            pairs[n++] = (pxc_pkg_pair_t){pxc_package_key(arena, s->namespace_name), mod};
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!pairs[i].package) {
+            pairs[i] = pairs[--n]; /* allocation failure: drop the pair */
+            i--;
+        }
+    }
+    cbm_pxc_packages_t *t = (cbm_pxc_packages_t *)pxc_packages_seal(arena, pairs, n);
+    if (t && t->count > 0 && ctx->gbuf && ctx->registry && labels) {
+        /* The graph holds a node for every registry symbol on every route
+         * (the incremental ones seed the registry from it). */
+        pxc_type_index_build_t b = {.t = t, .reg = ctx->registry, .labels = labels, .arena = arena};
+        /* The nodes of the type labels only (the index sorts what it
+         * gathers, so the order is not read), each live as
+         * cbm_gbuf_foreach_node counts a node live. */
+        for (const char *const *l = labels; *l; l++) {
+            const cbm_gbuf_node_t **nodes = NULL;
+            int count = 0;
+            if (cbm_gbuf_find_by_label(ctx->gbuf, *l, &nodes, &count) != 0) {
+                continue;
+            }
+            for (int i = 0; nodes && i < count; i++) {
+                if (nodes[i] && nodes[i]->qualified_name &&
+                    cbm_gbuf_find_by_qn(ctx->gbuf, nodes[i]->qualified_name)) {
+                    pxc_type_index_node(nodes[i], &b);
+                }
+            }
+        }
+        pxc_type_index_seal(t, &b);
+    }
+    return t;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs(CBMArena *arena, const char *const *packages,
+                                                      const char *const *modules, int count) {
+    pxc_pkg_pair_t *pairs =
+        count > 0 ? (pxc_pkg_pair_t *)cbm_arena_alloc(arena, (size_t)count * sizeof(*pairs)) : NULL;
+    for (int i = 0; pairs && i < count; i++) {
+        pairs[i] = (pxc_pkg_pair_t){packages[i], modules[i]};
+    }
+    return pxc_packages_seal(arena, pairs, pairs ? count : 0);
+}
+
+const cbm_pxc_packages_t *cbm_pxc_packages_from_pairs_types(CBMArena *arena,
+                                                            const char *const *packages,
+                                                            const char *const *modules, int count,
+                                                            const char *const *types,
+                                                            int type_count) {
+    cbm_pxc_packages_t *t =
+        (cbm_pxc_packages_t *)cbm_pxc_packages_from_pairs(arena, packages, modules, count);
+    static const char *const any[] = {"Class", NULL};
+    pxc_type_index_build_t b = {.t = t, .reg = NULL, .labels = any, .arena = arena};
+    for (int i = 0; t && i < type_count; i++) {
+        pxc_type_index_add(&b, types[i], "Class");
+    }
+    if (t) {
+        pxc_type_index_seal(t, &b);
+    }
+    return t;
+}
+#endif
+
+int cbm_pxc_package_modules(const cbm_pxc_packages_t *t, const char *package, size_t len,
+                            const char *const **out_first) {
+    if (out_first) {
+        *out_first = NULL;
+    }
+    if (!t || !package || t->count == 0) {
+        return 0;
+    }
+    int lo = 0;
+    int hi = t->count; /* first pair whose package is >= the key */
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        PXC_PKG_WORK(1);
+        if (pxc_cmp_n(t->by_package[mid].package, package, len) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    int end = t->count; /* first pair whose package is > the key: a second search, so
+                         * counting a package's modules never walks them */
+    for (int l2 = lo; l2 < end;) {
+        int mid = l2 + (end - l2) / 2;
+        PXC_PKG_WORK(1);
+        if (pxc_cmp_n(t->by_package[mid].package, package, len) <= 0) {
+            l2 = mid + 1;
+        } else {
+            end = mid;
+        }
+    }
+    if (out_first && end > lo) {
+        *out_first = &t->modules[lo];
+    }
+    return end - lo;
+}
+
+/* The one package module `module` (len bytes) declares: *found tells whether
+ * the module is in the table; NULL when it is not or declares two. */
+static const char *pxc_module_package(const cbm_pxc_packages_t *t, const char *module, size_t len,
+                                      bool *found) {
+    *found = false;
+    if (!t || t->count == 0) {
+        return NULL;
+    }
+    int lo = 0;
+    int hi = t->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        PXC_PKG_WORK(1);
+        if (pxc_cmp_n(t->by_module[mid].module, module, len) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= t->count || pxc_cmp_n(t->by_module[lo].module, module, len) != 0) {
+        return NULL;
+    }
+    *found = true;
+    PXC_PKG_WORK(1);
+    bool two = lo + 1 < t->count && pxc_cmp_n(t->by_module[lo + 1].module, module, len) == 0;
+    return two ? NULL : t->by_module[lo].package;
+}
+
+/* ── The declared-type step's import map from a file's own import rows ──
+ *
+ * For an engine row with scope_imports_from_rows (pxc_engine_t). Every row
+ * binds its local name. A row whose path is `<package>.<rest>` for a project
+ * package (the longest such prefix) binds the one QN `<module>.<rest>` a
+ * module of that package defines (no QN when two modules or none do: then
+ * the path itself, which names nothing in the registry). An open row (local
+ * CBM_TYPE_SCOPE_OPEN_KEY) over a package binds every module of it; over a
+ * type (`<package>.<rest>`), the one QN as above. With the row's
+ * scope_own_package, each other module of the file's own package is open as
+ * well. Keys and values live in `scratch`. */
+typedef struct {
+    const char **keys;
+    const char **vals;
+    int count;
+    int cap;
+    CBMArena *scratch;
+} pxc_rows_map_t;
+
+static void pxc_rows_map_add(pxc_rows_map_t *m, const char *key, const char *val) {
+    if (m->count == m->cap) {
+        int cap = m->cap ? m->cap * 2 : 16;
+        const char **keys =
+            (const char **)cbm_arena_alloc(m->scratch, (size_t)cap * sizeof(char *));
+        const char **vals =
+            (const char **)cbm_arena_alloc(m->scratch, (size_t)cap * sizeof(char *));
+        if (!keys || !vals) {
+            return;
+        }
+        if (m->count) {
+            memcpy(keys, m->keys, (size_t)m->count * sizeof(char *));
+            memcpy(vals, m->vals, (size_t)m->count * sizeof(char *));
+        }
+        m->keys = keys;
+        m->vals = vals;
+        m->cap = cap;
+    }
+    m->keys[m->count] = key;
+    m->vals[m->count] = val;
+    m->count++;
+}
+
+/* An open import of a whole package: one value (CBM_TYPE_SCOPE_OPEN_PACKAGE
+ * and the package), answered through the type index (pxc_open_package). */
+static void pxc_rows_map_open_package(pxc_rows_map_t *m, const char *package, size_t len) {
+    const char *val =
+        cbm_arena_sprintf(m->scratch, "%c%.*s", CBM_TYPE_SCOPE_OPEN_PACKAGE, (int)len, package);
+    if (val) {
+        pxc_rows_map_add(m, CBM_TYPE_SCOPE_OPEN_KEY, val);
+    }
+}
+
+typedef struct {
+    const cbm_pxc_packages_t *t;
+    CBMArena *scratch;
+} pxc_open_package_ud_t;
+
+/* cbm_type_scope_t.open_package over the type index. */
+static const char *pxc_open_package(const void *ud, const char *package, const char *dotted,
+                                    bool *two) {
+    const pxc_open_package_ud_t *u = (const pxc_open_package_ud_t *)ud;
+    return pxc_package_type(u->t, u->scratch, package, strlen(package), dotted, two);
+}
+
+static void pxc_rows_map_row(const cbm_pipeline_ctx_t *ctx, const cbm_pxc_packages_t *t,
+                             pxc_rows_map_t *m, const char *local, const char *path) {
+    (void)ctx;
+    bool open = strcmp(local, CBM_TYPE_SCOPE_OPEN_KEY) == 0;
+    const char *const *mods = NULL;
+    int mod_count = 0;
+    size_t pkg_len = strlen(path);
+    /* The longest prefix of the path that is a project package. */
+    for (;;) {
+        mod_count = cbm_pxc_package_modules(t, path, pkg_len, &mods);
+        if (mod_count > 0) {
+            break;
+        }
+        while (pkg_len > 0 && path[pkg_len - 1] != '.') {
+            pkg_len--;
+        }
+        if (pkg_len == 0) {
+            break;
+        }
+        pkg_len--; /* drop the '.' */
+    }
+    if (mod_count > 0 && open && path[pkg_len] == '\0') {
+        pxc_rows_map_open_package(m, path, pkg_len);
+        return;
+    }
+    /* The one `<module>.<rest>` a module of the package defines: two modules
+     * defining it are no answer, never a pick. */
+    bool two = false;
+    const char *member =
+        mod_count > 0 && path[pkg_len] == '.'
+            ? pxc_package_type(t, m->scratch, path, pkg_len, path + pkg_len + 1, &two)
+            : NULL;
+    pxc_rows_map_add(m, local, member ? member : path);
+}
+
+static int pxc_scope_imports_from_rows(const cbm_pipeline_ctx_t *ctx, const cbm_pxc_packages_t *t,
+                                       const CBMFileResult *fr, const char *module_qn,
+                                       bool own_package, CBMArena *scratch, const char ***out_keys,
+                                       const char ***out_vals) {
+    pxc_rows_map_t m = {.scratch = scratch};
+    for (int i = 0; i < fr->imports.count; i++) {
+        const CBMImport *imp = &fr->imports.items[i];
+        if (imp->local_name && imp->local_name[0] && imp->module_path && imp->module_path[0]) {
+            pxc_rows_map_row(ctx, t, &m, imp->local_name, imp->module_path);
+        }
+    }
+    if (own_package && fr->namespace_name && fr->namespace_name[0]) {
+        /* The other modules of the own package, as one open package (the own
+         * module answers before any open import does). */
+        const char *key = pxc_package_key(scratch, fr->namespace_name);
+        const char *const *mods = NULL;
+        int mod_count = key ? cbm_pxc_package_modules(t, key, strlen(key), &mods) : 0;
+        bool other =
+            mod_count > 1 || (mod_count == 1 && (!module_qn || strcmp(mods[0], module_qn) != 0));
+        if (other) {
+            pxc_rows_map_open_package(&m, key, strlen(key));
+        }
+    }
+    *out_keys = m.keys;
+    *out_vals = m.vals;
+    return m.count;
+}
+
+/* ── Identities in the namespace form of the JVM registries ────────────
+ *
+ * The collector names a JVM def `<package>.<name>` (pxc_jvm_def_qn) after the
+ * fold and the attach, which read graph QNs. An identity is a graph QN of a
+ * type the step found either in the def's own module or in a module of the
+ * package table (its import map is built from those, scope_imports_from_rows),
+ * so its registry form is the package of that module, then its name: the own
+ * module with the file's own package (`own_ns`), else the longest prefix of
+ * the QN that is a table module, which must declare one package. An identity
+ * in a module without a package keeps its QN (its type was not renamed); one
+ * whose module is unknown or declares two packages is dropped. */
+static const char *pxc_jvm_identity(CBMArena *arena, const char *qn, size_t len,
+                                    const char *module_qn, const char *own_ns,
+                                    const cbm_pxc_packages_t *t) {
+    const char *leaf = qn;
+    for (size_t i = 0; i < len; i++) {
+        if (qn[i] == '.') {
+            leaf = qn + i + 1;
+        }
+    }
+    size_t leaf_len = len - (size_t)(leaf - qn);
+    const char *ns = NULL;
+    bool found = false;
+    size_t mod_len = module_qn ? strlen(module_qn) : 0;
+    /* The longest prefix that is a module: the own module, or a table one. */
+    for (size_t cut = leaf > qn ? (size_t)(leaf - qn) - 1 : 0; !found && cut > 0; cut--) {
+        if (qn[cut] != '.') {
+            continue;
+        }
+        if (cut == mod_len && strncmp(qn, module_qn, mod_len) == 0) {
+            found = true;
+            ns = own_ns;
+            break;
+        }
+        ns = pxc_module_package(t, qn, cut, &found);
+        if (found && !ns) {
+            return NULL; /* the module declares two packages */
+        }
+    }
+    if (!found) {
+        return NULL;
+    }
+    if (!ns || !ns[0]) {
+        return cbm_arena_strndup(arena, qn, len);
+    }
+    return cbm_arena_sprintf(arena, "%s.%.*s", ns, (int)leaf_len, leaf);
+}
+
+/* A def's "spelling=QN|..." identities in the registry form, in `arena`;
+ * NULL when none is left. */
+static const char *pxc_jvm_identities(CBMArena *arena, const char *type_scope,
+                                      const char *module_qn, const char *own_ns,
+                                      const cbm_pxc_packages_t *t) {
+    int pieces = 1;
+    for (const char *p = type_scope; p && *p; p++) {
+        pieces += *p == '|';
+    }
+    /* Each identity's "spelling=" and its registry form, then one copy. */
+    const char **spell = (const char **)cbm_arena_alloc(arena, (size_t)pieces * sizeof(char *));
+    size_t *spell_len = (size_t *)cbm_arena_alloc(arena, (size_t)pieces * sizeof(size_t));
+    const char **form = (const char **)cbm_arena_alloc(arena, (size_t)pieces * sizeof(char *));
+    int kept = 0;
+    size_t total = 0;
+    for (const char *p = type_scope; spell && spell_len && form && p && *p;) {
+        const char *eq = strchr(p, '=');
+        if (!eq) {
+            break;
+        }
+        const char *bar = strchr(eq, '|');
+        size_t qlen = bar ? (size_t)(bar - eq - 1) : strlen(eq + 1);
+        const char *j = pxc_jvm_identity(arena, eq + 1, qlen, module_qn, own_ns, t);
+        if (j && kept < pieces) {
+            spell[kept] = p;
+            spell_len[kept] = (size_t)(eq - p) + 1;
+            form[kept] = j;
+            total += spell_len[kept] + strlen(j) + 1;
+            kept++;
+        }
+        p = bar ? bar + 1 : eq + 1 + qlen;
+    }
+    char *out = kept ? (char *)cbm_arena_alloc(arena, total) : NULL;
+    size_t at = 0;
+    for (int i = 0; out && i < kept; i++) {
+        if (i) {
+            out[at++] = '|';
+        }
+        memcpy(out + at, spell[i], spell_len[i]);
+        at += spell_len[i];
+        memcpy(out + at, form[i], strlen(form[i]));
+        at += strlen(form[i]);
+    }
+    if (out) {
+        out[at] = '\0';
+    }
+    return out;
+}
+
+/* A JVM def renamed into the namespace form (pxc_jvm_def_qn), from the graph
+ * QN, parent class and name it was collected with. */
+/* A Java nested type's owner, the type it is declared in (its graph QN, which
+ * the rename below turns into the namespace form): the member-type index of
+ * the Java registries reads it (java_register_types). A top-level type, or
+ * any other def, keeps what it has. */
+static void pxc_java_type_owner(CBMArena *arena, CBMLSPDef *d, const char *module_qn) {
+    /* The labels the Java registrar registers as types (java_type_label). */
+    static const char *const type_labels[] = {"Class", "Interface", "Enum", "Type", NULL};
+    bool type = false;
+    for (int i = 0; d->label && type_labels[i] && !type; i++) {
+        type = strcmp(d->label, type_labels[i]) == 0;
+    }
+    size_t mod_len = module_qn ? strlen(module_qn) : 0;
+    const char *qn = d->qualified_name;
+    if (!type || d->receiver_type || !qn || !mod_len || strncmp(qn, module_qn, mod_len) != 0 ||
+        qn[mod_len] != '.') {
+        return;
+    }
+    const char *last = strrchr(qn + mod_len + 1, '.');
+    if (last) {
+        d->receiver_type = cbm_arena_strndup(arena, qn, (size_t)(last - qn));
+    }
+}
+
+static void pxc_jvm_rename(CBMArena *arena, CBMLSPDef *d, const char *namespace_name) {
+    CBMDefinition src;
+    memset(&src, 0, sizeof(src));
+    src.name = d->short_name;
+    src.qualified_name = d->qualified_name;
+    src.parent_class = d->receiver_type;
+    d->qualified_name = pxc_jvm_def_qn(arena, &src, namespace_name, d->label);
+    d->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src.parent_class);
+}
+
 static const char *pxc_qn_leaf(const char *name) {
     if (!name) {
         return NULL;
@@ -732,13 +1487,10 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
-    if (pxc_is_jvm_lang(lang) && namespace_name && namespace_name[0]) {
-        dst->qualified_name = pxc_jvm_def_qn(arena, src, namespace_name, label);
-        dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
-    } else {
-        dst->qualified_name = cbm_arena_strdup(arena, src->qualified_name);
-        dst->receiver_type = src->parent_class ? cbm_arena_strdup(arena, src->parent_class) : NULL;
-    }
+    /* A JVM def is renamed into its namespace form by the collector, after
+     * the field fold and the identity attach have read its graph QN. */
+    dst->qualified_name = cbm_arena_strdup(arena, src->qualified_name);
+    dst->receiver_type = src->parent_class ? cbm_arena_strdup(arena, src->parent_class) : NULL;
     /* Copies, not borrows: a result may be parked on disk (spill mode) the
      * moment the collector is done with it; the def list outlives it. */
     dst->short_name = cbm_arena_strdup(arena, src->name);
@@ -907,24 +1659,44 @@ static void pxc_fold_fields(CBMArena *arena, const CBMFileResult *fr, CBMLSPDef 
                             int end, CBMLanguage lang, const pxc_base_scope_t *bs,
                             const char *module_qn);
 
+/* Whether the engine row of `lang` builds the step's import map from the
+ * file's own import rows (pxc_engine_t), and with its own package open. */
+static bool pxc_scope_rows(CBMLanguage lang, bool *own_package);
+
 /* One file's declared-type scope (type_scope.h): the project registry, the
- * file's module and LSP import map, and for a lexical row the file's
- * definitions and module facts. The collector attaches the file's identities
- * with it, and a walk reads the calling file's own identities from the same
- * scope (cbm_pxc_file_scope). */
-static cbm_type_scope_file_t *pxc_file_scope_begin(const cbm_pipeline_ctx_t *ctx,
-                                                   const cbm_type_scope_lang_t *row,
-                                                   const CBMFileResult *fr, const char *module_qn,
-                                                   const char **imp_keys, const char **imp_vals,
-                                                   int imp_count) {
+ * file's module and LSP import map (from its own import rows over the run's
+ * package table for a row with scope_imports_from_rows, in `scratch`), and
+ * for a lexical row the file's definitions and module facts. The collector
+ * attaches the file's identities with it, and a walk reads the calling
+ * file's own identities from the same scope (cbm_pxc_file_scope). */
+static cbm_type_scope_file_t *pxc_file_scope_begin(
+    const cbm_pipeline_ctx_t *ctx, const cbm_type_scope_lang_t *row, const CBMFileResult *fr,
+    const char *module_qn, const char **imp_keys, const char **imp_vals, int imp_count,
+    const cbm_pxc_packages_t *packages, CBMArena *scratch) {
     if (!ctx || !ctx->registry || !row || !fr) {
         return NULL;
+    }
+    bool own_package = false;
+    if (pxc_scope_rows(row->lang, &own_package)) {
+        if (!scratch) {
+            return NULL;
+        }
+        imp_count = pxc_scope_imports_from_rows(ctx, packages, fr, module_qn, own_package, scratch,
+                                                &imp_keys, &imp_vals);
+    }
+    pxc_open_package_ud_t *open_ud =
+        packages && scratch ? (pxc_open_package_ud_t *)cbm_arena_alloc(scratch, sizeof(*open_ud))
+                            : NULL;
+    if (open_ud) {
+        *open_ud = (pxc_open_package_ud_t){.t = packages, .scratch = scratch};
     }
     cbm_type_scope_t scope = {.reg = ctx->registry,
                               .module_qn = module_qn,
                               .imp_keys = imp_keys,
                               .imp_vals = imp_vals,
-                              .imp_count = imp_count};
+                              .imp_count = imp_count,
+                              .open_package = open_ud ? pxc_open_package : NULL,
+                              .open_package_ud = open_ud};
     if (row->lexical_scopes) {
         /* The file's own scopes: its definitions and the module's ordered
          * namespace facts. */
@@ -932,6 +1704,9 @@ static cbm_type_scope_file_t *pxc_file_scope_begin(const cbm_pipeline_ctx_t *ctx
         scope.file_def_count = fr->defs.count;
         scope.module_facts = &fr->py_namespace;
         scope.graph = ctx->gbuf; /* the graph the import map read */
+    } else if (row->type_params_shadow) {
+        scope.file_defs = fr->defs.items; /* their type parameters */
+        scope.file_def_count = fr->defs.count;
     }
     return cbm_type_scope_file_begin(row, &scope);
 }
@@ -1370,6 +2145,18 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                     CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, int *out_def_starts) {
+    return cbm_pxc_collect_all_defs_ex(ctx, arena, cache, files, file_count, project_name,
+                                       def_modules, out_count, out_def_starts, NULL);
+}
+
+CBMLSPDef *cbm_pxc_collect_all_defs_ex(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                       CBMFileResult **cache, const cbm_file_info_t *files,
+                                       int file_count, const char *project_name, char **def_modules,
+                                       int *out_count, int *out_def_starts,
+                                       const cbm_pxc_packages_t **out_packages) {
+    if (out_packages) {
+        *out_packages = NULL;
+    }
     const cbm_result_spill_t *spill = ctx ? ctx->spill : NULL;
     bool owner_walk_required = ctx && atomic_load(&ctx->test_definition_owners_seen);
     int total = 0;
@@ -1417,6 +2204,19 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
     }
     int capacity = total;
     int idx = 0;
+    /* The run's package table, once, before any def: a row that reads the
+     * step's import map from import rows needs every file's package. */
+    const cbm_pxc_packages_t *packages = NULL;
+    for (int fi = 0; ctx && ctx->registry && !packages && fi < file_count; fi++) {
+        if (cbm_pxc_wants_identities(files[fi].language) &&
+            pxc_scope_rows(files[fi].language, NULL)) {
+            packages = pxc_packages_build(ctx, arena, cache, files, file_count, project_name,
+                                          cbm_type_scope_lang(files[fi].language)->labels);
+        }
+    }
+    if (out_packages) {
+        *out_packages = packages;
+    }
     for (int fi = 0; fi < file_count; fi++) {
         if (out_def_starts) {
             out_def_starts[fi] = idx;
@@ -1472,7 +2272,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                 ? cbm_type_scope_lang(files[fi].language)
                 : NULL;
         bool resolve_bases = ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language);
-        if (resolve_bases || scope_lang) {
+        bool scope_rows = scope_lang && pxc_scope_rows(files[fi].language, NULL);
+        if (resolve_bases || (scope_lang && !scope_rows)) {
             /* Bases and field annotations resolve through annotation-only
              * imports too: `if TYPE_CHECKING:` exists for them (#1277). */
             cbm_pxc_build_import_map_ex(ctx->gbuf, project_name, files[fi].rel_path,
@@ -1514,12 +2315,31 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         /* Every declared type this file wrote, resolved once in this file's
          * scope; the identities travel with the defs (and their surface). */
         if (scope_lang) {
-            cbm_type_scope_file_t *ts_file = pxc_file_scope_begin(
-                ctx, scope_lang, fr, def_modules[fi], bs.imp_keys, bs.imp_vals, bs.imp_count);
+            CBMArena scope_scratch; /* an import map from rows, for this file */
+            cbm_arena_init_lazy(&scope_scratch, CBM_SZ_4K);
+            cbm_type_scope_file_t *ts_file =
+                pxc_file_scope_begin(ctx, scope_lang, fr, def_modules[fi], bs.imp_keys, bs.imp_vals,
+                                     bs.imp_count, packages, &scope_scratch);
             for (int di = file_start; ts_file && di < idx; di++) {
                 cbm_type_scope_attach(ts_file, arena, &defs[di]);
             }
             cbm_type_scope_file_end(ts_file);
+            cbm_arena_destroy(&scope_scratch);
+        }
+        /* JVM defs take the namespace form their registries key (the fold
+         * and the attach above read their graph QNs), and their identities
+         * with them. */
+        for (int di = file_start; pxc_is_jvm_lang(files[fi].language) && di < idx; di++) {
+            if (files[fi].language == CBM_LANG_JAVA) {
+                pxc_java_type_owner(arena, &defs[di], def_modules[fi]);
+            }
+            if (defs[di].type_scope) {
+                defs[di].type_scope = pxc_jvm_identities(arena, defs[di].type_scope,
+                                                         def_modules[fi], namespace_name, packages);
+            }
+            if (namespace_name && namespace_name[0]) {
+                pxc_jvm_rename(arena, &defs[di], namespace_name);
+            }
         }
         cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (fr_loaded) {
@@ -2289,6 +3109,7 @@ typedef struct {
      * cbm_pxc_run_one route): a walk reads the calling file's own identities
      * through cbm_pxc_file_scope(f->ctx, ...). */
     const cbm_pipeline_ctx_t *ctx;
+    const cbm_pxc_packages_t *packages; /* CBMCrossLspRegistries.packages */
 } pxc_file_t;
 
 /* One walk: where it resolves (`reg`, the per-file overlay chained to the
@@ -2354,6 +3175,14 @@ struct pxc_engine {
      * attaches them to the language's defs and the per-file selection follows
      * them. The language has a cbm_type_scope_lang row. */
     bool wants_identities;
+    /* The step's import map is built from the file's own import rows over the
+     * run's package table (pxc_scope_imports_from_rows), not from IMPORTS
+     * edges: for languages whose import names a package member, a package
+     * spanning several directories, and whose edges name a file of the
+     * package. With scope_own_package, the other modules of the file's own
+     * package are open imports as well. */
+    bool scope_imports_from_rows;
+    bool scope_own_package;
     /* The fold of a file's fields into their owner type's field_defs
      * ("name:type|..."), the text the registrars read (pxc_fold_fields). */
     pxc_field_source_t field_source;
@@ -2504,19 +3333,223 @@ static bool pxc_ts_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
 
 /* ── Java ── */
 
+/* The calling file's verified import identities (cbm_type_scope_file_imports)
+ * in the JVM registries' QN form (pxc_jvm_identity), in `scratch`: an import
+ * the step could not verify is not among them. Their count. */
+static int pxc_jvm_file_imports(const pxc_file_t *f, CBMArena *scratch, const char ***out_locals,
+                                const char ***out_qns) {
+    *out_locals = NULL;
+    *out_qns = NULL;
+    cbm_type_scope_file_t *fs =
+        cbm_pxc_file_scope(f->ctx, f->lang, f->result, f->module_qn, f->imp_keys, f->imp_vals,
+                           f->imp_count, f->packages, scratch);
+    const char *const *locals = NULL;
+    const char *const *qns = NULL;
+    int n = cbm_type_scope_file_imports(fs, &locals, &qns);
+    const char **out_l =
+        n > 0 ? (const char **)cbm_arena_alloc(scratch, (size_t)n * sizeof(char *)) : NULL;
+    const char **out_q =
+        n > 0 ? (const char **)cbm_arena_alloc(scratch, (size_t)n * sizeof(char *)) : NULL;
+    const char *own_ns = f->result->namespace_name;
+    if ((!own_ns || !own_ns[0]) && f->rel_path) {
+        own_ns = pxc_infer_jvm_namespace(scratch, f->rel_path, f->lang);
+    }
+    int kept = 0;
+    for (int i = 0; out_l && out_q && i < n; i++) {
+        const char *qn =
+            pxc_jvm_identity(scratch, qns[i], strlen(qns[i]), f->module_qn, own_ns, f->packages);
+        if (qn) {
+            out_l[kept] = cbm_arena_strdup(scratch, locals[i]);
+            out_q[kept] = qn;
+            kept++;
+        }
+    }
+    cbm_type_scope_file_end(fs); /* NULL-safe; the copies live in scratch */
+    *out_locals = out_l;
+    *out_qns = out_q;
+    return kept;
+}
+
+/* An invocation row at an exact call span: its key
+ * "<caller>\x1f<start>:<end>", or NULL. */
+static const char *pxc_java_call_site(CBMArena *a, const CBMResolvedCall *rc) {
+    if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn ||
+        rc->site_end_byte <= rc->site_start_byte) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(a, "%s\x1f%u:%u", rc->caller_qn, (unsigned)rc->site_start_byte,
+                             (unsigned)rc->site_end_byte);
+}
+
+/* The class a constructor row names: the class itself for
+ * `lsp_constructor_synth`, the constructor's owner for `lsp_constructor`
+ * (`<class>.<leaf>`). Length in *len; NULL for any other row. */
+static const char *pxc_java_ctor_class(const CBMResolvedCall *rc, size_t *len) {
+    if (!rc->strategy || !rc->callee_qn || strncmp(rc->strategy, "lsp_constructor", 15) != 0) {
+        return NULL;
+    }
+    *len = strlen(rc->callee_qn);
+    if (strcmp(rc->strategy, "lsp_constructor") == 0) {
+        const char *dot = strrchr(rc->callee_qn, '.');
+        if (!dot) {
+            return NULL;
+        }
+        *len = (size_t)(dot - rc->callee_qn);
+    }
+    return rc->callee_qn;
+}
+
+/* The per-file row at a call the cross run answered with `cross` is dropped,
+ * except at a constructor call whose per-file row names another class: there
+ * both rows stay and the call join hands the call to the name chain, as on the
+ * base (the class node; `java_typed_calls` pins it for an own-package class
+ * that shares its name with a java.lang type). */
+static bool pxc_java_superseded(const CBMResolvedCall *cross, const CBMResolvedCall *prior) {
+    size_t cross_len = 0;
+    const char *cross_class = pxc_java_ctor_class(cross, &cross_len);
+    if (!cross_class) {
+        return true;
+    }
+    size_t prior_len = 0;
+    const char *prior_class = pxc_java_ctor_class(prior, &prior_len);
+    return prior_class && prior_len == cross_len &&
+           strncmp(prior_class, cross_class, cross_len) == 0;
+}
+
+/* One answer per call. The per-file run (extraction) and the cross run both
+ * resolve the file's calls, the per-file one without the other files' types:
+ * it types an imported class as its unregistered canonical name, and its
+ * sole-implementer scan sees the JDK seed (`HashSet.isEmpty` for a `Set`
+ * receiver, where the cross run says `Set.isEmpty`); at `new X()` of an
+ * imported class it names the class where the cross run names the declared
+ * constructor. Where the two name different targets at one call, the call
+ * join reads the call as ambiguous and hands it to the name chain. So where
+ * the cross run answers a call (same caller and exact call span, at or above
+ * the confidence floor), the per-file run's row for that call is dropped
+ * (pxc_java_superseded); a cross constructor row without a class answer is
+ * dropped first (pxc_java_drop_unresolved_ctors). One hash per file. */
+/* A constructor row of the cross run whose class is a bare name: the cross
+ * run has no answer for the type (an import whose class the declared-type
+ * step could not verify, or a QN two types share). It is no answer, so it is
+ * dropped and the per-file run's row for the call stands alone, as on the
+ * base; kept, it would make the call ambiguous and hand it to the name chain. */
+static void pxc_java_drop_unresolved_ctors(CBMResolvedCallArray *out) {
+    int kept = 0;
+    for (int i = 0; i < out->count; i++) {
+        size_t len = 0;
+        const char *cls = pxc_java_ctor_class(&out->items[i], &len);
+        if (cls && !memchr(cls, '.', len)) {
+            continue;
+        }
+        out->items[kept++] = out->items[i];
+    }
+    out->count = kept;
+}
+
+static void pxc_java_one_answer_per_call(const pxc_file_t *f, pxc_walk_t *w) {
+    CBMResolvedCallArray *prior = &f->result->resolved_calls;
+    if (w->out) {
+        pxc_java_drop_unresolved_ctors(w->out);
+    }
+    const CBMResolvedCallArray *out = w->out;
+    if (!out || out->count == 0 || prior->count == 0) {
+        return;
+    }
+    CBMHashTable *answered = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, (uint32_t)(out->count + 1));
+    if (!answered) {
+        return;
+    }
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        const char *key =
+            rc->confidence >= CBM_LSP_CONFIDENCE_FLOOR ? pxc_java_call_site(w->scratch, rc) : NULL;
+        if (key) {
+            cbm_ht_set(answered, key, (void *)rc);
+        }
+    }
+    int kept = 0;
+    for (int i = 0; i < prior->count; i++) {
+        const CBMResolvedCall *rc = &prior->items[i];
+        const char *key = pxc_java_call_site(w->scratch, rc);
+        const CBMResolvedCall *cross = key ? cbm_ht_get(answered, key) : NULL;
+        if (cross && pxc_java_superseded(cross, rc)) {
+            continue;
+        }
+        prior->items[kept++] = *rc;
+    }
+    prior->count = kept;
+    cbm_ht_free(answered);
+}
+
 static bool pxc_java_run_registry(const pxc_file_t *f, pxc_walk_t *w) {
     /* Java builds its own-module overlay on top of the one it is handed; both
-     * live in scratch. */
+     * live in scratch. It is handed the calling file's verified imports. */
+    const char **locals = NULL;
+    const char **qns = NULL;
+    int n = pxc_jvm_file_imports(f, w->scratch, &locals, &qns);
     cbm_run_java_lsp_cross_with_registry(w->scratch, f->result, f->source, f->source_len,
-                                         f->module_qn, w->reg, f->imp_keys, f->imp_vals,
-                                         f->imp_count, f->result->cached_tree, w->out);
+                                         f->module_qn, w->reg, locals, qns, n,
+                                         f->result->cached_tree, w->out);
+    pxc_java_one_answer_per_call(f, w);
     return true;
 }
 
+/* Whether some project file declares `package` (len bytes) or a package
+ * below it: the package table's answer for a Java cross run without a shared
+ * registry (CBMJavaProjectPackages), which is how the shared registry judges
+ * a receiver's package. Two binary searches. */
+static bool pxc_package_declared(const void *ud, const char *package, size_t len) {
+    const cbm_pxc_packages_t *t = (const cbm_pxc_packages_t *)ud;
+    if (!t || !package || len == 0 || len + 1 >= CBM_SZ_1K) {
+        return false;
+    }
+    if (cbm_pxc_package_modules(t, package, len, NULL) > 0) {
+        return true;
+    }
+    char below[CBM_SZ_1K]; /* "<package>.": the first package under it */
+    memcpy(below, package, len);
+    below[len] = '.';
+    int lo = 0;
+    int hi = t->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        PXC_PKG_WORK(1);
+        if (strncmp(t->by_package[mid].package, below, len + 1) < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < t->count && strncmp(t->by_package[lo].package, below, len + 1) == 0;
+}
+
+/* CBMJavaProjectPackages.indexed over the run's package table: its type
+ * index holds every project type of the run's graph by (package, name). */
+static bool pxc_package_indexed(const void *ud, const char *package, size_t len, const char *name,
+                                size_t name_len) {
+    const cbm_pxc_packages_t *t = (const cbm_pxc_packages_t *)ud;
+    char simple[CBM_SZ_256];
+    if (!t || !package || !name || name_len == 0 || name_len >= sizeof(simple)) {
+        return false;
+    }
+    memcpy(simple, name, name_len);
+    simple[name_len] = '\0';
+    int first = 0;
+    return pxc_package_type_modules(t, package, len, simple, &first) > 0;
+}
+
 static bool pxc_java_run_defs(const pxc_file_t *f, pxc_walk_t *w) {
-    cbm_run_java_lsp_cross(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
-                           w->def_count, f->imp_keys, f->imp_vals, f->imp_count,
-                           f->result->cached_tree, w->out);
+    const char **locals = NULL;
+    const char **qns = NULL;
+    int n = pxc_jvm_file_imports(f, w->scratch, &locals, &qns);
+    /* No shared registry here (an incremental closure of a few files): the
+     * engine judges a library receiver by the run's package table. */
+    CBMJavaProjectPackages packages = {
+        .declared = pxc_package_declared, .ud = f->packages, .indexed = pxc_package_indexed};
+    cbm_run_java_lsp_cross_packages(w->scratch, f->source, f->source_len, f->module_qn, w->defs,
+                                    w->def_count, locals, qns, n, f->result->cached_tree,
+                                    f->packages ? &packages : NULL, f->result, w->out);
+    pxc_java_one_answer_per_call(f, w);
     return true;
 }
 
@@ -2637,13 +3670,20 @@ static const pxc_engine_t pxc_engines[] = {
      .build_registry = cbm_ts_build_cross_registry,
      .run_with_registry = pxc_ts_run_registry,
      .run_one = pxc_ts_run_defs},
-    /* The JVM def universe, Kotlin defs included. */
+    /* The JVM def universe, Kotlin defs included. Its imports name members of
+     * packages that span directories, and its IMPORTS edges name a file of
+     * the package: the step's import map comes from the import rows. */
     {.name = "java",
      .langs = {CBM_LANG_JAVA},
      .lang_count = 1,
      .build_registry = cbm_java_build_cross_registry,
      .run_with_registry = pxc_java_run_registry,
-     .run_one = pxc_java_run_defs},
+     .run_one = pxc_java_run_defs,
+     .wants_identities = true,
+     .scope_imports_from_rows = true,
+     .scope_own_package = true,
+     .field_source = PXC_FIELDS_DEFS,
+     .field_owner_label = "Class"},
     /* Ruby constants live in one global namespace and Rails/Zeitwerk autoloads
      * them without require statements, so an own+imports filter would starve
      * almost all cross-file resolution: the walk always sees the whole project. */
@@ -2699,6 +3739,14 @@ bool cbm_pxc_wants_identities(CBMLanguage lang) {
     return e && e->wants_identities;
 }
 
+static bool pxc_scope_rows(CBMLanguage lang, bool *own_package) {
+    const pxc_engine_t *e = pxc_engine_for(lang);
+    if (own_package) {
+        *own_package = e && e->scope_own_package;
+    }
+    return e && e->scope_imports_from_rows;
+}
+
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     return pxc_engine_for(lang) != NULL;
 }
@@ -2731,12 +3779,13 @@ CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r, CBMLa
 cbm_type_scope_file_t *cbm_pxc_file_scope(const cbm_pipeline_ctx_t *ctx, CBMLanguage lang,
                                           const CBMFileResult *result, const char *module_qn,
                                           const char **imp_keys, const char **imp_vals,
-                                          int imp_count) {
+                                          int imp_count, const cbm_pxc_packages_t *packages,
+                                          CBMArena *scratch) {
     if (!cbm_pxc_wants_identities(lang)) {
         return NULL;
     }
     return pxc_file_scope_begin(ctx, cbm_type_scope_lang(lang), result, module_qn, imp_keys,
-                                imp_vals, imp_count);
+                                imp_vals, imp_count, packages, scratch);
 }
 
 /* ── The field fold ── */
@@ -3051,7 +4100,8 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                     .module_def_index = module_def_index,
                     .all_defs = all_defs,
                     .all_def_count = all_def_count,
-                    .ctx = cross_registries ? cross_registries->ctx : NULL};
+                    .ctx = cross_registries ? cross_registries->ctx : NULL,
+                    .packages = cross_registries ? cross_registries->packages : NULL};
     CBMTypeRegistry *prebuilt = cbm_pxc_registry_for_lang(cross_registries, lang);
     if (prebuilt && e && e->run_with_registry) {
         pxc_walk_registry(e, &f, prebuilt, true);
@@ -3193,9 +4243,10 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_arena_init(&ctx->seq_cross_arena);
         ctx->seq_cross_arena_live = true;
     }
-    CBMLSPDef *all_defs =
-        cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
-                                 ctx->project_name, def_modules, &def_count, def_starts);
+    const cbm_pxc_packages_t *packages = NULL; /* in seq_cross_arena, like the defs */
+    CBMLSPDef *all_defs = cbm_pxc_collect_all_defs_ex(ctx, &ctx->seq_cross_arena, cache, files,
+                                                      file_count, ctx->project_name, def_modules,
+                                                      &def_count, def_starts, &packages);
     if (def_count < 0 || (owner_walk_required && (!all_defs || def_count <= 0))) {
         atomic_store(&ctx->test_declarations_failed, 1);
         cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
@@ -3238,6 +4289,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMCrossLspRegistries cross_registries;
     memset(&cross_registries, 0, sizeof(cross_registries));
     cross_registries.ctx = ctx;
+    cross_registries.packages = packages;
     if (all_defs) {
         CBMArena *xa = &ctx->seq_cross_arena;
         if (!ctx->seq_cross_arena_live) {
@@ -3613,6 +4665,25 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
 }
 
 void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
+    /* Every route frees the index once its resolve is done (the sequential
+     * driver, the parallel resolve, an incremental run): the measurement of
+     * the Java answers the registry cannot fully scope ends there. */
+    uint64_t unknown_scope = cbm_java_take_unknown_scope_answers();
+    if (cbm_profile_active && unknown_scope > 0) {
+        char n[CBM_SZ_32];
+        snprintf(n, sizeof(n), "%llu", (unsigned long long)unknown_scope);
+        cbm_log_info("java.unknown_scope", "answers", n);
+    }
+    uint64_t unseen[5];
+    cbm_java_take_unseen_counts(&unseen[0], &unseen[1], &unseen[2], &unseen[3], &unseen[4]);
+    if (cbm_profile_active) {
+        char n[5][CBM_SZ_32];
+        for (int i = 0; i < 5; i++) {
+            snprintf(n[i], sizeof(n[i]), "%llu", (unsigned long long)unseen[i]);
+        }
+        cbm_log_info("java.unseen", "project", n[0], "closure", n[1], "external", n[2], "unknown",
+                     n[3], "project_package", n[4]);
+    }
     if (!idx) {
         return;
     }
@@ -3695,9 +4766,31 @@ static const pxc_module_entry_t *pxc_py_spec_entry(const CBMModuleDefIndex *idx,
     return NULL;
 }
 
+/* The declared-package entry of a JVM QN in the namespace form (a JVM row's
+ * identities, pxc_jvm_identities): its nearest package prefix, or the default
+ * package for a QN without one. `key` holds the QN and is cut in place. */
+static const pxc_module_entry_t *pxc_jvm_package_entry(const CBMModuleDefIndex *idx, char *key) {
+    if (!idx->namespace_ht) {
+        return NULL;
+    }
+    if (!strchr(key, '.')) {
+        return (const pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht,
+                                                      pxc_namespace_index_key(NULL));
+    }
+    for (char *dot = strrchr(key, '.'); dot; dot = strrchr(key, '.')) {
+        *dot = '\0';
+        const pxc_module_entry_t *e =
+            (const pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, key);
+        if (e) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
 /* The index entry of the module that declares the definition `qn`: its
- * nearest proper module prefix (a Python package through its __init__), or
- * NULL. */
+ * nearest proper module prefix (a Python package through its __init__; for a
+ * JVM QN in the namespace form, its package), or NULL. */
 static const pxc_module_entry_t *pxc_module_of_qn(const CBMModuleDefIndex *idx, const char *qn,
                                                   size_t len, CBMLanguage lang) {
     char key[CBM_SZ_1K];
@@ -3709,7 +4802,7 @@ static const pxc_module_entry_t *pxc_module_of_qn(const CBMModuleDefIndex *idx, 
     for (;;) {
         char *dot = strrchr(key, '.');
         if (!dot) {
-            return NULL;
+            break;
         }
         *dot = '\0';
         const pxc_module_entry_t *e = (const pxc_module_entry_t *)cbm_ht_get(idx->ht, key);
@@ -3720,6 +4813,12 @@ static const pxc_module_entry_t *pxc_module_of_qn(const CBMModuleDefIndex *idx, 
             return e;
         }
     }
+    if (!pxc_is_jvm_lang(lang)) {
+        return NULL;
+    }
+    memcpy(key, qn, len);
+    key[len] = '\0';
+    return pxc_jvm_package_entry(idx, key);
 }
 
 /* A def the selection reaches through: a Python namespace record, or a def

@@ -1237,6 +1237,35 @@ TEST(java_local_name_last_segment) {
     PASS();
 }
 
+/* The local name of the import row with this module path, or "". */
+static const char *imp_local_at(const CBMFileResult *r, const char *module_path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->module_path && strcmp(imp->module_path, module_path) == 0) {
+            return imp->local_name ? imp->local_name : "";
+        }
+    }
+    return "";
+}
+
+/* An on-demand import (`import a.b.*;`, `import static a.B.*;`) binds no name:
+ * it is an open import, local "*" with the package or type as its path (the
+ * declared-type step's open-import key). A single-type import beside it keeps
+ * its last segment. */
+TEST(java_on_demand_import_is_open) {
+    CBMFileResult *r = do_extract("import com.acme.model.*;\nimport static org.junit.Assert.*;\n"
+                                  "import com.acme.svc.Billing;\npublic class A {}\n",
+                                  CBM_LANG_JAVA, "A.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 3);
+    ASSERT_STR_EQ(imp_local_at(r, "com.acme.model"), "*");
+    ASSERT_STR_EQ(imp_local_at(r, "org.junit.Assert"), "*");
+    ASSERT_STR_EQ(imp_local_at(r, "com.acme.svc.Billing"), "Billing");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * C#: local_name field spot-check
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1467,6 +1496,7 @@ SUITE(extraction_imports) {
     /* Local-name field spot-checks */
     RUN_TEST(rust_local_name_last_segment);
     RUN_TEST(java_local_name_last_segment);
+    RUN_TEST(java_on_demand_import_is_open);
     RUN_TEST(csharp_local_name_last_segment);
 
     /* ES named-import member (call resolution spells calls through it) */

@@ -13,6 +13,7 @@
 
 #include "foundation/constants.h"
 #include "graph_buffer/graph_buffer.h" /* the module check of a target */
+#include "lsp/java_lsp.h"              /* cbm_java_lang_type (the Java row) */
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -27,6 +28,8 @@
 static const char *const go_labels[] = {"Struct", "Interface", "Type", "Class", "Enum", NULL};
 /* Python: what py_register_lsp_defs registers as a type. */
 static const char *const py_labels[] = {"Class", "Interface", "Protocol", "Type", NULL};
+/* Java: what cbm_java_register_lsp_defs registers as a type. */
+static const char *const java_labels[] = {"Class", "Interface", "Enum", "Type", NULL};
 
 /* One row per language whose engine reads identities. A row states every
  * field; a further language plugs in by appending its row. */
@@ -61,6 +64,26 @@ static const cbm_type_scope_lang_t type_scope_langs[] = {
      .param_types = true,
      .field_types = false, /* folded as resolved QNs (pass_lsp_cross.c) */
      .embedded_types = false /* bases arrive as resolved QNs */},
+    /* Java: its import map is built from its own import rows over the run's
+     * packages (the engine row's scope_imports_from_rows); its registry keys
+     * namespace QNs, so every identity is stored (the collector rewrites them
+     * into that form with the defs). */
+    {.lang = CBM_LANG_JAVA,
+     .scope_source = CBM_TYPE_SCOPE_MODULE_IMPORTS,
+     .quoted_names = false,
+     .colon_paths = false,
+     .labels = java_labels,
+     .engine_qualifies_own_module = false,
+     .imports_bind_modules = false, /* `import a.B;` binds the type B */
+     .lexical_scopes = false,
+     .open_imports = true, /* `import a.*;` and `import static a.B.*;` */
+     .implicit_external = cbm_java_lang_type,
+     .nested_types = true,
+     .type_params_shadow = true, /* `class Box<Item>`: Item is no project class */
+     .return_types = true,
+     .param_types = true,
+     .field_types = true,
+     .embedded_types = true},
 };
 
 const cbm_type_scope_lang_t *cbm_type_scope_lang(CBMLanguage lang) {
@@ -313,6 +336,20 @@ static void type_scope_compare_overloads(cbm_type_scope_file_t *f) {
     }
 }
 
+/* One definition's type parameter names into f->tparams. */
+static void type_scope_index_type_params(cbm_type_scope_file_t *f, const CBMDefinition *d) {
+    for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
+        const char *bar = strchr(p, '|');
+        size_t len = bar ? (size_t)(bar - p) : strlen(p);
+        char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
+        TYPE_SCOPE_WORK(len + 1);
+        if (name && !cbm_ht_get(f->tparams, name)) {
+            cbm_ht_set(f->tparams, name, name);
+        }
+        p = bar ? bar + 1 : p + len;
+    }
+}
+
 /* Hash the file's own definitions, its type parameter names and the names
  * its class bodies bind. */
 static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
@@ -337,16 +374,7 @@ static bool type_scope_index_file_defs(cbm_type_scope_file_t *f) {
         type_scope_index_class_bindings(f, d);
         type_scope_index_global_names(f, d);
         type_scope_index_overload(f, d);
-        for (const char *p = d->type_facts ? d->type_facts->type_params : NULL; p && *p;) {
-            const char *bar = strchr(p, '|');
-            size_t len = bar ? (size_t)(bar - p) : strlen(p);
-            char *name = len ? cbm_arena_strndup(&f->keys, p, len) : NULL;
-            TYPE_SCOPE_WORK(len + 1);
-            if (name && !cbm_ht_get(f->tparams, name)) {
-                cbm_ht_set(f->tparams, name, name);
-            }
-            p = bar ? bar + 1 : p + len;
-        }
+        type_scope_index_type_params(f, d);
     }
     type_scope_compare_overloads(f);
     return true;
@@ -378,6 +406,16 @@ cbm_type_scope_file_t *cbm_type_scope_file_begin(const cbm_type_scope_lang_t *la
         (lang->lexical_scopes && !type_scope_index_file_defs(f))) {
         cbm_type_scope_file_end(f);
         return NULL;
+    }
+    if (lang->type_params_shadow && !lang->lexical_scopes) {
+        f->tparams = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 8);
+        if (!f->tparams) {
+            cbm_type_scope_file_end(f);
+            return NULL;
+        }
+        for (int i = 0; i < scope->file_def_count && scope->file_defs; i++) {
+            type_scope_index_type_params(f, &scope->file_defs[i]);
+        }
     }
     for (int i = 0; i < scope->imp_count; i++) {
         const char *key = scope->imp_keys ? scope->imp_keys[i] : NULL;
@@ -514,7 +552,19 @@ static const char *type_scope_via_open(cbm_type_scope_file_t *f, const char *dot
     }
     const char *found = NULL;
     for (int i = 0; i < f->open_count; i++) {
-        const char *qn = cbm_arena_sprintf(&f->keys, "%s.%s", f->open[i], dotted);
+        const char *qn = NULL;
+        if (f->open[i][0] == CBM_TYPE_SCOPE_OPEN_PACKAGE) {
+            /* A package: one lookup, however many modules declare it. */
+            bool two = false;
+            qn = f->scope.open_package
+                     ? f->scope.open_package(f->scope.open_package_ud, f->open[i] + 1, dotted, &two)
+                     : NULL;
+            if (two) {
+                return NULL;
+            }
+        } else {
+            qn = cbm_arena_sprintf(&f->keys, "%s.%s", f->open[i], dotted);
+        }
         const char *hit = qn ? type_scope_target(f, qn) : NULL;
         if (hit && found && strcmp(hit, found) != 0) {
             return NULL;
@@ -970,6 +1020,15 @@ static void type_scope_on_name(const char *name, size_t len, void *ud) {
     }
     if (b->file->lang->lexical_scopes && type_scope_shadowed(b->file, name, len)) {
         return;
+    }
+    if (b->file->lang->type_params_shadow && b->file->tparams) {
+        char head[CBM_SZ_256];
+        size_t head_len = type_scope_head_len(name, len);
+        TYPE_SCOPE_WORK(1);
+        if (!type_scope_key(name, head_len, head, sizeof(head)) ||
+            cbm_ht_get(b->file->tparams, head)) {
+            return; /* a type parameter of the file: no identity */
+        }
     }
     bool decided = false;
     const char *qn = b->file->nest_memo ? type_scope_nested(b->file, name, len, &decided) : NULL;

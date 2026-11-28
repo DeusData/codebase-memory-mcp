@@ -765,16 +765,19 @@ TEST(type_scope_calling_file_scope_per_engine) {
     cbm_pipeline_ctx_t *ctx = calloc(1, sizeof(*ctx));
     ASSERT_NOT_NULL(ctx);
     ctx->registry = u.reg;
-    cbm_type_scope_file_t *f = cbm_pxc_file_scope(ctx, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1);
+    cbm_type_scope_file_t *f =
+        cbm_pxc_file_scope(ctx, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1, NULL, NULL);
     ASSERT_NOT_NULL(f);
     const char *const *locals = NULL;
     const char *const *qns = NULL;
     ASSERT_EQ(cbm_type_scope_file_imports(f, &locals, &qns), 1);
     ASSERT_STR_EQ(qns[0], "p.a.Store");
     cbm_type_scope_file_end(f);
-    ASSERT_NULL(cbm_pxc_file_scope(NULL, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1));
-    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_CPP, fr, "p.app", keys, vals, 1));
-    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_JAVA, fr, "p.app", keys, vals, 1));
+    ASSERT_NULL(cbm_pxc_file_scope(NULL, CBM_LANG_PYTHON, fr, "p.app", keys, vals, 1, NULL, NULL));
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_CPP, fr, "p.app", keys, vals, 1, NULL, NULL));
+    /* Java reads identities since B1 (its map comes from import rows, built in
+     * the scratch arena it is handed); Kotlin reads none yet. */
+    ASSERT_NULL(cbm_pxc_file_scope(ctx, CBM_LANG_KOTLIN, fr, "p.app", keys, vals, 1, NULL, NULL));
     free(ctx);
     free(fr);
     ts_unit_end(&u);
@@ -1057,19 +1060,19 @@ static uint64_t ts_decline_work(int n, const char **reason) {
     for (int i = 0; i < n; i++) {
         char *json = (char *)malloc(256);
         snprintf(json, 256,
-                 "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
+                 "{\"v\":7,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
                  "\"Function\",\"lg\":%d,\"ty\":\"store.T%d=p.store.T%d\"}],\"reg\":[],\"py\":null}",
                  (int)CBM_LANG_GO, i, (int)CBM_LANG_GO, i, i);
         rows[i].defs_json = json;
     }
     char before_row[256];
     snprintf(before_row, sizeof(before_row),
-             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":7,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":\"Impl\"}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     char after_row[256];
     snprintf(after_row, sizeof(after_row),
-             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":7,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":null}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     const char *old_rows[] = {before_row};

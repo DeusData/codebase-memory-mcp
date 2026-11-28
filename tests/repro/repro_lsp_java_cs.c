@@ -348,10 +348,14 @@ static const char kJavaStaticCall[] =
     "    int run(int v) { return MathUtil.square(v); }\n"
     "}\n";
 
-/* lsp_interface_resolve — a call through an interface-typed receiver where the
- * interface has exactly ONE concrete implementer in the registry; the call is
- * resolved to that sole impl (java_lsp.c:1932-1985). */
+/* A call through an interface-typed receiver whose interface has exactly ONE
+ * concrete implementer: it binds the interface's method, as javac's
+ * invokeinterface names it (r1/Shape.area), never the sole implementer.
+ * The package lets main's engine type the receiver; main's rule then bound
+ * the sole implementer (r1.Square.area). */
 static const char kJavaInterfaceResolve[] =
+    "package r1;\n"
+    "\n"
     "interface Shape {\n"
     "    int area();\n"
     "}\n"
@@ -362,10 +366,12 @@ static const char kJavaInterfaceResolve[] =
     "    int run(Shape s) { return s.area(); }\n"
     "}\n";
 
-/* lsp_interface_dispatch — a call through an interface-typed receiver with NO
- * sole concrete impl (two implementers), so the resolver falls back to a
- * synthesized iface-qualified target (java_lsp.c:1989-1990). */
+/* A call through an interface-typed receiver with two implementers: it binds
+ * the interface's method as well (r2/Shape.area), by type dispatch; main's
+ * rule drew it as a synthesized lsp_interface_dispatch. */
 static const char kJavaInterfaceDispatch[] =
+    "package r2;\n"
+    "\n"
     "interface Shape {\n"
     "    int area();\n"
     "}\n"
@@ -651,14 +657,62 @@ TEST(repro_lsp_java_static_call) {
                                "lsp_static_call");
 }
 
+/* The interface call's target as javac binds it (invokeinterface
+ * Shape.area): a CALLS edge from Client.run to Shape.area drawn by the
+ * engine's type dispatch, and no CALLS edge to an implementer's method. */
+static int assert_interface_method_target(const char *filename, const char *src) {
+    RProj lp;
+    cbm_store_t *store = rh_index(&lp, filename, src);
+    if (!store) {
+        printf("  %sFAIL%s %s:%d: index failed for the interface target\n", tf_red(), tf_reset(),
+               __FILE__, __LINE__);
+        rh_cleanup(&lp, store);
+        return 1;
+    }
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int to_iface = 0;
+    if (cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src_node = {0};
+            cbm_node_t tgt = {0};
+            bool ok = cbm_store_find_node_by_id(store, edges[i].source_id, &src_node) ==
+                          CBM_STORE_OK &&
+                      cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK;
+            size_t tl = ok && tgt.qualified_name ? strlen(tgt.qualified_name) : 0;
+            if (ok && src_node.name && strcmp(src_node.name, "run") == 0 && tl >= 11 &&
+                strcmp(tgt.qualified_name + tl - 11, ".Shape.area") == 0 &&
+                edges[i].properties_json &&
+                strstr(edges[i].properties_json, "\"lsp_type_dispatch\"")) {
+                to_iface++;
+            }
+            cbm_node_free_fields(&src_node);
+            cbm_node_free_fields(&tgt);
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    int rc = 0;
+    if (to_iface != 1) {
+        printf("  %sFAIL%s %s:%d: want one lsp_type_dispatch CALLS edge run -> Shape.area, have %d\n",
+               tf_red(), tf_reset(), __FILE__, __LINE__, to_iface);
+        rc = 1;
+    }
+    if (!inv_no_calls_edge_to_qn(store, lp.project, "Square.area") ||
+        !inv_no_calls_edge_to_qn(store, lp.project, "Circle.area")) {
+        printf("  %sFAIL%s %s:%d: a CALLS edge reaches an implementer's area\n", tf_red(),
+               tf_reset(), __FILE__, __LINE__);
+        rc = 1;
+    }
+    rh_cleanup(&lp, store);
+    return rc;
+}
+
 TEST(repro_lsp_java_interface_resolve) {
-    return assert_lsp_strategy("Client.java", kJavaInterfaceResolve,
-                               "lsp_interface_resolve");
+    return assert_interface_method_target("r1/Client.java", kJavaInterfaceResolve);
 }
 
 TEST(repro_lsp_java_interface_dispatch) {
-    return assert_lsp_strategy("Client.java", kJavaInterfaceDispatch,
-                               "lsp_interface_dispatch");
+    return assert_interface_method_target("r2/Client.java", kJavaInterfaceDispatch);
 }
 
 TEST(repro_lsp_java_method_ref_ctor) {
@@ -782,6 +836,54 @@ TEST(repro_lsp_cs_ctor_synthetic) {
                                "cs_ctor_synthetic");
 }
 
+/* Known red (whitelisted on this board): overload choice on the receiver's
+ * own class. javac 21 binds the most specific method applicable to the
+ * arguments' types, and tries non-varargs methods first: `b.f(o)` with
+ * Over1A.f(Object) and Over1B.f(String) binds Over1A.f; `s.log("x")` with
+ * Over2Base.log(String) and Over2Sub.log(String, Object...) binds
+ * Over2Base.log. The engine chooses by name and argument count on the
+ * receiver's class (the registry's lookup by arguments, shared), so it names
+ * Over1B.f and Over2Sub.log (lsp_type_dispatch), as main does. Tried in round
+ * 8 of B1: the inherited rule now gives no answer where a farther overload or
+ * the argument count leaves the choice to the types (test_java_type_scope.c
+ * shape 35); the receiver's own class keeps main's answer by ruling, since the
+ * fix is overload resolution by argument types, which the shared member walk
+ * does not have. Each case asserts javac's answer: no edge to the nearer
+ * method. */
+static const char kJavaOverloadByTypes[] =
+    "class Over1A {\n"
+    "    void f(Object o) { }\n"
+    "}\n"
+    "class Over1B extends Over1A {\n"
+    "    void f(String s) { }\n"
+    "    void ctl1() { }\n"
+    "}\n"
+    "public class Client {\n"
+    "    void use(Over1B b, Object o) { b.f(o); }\n"
+    "    void control(Over1B b) { b.ctl1(); }\n"
+    "}\n";
+
+static const char kJavaOverloadVarargs[] =
+    "class Over2Base {\n"
+    "    void log(String m) { }\n"
+    "}\n"
+    "class Over2Sub extends Over2Base {\n"
+    "    void log(String f, Object... a) { }\n"
+    "    void ctl2() { }\n"
+    "}\n"
+    "public class Client {\n"
+    "    void use(Over2Sub s) { s.log(\"x\"); }\n"
+    "    void control(Over2Sub s) { s.ctl2(); }\n"
+    "}\n";
+
+TEST(repro_lsp_java_overload_by_types) {
+    return assert_no_resolvable_edge("Client.java", kJavaOverloadByTypes, "Over1B.f");
+}
+
+TEST(repro_lsp_java_overload_varargs) {
+    return assert_no_resolvable_edge("Client.java", kJavaOverloadVarargs, "Over2Sub.log");
+}
+
 /* ── Suite ───────────────────────────────────────────────────────────────── */
 
 SUITE(repro_lsp_java_cs) {
@@ -802,6 +904,8 @@ SUITE(repro_lsp_java_cs) {
     RUN_TEST(repro_lsp_java_constructor);
     RUN_TEST(repro_lsp_java_constructor_synth);
     RUN_TEST(repro_lsp_java_unresolved);
+    RUN_TEST(repro_lsp_java_overload_by_types); /* known red, see the note at the case */
+    RUN_TEST(repro_lsp_java_overload_varargs);  /* known red, see the note at the case */
 
     /* C# passes. */
     RUN_TEST(repro_lsp_cs_static_typed);

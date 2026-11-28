@@ -2078,9 +2078,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             int fresh_count = 0;
             CBMLSPDef *fresh_defs =
                 def_modules && def_starts
-                    ? cbm_pxc_collect_all_defs(ctx, &closure->arena, cache, changed_files, ci,
-                                               ctx->project_name, def_modules, &fresh_count,
-                                               def_starts)
+                    ? cbm_pxc_collect_all_defs_ex(ctx, &closure->arena, cache, changed_files, ci,
+                                                  ctx->project_name, def_modules, &fresh_count,
+                                                  def_starts, &cross_registries.packages)
                     : NULL;
             if (fresh_count < 0 || (owner_walk_required && (!fresh_defs || fresh_count <= 0))) {
                 /* Do not substitute the previous generation's definitions for
@@ -2156,9 +2156,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             def_modules = cbm_arena_alloc(&legacy_cross_arena, (size_t)ci * sizeof(*def_modules));
             if (def_modules) {
                 memset(def_modules, 0, (size_t)ci * sizeof(*def_modules));
-                all_defs =
-                    cbm_pxc_collect_all_defs(ctx, &legacy_cross_arena, cache, changed_files, ci,
-                                             ctx->project_name, def_modules, &all_def_count, NULL);
+                all_defs = cbm_pxc_collect_all_defs_ex(
+                    ctx, &legacy_cross_arena, cache, changed_files, ci, ctx->project_name,
+                    def_modules, &all_def_count, NULL, &cross_registries.packages);
             }
             if (!all_defs || all_def_count <= 0) {
                 atomic_store(&ctx->test_declarations_failed, 1);

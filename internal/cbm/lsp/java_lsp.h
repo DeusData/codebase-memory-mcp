@@ -44,7 +44,16 @@ enum {
     CBM_JAVA_IMPORT_STATIC = 1,    /* import static com.foo.Bar.method; */
     CBM_JAVA_IMPORT_ON_DEMAND = 2, /* import com.foo.*; — package on-demand */
     CBM_JAVA_IMPORT_STATIC_OD = 3, /* import static com.foo.Bar.*; */
+    /* A name the calling file's imports bind to a project type, verified by
+     * the declared-type step (src/pipeline/type_scope.h): the registered QN of
+     * that type. Handed in by the cross-file walks. */
+    CBM_JAVA_IMPORT_IDENTITY = 4,
 };
+
+/* True when `name` (len bytes) is one of the java.lang types the engine knows:
+ * the implicit on-demand import of every compilation unit (the declared-type
+ * step's implicit external scope for Java). */
+bool cbm_java_lang_type(const char *name, size_t len);
 
 /* Per-file resolution context. */
 typedef struct {
@@ -74,6 +83,32 @@ typedef struct {
     int import_count;
     int import_cap;
     CBMNameRows import_rows; /* import_local_names by name, rows in table order */
+    bool imports_scanned;    /* the file's package and import declarations are read */
+    /* The run's project packages, for a cross run without a shared registry
+     * (java_receiver_is_external); NULL when not known. */
+    const struct CBMJavaProjectPackages *project_packages;
+    bool cross_run;            /* a cross-file run (counts answers, see below) */
+    void *unknown_scope_types; /* CBMHashTable of types a simple name resolved to inside a
+                                * class with a supertype the registry does not know */
+    /* Step 0 of java_resolve_type_name per (enclosing classes, simple name),
+     * for this file only (java_step0): a CBMHashTable made once the registry
+     * is complete (step0_ready) and dropped when its type count changes. */
+    void *step0_memo;
+    int step0_memo_types;
+    unsigned class_epoch; /* changes with every push and pop of the enclosing classes */
+    bool step0_ready;
+    /* java_inherited_member per (class, simple name), for this file only
+     * (java_inherited_member_ctx): made and dropped as step0_memo. */
+    void *walk_memo;
+    int walk_memo_types;
+    /* The inherited rule's answer per (declaring class, method name, argument
+     * count) (java_inherited_unique): made and dropped as walk_memo. */
+    void *inherit_memo;
+    int inherit_memo_types;
+    /* The unseen kinds of a class's ancestry (java_class_unseen): made and
+     * dropped as walk_memo. */
+    void *unseen_memo;
+    int unseen_memo_types;
 
     /* While signatures are patched: the registered functions' QNs, by name
      * (overloads share a QN). NULL func_names: a scan answers instead. */
@@ -154,14 +189,28 @@ const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
 void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root);
 
-/* Cross-file LSP: build registry from defs + stdlib, re-parse if needed,
- * walk and resolve. defs include both local + cross-file definitions. */
+/* Cross-file LSP: register defs into a registry. A def's declared types (its
+ * return, parameter and field types and its supertypes) take the identities
+ * the declared-type step resolved in the scope of the file that wrote them
+ * (CBMLSPDef.type_scope, in the registry's QN form); a spelling without one
+ * gets no project type. Register every type def first and call
+ * cbm_java_mark_ambiguous_types before the methods: an identity two defs
+ * share is no answer. */
 void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                 int def_count);
 
+/* Mark every type QN that two or more of the type defs register (a nested
+ * type flattened onto a same-named one of its package, one class in two
+ * source trees): no identity naming it is used. Before finalize. */
+void cbm_java_mark_ambiguous_types(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
+                                   int def_count);
+
 /* Tier 2 (#1669): build the shared JVM cross registry ONCE per run, then
  * resolve each file against it with a small own-module overlay. Skips the
- * per-file registry build that made cross-file LSP O(files x corpus_defs). */
+ * per-file registry build that made cross-file LSP O(files x corpus_defs).
+ * In both cross entry points below, import_names / import_qns are the calling
+ * file's verified import identities (CBM_JAVA_IMPORT_IDENTITY), local name ->
+ * registered QN; the file's own import declarations are read from its AST. */
 CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
 void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result,
                                           const char *source, int source_len, const char *module_qn,
@@ -173,6 +222,56 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out);
+
+/* The run's project packages: declared(ud, package, len) is true when some
+ * project file declares `package` (len bytes, no trailing dot) or a package
+ * below it. A cross run over a shared registry reads that from the registry;
+ * the per-file run below has none and asks this instead. */
+typedef struct CBMJavaProjectPackages {
+    bool (*declared)(const void *ud, const char *package, size_t len);
+    const void *ud;
+    /* The run's index (its graph) holds a type `name` (name_len bytes) of
+     * `package` (len bytes): one a closure's registry may lack. NULL: not
+     * known, as for a full run, whose registry holds every indexed type. */
+    bool (*indexed)(const void *ud, const char *package, size_t len, const char *name,
+                    size_t name_len);
+} CBMJavaProjectPackages;
+
+/* cbm_run_java_lsp_cross with the run's project packages (NULL: as
+ * cbm_run_java_lsp_cross), so a receiver of a library type is told apart
+ * from an unresolved project type as on a run over the shared registry. */
+void cbm_run_java_lsp_cross_packages(CBMArena *arena, const char *source, int source_len,
+                                     const char *module_qn, CBMLSPDef *defs, int def_count,
+                                     const char **import_names, const char **import_qns,
+                                     int import_count, TSTree *cached_tree,
+                                     const CBMJavaProjectPackages *packages, CBMFileResult *result,
+                                     CBMResolvedCallArray *out);
+
+/* Engine answers of cross runs that rest on a simple type name resolved
+ * inside a class whose supertypes (its own or an enclosing class's) include
+ * one the registry does not know (a library type, which may declare member
+ * types no answer sees): the count since the last call, which restarts it. A
+ * measurement only (CBM_PROFILE line java.unknown_scope, end of a resolve). */
+uint64_t cbm_java_take_unknown_scope_answers(void);
+
+/* The supertypes a cross run's registry does not hold, since the last call
+ * (which restarts them; CBM_PROFILE line java.unseen, end of a resolve):
+ * *project, answers withheld (rule i: a spelling no type has, or on a closure
+ * run a type the index holds that the closure lacks); *closure, those of the
+ * latter kind (each a defect of the closure); *external, *unknown and
+ * *package, the answers of cbm_java_take_unknown_scope_answers split by the
+ * supertypes they rest on (rule ii): one of unknown package, else one in a
+ * project package outside the index, else all known outside the project. */
+void cbm_java_take_unseen_counts(uint64_t *project, uint64_t *closure, uint64_t *external,
+                                 uint64_t *unknown, uint64_t *package);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* The member type `name` that the type `cls` inherits along its registered
+ * supertypes (JLS 8.5), or NULL: the walk the resolver runs, for the growth
+ * tests (its work counts in cbm_lsp_work_steps). */
+const char *cbm_java_test_inherited_member(const CBMTypeRegistry *reg, CBMArena *arena,
+                                           const char *cls, const char *name);
+#endif
 
 /* Register the Java standard library (java.lang/util/io/etc.) into reg.
  * Implementation lives in generated/java_stdlib_data.c. */

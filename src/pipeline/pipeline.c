@@ -3105,14 +3105,16 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * disk by now); the per-language cross registries share it. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
+    const cbm_pxc_packages_t *packages = NULL; /* the run's package table, in the same arena */
     CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-        all_defs = def_modules ? cbm_pxc_collect_all_defs(ctx, &cross_lsp_arena, cache, files,
-                                                          file_count, ctx->project_name,
-                                                          def_modules, &def_count, def_starts)
-                               : NULL;
+        all_defs = def_modules
+                       ? cbm_pxc_collect_all_defs_ex(ctx, &cross_lsp_arena, cache, files,
+                                                     file_count, ctx->project_name, def_modules,
+                                                     &def_count, def_starts, &packages)
+                       : NULL;
     }
     if (def_count < 0) {
         atomic_store(&ctx->test_declarations_failed, 1);
@@ -3157,6 +3159,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMCrossLspRegistries cross_registries;
     memset(&cross_registries, 0, sizeof(cross_registries));
     cross_registries.ctx = ctx;
+    cross_registries.packages = packages;
     if (all_defs) {
         /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
          * ONE engine instead of re-diagnosing the whole pass (the cs builder

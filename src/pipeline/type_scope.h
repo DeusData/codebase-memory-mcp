@@ -64,6 +64,10 @@ typedef enum {
 
 /* The import-map key of an open import (see open_imports). */
 #define CBM_TYPE_SCOPE_OPEN_KEY "*"
+/* An open import's value that starts with this byte names a package (the
+ * rest), answered through cbm_type_scope_t.open_package, instead of a module
+ * or a type QN. */
+#define CBM_TYPE_SCOPE_OPEN_PACKAGE '\x1c'
 
 /* How one language writes type names, and what its engine consumes. */
 typedef struct {
@@ -98,10 +102,11 @@ typedef struct {
     bool lexical_scopes;
     /* Open (on-demand) imports (Java and Kotlin `.*`, C# `using N;`): each
      * import-map entry under CBM_TYPE_SCOPE_OPEN_KEY names a package whose
-     * every type is visible. A bare name the own module and the named
-     * imports leave unbound is `<package>.<name>` in each open package: one
-     * target across all of them is its identity, two or more are none.
-     * Without the flag the key is an ordinary local name. */
+     * every type is visible (a module QN, a type QN, or a package through
+     * open_package). A bare name the own module and the named imports leave
+     * unbound is `<package>.<name>` in each open package: one target across
+     * all of them is its identity, two or more are none. Without the flag
+     * the key is an ordinary local name. */
     bool open_imports;
     /* The language's implicit external scope (java.lang, kotlin.*, the C#
      * global namespace): true when a bare name is declared there. A name the
@@ -116,6 +121,13 @@ typedef struct {
      * supertype declares is not seen: past an enclosing type with a supertype
      * the answer is a possible type, not a proven one. */
     bool nested_types;
+    /* Type parameters (Java): a bare name the file declares as a type
+     * parameter of a class, interface, method or constructor
+     * (CBMDefTypeFacts.type_params) gets no identity anywhere in the file;
+     * where it is in scope it is that parameter, and the step does not track
+     * each one's scope. Needs cbm_type_scope_t.file_defs. (A lexical row
+     * already gives its file's type parameters none.) */
+    bool type_params_shadow;
     /* Which CBMLSPDef texts hold raw type spellings for this language. Every
      * row states each one. */
     bool return_types;
@@ -136,8 +148,9 @@ typedef struct {
     const char *const *imp_keys;
     const char *const *imp_vals;
     int imp_count;
-    /* lexical_scopes only: the file's extraction definitions, in any order
-     * (their QNs, labels and type facts); NULL with def_count 0 = none. */
+    /* lexical_scopes (and type_params_shadow): the file's extraction
+     * definitions, in any order (their QNs, labels and type facts); NULL with
+     * def_count 0 = none. */
     const CBMDefinition *file_defs;
     int file_def_count;
     /* lexical_scopes only: the module's ordered namespace facts. Without a
@@ -154,6 +167,12 @@ typedef struct {
      * several, or the closure is incomplete). */
     const char *(*visible)(void *ud, const char *name, size_t len);
     void *visible_ud;
+    /* open_imports with CBM_TYPE_SCOPE_OPEN_PACKAGE values: the one QN
+     * `<module>.<dotted>` a module of `package` defines, or NULL; *two when
+     * two or more modules of it do (then the name has no identity). NULL:
+     * such a value answers nothing. */
+    const char *(*open_package)(const void *ud, const char *package, const char *dotted, bool *two);
+    const void *open_package_ud;
 } cbm_type_scope_t;
 
 /* Per-file working state: the import map by key, the file's own scopes, and
