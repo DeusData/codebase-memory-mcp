@@ -13,6 +13,7 @@ extern const TSLanguage *tree_sitter_rust(void);
 extern const TSLanguage *tree_sitter_java(void);
 extern const TSLanguage *tree_sitter_cpp(void);
 extern const TSLanguage *tree_sitter_c_sharp(void);
+extern const TSLanguage *tree_sitter_vbnet(void);
 extern const TSLanguage *tree_sitter_php_only(void);
 extern const TSLanguage *tree_sitter_lua(void);
 extern const TSLanguage *tree_sitter_scala(void);
@@ -303,6 +304,8 @@ static const char *cfscript_import_types[] = {"import_statement", "import", NULL
 static const char *cfml_func_types[] = {"cf_function_tag", "function_declaration",
                                         "function_expression", NULL};
 static const char *cfml_call_types[] = {"call_expression", NULL};
+static const char *cfml_import_types[] = {"cf_selfclose_tag", "cf_start_tag",
+                                          "cf_start_tag_with_selfclose", NULL};
 static const char *cfml_branch_types[] = {
     "cf_if_tag",     "cf_elseif_tag",   "cf_else_tag",      "if_statement",
     "for_statement", "while_statement", "switch_statement", NULL};
@@ -398,6 +401,36 @@ static const char *cs_assign_types[] = {"assignment_expression", "postfix_unary_
                                         "prefix_unary_expression", NULL};
 static const char *cs_throw_types[] = {"throw_statement", "throw_expression", NULL};
 static const char *cs_decorator_types[] = {"attribute", NULL};
+
+// ==================== VB.NET ====================
+// Node kinds from the vendored vbnet grammar (govindbanura/tree-sitter-vbnet
+// with CodeGraph's patch; see vendored grammar MANIFEST.md). Sub and Function
+// both parse as method_declaration, MustOverride members as
+// abstract_method_declaration and Declare members as
+// external_method_declaration. A VB Module is a static-class-like container
+// so it rides in class_types; class_label_for_kind's default labels it, and a
+// Structure, "Class", while interface_declaration/enum_declaration get
+// "Interface"/"Enum" like C#'s. VB uses one parenthesised form for calls and
+// indexing: `F()` parses as invocation_expression, `F(x)` as
+// array_access_expression, so both are call nodes.
+static const char *vb_func_types[] = {"method_declaration",           "constructor_declaration",
+                                      "interface_method_declaration", "abstract_method_declaration",
+                                      "external_method_declaration",  NULL};
+static const char *vb_class_types[] = {"class_declaration",     "module_declaration",
+                                       "structure_declaration", "interface_declaration",
+                                       "enum_declaration",      NULL};
+static const char *vb_module_types[] = {"source_file", NULL};
+static const char *vb_call_types[] = {"invocation_expression", "array_access_expression",
+                                      "object_creation_expression", NULL};
+static const char *vb_import_types[] = {"imports_statement", NULL};
+static const char *vb_branch_types[] = {
+    "if_statement", "for_statement",    "for_each_statement", "while_statement",
+    "do_statement", "select_statement", "try_statement",      NULL};
+static const char *vb_var_types[] = {"field_declaration", "declaration_statement", NULL};
+static const char *vb_field_types[] = {"field_declaration", "property_declaration", NULL};
+static const char *vb_assign_types[] = {"assignment_statement", NULL};
+static const char *vb_throw_types[] = {"throw_statement", NULL};
+static const char *vb_decorator_types[] = {"attribute", NULL};
 
 // ==================== PHP ====================
 static const char *php_func_types[] = {"function_static_declaration", "anonymous_function",
@@ -1701,8 +1734,11 @@ static const char *objectscript_udl_func_types[] = {"method", "classmethod", "qu
 static const char *objectscript_udl_class_types[] = {"class_definition", NULL};
 static const char *objectscript_udl_field_types[] = {
     "property", "parameter", "index", "trigger", "xdata", "storage", "foreignkey", NULL};
-static const char *objectscript_udl_call_types[] = {"class_method_call", "method_call",
-                                                    "relative_dot_method", "macro", NULL};
+/* Instance calls (`Do obj.M()`) have no call node of their own: the grammar
+ * hides method_call, leaving do_parameter/job_argument with an oref_method
+ * child. cbm_is_call_site() matches those via cbm_objectscript_is_instance_call. */
+static const char *objectscript_udl_call_types[] = {"class_method_call", "relative_dot_method",
+                                                    "macro", NULL};
 static const char *objectscript_udl_module_types[] = {"source_file", NULL};
 /* Branching nodes for cyclomatic complexity (verified against grammar node-types) */
 static const char *objectscript_udl_branch_types[] = {
@@ -2153,9 +2189,9 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_CFML
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
-                       cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
-                       empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       cfml_embedded_imports},
+                       cfml_call_types, cfml_import_types, empty_types, cfml_branch_types,
+                       empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                       tree_sitter_cfml, cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,
@@ -2756,6 +2792,11 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                         plsql_module_types, plsql_call_types, empty_types, empty_types,
                         plsql_branch_types, empty_types, plsql_assign_types, plsql_throw_types,
                         NULL, empty_types, NULL, NULL, tree_sitter_plsql, NULL},
+    // CBM_LANG_VISUALBASIC — VB.NET (.vb)
+    [CBM_LANG_VISUALBASIC] = {CBM_LANG_VISUALBASIC, vb_func_types, vb_class_types, vb_field_types,
+                              vb_module_types, vb_call_types, vb_import_types, vb_import_types,
+                              vb_branch_types, vb_var_types, vb_assign_types, vb_throw_types, NULL,
+                              vb_decorator_types, cs_env_funcs, NULL, tree_sitter_vbnet, NULL},
 
 };
 

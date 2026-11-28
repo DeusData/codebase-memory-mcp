@@ -113,6 +113,19 @@ class BinarySelectionTests(unittest.TestCase):
         self.assertNotIn("install.sh", output)
 
 
+class CandidateVerifyBoundTests(unittest.TestCase):
+    def test_candidate_verification_waits_minutes(self):
+        # A slow host can need far more than 15 s to run a fresh binary's
+        # --version (#2877); a candidate that never answers must still release
+        # the start. Same bound as the Go wrapper and the npm wrapper.
+        self.assertGreaterEqual(_cli._CANDIDATE_TIMEOUT_SECONDS, 120)
+
+    def test_verify_candidate_passes_the_bound(self):
+        with mock.patch.object(_cli.subprocess, "run") as run:
+            _cli._verify_candidate(Path("candidate"))
+        self.assertEqual(run.call_args.kwargs["timeout"], _cli._CANDIDATE_TIMEOUT_SECONDS)
+
+
 class ProcessLivenessTests(unittest.TestCase):
     def test_windows_probe_never_calls_os_kill(self):
         with mock.patch.object(_cli.os, "name", "nt"), mock.patch.object(

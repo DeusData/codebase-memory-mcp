@@ -46,7 +46,10 @@ _LOOPBACK_HTTP_URL = re.compile(
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 _MAX_REDIRECTS = 5
 _NETWORK_TIMEOUT_SECONDS = 120
-_CANDIDATE_TIMEOUT_SECONDS = 15
+# How long a downloaded binary may take to answer --version: generous for a
+# slow host, finite so a candidate that never answers cannot hang the start.
+# Keep in sync with the Go wrapper (candidateVerifyBound) and the npm wrapper.
+_CANDIDATE_TIMEOUT_SECONDS = 300
 # Entry-count guard for the archive namespace check. Keep in sync with the
 # Go wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the npm wrapper.
 _MAX_ARCHIVE_MEMBERS = 64

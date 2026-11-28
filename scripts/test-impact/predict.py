@@ -18,7 +18,7 @@ The mapping is the one the September 2026 test-impact replay measured
 
 Usage: predict.py --root DIR --changed FILE --selection FILE [--detect FILE]
                   [--depth N] [--meta JSON] --out FILE [--summary FILE]
-       predict.py --needs-graph --changed FILE    (prints yes|no)
+       predict.py --needs-graph --changed FILE [--selection FILE]    (prints yes|no)
 """
 import argparse
 import json
@@ -205,13 +205,15 @@ def main():
     a = ap.parse_args()
     with open(a.changed, encoding="utf-8") as fh:
         changed = sorted({line.strip() for line in fh if line.strip()})
+    selection = {}
+    if a.selection:
+        with open(a.selection, encoding="utf-8") as fh:
+            selection = json.load(fh)
     if a.needs_graph:
-        print("yes" if needs_graph(changed) else "no")
+        print("yes" if needs_graph(changed) and not selection.get("full") else "no")
         return 0
     if not (a.root and a.selection and a.out):
         ap.error("--root, --selection and --out are required")
-    with open(a.selection, encoding="utf-8") as fh:
-        selection = json.load(fh)
     detect = None
     if a.detect:
         with open(a.detect, encoding="utf-8") as fh:

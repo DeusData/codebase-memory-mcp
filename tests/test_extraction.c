@@ -723,6 +723,33 @@ TEST(extract_cfml_tag_issue38) {
     PASS();
 }
 
+TEST(extract_cfml_template_imports) {
+    CBMFileResult *r = extract("<!--- <cfinclude template='comment.cfm'> --->\n"
+                               "<cfinclude template=\"local.cfm\">\n"
+                               "<cfif true>\n"
+                               "    <CFMODULE Name='ignored' TEMPLATE='/views/panel.cfm' />\n"
+                               "<cfelse>\n"
+                               "    <CFINCLUDE TEMPLATE='partials/#var#.cfm' />\n"
+                               "</cfif>\n"
+                               "<cfsetting template='unrelated.cfm'>\n"
+                               "<cfmodule name='tags.only'>\n"
+        "<cfinclude template=missing.cfm />\n"
+        "<cfinclude template='o''brien.cfm' />\n"
+        "<cfinclude template=\"a\"\"b.cfm\" />\n",
+                               CBM_LANG_CFML, "app", "index.cfm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 6);
+    const char *const paths[] = {"local.cfm", "/views/panel.cfm", "partials/#var#.cfm",
+                                 "missing.cfm", "o'brien.cfm", "a\"b.cfm"};
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        ASSERT_STR_EQ(imp->module_path, paths[i]);
+        ASSERT_EQ(imp->kind, CBM_IMPORT_KIND_TEMPLATE);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- CFML tag dialect: script functions inside a <cfscript> block of a tag
  * component. The HTML-derived cfml grammar keeps the <cfscript> body as an
  * opaque cf_script_content token, so these functions only surface once the
@@ -733,16 +760,17 @@ TEST(extract_cfml_tag_issue38) {
  * the cfml grammar) does not prevent recovery of the functions. --- */
 TEST(extract_cfml_embedded_cfscript_defs) {
     /* Source layout (1-based lines): 1 <cfcomponent>, 2 <cfsetting>, 3 <cfscript>,
-     * 4 greet(), 7 addTwo(), 10 </cfscript>, 11 <cffunction tagPing>, 14 close. */
+     * 4 greet(), 7 addTwo(), 10 import, 11 </cfscript>, 12 <cffunction tagPing>. */
     CBMFileResult *r = extract("<cfcomponent>\n"
                                "<cfsetting requesttimeout=\"10\">\n"
                                "<cfscript>\n"
                                "    public string function greet(string who) {\n"
-                               "        return \"hi \" & who;\n"
+                               "        return createObject(\"component\", who);\n"
                                "    }\n"
                                "    private numeric function addTwo(numeric a) {\n"
                                "        return a + 2;\n"
                                "    }\n"
+                               "    import services.Greeter;\n"
                                "</cfscript>\n"
                                "<cffunction name=\"tagPing\" returntype=\"string\">\n"
                                "    <cfreturn \"pong\">\n"
@@ -753,6 +781,10 @@ TEST(extract_cfml_embedded_cfscript_defs) {
     /* Script functions inside <cfscript> are recovered ... */
     ASSERT(has_def(r, "Function", "greet"));
     ASSERT(has_def(r, "Function", "addTwo"));
+    ASSERT(has_call(r, "createObject"));
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_STR_EQ(r->imports.items[0].module_path, "services.Greeter");
+    ASSERT_EQ(r->imports.items[0].kind, CBM_IMPORT_KIND_DEFAULT);
     /* ... alongside the tag-dialect <cffunction> in the same component. */
     ASSERT(has_def(r, "Function", "tagPing"));
     /* Line numbers are remapped from block-relative back to host-file lines. */
@@ -1801,6 +1833,52 @@ static const char *def_return_type(CBMFileResult *r, const char *name) {
         }
     }
     return NULL;
+}
+
+/* tree-sitter-c-sharp names a method's return type `returns`, not `type`. */
+TEST(csharp_method_return_type) {
+    CBMFileResult *r = extract("using System.Threading.Tasks;\n"
+                               "namespace App { public class Basket {\n"
+                               "  public async Task<Basket> AddItem(int id) { return this; }\n"
+                               "  public decimal Total() { return 0m; }\n"
+                               "  public void Clear() {}\n"
+                               "  public string[] Names() => new string[0];\n"
+                               "  public Basket() {}\n"
+                               "} }",
+                               CBM_LANG_CSHARP, "t", "Basket.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "AddItem"), "Task<Basket>");
+    ASSERT_STR_EQ(def_return_type(r, "Total"), "decimal");
+    ASSERT_STR_EQ(def_return_type(r, "Clear"), "void");
+    ASSERT_STR_EQ(def_return_type(r, "Names"), "string[]");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Methods in an `impl` block publish their declared return type like a free
+ * `fn` does; a method without `->` has none. */
+TEST(rust_impl_method_return_type) {
+    CBMFileResult *r = extract("struct Matcher;\n"
+                               "pub fn free() -> u8 { 0 }\n"
+                               "impl Matcher {\n"
+                               "    pub fn build(&self, p: &str) -> Result<Matcher, Error> { todo!() }\n"
+                               "    fn name(&self) -> &'static str { \"m\" }\n"
+                               "    fn reset(&mut self) {}\n"
+                               "}\n"
+                               "impl Clone for Matcher {\n"
+                               "    fn clone(&self) -> Self { Matcher }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "matcher.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "free"), "u8");
+    ASSERT_STR_EQ(def_return_type(r, "build"), "Result<Matcher, Error>");
+    ASSERT_STR_EQ(def_return_type(r, "name"), "&'static str");
+    ASSERT_STR_EQ(def_return_type(r, "clone"), "Self");
+    ASSERT_NULL(def_return_type(r, "reset"));
+    cbm_free_result(r);
+    PASS();
 }
 
 /* A member's name is the identifier at the bottom of its declarator, and its
@@ -4827,6 +4905,281 @@ TEST(cpp_gtest_f_unique_name_issue1266) {
     ASSERT(has_def(r, "Function", "TEST_F_MyFixture_SecondTest"));
     ASSERT(!has_def(r, "Function", "TEST_F"));
     cbm_free_result(r);
+    PASS();
+}
+
+/* A call written in a GoogleTest body belongs to the test's own node. The def
+ * walk names TEST(Suite, Case) TEST_Suite_Case (#1266), so the three places
+ * that name the caller of a call must name it the same way: the call-scope
+ * walk (CBMCall.enclosing_func_qn), the enclosing-function helper behind the
+ * reference extractors (CBMUsage.enclosing_func_qn) and the C/C++ engine
+ * (CBMResolvedCall.caller_qn). Under the bare macro name no node exists, and
+ * the pipeline sources every such call at the file. One row per macro form
+ * the def walk renames, plus one inside a namespace. */
+static const char gtest_caller_src[] =
+    "int helper_sum(int a, int b) { return a + b; }\n"
+    "int kLimit = 3;\n"
+    "TEST(WidgetSuite, Adds) { helper_sum(1, kLimit); }\n"
+    "TEST_F(WidgetFixture, Runs) { helper_sum(2, kLimit); }\n"
+    "TEST_P(WidgetParam, Each) { helper_sum(3, kLimit); }\n"
+    "TYPED_TEST(WidgetTyped, Holds) { helper_sum(4, kLimit); }\n"
+    "TYPED_TEST_P(WidgetTypedP, Keeps) { helper_sum(5, kLimit); }\n"
+    "namespace demo {\n"
+    "TEST(NsSuite, Inside) { helper_sum(6, kLimit); }\n"
+    "}\n";
+
+static const char *const gtest_caller_names[] = {
+    "TEST_WidgetSuite_Adds",        "TEST_F_WidgetFixture_Runs",       "TEST_P_WidgetParam_Each",
+    "TYPED_TEST_WidgetTyped_Holds", "TYPED_TEST_P_WidgetTypedP_Keeps", "demo.TEST_NsSuite_Inside"};
+
+static int count_resolved_from(const CBMFileResult *r, const char *caller_qn,
+                               const char *callee_suffix) {
+    int count = 0;
+    size_t sl = strlen(callee_suffix);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t cl = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        if (rc->caller_qn && strcmp(rc->caller_qn, caller_qn) == 0 && cl >= sl &&
+            strcmp(rc->callee_qn + cl - sl, callee_suffix) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+TEST(cpp_gtest_body_caller_is_test_node) {
+    CBMFileResult *r = extract(gtest_caller_src, CBM_LANG_CPP, "t", "widget_test.cc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Inputs reached: every body's call and reference was extracted. */
+    ASSERT_EQ(count_calls_named(r, "helper_sum"), 6);
+    ASSERT_EQ(count_usages_named(r, "kLimit"), 6);
+    for (size_t i = 0; i < sizeof(gtest_caller_names) / sizeof(gtest_caller_names[0]); i++) {
+        const CBMDefinition *def = find_def_in_module(r, gtest_caller_names[i]);
+        if (!def) {
+            printf("  no definition %s\n", gtest_caller_names[i]);
+        }
+        ASSERT_NOT_NULL(def);
+        int calls = count_calls_from(r, "helper_sum", def->qualified_name);
+        int refs = count_usages_from(r, "kLimit", def->qualified_name);
+        int lsp = count_resolved_from(r, def->qualified_name, ".helper_sum");
+        if (calls != 1 || refs != 1 || lsp != 1) {
+            printf("  %s: calls %d, references %d, engine %d\n", def->qualified_name, calls, refs,
+                   lsp);
+        }
+        ASSERT_EQ(calls, 1); /* RED on 08a7a586: the call-scope walk says <module>.TEST */
+        ASSERT_EQ(refs, 1);  /* RED on 08a7a586: cbm_enclosing_func_qn says <module>.TEST */
+        ASSERT_EQ(lsp, 1);   /* RED on 08a7a586: the engine's caller is <module>.TEST */
+    }
+    /* Nothing is left on the bare macro names (the positive rows above are the
+     * partner: the same calls, under the test names). */
+    static const char *const bare[] = {"TEST",       "TEST_F",       "TEST_P",
+                                       "TYPED_TEST", "TYPED_TEST_P", "demo.TEST"};
+    for (size_t i = 0; i < sizeof(bare) / sizeof(bare[0]); i++) {
+        char qn[256];
+        snprintf(qn, sizeof(qn), "%s.%s", r->module_qn, bare[i]);
+        ASSERT_EQ(count_calls_from(r, "helper_sum", qn), 0);
+        ASSERT_EQ(count_usages_from(r, "kLimit", qn), 0);
+        ASSERT_EQ(count_resolved_from(r, qn, ".helper_sum"), 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every C++ file is also read a second time after the built-in preprocessor,
+ * and that view can spell a test's head differently: a project macro among the
+ * arguments is expanded, comments are gone, and a project's own TEST macro is
+ * replaced by its expansion. The second view must still name the body as the
+ * raw view's definition, or the same call is drawn from the test node and, a
+ * second time, from the File. The definition's name drops comments from the
+ * head's arguments. Rows of each view are counted per origin, so the second
+ * view is shown to have run (the positive partner of "no other caller"). */
+static int pp_rows(const CBMFileResult *r, const char *callee, const char *ref,
+                   const char *caller_qn, CBMSourceOrigin origin, int *calls, int *engine,
+                   int *refs) {
+    *calls = *engine = *refs = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        *calls += c->callee_name && strcmp(c->callee_name, callee) == 0 &&
+                  c->source_origin == origin && c->enclosing_func_qn &&
+                  (!caller_qn || strcmp(c->enclosing_func_qn, caller_qn) == 0);
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t cl = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        size_t nl = strlen(callee);
+        *engine += rc->kind == CBM_RESOLVED_INVOCATION && rc->source_origin == origin && cl > nl &&
+                   rc->callee_qn[cl - nl - 1] == '.' &&
+                   strcmp(rc->callee_qn + cl - nl, callee) == 0 && rc->caller_qn &&
+                   (!caller_qn || strcmp(rc->caller_qn, caller_qn) == 0);
+    }
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        *refs += u->ref_name && strcmp(u->ref_name, ref) == 0 && u->source_origin == origin &&
+                 u->enclosing_func_qn &&
+                 (!caller_qn || strcmp(u->enclosing_func_qn, caller_qn) == 0);
+    }
+    return *calls + *engine + *refs;
+}
+
+/* `callee` and `ref` occur in this test's body only. */
+static int assert_pp_view_names_raw_test(const CBMFileResult *r, const char *def_name,
+                                         const char *callee, const char *ref) {
+    const CBMDefinition *def = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, def_name) == 0) {
+            def = &r->defs.items[i];
+        }
+    }
+    if (!def) {
+        printf("  no definition named %s\n", def_name);
+    }
+    ASSERT_NOT_NULL(def);
+    int any[3];
+    int own[3];
+    for (int origin = 0; origin < 2; origin++) {
+        CBMSourceOrigin o = origin ? CBM_SOURCE_ORIGIN_PREPROCESSED : CBM_SOURCE_ORIGIN_RAW;
+        (void)pp_rows(r, callee, ref, NULL, o, &any[0], &any[1], &any[2]);
+        (void)pp_rows(r, callee, ref, def->qualified_name, o, &own[0], &own[1], &own[2]);
+        if (any[0] != own[0] || any[1] != own[1] || any[2] != own[2]) {
+            printf(
+                "  %s, %s view: calls %d of %d, engine %d of %d, references %d of %d at the test\n",
+                def_name, origin ? "preprocessed" : "raw", own[0], any[0], own[1], any[1], own[2],
+                any[2]);
+        }
+        /* Both views saw the call, its resolution and the reference. */
+        ASSERT_GTE(any[0], 1);
+        ASSERT_GTE(any[1], 1);
+        ASSERT_GTE(any[2], 1);
+        /* RED on cbm-ctest-caller-c2a10ffd: the preprocessed view names the
+         * test from its own head text, a name no definition carries. */
+        ASSERT_EQ(own[0], any[0]);
+        ASSERT_EQ(own[1], any[1]);
+        ASSERT_EQ(own[2], any[2]);
+    }
+    return 0;
+}
+
+TEST(cpp_gtest_preprocessed_view_names_the_raw_test) {
+    static const char suites[] = "int kVia = 1;\n"
+                                 "int kBlock = 2;\n"
+                                 "int kLine = 3;\n"
+                                 "int via_target(int v) { return v; }\n"
+                                 "int block_target(int v) { return v; }\n"
+                                 "int line_target(int v) { return v; }\n"
+                                 "#define MY_SUITE RealSuite\n"
+                                 "TEST(MY_SUITE, ViaMacro) { via_target(kVia); }\n"
+                                 "TEST(CommentSuite /* c */, Commented) { block_target(kBlock); }\n"
+                                 "TEST(LineCommentSuite,  // why\n"
+                                 "     LineCommented) {\n"
+                                 "  line_target(kLine);\n"
+                                 "}\n";
+    CBMFileResult *r = extract(suites, CBM_LANG_CPP, "t", "misc_test.cc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The definitions keep the raw head's names, without its comments
+     * (RED on cbm-ctest-caller-c2a10ffd: TEST_CommentSuite_/\* c *\/). */
+    ASSERT_EQ(assert_pp_view_names_raw_test(r, "TEST_MY_SUITE_ViaMacro", "via_target", "kVia"), 0);
+    ASSERT_EQ(
+        assert_pp_view_names_raw_test(r, "TEST_CommentSuite_Commented", "block_target", "kBlock"),
+        0);
+    ASSERT_EQ(assert_pp_view_names_raw_test(r, "TEST_LineCommentSuite_LineCommented", "line_target",
+                                            "kLine"),
+              0);
+    cbm_free_result(r);
+
+    /* A project's own one-argument TEST macro: the def walk names its use
+     * TEST_alpha, the second view sees `void test_alpha()`. */
+    static const char own[] = "int kShared = 1;\n"
+                              "int helper_b(int v) { return v; }\n"
+                              "#define TEST(name) void test_##name()\n"
+                              "TEST(alpha) { helper_b(kShared); }\n";
+    r = extract(own, CBM_LANG_CPP, "t", "own_test_macro.cc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(assert_pp_view_names_raw_test(r, "TEST_alpha", "helper_b", "kShared"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Two tests on one line share their raw line span, so the second view cannot
+ * tell them apart by lines: each keeps the name its own head gives, which is
+ * the raw view's name when the two heads read the same. */
+TEST(cpp_gtest_preprocessed_view_one_line_pair) {
+    static const char src[] = "int kShared = 1;\n"
+                              "int helper_c(int v) { return v; }\n"
+                              "#define UNUSED_MACRO 1\n"
+                              "TEST(PairSuite, First) { helper_c(kShared); } "
+                              "TEST(PairSuite, Second) { helper_c(kShared); }\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "t", "pair_test.cc");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *first = find_def_in_module(r, "TEST_PairSuite_First");
+    const CBMDefinition *second = find_def_in_module(r, "TEST_PairSuite_Second");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    int any[3];
+    int a[3];
+    int b[3];
+    (void)pp_rows(r, "helper_c", "kShared", NULL, CBM_SOURCE_ORIGIN_PREPROCESSED, &any[0], &any[1],
+                  &any[2]);
+    (void)pp_rows(r, "helper_c", "kShared", first->qualified_name, CBM_SOURCE_ORIGIN_PREPROCESSED,
+                  &a[0], &a[1], &a[2]);
+    (void)pp_rows(r, "helper_c", "kShared", second->qualified_name, CBM_SOURCE_ORIGIN_PREPROCESSED,
+                  &b[0], &b[1], &b[2]);
+    ASSERT_EQ(any[0], 2); /* the second view ran and saw both calls */
+    ASSERT_EQ(a[0], 1);
+    ASSERT_EQ(b[0], 1);
+    ASSERT_EQ(a[1] + b[1], any[1]);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The preprocessed view finds the raw test of a body by a binary search over
+ * the file's test spans, sorted once per file, and over the view's indexed
+ * top-level definitions: counted work (spans indexed, nodes walked, search
+ * steps) grows like n log n with the number of tests, never n^2. So it pins
+ * "not worse than main's growth": main's own calls pass on such a file grows
+ * faster than n log n (not counted here), and this change adds no growth of
+ * its own beyond n log n. */
+static uint64_t pp_test_span_work(int tests, int *at_tests) {
+    size_t cap = (size_t)tests * 64 + 256;
+    char *src = malloc(cap);
+    if (!src) {
+        return UINT64_MAX;
+    }
+    int off = snprintf(src, cap, "int span_target() { return 0; }\n#define SPAN_UNUSED 1\n");
+    for (int i = 0; i < tests; i++) {
+        off += snprintf(src + off, cap - (size_t)off,
+                        "TEST(SpanSuite, Case%d) { span_target(); }\n", i);
+    }
+    cbm_test_span_test_reset();
+    CBMFileResult *r = cbm_extract_file(src, off, CBM_LANG_CPP, "t", "span_test.cc", 0, NULL, NULL);
+    free(src);
+    uint64_t work = r ? cbm_test_span_test_work() : UINT64_MAX;
+    *at_tests = 0;
+    for (int i = 0; r && i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        *at_tests += c->source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED && c->callee_name &&
+                     strcmp(c->callee_name, "span_target") == 0 && c->enclosing_func_qn &&
+                     strstr(c->enclosing_func_qn, ".TEST_SpanSuite_Case") != NULL;
+    }
+    cbm_free_result(r);
+    return work;
+}
+
+TEST(cpp_gtest_preprocessed_view_lookup_growth) {
+    enum { SMALL = 100, BIG = 1000, WORK_RATIO_MAX = 20 };
+    int small_at = 0;
+    int big_at = 0;
+    uint64_t small = pp_test_span_work(SMALL, &small_at);
+    uint64_t big = pp_test_span_work(BIG, &big_at);
+    fprintf(stderr, "  [pp-test-spans] work(%d)=%llu work(%d)=%llu\n", SMALL,
+            (unsigned long long)small, BIG, (unsigned long long)big);
+    ASSERT_TRUE(small != UINT64_MAX && big != UINT64_MAX);
+    ASSERT_EQ(small_at, SMALL); /* the second view ran and placed every body */
+    ASSERT_EQ(big_at, BIG);
+    ASSERT_GTE(small, (uint64_t)SMALL);
+    ASSERT(big <= small * WORK_RATIO_MAX); /* 10x input: n log n is about 15x, n^2 100x */
     PASS();
 }
 
@@ -10460,6 +10813,161 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_companion_owners_are_distinct) {
+    CBMFileResult *r = extract("case class Rational private (n: Int, d: Int) {\n"
+                               "  lazy val isWhole: Boolean = d == 1\n"
+                               "  def reciprocal: Rational = Rational(d, n)\n"
+                               "}\n"
+                               "case object Rational {\n"
+                               "  val zero: Rational = Rational(0, 1)\n"
+                               "  def apply(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational.reciprocal"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational#object.apply"));
+    /* Class-body vals keep their module-level QN like every other language;
+     * parent_class tells the two owners apart. */
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.isWhole"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.zero"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_trait_companion_and_standalone_object) {
+    CBMFileResult *r = extract("trait Codec {\n"
+                               "  def encode(s: String): Array[Byte]\n"
+                               "}\n"
+                               "object Codec {\n"
+                               "  def utf8: Codec = ???\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Codec] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Codec.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Trait companions collide just like class companions. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec.encode"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec#object.utf8"));
+    /* A standalone object has nothing to collide with and keeps its plain QN. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry"));
+    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry.lookup"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Companion detection is answered per scope from a cache built on the first
+ * query in that scope, so the same name must be judged against its own
+ * scope's siblings only: `object Node` is a companion at the top level and
+ * standalone inside `Tree`, and a scope with no class at all (`Ops`) must not
+ * turn any of its objects into companions. A flat sealed hierarchy of many
+ * case classes and case objects in one scope is the shape that used to be
+ * quadratic; every object there must still be classified correctly. */
+TEST(extract_scala_companion_detection_is_scoped) {
+    CBMFileResult *r = extract("class Node(v: Int)\n"
+                               "object Node { def leaf: Node = new Node(0) }\n"
+                               "object Tree {\n"
+                               "  object Node { def root: Int = 0 }\n"
+                               "  class Leaf\n"
+                               "  object Leaf { def make: Leaf = new Leaf }\n"
+                               "}\n"
+                               "object Ops {\n"
+                               "  object Node { def count: Int = 1 }\n"
+                               "  object Leaf { def count: Int = 2 }\n"
+                               "}\n"
+                               "sealed trait Op\n"
+                               "case class Add(n: Int) extends Op\n"
+                               "case object Add extends Op\n"
+                               "case class Sub(n: Int) extends Op\n"
+                               "case object Neg extends Op\n"
+                               "case object Op { def all: Seq[Op] = Nil }\n",
+                               CBM_LANG_SCALA, "t", "Ast.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node#object.leaf"));
+    /* Inside `Tree` there is no class Node, so its `object Node` is standalone,
+     * while `Leaf` has a class sibling there. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Tree.Node#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node.root"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf#object.make"));
+    /* `Ops` holds objects only; nothing there is a companion, whatever the
+     * neighbouring scopes declare. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Node#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Leaf"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Leaf#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node.count"));
+    /* Sealed hierarchy in one scope: companions of a case class and of the
+     * sealed trait get `#object`, a case object without a class sibling does not. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Sub"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Sub#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Neg"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Neg#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op#object"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op#object.all"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2154: an object beside a same-named class is its companion and gets the
+ * Owner#object fence (CBM_SCALA_OBJECT_QN_SUFFIX): `name` stays Owner, the
+ * label is the object's own, and its members live under the fence. An object
+ * with no such type beside it keeps its plain QN, and no QN carries `$`. */
+TEST(extract_scala_object_beside_class_gets_object_fence) {
+    CBMFileResult *r = extract("class Rational(n: Int, d: Int)\n"
+                               "object Rational {\n"
+                               "  def make(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Rational] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *cls = pyn_def(r, "t.Rational.Rational");
+    ASSERT_NOT_NULL(cls);
+    const CBMDefinition *obj = pyn_def(r, "t.Rational.Rational" CBM_SCALA_OBJECT_QN_SUFFIX);
+    ASSERT_NOT_NULL(obj);
+    ASSERT_STR_EQ(obj->name, "Rational");
+    ASSERT_STR_EQ(obj->label, "Class");
+    const CBMDefinition *make = pyn_def(r, "t.Rational.Rational#object.make");
+    ASSERT_NOT_NULL(make);
+    ASSERT_STR_EQ(make->parent_class, "t.Rational.Rational#object");
+
+    /* Control: no type named Registry, so the object keeps its plain QN. */
+    ASSERT_NOT_NULL(pyn_def(r, "t.Rational.Registry"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.Rational.Registry.lookup"));
+    ASSERT_FALSE(has_def_qn(r, "t.Rational.Registry#object"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        ASSERT(!qn || !strchr(qn, '$'));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_import_selectors_and_aliases) {
     CBMFileResult *r = extract("import foo.Direct\n"
                                "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
@@ -12891,6 +13399,12 @@ TEST(doc_perl_module_doc_is_the_pod_no_sub_holds) {
     ASSERT_NOT_NULL(r);
     ASSERT_NULL(r->module_doc);
     cbm_free_result(r);
+    /* POD without any declarations leaves both scope sort inputs empty. */
+    r = extract("=head1 NAME\n\nStandalone module.\n\n=cut\n", CBM_LANG_PERL, "t", "Standalone.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+    ASSERT_STR_EQ(r->module_doc, "=head1 NAME\n\nStandalone module.\n\n=cut");
+    cbm_free_result(r);
     PASS();
 }
 
@@ -13439,6 +13953,77 @@ TEST(objectscript_udl_methods_after_goto_label) {
     PASS();
 }
 
+/* #1261: a brace inside a Language = python body (string, comment, triple
+ * quote) must not desynchronize the body lexer. Before the grammar fix the
+ * first such body swallowed every later method in the class, together with
+ * their CALLS, and extraction still reported no error. */
+static void assert_python_body_is_contained(const char *py_body, int *failed) {
+    char src[1024];
+    snprintf(src, sizeof(src),
+             "Class My.Brace Extends %%RegisteredObject\n"
+             "{\n"
+             "ClassMethod PyBad() As %%String [ Language = python ]\n"
+             "{\n"
+             "%s"
+             "}\n"
+             "ClassMethod RealOne() As %%String\n"
+             "{\n"
+             "    Do ##class(My.Tgt).Hit()\n"
+             "    Quit \"one\"\n"
+             "}\n"
+             "ClassMethod RealTwo() As %%String\n"
+             "{\n"
+             "    Do ##class(My.Tgt).Hit()\n"
+             "    Quit \"two\"\n"
+             "}\n"
+             "}\n",
+             py_body);
+    CBMFileResult *r = extract(src, CBM_LANG_OBJECTSCRIPT_UDL, "t", "Brace.cls");
+    int ok = r && !r->has_error && has_def(r, "Method", "PyBad") &&
+             has_def(r, "Method", "RealOne") && has_def(r, "Method", "RealTwo") &&
+             count_calls_named(r, "My.Tgt.Hit") == 2;
+    if (ok) {
+        /* PyBad must end at its own closing brace, before RealOne starts. */
+        const CBMDefinition *bad = find_def(r, "PyBad");
+        const CBMDefinition *one = find_def(r, "RealOne");
+        ok = bad && one && bad->end_line < one->start_line;
+    }
+    if (!ok) {
+        fprintf(stderr, "    python body not contained: %s", py_body);
+        (*failed)++;
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+}
+
+TEST(objectscript_udl_python_body_braces_do_not_swallow_class) {
+    int failed = 0;
+    /* The #1261 repro. */
+    assert_python_body_is_contained("    s = \"dict literal { unbalanced\"\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = 'closing } first'\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    # a { in a comment\n"
+                                    "    return 1\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = \"\"\"triple {\n"
+                                    "    still inside\"\"\"\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = 'escaped \\' {'\n"
+                                    "    return s\n",
+                                    &failed);
+    /* Balanced braces in real Python syntax keep working. */
+    assert_python_body_is_contained("    d = {'k': {'n': 1}}\n"
+                                    "    return str(d)\n",
+                                    &failed);
+    ASSERT_EQ(failed, 0);
+    PASS();
+}
+
 TEST(objectscript_udl_methods) {
     CBMFileResult *r = extract("Class MyApp.Utils Extends %RegisteredObject\n"
                                "{\n"
@@ -13536,6 +14121,32 @@ TEST(objectscript_routine_tags) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "Format"));
     ASSERT(has_def(r, "Function", "Log"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Each routine call form keeps the callee text it had before the grammar hid
+ * line_ref under routine_tag_call and extrinsic_function. */
+TEST(objectscript_routine_call_forms_callee_text) {
+    CBMFileResult *r = extract("run(x)\n"
+                               "    Do accept(x)\n"
+                               "    Do accept\n"
+                               "    Do accept^Other(x)\n"
+                               "    Do ^Other\n"
+                               "    Do accept+2^Other\n"
+                               "    Set a = $$accept(x)\n"
+                               "    Set b = $$accept^Other(x)\n"
+                               "    Set c = $$^Other(1)\n"
+                               "    Quit\n"
+                               "accept(value)\n"
+                               "    Quit value\n",
+                               CBM_LANG_OBJECTSCRIPT_ROUTINE, "t", "Forms.mac");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "accept"), 3);
+    ASSERT_EQ(count_calls_named(r, "accept^Other"), 2);
+    ASSERT_EQ(count_calls_named(r, "^Other"), 2);
+    ASSERT_EQ(count_calls_named(r, "accept+2^Other"), 1);
     cbm_free_result(r);
     PASS();
 }
@@ -13641,6 +14252,37 @@ TEST(objectscript_udl_trigger_body_tokens) {
             ASSERT(strstr(r->defs.items[i].body_tokens, "Log") != NULL ||
                    strstr(r->defs.items[i].body_tokens, "Audit") != NULL ||
                    strstr(r->defs.items[i].body_tokens, "id") != NULL);
+            break;
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_udl_storage_docstring) {
+    CBMFileResult *r = extract("Class MyApp.Patient Extends %Persistent\n"
+                               "{\n"
+                               "Storage Default\n"
+                               "{\n"
+                               "<Data name=\"PatientDefaultData\">\n"
+                               "<Value name=\"1\"><Value>%classname</Value></Value>\n"
+                               "</Data>\n"
+                               "<DataLocation>^MyApp.PatientD</DataLocation>\n"
+                               "<IdLocation>^MyApp.PatientD</IdLocation>\n"
+                               "<Type>%Storage.Persistent</Type>\n"
+                               "}\n"
+                               "}\n",
+                               CBM_LANG_OBJECTSCRIPT_UDL, "t", "Patient.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Storage", "Default"));
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Storage") == 0 &&
+            strcmp(r->defs.items[i].name, "Default") == 0) {
+            ASSERT_NOT_NULL(r->defs.items[i].docstring);
+            ASSERT(strstr(r->defs.items[i].docstring, "\"data_global\":\"^MyApp.PatientD\"") !=
+                   NULL);
+            ASSERT(strstr(r->defs.items[i].docstring, "\"id_global\"") != NULL);
             break;
         }
     }
@@ -15926,6 +16568,420 @@ TEST(extraction_marker_round_trips_non_ascii_environment_path) {
 }
 #endif
 
+/* ===================================================================
+ * Group I: VB.NET structural extraction
+ * =================================================================== */
+
+TEST(vb_basic_declarations) {
+    CBMFileResult *r = extract("Namespace DemoApp\n"
+                               "    Module MathHelpers\n"
+                               "        Function AddOne(x As Integer) As Integer\n"
+                               "            Return x + 1\n"
+                               "        End Function\n"
+                               "    End Module\n"
+                               "\n"
+                               "    Class Customer\n"
+                               "        Public Property Name As String\n"
+                               "        Public Sub Save()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "\n"
+                               "    Interface IRunnable\n"
+                               "        Sub Run()\n"
+                               "    End Interface\n"
+                               "\n"
+                               "    Enum Status\n"
+                               "        Active\n"
+                               "        Disabled\n"
+                               "    End Enum\n"
+                               "End Namespace\n",
+                               CBM_LANG_VISUALBASIC, "t", "Demo.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "MathHelpers"));
+    ASSERT(has_def(r, "Method", "AddOne"));
+    ASSERT(has_def(r, "Class", "Customer"));
+    ASSERT(has_def(r, "Field", "Name"));
+    ASSERT(has_def(r, "Method", "Save"));
+    ASSERT(has_def(r, "Interface", "IRunnable"));
+    ASSERT(has_def(r, "Method", "Run"));
+    ASSERT(has_def(r, "Enum", "Status"));
+    ASSERT(has_def(r, "Variable", "Active"));
+    ASSERT(has_def(r, "Variable", "Disabled"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_method_qn_scoped_to_class) {
+    CBMFileResult *r = extract("Class Customer\n"
+                               "    Public Sub Save()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Customer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Save") == 0) {
+            found = 1;
+            ASSERT_STR_EQ(r->defs.items[i].label, "Method");
+            ASSERT_STR_EQ(r->defs.items[i].qualified_name, "t.Customer.Customer.Save");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_inherits_implements_next_line) {
+    /* The standard VB.NET form: clauses on their own lines after the header. */
+    CBMFileResult *r = extract("Class Manager\n"
+                               "    Inherits Employee\n"
+                               "    Implements IRunnable, IDisposable\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Manager.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Manager") == 0) {
+            found = 1;
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes);
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[0]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[0], "Employee");
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[1]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[1], "IRunnable");
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[2]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[2], "IDisposable");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_qualified_base_dotted_name) {
+    CBMFileResult *r = extract("Partial Class Form1\n"
+                               "    Inherits System.Windows.Forms.Form\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Form1") == 0) {
+            found = 1;
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes);
+            ASSERT_NOT_NULL(r->defs.items[i].base_classes[0]);
+            ASSERT_STR_EQ(r->defs.items[i].base_classes[0], "System.Windows.Forms.Form");
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_constructor_extracted_as_new) {
+    CBMFileResult *r = extract("Class Customer\n"
+                               "    Public Sub New(name As String)\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Customer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "New"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_calls_bare_member_and_new) {
+    CBMFileResult *r = extract("Class Svc\n"
+                               "    Public Sub Run()\n"
+                               "        Validate()\n"
+                               "        Dim c As New Customer()\n"
+                               "        c.Save(1)\n"
+                               "        Me.Helper()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Svc.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "Validate"));
+    ASSERT(has_call(r, "Customer")); /* As New Customer() constructor call */
+    ASSERT(has_call(r, "c.Save"));
+    ASSERT(has_call(r, "Helper")); /* Me.Helper() self-call, receiver stripped */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_region_does_not_break_extraction) {
+    CBMFileResult *r = extract("Module Helpers\n"
+                               "#Region \"Utils\"\n"
+                               "    Sub DoWork()\n"
+                               "    End Sub\n"
+                               "#End Region\n"
+                               "    Sub After()\n"
+                               "    End Sub\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "Helpers.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Helpers"));
+    ASSERT(has_def(r, "Method", "DoWork"));
+    ASSERT(has_def(r, "Method", "After"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_winforms_designer_shapes) {
+    /* Designer-generated file shapes: attribute with `_` continuation before
+     * the class, Partial modifier, WithEvents fields, As New initializers. */
+    CBMFileResult *r = extract("<Global.Microsoft.VisualBasic.CompilerServices.DesignerGenerated()> _\n"
+                               "Partial Class Form1\n"
+                               "    Inherits System.Windows.Forms.Form\n"
+                               "    Private components As System.ComponentModel.IContainer\n"
+                               "    Friend WithEvents Button1 As System.Windows.Forms.Button\n"
+                               "    Private Sub InitializeComponent()\n"
+                               "        Me.Button1 = New System.Windows.Forms.Button()\n"
+                               "        Me.SuspendLayout()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Form1"));
+    ASSERT(has_def(r, "Method", "InitializeComponent"));
+    ASSERT(has_def(r, "Field", "components"));
+    ASSERT(has_def(r, "Field", "Button1"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_handles_and_addhandler_parse) {
+    /* Handles clause + AddHandler/AddressOf statement must not break parsing;
+     * the method defs and the AddressOf handler reference must survive. */
+    CBMFileResult *r = extract("Class Form1\n"
+                               "    Private Sub OnClick(sender As Object, e As EventArgs) Handles Button1.Click\n"
+                               "    End Sub\n"
+                               "    Private Sub Wire()\n"
+                               "        AddHandler Button1.Click, AddressOf OnClick\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "OnClick"));
+    ASSERT(has_def(r, "Method", "Wire"));
+    int handler_usage = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (strcmp(r->usages.items[i].ref_name, "OnClick") == 0) {
+            handler_usage = 1;
+        }
+    }
+    ASSERT_TRUE(handler_usage);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_imports_extracted) {
+    CBMFileResult *r = extract("Imports System.Text\n"
+                               "Imports System.Collections.Generic\n"
+                               "Module M\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "M.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(r->imports.count >= 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(vb_nested_class_extracted) {
+    CBMFileResult *r = extract("Class Outer\n"
+                               "    Class Inner\n"
+                               "        Public Sub Go()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Outer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Outer"));
+    ASSERT(has_def(r, "Class", "Inner"));
+    ASSERT(has_def(r, "Method", "Go"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Number of calls whose callee is exactly `callee` (has_call matches a
+ * substring, which cannot tell "System" from "System.Windows.Forms.Button"). */
+static int vb_call_count_exact(CBMFileResult *r, const char *callee) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The grammar reads `New A.B.C()` as `New A` plus member accesses; the call
+ * names the whole type, and the `New A` prefix is no call of its own. Without
+ * an argument list no call encloses the chain, so the prefix names it. */
+TEST(vb_new_dotted_type_is_one_constructor_call) {
+    CBMFileResult *r = extract("Class Form1\n"
+                               "    Private Sub InitializeComponent()\n"
+                               "        Me.Button1 = New System.Windows.Forms.Button()\n"
+                               "        Me.ClientSize = New System.Drawing.Size(284, 261)\n"
+                               "        components = New System.ComponentModel.Container\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Form1.Designer.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Windows.Forms.Button"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.Drawing.Size"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System.ComponentModel.Container"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "System"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A call with arguments parses as array_access_expression (VB writes calls
+ * and indexing alike; coverage from #2885), and the Me/MyClass receiver is
+ * matched by node kind, so its spelling does not matter. */
+TEST(vb_calls_with_arguments_and_any_case_receiver) {
+    CBMFileResult *r = extract("Class Svc\n"
+                               "    Public Sub Run()\n"
+                               "        Dim x = Compute(1, 2)\n"
+                               "        me.Helper()\n"
+                               "        MYCLASS.Other(x)\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Svc.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(vb_call_count_exact(r, "Compute"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Helper"), 1);
+    ASSERT_EQ(vb_call_count_exact(r, "Other"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Dim a, b As Integer`: every name before an As clause takes its type, and
+ * `As New List(Of String)()` names the constructed type. */
+TEST(vb_field_types_from_as_clauses) {
+    CBMFileResult *r = extract("Class Holder\n"
+                               "    Dim a, b As Integer\n"
+                               "    Private items As New List(Of String)()\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Holder.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int typed = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Field") != 0 || !d->return_type) {
+            continue;
+        }
+        if ((strcmp(d->name, "a") == 0 || strcmp(d->name, "b") == 0) &&
+            strcmp(d->return_type, "Integer") == 0) {
+            typed++;
+        }
+        if (strcmp(d->name, "items") == 0 && strcmp(d->return_type, "List") == 0) {
+            typed++;
+        }
+    }
+    ASSERT_EQ(typed, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Imports with and without an alias (coverage from #2885). */
+TEST(vb_imports_alias_and_path) {
+    CBMFileResult *r = extract("Imports System.Text\n"
+                               "Imports Col = System.Collections.Generic\n"
+                               "Module M\n"
+                               "End Module\n",
+                               CBM_LANG_VISUALBASIC, "t", "M.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int text = 0;
+    int aliased = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->module_path, "System.Text") == 0 && strcmp(imp->local_name, "Text") == 0) {
+            text++;
+        }
+        if (strcmp(imp->module_path, "System.Collections.Generic") == 0 &&
+            strcmp(imp->local_name, "Col") == 0) {
+            aliased++;
+        }
+    }
+    ASSERT_EQ(text, 1);
+    ASSERT_EQ(aliased, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Interface members, MustOverride members and a type nested in a type. */
+TEST(vb_interface_abstract_and_nested_members) {
+    CBMFileResult *r = extract("Public Interface IShape\n"
+                               "    Function Area() As Double\n"
+                               "End Interface\n"
+                               "Public MustInherit Class Shape\n"
+                               "    Implements IShape\n"
+                               "    Public MustOverride Function Area() As Double Implements "
+                               "IShape.Area\n"
+                               "    Public Class Unit\n"
+                               "        Public Sub Scale()\n"
+                               "        End Sub\n"
+                               "    End Class\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", "Shape.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "IShape"));
+    ASSERT(has_def_qn(r, "t.Shape.IShape.Area"));
+    ASSERT(has_def_qn(r, "t.Shape.Shape.Area"));
+    ASSERT(has_def(r, "Class", "Unit"));
+    ASSERT(has_def(r, "Method", "Scale"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* is_test of the Method `Run` the source below defines, extracted as `path`;
+ * -1 when no such Method was extracted. */
+static int vb_run_method_is_test(const char *path) {
+    CBMFileResult *r = extract("Public Class OrderTests\n"
+                               "    Public Sub Run()\n"
+                               "    End Sub\n"
+                               "End Class\n",
+                               CBM_LANG_VISUALBASIC, "t", path);
+    int verdict = -1;
+    for (int i = 0; r && i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "Run") == 0) {
+            verdict = d->is_test ? 1 : 0;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    return verdict;
+}
+
+/* *Test.vb / *Tests.vb are test files (from #2885), and that verdict reaches
+ * the methods they define: the registry ranks on it (#2427). */
+TEST(vb_test_file_names) {
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTests.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_TRUE(cbm_is_test_file("src/OrderTest.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_FALSE(cbm_is_test_file("src/Order.vb", CBM_LANG_VISUALBASIC));
+    ASSERT_EQ(vb_run_method_is_test("src/OrderTests.vb"), 1);
+    ASSERT_EQ(vb_run_method_is_test("src/Order.vb"), 0);
+    PASS();
+}
+
 SUITE(extraction) {
 #ifdef _WIN32
     RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
@@ -15975,6 +17031,10 @@ SUITE(extraction) {
     RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_companion_owners_are_distinct);
+    RUN_TEST(extract_scala_trait_companion_and_standalone_object);
+    RUN_TEST(extract_scala_companion_detection_is_scoped);
+    RUN_TEST(extract_scala_object_beside_class_gets_object_fence);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_scala_chained_package_clauses);
@@ -15984,17 +17044,20 @@ SUITE(extraction) {
     /* InterSystems ObjectScript (UDL / routine / Export XML). */
     RUN_TEST(objectscript_udl_class);
     RUN_TEST(objectscript_udl_methods_after_goto_label);
+    RUN_TEST(objectscript_udl_python_body_braces_do_not_swallow_class);
     RUN_TEST(objectscript_udl_methods);
     RUN_TEST(objectscript_udl_base_classes);
     RUN_TEST(objectscript_udl_multiple_bases);
     RUN_TEST(objectscript_udl_properties);
     RUN_TEST(objectscript_routine_tags);
+    RUN_TEST(objectscript_routine_call_forms_callee_text);
     RUN_TEST(objectscript_udl_query_member);
     RUN_TEST(objectscript_udl_index_member);
     RUN_TEST(objectscript_udl_xdata_member);
     RUN_TEST(objectscript_udl_trigger_member);
     RUN_TEST(objectscript_udl_trigger_body_quit);
     RUN_TEST(objectscript_udl_trigger_body_tokens);
+    RUN_TEST(objectscript_udl_storage_docstring);
     RUN_TEST(objectscript_udl_ensemble_production_def_parses_items);
     RUN_TEST(objectscript_udl_ensemble_production_def_hs_settings);
     RUN_TEST(objectscript_udl_ensemble_production_def_absent_no_error);
@@ -16010,6 +17073,25 @@ SUITE(extraction) {
     RUN_TEST(call_args_skip_comments_between_arguments);
     RUN_TEST(objectscript_data_flows_class_method_args);
     RUN_TEST(objectscript_data_flows_instance_method_args);
+
+    /* Group I: VB.NET structural extraction */
+    RUN_TEST(vb_basic_declarations);
+    RUN_TEST(vb_method_qn_scoped_to_class);
+    RUN_TEST(vb_inherits_implements_next_line);
+    RUN_TEST(vb_qualified_base_dotted_name);
+    RUN_TEST(vb_constructor_extracted_as_new);
+    RUN_TEST(vb_calls_bare_member_and_new);
+    RUN_TEST(vb_region_does_not_break_extraction);
+    RUN_TEST(vb_winforms_designer_shapes);
+    RUN_TEST(vb_handles_and_addhandler_parse);
+    RUN_TEST(vb_imports_extracted);
+    RUN_TEST(vb_nested_class_extracted);
+    RUN_TEST(vb_new_dotted_type_is_one_constructor_call);
+    RUN_TEST(vb_calls_with_arguments_and_any_case_receiver);
+    RUN_TEST(vb_field_types_from_as_clauses);
+    RUN_TEST(vb_imports_alias_and_path);
+    RUN_TEST(vb_interface_abstract_and_nested_members);
+    RUN_TEST(vb_test_file_names);
     RUN_TEST(iris_export_xml_simple_class);
     RUN_TEST(iris_export_xml_classmethod);
     RUN_TEST(iris_export_xml_property_parameter_index);
@@ -16038,6 +17120,7 @@ SUITE(extraction) {
     RUN_TEST(extract_qml_issue42);
     RUN_TEST(extract_cfscript_issue38);
     RUN_TEST(extract_cfml_tag_issue38);
+    RUN_TEST(extract_cfml_template_imports);
     RUN_TEST(extract_cfml_embedded_cfscript_defs);
     RUN_TEST(extract_helm_templates_issue338);
     RUN_TEST(extract_helm_values_toplevel_issue338);
@@ -16064,6 +17147,7 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
+    RUN_TEST(csharp_method_return_type);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
     RUN_TEST(csharp_constructor_of_type_named_extension);
@@ -16082,6 +17166,7 @@ SUITE(extraction) {
     /* Systems */
     RUN_TEST(rust_function);
     RUN_TEST(rust_struct);
+    RUN_TEST(rust_impl_method_return_type);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
@@ -16221,6 +17306,10 @@ SUITE(extraction) {
     RUN_TEST(cpp_function);
     RUN_TEST(cpp_gtest_same_name_collision_issue1266);
     RUN_TEST(cpp_gtest_f_unique_name_issue1266);
+    RUN_TEST(cpp_gtest_body_caller_is_test_node);
+    RUN_TEST(cpp_gtest_preprocessed_view_names_the_raw_test);
+    RUN_TEST(cpp_gtest_preprocessed_view_one_line_pair);
+    RUN_TEST(cpp_gtest_preprocessed_view_lookup_growth);
     RUN_TEST(cpp_out_of_line_method_issue428);
     RUN_TEST(cobol_paragraph);
     RUN_TEST(verilog_module);

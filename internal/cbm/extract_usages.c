@@ -2127,8 +2127,10 @@ static bool js_var_binding(TSNode node) {
 }
 
 static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
-    return (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types)) ||
-           (spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types));
+    /* Like the unified walker, preserve ordinary expressions in CFML tags. */
+    return spec->language != CBM_LANG_CFML &&
+           ((spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types)) ||
+            (spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types)));
 }
 
 static TSNode nearest_import_ancestor(TSNode node, const CBMLangSpec *spec) {
@@ -2682,7 +2684,8 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
     if (!frames) {
         return;
     }
-    bool has_imports = spec->import_node_types && spec->import_node_types[0];
+    bool has_imports =
+        spec->language != CBM_LANG_CFML && spec->import_node_types && spec->import_node_types[0];
     bool has_from_imports = spec->import_from_types && spec->import_from_types[0];
     int call_depth = 0;
     int import_depth = 0;
@@ -2694,7 +2697,7 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
         UsageFrame *f = &frames[top - 1];
         if (entering) {
             try_emit_usage(ctx, f->node, spec, call_depth > 0, import_depth > 0);
-            f->counts_call = cbm_kind_in_set(f->node, spec->call_node_types);
+            f->counts_call = cbm_is_call_site(ctx->language, f->node, spec->call_node_types);
             f->counts_import =
                 (has_imports && cbm_kind_in_set(f->node, spec->import_node_types)) ||
                 (has_from_imports && cbm_kind_in_set(f->node, spec->import_from_types));

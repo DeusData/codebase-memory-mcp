@@ -1706,6 +1706,32 @@ TEST(pipeline_frozen_base_repairs_or_rebuilds_to_the_full_graph) {
     PASS();
 }
 
+TEST(pipeline_frozen_cfml_include_inventory_invalidates_base) {
+    ASSERT_EQ(pf_init_status, 0);
+    pf_fixture_t f = {0};
+    ASSERT_TRUE(pf_open(&f));
+    ASSERT_TRUE(pf_source_write(&f, "index.cfm", "<cfinclude template='/views/x.cfm'>\n"));
+    ASSERT_EQ(th_write_file(TH_PATH(f.source, "a/views/x.cfm"), "<p>First</p>\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(f.source, "b/views/x.cfm"), "<p>Second</p>\n"), 0);
+    char base[1024], repaired[1024], full[1024], removed[1024];
+    ASSERT_TRUE(pf_path(base, sizeof(base), f.home, "base.db"));
+    ASSERT_TRUE(pf_path(repaired, sizeof(repaired), f.home, "repaired.db"));
+    ASSERT_TRUE(pf_path(full, sizeof(full), f.home, "full.db"));
+    ASSERT_TRUE(pf_path(removed, sizeof(removed), f.source, "b/views/x.cfm"));
+    cbm_pipeline_frozen_route_t route;
+    ASSERT_TRUE(pf_build_into(&f, NULL, base, &route));
+    ASSERT_EQ(remove(removed), 0);
+    ASSERT_TRUE(pf_build_into(&f, base, repaired, &route));
+    ASSERT_EQ(route, CBM_PIPELINE_FROZEN_ROUTE_FULL);
+    ASSERT_TRUE(pf_build_into(&f, NULL, full, &route));
+    unsigned char a[32], b[32];
+    ASSERT_TRUE(pf_digest(repaired, a));
+    ASSERT_TRUE(pf_digest(full, b));
+    ASSERT_MEM_EQ(a, b, 32);
+    ASSERT_TRUE(pf_close(&f));
+    PASS();
+}
+
 SUITE(pipeline_frozen) {
     RUN_TEST(pipeline_frozen_real_parse_gap_is_recorded_not_refused);
     pf_init_status = cbm_init();
@@ -1724,5 +1750,6 @@ SUITE(pipeline_frozen) {
     RUN_TEST(pipeline_frozen_missing_listed_file_is_input_changed);
     RUN_TEST(pipeline_frozen_rejects_malformed_file_lists);
     RUN_TEST(pipeline_frozen_base_repairs_or_rebuilds_to_the_full_graph);
+    RUN_TEST(pipeline_frozen_cfml_include_inventory_invalidates_base);
     cbm_work_arena_release();
 }
