@@ -2237,6 +2237,68 @@ TEST(vbnet_vendored_grammar_parses_real_vb_clean) {
     PASS();
 }
 
+TEST(vbnet_vendored_grammar_parses_repeated_target_assembly_block) {
+    static const char src[] =
+        "<Assembly: System.Reflection.AssemblyVersionAttribute(\"2.9.0.0\"),  _\n"
+        " Assembly: System.Reflection.AssemblyFileVersionAttribute(\"2.8.0.16\"),  _\n"
+        " Assembly: System.Reflection.AssemblyInformationalVersionAttribute(\"2.9.0.0\")>\n"
+        "\n"
+        "Namespace Repro\n"
+        "    Public Class Thing\n"
+        "        Public Function Describe() As String\n"
+        "            Return \"ok\"\n"
+        "        End Function\n"
+        "    End Class\n"
+        "End Namespace\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_FALSE(ts_node_has_error(root));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+TEST(vbnet_vendored_grammar_parses_generated_code_quirks) {
+    static const char src[] =
+        "Module Quirks\n"
+        "    Sub Work()\n"
+        "        PostTask(\"Bill\", 10, invoiceIndex: = invoiceIndex)\n"
+        "        taxRateTotal + = tax.Data.Rate.Value\n"
+        "    End Sub\n"
+        "    Public ReadOnly Default Property Instance(name As String) As Object\n"
+        "        Get\n"
+        "            Return Nothing\n"
+        "        End Get\n"
+        "    End Property\n"
+        "    Public Property Cache() As Object\n"
+        "        Set(ByVal value As Object)\n"
+        "            _cache = value\n"
+        "        End Set\n"
+        "        Get\n"
+        "            Return _cache\n"
+        "        End Get\n"
+        "    End Property\n"
+        "    Sub WithNbspIndent()\n"
+        "        Dim a = 1\n"
+        "\xC2\xA0\xC2\xA0\xC2\xA0 Dim b = 2\n"
+        "    End Sub\n"
+        "End Module\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, tree_sitter_vbnet()));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    ASSERT_FALSE(ts_node_has_error(root));
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 TEST(vbnet_vendored_grammar_still_flags_broken_source) {
     static const char broken[] = "Public Class Broken\n    Public Sub (\nEnd Class\n";
     TSParser *parser = ts_parser_new();
@@ -2816,6 +2878,8 @@ SUITE(parse_coverage) {
     RUN_TEST(pascal_ascii_control_still_clean_issue2211);
     RUN_TEST(pascal_broken_source_still_flagged_issue2211);
     RUN_TEST(vbnet_vendored_grammar_parses_real_vb_clean);
+    RUN_TEST(vbnet_vendored_grammar_parses_repeated_target_assembly_block);
+    RUN_TEST(vbnet_vendored_grammar_parses_generated_code_quirks);
     RUN_TEST(vbnet_vendored_grammar_still_flags_broken_source);
     RUN_TEST(vba_vendored_grammar_parses_dual_target_vb6_class_clean);
     RUN_TEST(vba_vendored_grammar_parses_vb6_form_clean);

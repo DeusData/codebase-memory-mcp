@@ -1,0 +1,354 @@
+Assembly Attributes Repeated Target Multiline
+==================
+
+<Assembly: System.Reflection.AssemblyVersionAttribute("2.9.0.0"),  _
+ Assembly: System.Reflection.AssemblyFileVersionAttribute("2.8.0.16"),  _
+ Assembly: System.Reflection.AssemblyInformationalVersionAttribute("2.9.0.0")>
+
+Namespace Repro
+    Public Class Thing
+        Public Function Describe() As String
+            Return "ok"
+        End Function
+    End Class
+End Namespace
+
+---
+
+(source_file
+  (empty_statement)
+  (global_attribute_section
+    (attribute_target)
+    (attribute
+      (qualified_name
+        (qualified_name
+          (simple_name
+            (identifier))
+          (simple_name
+            (identifier)))
+        (simple_name
+          (identifier)))
+      (attribute_argument_list
+        (string_literal)))
+    (attribute_target)
+    (attribute
+      (qualified_name
+        (qualified_name
+          (simple_name
+            (identifier))
+          (simple_name
+            (identifier)))
+        (simple_name
+          (identifier)))
+      (attribute_argument_list
+        (string_literal)))
+    (attribute_target)
+    (attribute
+      (qualified_name
+        (qualified_name
+          (simple_name
+            (identifier))
+          (simple_name
+            (identifier)))
+        (simple_name
+          (identifier)))
+      (attribute_argument_list
+        (string_literal))))
+  (namespace_declaration
+    (simple_name
+      (identifier))
+    (class_declaration
+      (member_modifier)
+      (identifier)
+      (method_declaration
+        (member_modifier)
+        (identifier)
+        (parameter_list)
+        (as_clause
+          (predefined_type))
+        (return_statement
+          (string_literal))))))
+
+Generated Code Quirks
+==================
+
+Module Quirks
+    Sub Work()
+        PostTask("Bill", 10, invoiceIndex: = invoiceIndex)
+        taxRateTotal + = tax.Data.Rate.Value
+    End Sub
+
+    Public ReadOnly Default Property Instance(name As String) As Object
+        Get
+            Return Nothing
+        End Get
+    End Property
+
+    Public Property Cache() As Object
+        Set(ByVal value As Object)
+            _cache = value
+        End Set
+        Get
+            Return _cache
+        End Get
+    End Property
+End Module
+
+---
+
+(source_file
+  (empty_statement)
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list)
+      (expression_statement
+        (array_access_expression
+          (identifier)
+          (string_literal)
+          (integer_literal)
+          (named_argument
+            (identifier)
+            (identifier))))
+      (assignment_statement
+        (identifier)
+        (member_access_expression
+          (member_access_expression
+            (member_access_expression
+              (identifier)
+              (identifier))
+            (identifier))
+          (identifier))))
+    (property_declaration
+      (member_modifier)
+      (member_modifier)
+      (member_modifier)
+      (identifier)
+      (parameter_list
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type))))
+      (as_clause
+        (predefined_type))
+      (property_getter
+        (return_statement
+          (nothing_literal))))
+    (property_declaration
+      (member_modifier)
+      (identifier)
+      (parameter_list)
+      (as_clause
+        (predefined_type))
+      (property_setter
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (assignment_statement
+          (identifier)
+          (identifier)))
+      (property_getter
+        (return_statement
+          (identifier))))))
+
+Else If Two Words And Key Members
+==================
+
+Module Probe
+    Function Pct(langCode As Integer, pct As Double) As Boolean
+        If langCode = 1049 Then
+            Return False
+        Else If langCode <> 1049 And pct > 0.2 Then
+            Return True
+        End If
+    End Function
+
+    Sub Work(items As List(Of Object))
+        For Each item In items.Select(Function(i) New With { Key i.Year, Key i.ExpenseIndex }).Distinct()
+        Next
+    End Sub
+End Module
+
+---
+
+(source_file
+  (empty_statement)
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type))))
+      (as_clause
+        (predefined_type))
+      (if_statement
+        (binary_expression
+          (identifier)
+          (integer_literal))
+        (return_statement
+          (boolean_literal))
+        (elseif_clause
+          (binary_expression
+            (binary_expression
+              (identifier)
+              (integer_literal))
+            (binary_expression
+              (identifier)
+              (floating_point_literal)))
+          (return_statement
+            (boolean_literal)))))
+    (method_declaration
+      (identifier)
+      (parameter_list
+        (parameter
+          (identifier)
+          (as_clause
+            (generic_name
+              (identifier)
+              (type_argument_list
+                (predefined_type))))))
+      (for_each_statement
+        (identifier)
+        (invocation_expression
+          (member_access_expression
+            (array_access_expression
+              (member_access_expression
+                (identifier)
+                (identifier))
+              (lambda_expression
+                (lambda_parameter_list
+                  (lambda_parameter
+                    (identifier)))
+                (anonymous_object_creation_expression
+                  (anonymous_object_member_declarator
+                    (member_access_expression
+                      (identifier)
+                      (identifier)))
+                  (anonymous_object_member_declarator
+                    (member_access_expression
+                      (identifier)
+                      (identifier))))))
+            (identifier))
+          (argument_list))))))
+
+Inline Else Select Case Date
+==================
+
+Module Probe
+    Function F(x As Integer, ckDate As Date, replaceType As Integer) As Integer
+        If ckDate = #1/1/1980# Then
+            ckDate = #2/2/2000#
+        Else SetDefault(x)
+        End If
+Select Case replaceType
+        Case = 1
+            x = x + 1
+        Case Else
+            x = x - 1
+        End Select
+        Return x
+    End Function
+End Module
+
+---
+
+(source_file
+  (empty_statement)
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type))))
+      (as_clause
+        (predefined_type))
+      (if_statement
+        (binary_expression
+          (identifier)
+          (date_literal))
+        (assignment_statement
+          (identifier)
+          (date_literal))
+        (else_clause
+          (expression_statement
+            (array_access_expression
+              (identifier)
+              (identifier)))))
+      (select_statement
+        (identifier)
+        (case_clause
+          (case_value
+            (integer_literal))
+          (assignment_statement
+            (identifier)
+            (binary_expression
+              (identifier)
+              (integer_literal))))
+        (case_else_clause
+          (assignment_statement
+            (identifier)
+            (binary_expression
+              (identifier)
+              (integer_literal)))))
+      (return_statement
+        (identifier)))))
+
+As Clause Attribute
+==================
+
+Module Probe
+    Public Function GetItem() As <System.Xml.Serialization.XmlElementAttribute("ItemInfo")> CatalogItem
+        Return Nothing
+    End Function
+End Module
+
+---
+
+(source_file
+  (empty_statement)
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (member_modifier)
+      (identifier)
+      (parameter_list)
+      (as_clause
+        (attribute_list
+          (attribute
+            (qualified_name
+              (qualified_name
+                (qualified_name
+                  (simple_name
+                    (identifier))
+                  (simple_name
+                    (identifier)))
+                (simple_name
+                  (identifier)))
+              (simple_name
+                (identifier)))
+            (attribute_argument_list
+              (string_literal))))
+        (simple_name
+          (identifier)))
+      (return_statement
+        (nothing_literal)))))
