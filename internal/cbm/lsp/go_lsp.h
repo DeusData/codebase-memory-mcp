@@ -114,11 +114,25 @@ typedef struct {
      * by the registrar against def_module_qn like return_types. NULL = not an
      * identity alias. */
     const char *alias_target;
+    /* Ruby only: singleton-side method (`def self.m`, `class << self`), and a
+     * class/module's mixin macros as "|"-separated "<k>:<Const>" pairs (k = i,
+     * p or e). See CBMDefinition. */
+    bool is_singleton;
+    const char *mixin_refs;
     /* Identities of the type names this def's declared types write, resolved
      * once in the scope of the file that wrote them (src/pipeline/type_scope.h):
      * "spelling=QN|spelling=QN". Read with cbm_type_scope_find (type_rep.h).
      * NULL = no name needs one; the engine then qualifies as before. */
     const char *type_scope;
+    /* Member lookup (member_walk.h): one kind letter per embedded_types entry
+     * ('e' extends, 'i' implements, 't' trait use), plus a trailing '+' when
+     * the extractor left bases unrecorded; NULL = the entries' kinds are
+     * unknown. PHP today (embedded_types then lists the bases, then the
+     * traits). */
+    const char *supertype_kinds;
+    /* The rules the type's mixin uses apply to their members, as
+     * CBMDefTypeFacts.member_rules (PHP `insteadof` / `as`). NULL = none. */
+    const char *member_rules;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

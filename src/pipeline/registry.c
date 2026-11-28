@@ -151,6 +151,15 @@ struct cbm_registry {
     CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
     CBMHashTable *swift_overloads;  /* base callable QN -> overloads */
     swift_owners_t *swift_owners;
+    /* VB.NET: ASCII-folded name -> the by_name spelling it was registered
+     * under (key and value owned). Filled only by VB.NET definitions and read
+     * only by a VB.NET lookup that found nothing under its own spelling, so
+     * no other language sees it (vb_canonical_callee). */
+    CBMHashTable *vb_folded;
+    /* A Scala companion object (CBM_SCALA_OBJECT_QN_SUFFIX) is registered: the
+     * lookups that read `Owner.m` as `Owner#object.m` run only then, so every
+     * registry without one resolves exactly as before. */
+    bool scala_object_fences;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -172,6 +181,63 @@ static const char *simple_name(const char *qn) {
         seg = colons + 2;
     }
     return seg;
+}
+
+/* A Scala companion object is `<Owner>#object` (CBM_SCALA_OBJECT_QN_SUFFIX,
+ * cbm.h); source spells it `Owner`. The length of a QN segment without that
+ * trailing fence (unchanged when it has none). */
+enum { OBJECT_FENCE_LEN = sizeof(CBM_SCALA_OBJECT_QN_SUFFIX) - 1 };
+static size_t seg_len_without_object_fence(const char *seg, size_t len) {
+    if (len > OBJECT_FENCE_LEN &&
+        memcmp(seg + len - OBJECT_FENCE_LEN, CBM_SCALA_OBJECT_QN_SUFFIX, OBJECT_FENCE_LEN) == 0) {
+        return len - OBJECT_FENCE_LEN;
+    }
+    return len;
+}
+
+/* Length of the object fence at `s` when one ends a segment there (followed by
+ * '.' or the end of the QN), else 0. */
+static size_t object_fence_at(const char *s) {
+    return strncmp(s, CBM_SCALA_OBJECT_QN_SUFFIX, OBJECT_FENCE_LEN) == 0 &&
+                   (s[OBJECT_FENCE_LEN] == '.' || s[OBJECT_FENCE_LEN] == '\0')
+               ? OBJECT_FENCE_LEN
+               : 0;
+}
+
+/* Order two QNs as if no segment carried an object fence, so the fence's '#'
+ * (which sorts before '.') does not reorder a tie between unrelated
+ * candidates: `Signed.abs` still precedes
+ * `Signed#object.forAdditiveCommutativeGroup.abs`, as `Signed.abs` preceded
+ * `Signed.forAdditiveCommutativeGroup.abs` before the fence existed. Two QNs
+ * equal without their fences (`X.m`, `X#object.m`) order by fence count, the
+ * class member first: a call through a value reaches instance members. */
+static int qn_cmp_without_object_fence(const char *a, const char *b) {
+    int fences_a = 0;
+    int fences_b = 0;
+    for (;;) {
+        size_t fa = object_fence_at(a);
+        size_t fb = object_fence_at(b);
+        if (fa) {
+            a += fa;
+            fences_a++;
+        }
+        if (fb) {
+            b += fb;
+            fences_b++;
+        }
+        if (fa || fb) {
+            continue;
+        }
+        if (*a != *b || *a == '\0') {
+            break;
+        }
+        a++;
+        b++;
+    }
+    if (*a != *b) {
+        return (unsigned char)*a < (unsigned char)*b ? -1 : 1;
+    }
+    return fences_a - fences_b;
 }
 
 /* Extract everything before the last dot. Returns heap-allocated string. */
@@ -328,6 +394,12 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
     bool bs = csharp_reference_stub(best, best_lang);
     if (cs != bs) {
         return !cs;
+    }
+    if (r->scala_object_fences) {
+        int order = qn_cmp_without_object_fence(candidate, best);
+        if (order != 0) {
+            return order < 0;
+        }
     }
     return strcmp(candidate, best) < 0;
 }
@@ -1339,6 +1411,7 @@ static int xl_family(CBMLanguage lang) {
         return XL_FAM_JVM;
     case CBM_LANG_CSHARP:
     case CBM_LANG_FSHARP:
+    case CBM_LANG_VISUALBASIC:
         return XL_FAM_DOTNET;
     case CBM_LANG_PHP:
     case CBM_LANG_BLADE:
@@ -1552,6 +1625,12 @@ cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, cons
     if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
         return CBM_FIELD_CALL_DROP;
     }
+    /* VB.NET writes indexing like a call (`items(0)`, `Me.Cache(key)`), so a
+     * parenthesised name that lands on a Field indexes it or reads a property:
+     * it calls nothing, and it references the Field as C#'s `items[0]` does. */
+    if (caller_lang == CBM_LANG_VISUALBASIC) {
+        return CBM_FIELD_CALL_AS_USAGE;
+    }
     if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
         return CBM_FIELD_CALL_KEEP;
     }
@@ -1619,6 +1698,17 @@ bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_labe
     return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
 }
 
+bool cbm_call_never_names_data(CBMLanguage lang) {
+    /* VB.NET's Variables are enum members, and an enum member is never
+     * called: `Refresh()` in a Form calls Form.Refresh, not the `Refresh`
+     * member of some enum the short-name registry finds. Measured on
+     * staxrip/staxrip: 249 of 6,455 VB.NET CALLS edges landed on an enum
+     * member that way. A VB.NET call that lands on a Field never gets here:
+     * cbm_call_onto_field_policy has already made it a USAGE of the Field
+     * (indexing, or a delegate field invoked like a call). */
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_VISUALBASIC;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -1664,6 +1754,12 @@ static void free_swift_overloads(const char *key, void *value, void *ud) {
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
 }
 
+static void free_vb_folded(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
 static void swift_owners_free(swift_owners_t *index) {
     if (!index) {
         return;
@@ -1696,6 +1792,10 @@ void cbm_registry_free(cbm_registry_t *r) {
         cbm_ht_free(r->swift_overloads);
     }
     swift_owners_free(r->swift_owners);
+    if (r->vb_folded) {
+        cbm_ht_foreach(r->vb_folded, free_vb_folded, NULL);
+        cbm_ht_free(r->vb_folded);
+    }
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -1837,6 +1937,99 @@ static const char *registry_add_exact(cbm_registry_t *r, const char *qualified_n
     return cbm_ht_get_key(r->exact, qualified_name);
 }
 
+/* ── VB.NET case-insensitive names ───────────────────────────────── */
+
+/* ASCII-fold the `len` bytes of `name` into `out` (`cap` bytes). False when
+ * they do not fit. VB.NET identifiers are case-insensitive: `Calculate`,
+ * `CALCULATE` and `calculate` name one symbol. */
+static bool vb_fold(const char *name, size_t len, char *out, size_t cap) {
+    if (!name || len + SKIP_ONE > cap) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        out[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    }
+    out[len] = '\0';
+    return true;
+}
+
+/* Record the by_name spelling of a VB.NET definition under its folded form.
+ * Two spellings that fold alike (`Run`, `RUN`) keep the strcmp-smaller one,
+ * so the table does not depend on registration order; folding keeps the
+ * length, so the kept spelling is overwritten in place. */
+static void vb_index_folded(cbm_registry_t *r, const char *spelling) {
+    char folded[CBM_SZ_512];
+    size_t len = strlen(spelling);
+    if (!vb_fold(spelling, len, folded, sizeof(folded))) {
+        return;
+    }
+    if (!r->vb_folded) {
+        r->vb_folded = cbm_ht_create(CBM_SZ_512);
+        if (!r->vb_folded) {
+            return;
+        }
+    }
+    char *have = cbm_ht_get(r->vb_folded, folded);
+    if (have) {
+        if (strcmp(spelling, have) < 0) {
+            memcpy(have, spelling, len);
+        }
+        return;
+    }
+    char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, folded);
+    char *value = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, spelling);
+    if (!key || !value) {
+        if (key) {
+            cbm_free(CBM_MEM_CLASS_OTHER, key);
+        }
+        if (value) {
+            cbm_free(CBM_MEM_CLASS_OTHER, value);
+        }
+        return;
+    }
+    cbm_ht_set(r->vb_folded, key, value);
+}
+
+/* Respell each dot segment of a VB.NET `callee` the way a VB.NET definition
+ * spells it (`helpers.format` -> `Helpers.Format`) into `out`; a segment no
+ * definition folds to (a local variable) stays as written. False when nothing
+ * changes or the result does not fit. */
+static bool vb_canonical_callee(const cbm_registry_t *r, const char *callee, char *out,
+                                size_t cap) {
+    if (!r->vb_folded || !callee) {
+        return false;
+    }
+    size_t o = 0;
+    bool changed = false;
+    const char *seg = callee;
+    for (;;) {
+        size_t len = strcspn(seg, ".");
+        const char *dot = seg[len] == '.' ? seg + len : NULL;
+        char folded[CBM_SZ_512];
+        const char *canon = vb_fold(seg, len, folded, sizeof(folded))
+                                ? (const char *)cbm_ht_get(r->vb_folded, folded)
+                                : NULL;
+        /* o < cap holds here, so cap - o - SKIP_ONE cannot wrap: room for the
+         * segment plus its '.' or the terminating NUL. */
+        if (len >= cap - o - SKIP_ONE) {
+            return false;
+        }
+        if (canon && strncmp(canon, seg, len) != 0) {
+            changed = true;
+        }
+        memcpy(out + o, canon ? canon : seg, len);
+        o += len;
+        if (!dot) {
+            break;
+        }
+        out[o++] = '.';
+        seg = dot + SKIP_ONE;
+    }
+    out[o] = '\0';
+    return changed;
+}
+
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label, bool is_test) {
     cbm_registry_add_lang_in_module(r, name, qualified_name, label, CBM_LANG_COUNT, 0, is_test);
@@ -1908,6 +2101,9 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
     index_under_name(r, primary, owned_qn, is_test, lang);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        vb_index_folded(r, primary);
+    }
     /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
      * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
      * "#macro", but Macro is no registry label, so it never gets here). A
@@ -1920,6 +2116,10 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
      * capped suffix may carry a '#' of its own. */
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
         index_under_name(r, name, owned_qn, is_test, lang);
+    }
+    if (lang == CBM_LANG_SCALA && !r->scala_object_fences) {
+        size_t derived_len = strlen(derived);
+        r->scala_object_fences = seg_len_without_object_fence(derived, derived_len) != derived_len;
     }
 }
 
@@ -2204,13 +2404,27 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         }
     }
     char candidate[CBM_SZ_512];
+    const char *stored_key = NULL;
+    /* Scala: an import binds the class, but `Owner.m()` on the class's name is
+     * a call into its companion object, Owner#object -- tried first, because
+     * the term `Owner` is the object even where the class has a same-named
+     * member (cats `Chain.concat(a, b)` is the object's, not Chain#concat). */
+    if (r->scala_object_fences && suffix && suffix[0]) {
+        int n = snprintf(candidate, sizeof(candidate), "%s" CBM_SCALA_OBJECT_QN_SUFFIX ".%s",
+                         resolved, suffix);
+        stored_key =
+            n > 0 && n < (int)sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+        if (stored_key) {
+            return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        }
+    }
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);
     } else {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, prefix);
     }
     /* Use cbm_ht_get_key to get the persistent heap-owned key string */
-    const char *stored_key = cbm_ht_get_key(r->exact, candidate);
+    stored_key = cbm_ht_get_key(r->exact, candidate);
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
     }
@@ -2230,10 +2444,17 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
         if (arr) {
             size_t rd_len = strlen(resolved_dot);
             size_t ds_len = strlen(dot_suffix);
+            size_t r_len = strlen(resolved);
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
-                if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
+                /* ... or under its companion object, resolved#object. */
+                bool under_object =
+                    r->scala_object_fences && klen >= r_len + OBJECT_FENCE_LEN + 1 + ds_len &&
+                    strncmp(qn, resolved, r_len) == 0 &&
+                    memcmp(qn + r_len, CBM_SCALA_OBJECT_QN_SUFFIX ".", OBJECT_FENCE_LEN + 1) == 0;
+                if ((under_object ||
+                     (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0)) &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
@@ -2278,7 +2499,25 @@ static const char *same_module_candidate(const cbm_registry_t *r, const char *mo
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
                                             const char *suffix, const char *module_qn,
                                             size_t scope_len) {
-    const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
+    /* Scala `Owner.m` in the declaring file: the member may live under the
+     * companion object, Owner#object.m. Tried before the plain name, because
+     * the term `Owner` is the object even where the class declares a
+     * same-named member (cats `As.compose(that, this)` inside class As is the
+     * object's compose). Each owner segment is tried once; a name too long for
+     * the buffer is skipped. */
+    const char *stored_key = NULL;
+    for (const char *dot = r->scala_object_fences && callee_name ? strchr(callee_name, '.') : NULL;
+         dot; dot = strchr(dot + SKIP_ONE, '.')) {
+        char fenced[CBM_SZ_512];
+        int n = snprintf(fenced, sizeof(fenced), "%.*s" CBM_SCALA_OBJECT_QN_SUFFIX "%s",
+                         (int)(dot - callee_name), callee_name, dot);
+        stored_key = n > 0 && n < (int)sizeof(fenced)
+                         ? same_module_candidate(r, module_qn, scope_len, fenced)
+                         : NULL;
+        if (stored_key)
+            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+    }
+    stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
     if (!stored_key && suffix && suffix[0])
         stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
     if (stored_key)
@@ -2333,6 +2572,43 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
  * as trustworthy as a same-module hit. */
 #define CONF_QUALIFIED_SUFFIX 0.90
 
+/* qualified_suffix_match's second look at a candidate that carries a '#':
+ * `qn` (qlen bytes) ends with the dotted callee (w bytes) at a segment
+ * boundary once a Scala object fence is dropped from each candidate segment
+ * before the last -- `Owner.make` names Owner#object.make. The last segment
+ * is compared as it is, so a fenced definition (#field, #macro) never answers
+ * a bare name. */
+static bool object_fenced_tail_matches(const char *qn, size_t qlen, const char *dotted, size_t w) {
+    const char *q_end = qn + qlen;
+    const char *d_end = dotted + w;
+    for (bool last = true;; last = false) {
+        const char *q_seg = q_end;
+        while (q_seg > qn && q_seg[-1] != '.') {
+            q_seg--;
+        }
+        const char *d_seg = d_end;
+        while (d_seg > dotted && d_seg[-1] != '.') {
+            d_seg--;
+        }
+        size_t q_len = (size_t)(q_end - q_seg);
+        if (!last) {
+            q_len = seg_len_without_object_fence(q_seg, q_len);
+        }
+        size_t d_len = (size_t)(d_end - d_seg);
+        if (q_len != d_len || memcmp(q_seg, d_seg, d_len) != 0) {
+            return false;
+        }
+        if (d_seg == dotted) {
+            return true; /* every callee segment matched at a segment boundary */
+        }
+        if (q_seg == qn) {
+            return false; /* the callee has more segments than the candidate */
+        }
+        q_end = q_seg - SKIP_ONE;
+        d_end = d_seg - SKIP_ONE;
+    }
+}
+
 /* When a callee is package/namespace-qualified (Foo::Bar::sub or Foo.Bar.sub),
  * disambiguate among same-simple-name candidates by matching the FULL qualified
  * tail against each candidate QN at a segment boundary. Returns the sole
@@ -2344,6 +2620,20 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
  * both reduce to "run", so the bare-name scorer would route every caller to a
  * single winner. Language agnostic: callees with no separator return NULL and
  * leave behavior unchanged. */
+/* True when `fenced` is `plain`'s companion-object twin: plain is `X.m` and
+ * fenced is `X#object.m` (CBM_SCALA_OBJECT_QN_SUFFIX before the last segment). */
+static bool object_twin_of(const char *fenced, const char *plain) {
+    const char *last_dot = strrchr(plain, '.');
+    if (!last_dot) {
+        return false;
+    }
+    size_t owner_len = (size_t)(last_dot - plain);
+    return strlen(fenced) == strlen(plain) + OBJECT_FENCE_LEN &&
+           strncmp(fenced, plain, owner_len) == 0 &&
+           memcmp(fenced + owner_len, CBM_SCALA_OBJECT_QN_SUFFIX, OBJECT_FENCE_LEN) == 0 &&
+           strcmp(fenced + owner_len + OBJECT_FENCE_LEN, last_dot) == 0;
+}
+
 static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CBM_SZ_512];
@@ -2363,26 +2653,39 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         return NULL;
     }
     const char *match = NULL;
+    const char *second = NULL;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
         size_t qlen = strlen(qn);
-        if (qlen < w) {
-            continue;
-        }
-        const char *tail = qn + (qlen - w);
-        if (strcmp(tail, dotted) != 0) {
-            continue;
-        }
+        const char *tail = qlen >= w ? qn + (qlen - w) : NULL;
         /* Segment boundary: tail is the whole QN or is preceded by '.'. */
-        if (tail != qn && tail[-1] != '.') {
+        if (!(tail && strcmp(tail, dotted) == 0 && (tail == qn || tail[-1] == '.')) &&
+            !(strchr(qn, '#') && object_fenced_tail_matches(qn, qlen, dotted, w))) {
             continue;
+        }
+        if (second) {
+            return NULL; /* ambiguous — more than two qualified tails match */
         }
         if (match) {
-            return NULL; /* ambiguous — more than one qualified tail matches */
+            second = qn;
+        } else {
+            match = qn;
         }
-        match = qn;
     }
-    return match;
+    if (!second) {
+        return match;
+    }
+    /* Two matches are ambiguous unless they are a Scala class member and its
+     * companion object's twin (X.m and X#object.m): a callee written `X.m`
+     * names the object, so the object's member answers it (cats
+     * `Free.compile(fk)` is object Free's compile, not Free#compile). */
+    if (object_twin_of(second, match)) {
+        return second;
+    }
+    if (object_twin_of(match, second)) {
+        return match;
+    }
+    return NULL; /* ambiguous — more than one qualified tail matches */
 }
 
 /* True when the first segment of the dotted chain `dotted` is one of C#'s
@@ -2495,7 +2798,8 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         }
         for (const char *anc = candidate_qn; anc < cand_last;) {
             const char *anc_end = strchr(anc, '.');
-            size_t anc_len = (size_t)(anc_end - anc);
+            /* A companion object Owner#object is written Owner in the chain. */
+            size_t anc_len = seg_len_without_object_fence(anc, (size_t)(anc_end - anc));
             if (anc_len == len && len > 0 && strncmp(seg, anc, len) == 0) {
                 return true;
             }
@@ -3019,6 +3323,59 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
         .items = items, .count = n, .cap = n, .is_test = is_test, .is_test_cap = n, .lang = lang};
 }
 
+/* ── Scala, Strategy 4 with an import map (#2360 follow-up) ──────────
+ * Since Scala imports resolve (#2360), almost every Scala file reaches
+ * Strategy 4 with an import map, and resolve_multi_with_imports keeps only
+ * the import-reachable candidates. A method of the calling file itself is
+ * never import-reachable, so an imported type's same-named method displaced
+ * it: a bare `bimap` in EitherT.scala went to Bifunctor's syntax class. Scala
+ * only; every other language keeps the shared path unchanged. */
+
+/* The best candidate declared in the calling file (its QN extends the
+ * caller's module QN), ranked as every pick is; NULL when there is none. */
+static const char *scala_module_local_pick(const cbm_registry_t *r, const qn_array_t *arr,
+                                           const char *module_qn, bool caller_test) {
+    size_t mlen = module_qn ? strlen(module_qn) : 0;
+    if (mlen == 0) {
+        return NULL;
+    }
+    const char *local[CBM_SZ_256];
+    uint8_t local_test[CBM_SZ_256];
+    uint8_t local_lang[CBM_SZ_256];
+    const uint8_t *flags = qn_test_flags(arr);
+    const uint8_t *langs = qn_lang_flags(arr);
+    int n = 0;
+    for (int i = 0; i < arr->count && n < CBM_SZ_256; i++) {
+        const char *qn = arr->items[i];
+        if (strncmp(qn, module_qn, mlen) == 0 && qn[mlen] == '.') {
+            local[n] = qn;
+            local_test[n] = flags[i];
+            local_lang[n] = langs ? langs[i] : (uint8_t)CBM_LANG_COUNT;
+            n++;
+        }
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    return best_by_import_distance(r, local, local_test, langs ? local_lang : NULL, n, module_qn,
+                                   caller_test);
+}
+
+/* Same-file candidate first: the calling file's own candidate, when the
+ * receiver gate a file without imports applies admits it (the exit at the end
+ * of resolve_name_candidates). An empty result means: continue as before. */
+static cbm_resolution_t scala_local_first(const cbm_registry_t *r, const qn_array_t *arr,
+                                          const char *callee_name, const char *module_qn,
+                                          bool caller_test) {
+    const char *local = scala_module_local_pick(r, arr, module_qn, caller_test);
+    if (!local || !receiver_chain_admits(callee_name, local, CBM_LANG_SCALA) ||
+        value_receiver_blind(r, arr, callee_name, local, module_qn, NULL, 0, CBM_LANG_SCALA)) {
+        return empty_result();
+    }
+    double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+    return (cbm_resolution_t){local, "suffix_match", conf, arr->count};
+}
+
 /* Strategies 3.5, 3 and 4 over one same-name candidate set. `lang` reaches
  * receiver_chain_admits and value_receiver_blind only (see there): it is the
  * calling file's language on the CALLS path and CBM_LANG_COUNT on every other
@@ -3056,6 +3413,12 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     }
 
     /* Strategy 4: multiple candidates */
+    if (lang == CBM_LANG_SCALA && import_vals && import_count > 0) {
+        cbm_resolution_t local = scala_local_first(r, arr, callee_name, module_qn, caller_test);
+        if (local.qualified_name) {
+            return local;
+        }
+    }
     if (import_vals && import_count > 0) {
         cbm_resolution_t res =
             resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count, caller_test);
@@ -5037,22 +5400,58 @@ static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
                                    : (module_qn ? strlen(module_qn) : 0);
 }
 
+/* VB.NET names are case-insensitive. A lookup that found nothing under the
+ * name as written retries once with every segment respelled the way a VB.NET
+ * definition spells it (vb_canonical_callee); one that did find something
+ * keeps it, so an exact spelling always wins. `call_lang` and `caller_test`
+ * are passed through as the first lookup received them
+ * (registry_resolve_scoped). */
+static cbm_resolution_t vb_resolve_folded(const cbm_registry_t *r, cbm_resolution_t res,
+                                          const char *callee_name, const char *module_qn,
+                                          const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count,
+                                          size_t scope_len, bool skip_members,
+                                          CBMLanguage call_lang, bool caller_test) {
+    if (res.qualified_name && res.qualified_name[0]) {
+        return res;
+    }
+    char canon[CBM_SZ_512];
+    if (!vb_canonical_callee(r, callee_name, canon, sizeof(canon))) {
+        return res;
+    }
+    return registry_resolve_scoped(r, canon, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, scope_len, skip_members, call_lang,
+                                   caller_test);
+}
+
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false,
-                                   CBM_LANG_COUNT, false);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, false);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, false);
+    }
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve_ref(const cbm_registry_t *r, const char *ref_name,
                                           const char *module_qn, const char **import_map_keys,
                                           const char **import_map_vals, int import_map_count,
                                           CBMLanguage lang, bool caller_test) {
-    return registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false,
-                                   CBM_LANG_COUNT, caller_test);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, ref_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, caller_test);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, ref_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, false, CBM_LANG_COUNT, caller_test);
+    }
+    return res;
 }
 
 static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
@@ -5065,9 +5464,15 @@ static cbm_resolution_t resolve_call_lang(const cbm_registry_t *r, const char *c
      * for the name; a C member call and every other language keep them. */
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
-    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
-                                   lang, caller_test);
+    size_t scope_len = lang_scope_len(module_qn, lang);
+    cbm_resolution_t res =
+        registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, skip_members, lang, caller_test);
+    if (lang == CBM_LANG_VISUALBASIC) {
+        res = vb_resolve_folded(r, res, callee_name, module_qn, import_map_keys, import_map_vals,
+                                import_map_count, scope_len, skip_members, lang, caller_test);
+    }
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,

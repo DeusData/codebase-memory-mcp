@@ -94,6 +94,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"php", "Class:1,Function:1,Module:1"},
     {"c_sharp", "Class:1,Method:1,Module:1"},
     {"csharp_extension_declaration", "Class:1,Method:1,Module:1"},
+    {"visualbasic", "Class:1,Method:1,Module:1"},
     {"bash", "Function:2,Module:1"},
     {"zsh", "Function:2,Module:1"},
     {"lua", "Function:2,Module:1"},

@@ -51,7 +51,7 @@ const (
 	requestTimeout        = 2 * time.Minute
 	connectTimeout        = 15 * time.Second
 	responseHeaderTimeout = 30 * time.Second
-	candidateTimeout      = 15 * time.Second
+	candidateVerifyBound  = 5 * time.Minute
 	maxArchiveMembers     = 64
 
 	runtimeSetLockName               = ".codebase-memory-mcp-runtime.lock"
@@ -1008,15 +1008,26 @@ func validateWindowsZipMember(raw string) (string, error) {
 }
 
 func verifyCandidate(path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), candidateTimeout)
+	return verifyCandidateWithCommand(path, exec.CommandContext)
+}
+
+func verifyCandidateWithCommand(
+	path string, command func(context.Context, string, ...string) *exec.Cmd,
+) error {
+	// Verification is decided by the child exit. A slow host can need far more
+	// than a few seconds, but this runs under the package-cache lock at every
+	// launch, so a candidate that never answers must not hold that lock forever:
+	// the bound is generous, not tight.
+	ctx, cancel := context.WithTimeout(context.Background(), candidateVerifyBound)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "--version")
+	cmd := command(ctx, path, "--version")
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("downloaded binary verification timed out: %w", ctx.Err())
+			return fmt.Errorf("downloaded binary verification did not finish within %s: %w",
+				candidateVerifyBound, ctx.Err())
 		}
 		return fmt.Errorf("downloaded binary failed to run: %w", err)
 	}

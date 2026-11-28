@@ -984,6 +984,15 @@ static int calls_emit_unresolved_service(cbm_pipeline_ctx_t *ctx, const CBMCall 
     return calls_emit_service_call(ctx, call, source_node, svc, NULL, evidence);
 }
 
+void cbm_pipeline_emit_field_call_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                        const cbm_gbuf_node_t *field, const CBMCall *call) {
+    char esc_ref[CBM_SZ_256];
+    cbm_json_escape(esc_ref, sizeof(esc_ref), call->callee_name);
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props), "{\"callee\":\"%s\"}", esc_ref);
+    cbm_gbuf_insert_edge(gbuf, source->id, field->id, "USAGE", props);
+}
+
 /* Apply the field-call policy after a registry target has been found. */
 static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                                  const CBMResolvedCallArray *lsp_calls,
@@ -994,6 +1003,9 @@ static const cbm_gbuf_node_t *calls_field_target(cbm_pipeline_ctx_t *ctx, const 
     switch (cbm_call_onto_field_policy(lang, call->callee_name, target_node->label,
                                        target_node->file_path)) {
     case CBM_FIELD_CALL_DROP:
+        return NULL;
+    case CBM_FIELD_CALL_AS_USAGE:
+        cbm_pipeline_emit_field_call_usage(ctx->gbuf, source_node, target_node, call);
         return NULL;
     case CBM_FIELD_CALL_BY_OWNER:
         /* An arrow call was already bound this way by registry resolution. */
@@ -1037,7 +1049,8 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     /* LSP textual fallbacks can also name data, as with static imports. The
      * call is handled: no edge, and no registry fallback after it. */
-    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+    if (cbm_java_suppress_call_to_data_member(cbm_call_never_names_data(lang),
+                                              target_node->label)) {
         return true;
     }
     cbm_resolution_t res = {0};
@@ -1449,10 +1462,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return calls_emit_route_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
                                      imp_count, route_mount, lang, evidence);
     }
-    /* A Java call never targets data — see cbm_java_suppress_call_to_data_member.
-     * The language gate lives here, as with the guards above, and MUST match
-     * pass_parallel.c exactly or the two resolvers diverge. */
-    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+    /* A Java or VB.NET call never targets data — see
+     * cbm_java_suppress_call_to_data_member. The language gate is
+     * cbm_call_never_names_data, shared with pass_parallel.c so the two
+     * resolvers cannot diverge. */
+    if (cbm_java_suppress_call_to_data_member(cbm_call_never_names_data(lang),
+                                              target_node->label)) {
         return 0;
     }
     /* A bare Go `init(...)` calls a local closure or parameter: never a
@@ -1593,9 +1608,12 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int resolved = 0;
     int unresolved = 0;
     int errors = 0;
+    /* the shared layer's memo for this pass (site_bind.h) */
+    cbm_site_memo_t *site_memo = NULL;
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_NOT_FOUND;
         }
 
@@ -1604,6 +1622,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
             if (atomic_load(&ctx->test_declarations_failed)) {
+                cbm_pipeline_site_memo_free(site_memo);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
             errors++;
@@ -1614,6 +1633,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             if (result_owned) {
                 cbm_free_result(result);
             }
+            cbm_pipeline_site_memo_free(site_memo);
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
@@ -1656,7 +1676,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_external_import_index_t ext_imports = {0};
         cbm_spawn_file_begin(result->imports.items, result->imports.count);
         cbm_site_file_t site;
-        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result);
+        cbm_pipeline_site_bind_begin(&site, ctx, ctx->gbuf, rel, files[i].language, result,
+                                     &site_memo, evidence);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1688,6 +1709,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         }
     }
 
+    cbm_pipeline_site_memo_free(site_memo);
     cbm_log_info("pass.done", "pass", "calls", "total", itoa_log(total_calls), "resolved",
                  itoa_log(resolved), "unresolved", itoa_log(unresolved), "errors",
                  itoa_log(errors));

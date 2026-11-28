@@ -1413,6 +1413,25 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
 }
 
 // Compute class QN for scope tracking.
+/* Scala: the scope of the object_definition the walk stands on, read off the
+ * walk's own cursor (one parent step) so a companion query never re-walks the
+ * tree from the root. The def walk has read every class body and the file's top
+ * level already; this matters for objects declared in a block. A null node
+ * when the cursor is elsewhere (the query then finds the scope itself). */
+static TSNode scala_object_scope(const CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    TSNode none = {0};
+    if (ctx->language != CBM_LANG_SCALA || strcmp(ts_node_type(node), "object_definition") != 0 ||
+        !state || !state->current_cursor || !state->occurrence_cursor ||
+        !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
+        return none;
+    }
+    ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
+    if (!ts_tree_cursor_goto_parent(state->occurrence_cursor)) {
+        return none;
+    }
+    return ts_tree_cursor_current_node(state->occurrence_cursor);
+}
+
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         return objectscript_get_class_name(ctx, node);
@@ -1479,13 +1498,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         outer_qn = ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state)
                                                     : state->enclosing_class_qn;
     }
+    /* Scala: a companion object's scope is Owner#object, as the def walk names
+     * the object (extract_defs.c emit_class_def). */
+    TSNode scope = scala_object_scope(ctx, node, state);
     if (outer_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name);
+        return cbm_scala_object_qn(ctx, node, scope,
+                                   cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name));
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    return cbm_scala_object_qn(
+        ctx, node, scope,
+        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language));
 }
 
 /* Forward declaration */

@@ -2937,15 +2937,25 @@ static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_
             return owner;
         }
         /* `import pkg.Owner.member`: the member must exist under the owner's
-         * QN. Binding the owner instead would mislabel the edge. */
-        char member_qn[CBM_SZ_512];
-        if (snprintf(member_qn, sizeof(member_qn), "%s.%s", owner->qualified_name,
-                     remainder + top_len + 1) >= (int)sizeof(member_qn)) {
-            return NULL;
-        }
-        const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-        if (scoped && scoped->label && import_targetable_label(scoped->label)) {
-            return scoped;
+         * QN. Binding the owner instead would mislabel the edge. Only object
+         * members are importable, so when Owner has a companion object its
+         * scope (Owner#object, CBM_SCALA_OBJECT_QN_SUFFIX) is tried before the
+         * class's. A name too long for the fenced probe still gets the plain one. */
+        static const char *const scopes[] = {CBM_SCALA_OBJECT_QN_SUFFIX, ""};
+        for (size_t si = 0; si < sizeof(scopes) / sizeof(scopes[0]); si++) {
+            char member_qn[CBM_SZ_512];
+            int n = snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name,
+                             scopes[si], remainder + top_len + 1);
+            if (n < 0 || n >= (int)sizeof(member_qn)) {
+                if (scopes[si][0]) {
+                    continue;
+                }
+                return NULL;
+            }
+            const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+            if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+                return scoped;
+            }
         }
         return NULL;
     }
@@ -4125,18 +4135,50 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 static const char php_import_complete[] = "{\"php_imports_complete\":1,";
 
 /* A resolver NULL can also mean unsupported input or a failed lookup. Only
- * the bounded namespace-only path and an unaliased global class `use` with no
- * same-named PHP type anywhere admit an absence proof. A covered-but-missing
- * PSR-4 file, any other global use, or an unavailable namespace map leaves the
- * whole file unknown; already resolved IMPORTS are still written. */
-/* A global-namespace class `use Exception;` names a project type only when a
- * PHP file declares a class-like symbol of that name. With no such node at all
- * (namespaced ones included, so the proof stays conservative), the import is
- * absent from the project: the PHP builtin or a vendor class. Without this a
- * single `use Exception;` left the whole file's evidence unknown, and its
- * project imports reached the PHP LSP as File QNs again. */
+ * the bounded namespace-only path and an unaliased global `use` (a class, a
+ * function or a constant; php_global_use_known_absent) of a name no PHP node
+ * of a label that use could bind carries admit an absence proof. A
+ * covered-but-missing PSR-4 file, an aliased global use, a global use of a
+ * name such a node carries, or an unavailable namespace map leaves the whole
+ * file unknown; already resolved IMPORTS are still written. */
+/* Whether a node of this label could be what a global `use` of this kind
+ * names: a class-like type for a class use, a function for `use function`; a
+ * File or Module of the name for any of them. A `use const` can name nothing
+ * else the graph holds: the graph has no node for a PHP constant (a top-level
+ * or namespaced `const`, a class constant and `define()` give none; PHP's
+ * variable kinds are assignments only), so the proof says only that the
+ * graph holds nothing a `use const` names. To revisit when constants get
+ * nodes. */
+static bool php_global_use_could_bind(const char *label, CBMImportKind kind) {
+    if (strcmp(label, "File") == 0 || strcmp(label, "Module") == 0) {
+        return true;
+    }
+    if (kind == CBM_IMPORT_KIND_FUNCTION) {
+        return strcmp(label, "Function") == 0;
+    }
+    if (kind == CBM_IMPORT_KIND_CONST) {
+        return false;
+    }
+    return strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+           strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0;
+}
+
+/* A global-namespace `use Exception;`, `use function sprintf;` or `use const
+ * PHP_EOL;` names a project symbol only when a PHP file declares one of that
+ * name that such a use can bind (php_global_use_could_bind). With no such node
+ * at all (namespaced ones included, so the proof stays conservative), the
+ * import is absent from the project: a PHP builtin or a vendor symbol. Without
+ * this a single such use left the whole file's evidence unknown, and its
+ * project imports reached the PHP LSP as File QNs again.
+ * Stated limits: names are compared as written (cbm_gbuf_find_by_name is an
+ * exact probe) while PHP compares class and function names in any ASCII case,
+ * so a project `function Foo()` does not withhold the proof for `use function
+ * foo;` (no version draws that call's edge: measured on main, #3053 and this
+ * change); and a function declared inside another function's body has no
+ * node, so there is no edge to draw to it either. */
 static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport *imp) {
-    if (!gbuf || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+    if (!gbuf || (imp->kind != CBM_IMPORT_KIND_DEFAULT && imp->kind != CBM_IMPORT_KIND_FUNCTION &&
+                  imp->kind != CBM_IMPORT_KIND_CONST)) {
         return false;
     }
     const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
@@ -4153,9 +4195,7 @@ static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport 
         if (!n || !n->label || !node_in_php_file(n)) {
             continue;
         }
-        if (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0 ||
-            strcmp(n->label, "Trait") == 0 || strcmp(n->label, "Enum") == 0 ||
-            strcmp(n->label, "File") == 0 || strcmp(n->label, "Module") == 0) {
+        if (php_global_use_could_bind(n->label, imp->kind)) {
             return false;
         }
     }

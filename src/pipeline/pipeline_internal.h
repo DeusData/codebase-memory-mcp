@@ -586,6 +586,11 @@ typedef struct {
      * files with the context, read-only afterwards, freed with it. NULL: no
      * import is read by the path rule (main's strategies decide). */
     struct cbm_include_universe *include_universe;
+
+    /* The shared cross-file layer's scope (site_bind.h): built after IMPORTS
+     * on one thread, read only by the resolvers, freed by the route that
+     * built it. NULL: no file of a row language (every site NO_ANSWER). */
+    struct cbm_site_scope *site_scope;
 } cbm_pipeline_ctx_t;
 
 /* The set for cbm_pipeline_ctx_t.indexed_files: every rel_path of `files`
@@ -941,6 +946,12 @@ bool cbm_pipeline_spawn_site(const cbm_gbuf_t *gbuf, CBMLanguage lang, const CBM
  * program) and the SPAWNS edge from `source` to it. */
 void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                              const cbm_pipeline_spawn_t *spawn);
+
+/* CBM_FIELD_CALL_AS_USAGE: the USAGE edge from `source` to the Field a call
+ * landed on, with the properties the usage pass writes. Shared by
+ * pass_calls.c and pass_parallel.c. */
+void cbm_pipeline_emit_field_call_usage(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                        const cbm_gbuf_node_t *field, const CBMCall *call);
 
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
@@ -1439,11 +1450,24 @@ typedef void (*cbm_ci_cmd_fn)(const cbm_ci_cmd_t *cmd, void *ud);
  * (.github/workflows/<name>.yml|yaml) or a composite action (action.yml|yaml). */
 bool cbm_ci_path(const char *rel);
 
+/* A local `uses:` of a GitHub workflow or composite action (pass_ci.c): a
+ * path from the repository root ("./..."), which is how GitHub reads it
+ * wherever the file lies. A step's names an action's directory (`path`; ""
+ * is the root), a job's names a reusable workflow file. `line` is 1-based. */
+typedef struct {
+    const char *path;
+    bool job;
+    int line;
+} cbm_ci_use_t;
+typedef void (*cbm_ci_use_fn)(const cbm_ci_use_t *use, void *ud);
+
 /* Hand each command line the CI configuration `rel` (YAML text src) runs to
  * fn: GitHub Actions run: steps for a workflow or composite action, else
- * Prow job containers. Strings live in arena `a`. */
+ * Prow job containers. In the same walk, each local `uses:` of a workflow or
+ * composite action goes to use_fn (NULL: not wanted) with use_ud, in
+ * document order. Strings live in arena `a`. */
 void cbm_ci_commands(CBMArena *a, const char *rel, const char *src, size_t len, cbm_ci_cmd_fn fn,
-                     void *ud);
+                     void *ud, cbm_ci_use_fn use_fn, void *use_ud);
 
 /* An image a build configuration builds from a Dockerfile (pass_ci.c). */
 typedef struct {
@@ -1455,6 +1479,18 @@ typedef struct {
 } cbm_build_site_t;
 typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
 
+/* A repository file a compose service names (pass_ci.c): a path relative to
+ * the compose file's directory, normalised -- a bind mount's host side
+ * ("volume"), an env_file entry ("env_file"), the file of a config or secret
+ * the service lists ("config" / "secret") -- with the 1-based line where the
+ * service names it. The path may be a directory, or a file the index does
+ * not hold. */
+typedef struct {
+    const char *path;
+    const char *via;
+    int line;
+} cbm_compose_file_t;
+
 /* A compose service (pass_ci.c): its image (a reference, variables
  * expanded; NULL: none or unknown), the Dockerfile its build names
  * (repository path; NULL: no build, or unknown), the service names its
@@ -1465,7 +1501,7 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * image_default_of: the variables whose inline default (${X:-d}) named the
  * image; image_override_of: those whose default the project's .env replaced
  * (JSON arrays, NULL: none), and default_image the image those defaults
- * name. */
+ * name. files: the repository paths it names (cbm_compose_file_t). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1479,6 +1515,8 @@ typedef struct {
     const int *env_lines;
     const char **env_hosts;
     int nenv;
+    const cbm_compose_file_t *files;
+    int nfiles;
     int line;
     int end_line;
 } cbm_compose_service_t;
@@ -1681,6 +1719,10 @@ extern _Atomic uint64_t g_importance_store_rows;
 extern _Atomic uint64_t g_k8s_candidates;
 extern _Atomic uint64_t g_op_candidates;
 extern _Atomic uint64_t g_sh_candidates;
+/* Targets, prerequisites and target-prerequisite pairs the Make dependency
+ * drawing looked at (pass_shell.c sh_make_deps): linear in a rule line's
+ * words plus its distinct pairs, however often a name is repeated. */
+extern _Atomic uint64_t g_sh_make_pairs;
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
@@ -1813,8 +1855,27 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
+ *  14: a config file REFERENCES_FILE the files it names: a Dockerfile's COPY
+ *      and ADD sources {via:copy|add}, a compose service's bind mounts,
+ *      env_file, configs and secrets, a Terraform block's file() family, a
+ *      workflow's local actions and reusable workflows {via:uses}, a
+ *      kustomization's generator files and configurations; and a Make rule
+ *      DEPENDS_ON {via:prerequisite} the rules of its makefile that its
+ *      prerequisites name (pass_docker.c, pass_ci.c, pass_terraform.c,
+ *      pass_k8s.c, pass_shell.c). An index built before has none of these
+ *      edges for its unchanged config files, so it rebuilds once on upgrade.
+ *  15: a Scala object with a same-named class, trait or enum beside it is
+ *      <Owner>#object and its members <Owner>#object.<m> (extract_defs.c,
+ *      helpers.c cbm_scala_object_qn). An index built before holds one merged
+ *      node for the type and its companion, so it rebuilds once on upgrade.
+ *  16: a Terragrunt stack (terragrunt.stack.hcl) IMPORTS {via:
+ *      terragrunt-stack} the Folder each unit / stack block's local source
+ *      names and the file each include names, its locals resolving
+ *      local.X; its reads IMPORTS {via: terragrunt} as a unit's
+ *      (pass_terraform.c). An index built before holds none of them, so it
+ *      rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 16 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
