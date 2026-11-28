@@ -155,6 +155,9 @@ void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
                                                   cbm_mcp_snippet_capture_test_hook_fn hook,
                                                   void *context);
 
+/* Lower the per-request search capture budget; zero restores the production limit. */
+void cbm_mcp_server_set_search_capture_budget_for_test(cbm_mcp_server_t *srv, size_t bytes);
+
 /* Runs before a cache-directory scan opens each project database, so a test
  * can cancel the request at an exact point of the scan (#2796). */
 typedef void (*cbm_mcp_project_scan_test_hook_fn)(void *context, const char *db_file);
