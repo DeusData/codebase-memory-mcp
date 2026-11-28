@@ -418,38 +418,112 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
 /* #606: a sub-floor `php_method_typed_unindexed` row still proves the receiver
  * is not a project class, so a weak short-name fallback must not bind it. A
  * project class with the same simple name keeps the fallback, since the PHP
- * LSP does not follow every cross-file type. */
+ * LSP does not follow every cross-file type.
+ *
+ * The check is three questions, asked by the scan below and by the per-file
+ * index (cbm_pipeline_lsp_index_php_receiver_unindexed) in the same words. */
+
+/* Rows read by a per-call scan of a file's engine rows (this check's and the
+ * matcher's below), counted inside the scan, whoever asks. */
+extern _Atomic uint64_t g_lsp_scan_rows; /* defined in pass_parallel.c */
+
+/* Can this row answer the check at all: an unindexed-receiver row whose callee
+ * names a class and a method. */
+static inline bool cbm_pipeline_php_unindexed_row(const CBMResolvedCall *rc) {
+    if (!rc || rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+        !rc->strategy || strcmp(rc->strategy, "php_method_typed_unindexed") != 0) {
+        return false;
+    }
+    const char *method_dot = strrchr(rc->callee_qn, '.');
+    return method_dot && method_dot != rc->callee_qn &&
+           (size_t)(method_dot - rc->callee_qn) < (size_t)CBM_SZ_512;
+}
+
+/* Is such a row this call's: the same caller, the same occurrence (or the
+ * legacy join) and the same leaf. */
+static inline bool cbm_pipeline_php_unindexed_row_is_for(const CBMResolvedCall *rc,
+                                                         const CBMCall *call) {
+    if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+        return false;
+    }
+    int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+    return site_rank != 0 && cbm_pipeline_invocation_leaf_matches(rc, call, site_rank);
+}
+
+/* The row's verdict: its receiver class is no type of the project. */
+static inline bool cbm_pipeline_php_unindexed_row_verdict(const CBMResolvedCall *rc,
+                                                          const cbm_registry_t *registry) {
+    char class_qn[CBM_SZ_512];
+    size_t class_len = (size_t)(strrchr(rc->callee_qn, '.') - rc->callee_qn);
+    memcpy(class_qn, rc->callee_qn, class_len);
+    class_qn[class_len] = '\0';
+    return !cbm_registry_has_type_named(registry, cbm_lsp_bare_segment(class_qn));
+}
+
+/* The first such row of the file, in array order, decides. */
 static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCallArray *arr,
                                                             const CBMCall *call,
                                                             const cbm_registry_t *registry) {
     if (!arr || !call || !call->enclosing_func_qn || !call->callee_name) {
         return false;
     }
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
-            !rc->strategy || strcmp(rc->strategy, "php_method_typed_unindexed") != 0 ||
-            strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
-            continue;
+        if (cbm_pipeline_php_unindexed_row(rc) && cbm_pipeline_php_unindexed_row_is_for(rc, call)) {
+            return cbm_pipeline_php_unindexed_row_verdict(rc, registry);
         }
-        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
-        if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
-            continue;
-        }
-        const char *method_dot = strrchr(rc->callee_qn, '.');
-        if (!method_dot || method_dot == rc->callee_qn) {
-            continue;
-        }
-        char class_qn[CBM_SZ_512];
-        size_t class_len = (size_t)(method_dot - rc->callee_qn);
-        if (class_len >= sizeof(class_qn)) {
-            continue;
-        }
-        memcpy(class_qn, rc->callee_qn, class_len);
-        class_qn[class_len] = '\0';
-        return !cbm_registry_has_type_named(registry, cbm_lsp_bare_segment(class_qn));
     }
     return false;
+}
+
+/* The matcher's row tests, asked by its scan below and by the per-file index
+ * (cbm_pipeline_lsp_index_find, pass_parallel.c) in the same words. */
+
+/* Can this row answer a call at all: an invocation row with both names, at or
+ * above the confidence floor. */
+static inline bool cbm_pipeline_invocation_row(const CBMResolvedCall *rc) {
+    return rc->kind == CBM_RESOLVED_INVOCATION && rc->caller_qn && rc->callee_qn &&
+           !(rc->confidence < CBM_LSP_CONFIDENCE_FLOOR);
+}
+
+/* The tail phase's caller test (JVM callers only): the row's caller and the
+ * call's caller share their Class.method tail, or, for a row at the call's
+ * exact occurrence, their bare last segment (Kotlin's package-against-file
+ * owner names of a top-level function). */
+static inline bool cbm_pipeline_invocation_tail_caller_matches(const CBMResolvedCall *rc,
+                                                               const CBMCall *call,
+                                                               const char *call_tail,
+                                                               int site_rank) {
+    if (call_tail && cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail)) {
+        return true;
+    }
+    if (site_rank != 2) {
+        return false;
+    }
+    const char *resolved_caller = cbm_lsp_bare_segment(rc->caller_qn);
+    const char *source_caller = cbm_lsp_bare_segment(call->enclosing_func_qn);
+    return resolved_caller && source_caller && strcmp(resolved_caller, source_caller) == 0;
+}
+
+/* One more row of the same rank for a best-row choice: the first row stays
+ * unless a later one names the same target with a higher confidence; a row
+ * with a different target makes the choice ambiguous for good. */
+static inline void cbm_pipeline_invocation_fold(const CBMResolvedCall **best, bool *ambiguous,
+                                                const CBMResolvedCall *rc, const cbm_gbuf_t *gbuf,
+                                                const char *project_name, bool allow_tail_match) {
+    if (!*best) {
+        *best = rc;
+        return;
+    }
+    if (!cbm_pipeline_invocation_targets_equal((*best)->callee_qn, rc->callee_qn, gbuf,
+                                               project_name, allow_tail_match)) {
+        *ambiguous = true;
+        return;
+    }
+    if (rc->confidence > (*best)->confidence) {
+        *best = rc;
+    }
 }
 
 /* Look up the highest-confidence LSP-resolved call entry whose caller QN
@@ -471,7 +545,13 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
  * bare last segment by cbm_lsp_bare_segment before matching.
  *
  * The pointer returned aliases into `arr` and stays valid as long as the
- * underlying CBMFileResult is alive. */
+ * underlying CBMFileResult is alive.
+ *
+ * This reads every row of the file for one call. Both resolvers ask through
+ * the per-file index (cbm_pipeline_lsp_index_find, pass_parallel.c), which
+ * comes here only where the index may not hold the answer; g_lsp_scan_rows
+ * counts the rows read here, whoever asks. */
+
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
     const cbm_gbuf_t *gbuf, const char *project_name) {
@@ -481,19 +561,14 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
 
     const CBMResolvedCall *best_exact_caller = NULL;
     int best_exact_caller_rank = 0;
     bool exact_caller_ambiguous = false;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION) {
-            continue;
-        }
-        if (!rc->caller_qn || !rc->callee_qn) {
-            continue;
-        }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if (!cbm_pipeline_invocation_row(rc)) {
             continue;
         }
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
@@ -529,6 +604,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     }
 
     const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
+    atomic_fetch_add_explicit(&g_lsp_scan_rows, (uint64_t)arr->count, memory_order_relaxed);
 
     const CBMResolvedCall *best_tail_exact = NULL;
     const CBMResolvedCall *best_tail_legacy = NULL;
@@ -536,45 +612,21 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     bool tail_legacy_ambiguous = false;
     for (int i = 0; i < arr->count; i++) {
         const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION) {
-            continue;
-        }
-        if (!rc->caller_qn || !rc->callee_qn) {
-            continue;
-        }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if (!cbm_pipeline_invocation_row(rc)) {
             continue;
         }
         int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
         if (site_rank == 0) {
             continue;
         }
-        bool caller_matches =
-            call_tail && cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail);
-        if (!caller_matches && site_rank == 2) {
-            const char *resolved_caller = cbm_lsp_bare_segment(rc->caller_qn);
-            const char *source_caller = cbm_lsp_bare_segment(call->enclosing_func_qn);
-            caller_matches =
-                resolved_caller && source_caller && strcmp(resolved_caller, source_caller) == 0;
-        }
-        if (!caller_matches || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
+        if (!cbm_pipeline_invocation_tail_caller_matches(rc, call, call_tail, site_rank) ||
+            !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
             continue;
         }
-
-        const CBMResolvedCall **best = site_rank == 2 ? &best_tail_exact : &best_tail_legacy;
-        bool *ambiguous = site_rank == 2 ? &tail_exact_ambiguous : &tail_legacy_ambiguous;
-        if (!*best) {
-            *best = rc;
-            continue;
-        }
-        if (!cbm_pipeline_invocation_targets_equal((*best)->callee_qn, rc->callee_qn, gbuf,
-                                                   project_name, allow_tail_match)) {
-            *ambiguous = true;
-            continue;
-        }
-        if (rc->confidence > (*best)->confidence) {
-            *best = rc;
-        }
+        cbm_pipeline_invocation_fold(site_rank == 2 ? &best_tail_exact : &best_tail_legacy,
+                                     site_rank == 2 ? &tail_exact_ambiguous
+                                                    : &tail_legacy_ambiguous,
+                                     rc, gbuf, project_name, allow_tail_match);
     }
     if (best_tail_exact) {
         return tail_exact_ambiguous ? NULL : best_tail_exact;

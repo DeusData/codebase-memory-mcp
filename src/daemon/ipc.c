@@ -2020,6 +2020,43 @@ static bool posix_directory_transition_secure(int parent_fd, int child_fd, const
     return true;
 }
 
+/* #3014: where the system has O_PATH, the walk holds each directory by an
+ * O_PATH handle. Every check below reads the handle (fstat, fstatfs), so the
+ * ownership, mode and symlink rules are unchanged, and a process confined by
+ * Landlock can validate ancestors it is not allowed to list: an O_RDONLY
+ * directory open needs the read-directory right on "/" and on every ancestor,
+ * an O_PATH open needs none. A handle that is chmod'ed or handed to the caller
+ * is first reopened through itself, which cannot name another directory. */
+#if defined(__linux__) && !defined(O_PATH)
+#error "O_PATH is not visible; the private-directory walk needs it on Linux"
+#endif
+#ifdef O_PATH
+#define PRIVATE_DIRECTORY_WALK_OPEN (O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+#else
+#define PRIVATE_DIRECTORY_WALK_OPEN (O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+#endif
+
+/* Replace a walk handle with an ordinary directory descriptor for the same
+ * directory. False leaves *directory_fd as it was. */
+static bool private_directory_walk_reopen(int *directory_fd) {
+#ifdef O_PATH
+    int opened = openat(*directory_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (opened < 0 || !fd_set_cloexec(opened)) {
+        if (opened >= 0) {
+            int saved_errno = errno;
+            (void)close(opened);
+            errno = saved_errno;
+        }
+        return false;
+    }
+    (void)close(*directory_fd);
+    *directory_fd = opened;
+#else
+    (void)directory_fd;
+#endif
+    return true;
+}
+
 static int private_directory_tree_open(const char *directory_path) {
     if (!directory_path || !directory_path[0] || O_DIRECTORY == 0 || O_NOFOLLOW == 0) {
         return -1;
@@ -2029,7 +2066,7 @@ static int private_directory_tree_open(const char *directory_path) {
         return -1;
     }
     bool absolute = path[0] == '/';
-    int current_fd = open(absolute ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int current_fd = open(absolute ? "/" : ".", PRIVATE_DIRECTORY_WALK_OPEN);
     bool ok = current_fd >= 0 && fd_set_cloexec(current_fd);
     char *cursor = path;
     while (ok && *cursor == '/') {
@@ -2084,16 +2121,22 @@ static int private_directory_tree_open(const char *directory_path) {
             if (!created && errno != EEXIST) {
                 ok = false;
             }
-            int next_fd =
-                ok ? openat(current_fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-                   : -1;
+            int next_fd = ok ? openat(current_fd, component, PRIVATE_DIRECTORY_WALK_OPEN) : -1;
             struct stat status;
             ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
                  S_ISDIR(status.st_mode) &&
                  posix_directory_transition_secure(current_fd, next_fd, path);
             if (ok && created) {
-                ok = status.st_uid == geteuid() && fchmod(next_fd, 0700) == 0 &&
-                     cbm_macos_extended_acl_fd_clear(next_fd) &&
+                ok = status.st_uid == geteuid();
+                if (ok && !private_directory_walk_reopen(&next_fd)) {
+                    ipc_validation_detail_set(
+                        "%s: could not reopen the new directory '%s' to set its mode (errno %d; "
+                        "it needs owner execute permission and, in a sandbox, the right to "
+                        "list it)",
+                        directory_path, component, errno);
+                    ok = false;
+                }
+                ok = ok && fchmod(next_fd, 0700) == 0 && cbm_macos_extended_acl_fd_clear(next_fd) &&
                      cbm_macos_extended_acl_fd_is_empty(next_fd);
             }
             if (ok) {
@@ -2122,6 +2165,13 @@ static int private_directory_tree_open(const char *directory_path) {
     if (ok && final_status.st_uid != geteuid()) {
         ipc_validation_detail_set("%s: owner uid %ld, expected euid %ld", directory_path,
                                   (long)final_status.st_uid, (long)geteuid());
+        ok = false;
+    }
+    if (ok && !private_directory_walk_reopen(&current_fd)) {
+        ipc_validation_detail_set("%s: could not reopen the directory to set its mode (errno %d; "
+                                  "it needs owner execute permission and, in a sandbox, the "
+                                  "right to list it)",
+                                  directory_path, errno);
         ok = false;
     }
     if (ok && fchmod(current_fd, 0700) != 0) {

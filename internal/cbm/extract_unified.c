@@ -1139,6 +1139,14 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     if (configured_qn) {
         return configured_qn;
     }
+    /* The preprocessed view of a C/C++ file: a body whose lines are a raw
+     * GoogleTest definition's is that test, whatever its expanded head reads. */
+    if (ctx->pp_test_spans && strcmp(ts_node_type(node), "function_definition") == 0) {
+        const char *raw_test = cbm_test_span_owner_qn(ctx->pp_test_spans, node);
+        if (raw_test) {
+            return raw_test;
+        }
+    }
 
     /* C# local functions nested in a member have no graph node. Attribute calls
      * in them to the enclosing function, whose definition span contains the
@@ -1307,6 +1315,17 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
+    /* GoogleTest `TEST(Suite, Case) {...}` and its four siblings: the def
+     * extractor names the definition TEST_Suite_Case (#1266). Name the call
+     * scope through the same helper, or every call in the body names a
+     * definition that was never minted and is sourced at the File node. */
+    char *test_name = cbm_cpp_test_macro_name(
+        ctx->arena, cbm_cpp_test_macro_names_on(ctx->language, ctx->test_declarations), name, node,
+        ctx->source);
+    if (test_name) {
+        name = test_name;
+    }
+
     /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
      * records this as Method "proj.file.Foo.bar". The call-scope QN must match
      * (be class-qualified) so an in-body call sources to the method, not a bare
@@ -1394,6 +1413,25 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
 }
 
 // Compute class QN for scope tracking.
+/* Scala: the scope of the object_definition the walk stands on, read off the
+ * walk's own cursor (one parent step) so a companion query never re-walks the
+ * tree from the root. The def walk has read every class body and the file's top
+ * level already; this matters for objects declared in a block. A null node
+ * when the cursor is elsewhere (the query then finds the scope itself). */
+static TSNode scala_object_scope(const CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    TSNode none = {0};
+    if (ctx->language != CBM_LANG_SCALA || strcmp(ts_node_type(node), "object_definition") != 0 ||
+        !state || !state->current_cursor || !state->occurrence_cursor ||
+        !ts_node_eq(ts_tree_cursor_current_node(state->current_cursor), node)) {
+        return none;
+    }
+    ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
+    if (!ts_tree_cursor_goto_parent(state->occurrence_cursor)) {
+        return none;
+    }
+    return ts_tree_cursor_current_node(state->occurrence_cursor);
+}
+
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         return objectscript_get_class_name(ctx, node);
@@ -1460,13 +1498,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
         outer_qn = ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state)
                                                     : state->enclosing_class_qn;
     }
+    /* Scala: a companion object's scope is Owner#object, as the def walk names
+     * the object (extract_defs.c emit_class_def). */
+    TSNode scope = scala_object_scope(ctx, node, state);
     if (outer_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name);
+        return cbm_scala_object_qn(ctx, node, scope,
+                                   cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name));
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    return cbm_scala_object_qn(
+        ctx, node, scope,
+        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language));
 }
 
 /* Forward declaration */
@@ -2509,6 +2552,11 @@ static bool is_export_of_declaration(TSNode node) {
 // ordinary invocation. Static node-kind membership is therefore not enough to
 // make the whole subtree an import scope.
 static bool is_actual_import_boundary(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    /* CFML's listed kinds are tag candidates. Their attributes can hold
+     * ordinary expressions, and a template include introduces no binding. */
+    if (ctx->language == CBM_LANG_CFML) {
+        return false;
+    }
     bool direct_import = spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types);
     bool from_import = spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types);
     if (!direct_import && !from_import) {

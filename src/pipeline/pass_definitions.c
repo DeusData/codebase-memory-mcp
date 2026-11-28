@@ -21,6 +21,7 @@ enum { PD_SWIFT_PROPS_MARGIN = 80 };
 #include <stdint.h>
 #include <ctype.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/site_bind.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h" /* cbm_alloc/cbm_free: the grown properties buffer */
@@ -1235,6 +1236,24 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_diagram_arrows(ctx, result);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
+        /* The shared layer's scope (site_bind.h): every file is extracted and
+         * its IMPORTS made; built once, before any resolver. The route that
+         * runs the resolvers frees it. Mirrors pipeline.c's parallel route. */
+        if (!ctx->site_scope) {
+            struct timespec st;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &st);
+            ctx->site_scope = cbm_pipeline_site_scope_build(ctx, files, file_count, local_cache,
+                                                            NULL, 0, NULL, 0);
+            if (ctx->site_scope) {
+                struct timespec now;
+                cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+                long ms = (long)((now.tv_sec - st.tv_sec) * CBM_MSEC_PER_SEC +
+                                 (now.tv_nsec - st.tv_nsec) / CBM_NSEC_PER_MSEC);
+                char ms_buf[CBM_SZ_32];
+                snprintf(ms_buf, sizeof(ms_buf), "%ld", ms);
+                cbm_log_info("pass.timing", "pass", "site_scope", "elapsed_ms", ms_buf);
+            }
+        }
         /* Publish instead of free — see the twin in pass_parallel.c (#1355).
          * Only the Scala index is pass-local. */
         cbm_pipeline_import_maps_free(NULL, scala_index);
@@ -1248,6 +1267,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
         }
+    } else if (!ctx->site_scope) {
+        /* No result cache (its allocation failed): no scope of the shared
+         * layer either, so every site keeps main's answer, as for a language
+         * without a row (never a wrong answer; the parallel route, which always
+         * has its cache, answers). Logged so a run that degraded shows it. */
+        cbm_log_warn("site_bind.scope_skipped", "reason", "no_result_cache", "effect",
+                     "main_decides_every_site");
     }
 
     cbm_registry_build_swift_owners(ctx->registry, ctx->gbuf, ctx->repo_path, ctx->excluded_dirs,

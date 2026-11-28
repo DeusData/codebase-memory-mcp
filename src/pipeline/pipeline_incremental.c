@@ -15,6 +15,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
 #include <stdio.h>
 #include <time.h>
+#include "pipeline/include_path.h"
 #include "pipeline/lsp_surface.h"
 #include "foundation/mem_core.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -23,6 +24,8 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline_internal.h"
 #include "helpers.h" /* cbm_fqn_module */
 #include "pipeline/doc_links.h"
+#include "pipeline/scope_closure.h"
+#include "pipeline/site_bind.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -322,6 +325,28 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
     return 0;
 }
 
+/* A changed set of indexed include targets can affect unchanged importers.
+ * Both manifest routes use the discovered list for this dependency. */
+static int semantic_manifest_add_include_listing(semantic_manifest_builder_t *builder,
+                                                 const char *project, const cbm_file_info_t *files,
+                                                 int file_count) {
+    for (int i = 0; i < file_count; i++) {
+        if (cbm_pipeline_frozen_checkpoint(builder->frozen)) {
+            return CBM_NOT_FOUND;
+        }
+        if (cbm_include_path_row(files[i].language)) {
+            char digest[CBM_SHA256_HEX_LEN + 1];
+            int rc = cbm_include_path_inventory_digest(files, file_count, digest);
+            if (rc != 0 || cbm_pipeline_frozen_checkpoint(builder->frozen)) {
+                return CBM_NOT_FOUND;
+            }
+            return semantic_manifest_add_digest(builder, project,
+                                                CBM_SEMANTIC_INPUT_INCLUDE_LISTING, digest, 0, 0);
+        }
+    }
+    return 0;
+}
+
 static int semantic_manifest_add(semantic_manifest_builder_t *builder, const char *project,
                                  const char *rel_path, const char *abs_path) {
     if (cbm_pipeline_frozen_checkpoint(builder->frozen))
@@ -569,6 +594,9 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
     }
+    if (rc == 0) {
+        rc = semantic_manifest_add_include_listing(&builder, project, files, file_count);
+    }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
     int hash_workers = cbm_pipeline_worker_count(p);
@@ -808,6 +836,9 @@ int cbm_pipeline_build_frozen_manifest(cbm_pipeline_t *p, const cbm_file_info_t 
     int rc = cbm_pipeline_frozen_checkpoint(p);
     if (rc == 0)
         rc = frozen_manifest_seed(&builder, p);
+    if (rc == 0)
+        rc = semantic_manifest_add_include_listing(&builder, cbm_pipeline_project_name(p), files,
+                                                   file_count);
     if (rc == 0 && file_count > 0)
         cbm_pipeline_frozen_manifest_dispatch(p);
     for (int i = 0; rc == 0 && i < file_count; i++) {
@@ -1535,6 +1566,12 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    /* The shared layer's scope reads every discovered file: the re-parsed
+     * ones fresh, the others from their stored facts (borrowed). */
+    const cbm_file_info_t *all_files;
+    int all_count;
+    const cbm_lsp_surface_row_t *stored_rows;
+    int stored_count;
 } closure_resolve_t;
 
 typedef struct {
@@ -1997,6 +2034,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             atomic_store(&shared_ids, registry_next_id);
         }
 
+        /* The shared layer's scope (site_bind.h), sealed before the resolve
+         * workers start: the re-parsed files fresh, every other discovered
+         * file of a row language from its stored facts (closure repair). */
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        ctx->site_scope = cbm_pipeline_site_scope_build(
+            ctx, changed_files, ci, cache, closure ? closure->all_files : NULL,
+            closure ? closure->all_count : 0, closure ? closure->stored_rows : NULL,
+            closure ? closure->stored_count : 0);
+        if (ctx->site_scope) {
+            cbm_log_info("pass.timing", "pass", "incr_site_scope", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+        }
+
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         CBMLSPDef *all_defs = NULL;
         int all_def_count = 0;
@@ -2075,7 +2125,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                  * path, filtered through module_def_index, is the SAME
                  * pre-Tier-2 resolution code the full pipeline still uses
                  * for languages without a shared registry, so convergence
-                 * is unaffected; only the amortization strategy changes. */
+                 * is unaffected; only the amortization strategy changes.
+                 * Ruby's fallback (cbm_run_ruby_lsp_cross) is exempt from the
+                 * def filter and so rebuilds the whole project table for each
+                 * changed Ruby file: at most CLOSURE_BUDGET_FLOOR_FILES
+                 * builds here, which is bounded and left as is. */
                 if (ci > CLOSURE_BUDGET_FLOOR_FILES) {
                     cbm_pxc_build_cross_registries(&closure->arena, all_defs, all_def_count,
                                                    &cross_registries);
@@ -2121,6 +2175,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:
+        cbm_pipeline_site_scope_free(ctx->site_scope);
+        ctx->site_scope = NULL;
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -2191,6 +2247,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc == 0) {
             (void)cbm_pipeline_pass_doc_links(ctx, changed_files, ci);
         }
+        /* the definitions pass built the shared layer's scope */
+        cbm_pipeline_site_scope_free(ctx->site_scope);
+        ctx->site_scope = NULL;
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
             ctx->result_cache = prior_cache;
@@ -2675,6 +2734,141 @@ static bool closure_release_values(cbm_store_t *store, const char *project, cons
     return hit;
 }
 
+/* Is p[0, n) a key of `table`? */
+static bool closure_docker_has(CBMHashTable *table, const char *p, size_t n) {
+    char key[CBM_SZ_4K];
+    if (n == 0 || n >= sizeof(key)) {
+        return false;
+    }
+    memcpy(key, p, n);
+    key[n] = '\0';
+    return cbm_ht_get(table, key) != NULL;
+}
+
+/* A Dockerfile below the repository root reads a COPY / ADD source under its
+ * own directory or under the root, the one of the two that holds the file; a
+ * source both hold is no edge (pass_docker.c dk_repo: REFERENCES_FILE, and
+ * the path mapping behind SPAWNS). Deleting one file of such a pair leaves the
+ * other as the single candidate: an edge the full index draws from a
+ * Dockerfile that did not change, and a repair of the deleted file alone does
+ * not read that Dockerfile again. So a deleted file whose partner path is
+ * still indexed declines. Every Dockerfile's directory counts, whether or not
+ * the Dockerfile names the file: it is not parsed here.
+ *
+ * The two directions, each one lookup per directory level of a path:
+ *  - deleted <dir>/<source>, <source> still a file at the root: the deleted
+ *    path's own prefixes are tried as Dockerfile directories;
+ *  - deleted <source>, <dir>/<source> still a file: every indexed file under
+ *    a Dockerfile directory enters `under` by its path below that directory,
+ *    and the deleted path is looked up there.
+ * A source that is a file under one context and a directory under the other
+ * is no edge either (dk_dir_under_other_context), and the directory goes
+ * with its last file. So the same holds one level up: a deleted file whose
+ * directory, below a Dockerfile directory, is a file at the root, or whose
+ * directory is <source> of a file <dir>/<source>, declines too -- also when
+ * the directory still holds other files, which costs a full run and no edge.
+ * Work is the path depths of the indexed and the deleted files (the deleted
+ * ones squared, a path being short), and only when a file was deleted and a
+ * Dockerfile lies below the root. Returns the reason, or NULL. */
+static const char *closure_docker_context_decline(const cbm_file_info_t *files, int file_count,
+                                                  CBMHashTable *files_by_path, char **deleted,
+                                                  int n_deleted) {
+    CBMHashTable *dirs = NULL; /* directories holding a Dockerfile (keys in `keys`) */
+    CBMArena keys;
+    cbm_arena_init_lazy(&keys, CBM_SZ_4K);
+    const char *decline = NULL;
+    for (int f = 0; n_deleted > 0 && f < file_count && !decline; f++) {
+        const char *rel = files[f].rel_path;
+        const char *slash = files[f].language == CBM_LANG_DOCKERFILE ? strrchr(rel, '/') : NULL;
+        if (!slash) {
+            continue;
+        }
+        dirs = dirs ? dirs : cbm_ht_create(0);
+        char *dir = dirs ? cbm_arena_strndup(&keys, rel, (size_t)(slash - rel)) : NULL;
+        if (!dir) {
+            decline = "alloc";
+        } else {
+            cbm_ht_set(dirs, dir, dir);
+        }
+    }
+    /* <source> of each indexed <dir>/<source> */
+    CBMHashTable *under = dirs && !decline ? cbm_ht_create(0) : NULL;
+    if (dirs && !decline && !under) {
+        decline = "alloc";
+    }
+    for (int f = 0; under && f < file_count; f++) {
+        const char *rel = files[f].rel_path;
+        for (const char *s = strchr(rel, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+            if (s[SKIP_ONE] && closure_docker_has(dirs, rel, (size_t)(s - rel))) {
+                cbm_ht_set(under, s + SKIP_ONE, (void *)rel);
+            }
+        }
+    }
+    for (int i = 0; under && i < n_deleted && !decline; i++) {
+        const char *gone = deleted[i];
+        if (cbm_ht_get(under, gone)) {
+            decline = "docker_context_pair_deleted"; /* <dir>/<gone> is still a file */
+        }
+        for (const char *s = strchr(gone, '/'); s && !decline; s = strchr(s + SKIP_ONE, '/')) {
+            /* a directory of the deleted file that is <source> of a file
+             * <dir>/<source>: under the root it may be no directory now */
+            if (closure_docker_has(under, gone, (size_t)(s - gone))) {
+                decline = "docker_context_pair_deleted";
+            }
+            if (decline || !closure_docker_has(dirs, gone, (size_t)(s - gone))) {
+                continue;
+            }
+            const char *src = s + SKIP_ONE;
+            if (cbm_ht_get(files_by_path, src)) {
+                decline = "docker_context_pair_deleted"; /* <source> is still a file at the root */
+            }
+            /* a directory below <dir> that is a file at the root */
+            for (const char *t = strchr(src, '/'); t && !decline; t = strchr(t + SKIP_ONE, '/')) {
+                if (closure_docker_has(files_by_path, src, (size_t)(t - src))) {
+                    decline = "docker_context_pair_deleted";
+                }
+            }
+        }
+    }
+    if (under) {
+        cbm_ht_free(under);
+    }
+    if (dirs) {
+        cbm_ht_free(dirs);
+    }
+    cbm_arena_destroy(&keys);
+    return decline;
+}
+
+/* A workflow names a local action by its directory, and its edge goes to the
+ * one action file that directory holds (pass_shell.c sh_ci_use); with both
+ * spellings, action.yml and action.yaml, there is none. Deleting one of the
+ * two makes the other the action: an edge the full index draws from a
+ * workflow that did not change, and the repair reads no workflow again. So
+ * a deleted action file whose other spelling is still indexed declines.
+ * One lookup per deleted file. Returns the reason, or NULL. */
+static const char *closure_local_action_decline(CBMHashTable *files_by_path, char **deleted,
+                                                int n_deleted) {
+    static const char *const names[PAIR_LEN] = {"action.yml", "action.yaml"};
+    for (int i = 0; i < n_deleted; i++) {
+        const char *p = deleted[i];
+        const char *slash = p ? strrchr(p, '/') : NULL;
+        const char *base = slash ? slash + SKIP_ONE : p;
+        for (int k = 0; base && k < PAIR_LEN; k++) {
+            if (strcmp(base, names[k]) != 0) {
+                continue;
+            }
+            char other[CBM_SZ_4K];
+            int n = snprintf(other, sizeof(other), "%.*s%s", (int)(base - p), p,
+                             names[PAIR_LEN - SKIP_ONE - k]);
+            if (n > 0 && (size_t)n < sizeof(other) && cbm_ht_get(files_by_path, other)) {
+                return "local_action_pair_deleted";
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -3125,6 +3319,107 @@ static const char *closure_add_includers(const cbm_lsp_surface_row_t *rows, int 
 /* Decide whether this manifest delta is closure-repairable, and if so build
  * the plan. Returns 1 with *plan filled, or 0 (decline → FULL) with the
  * reason logged. Every early exit declines; nothing here mutates state. */
+/* The file names (last path component) a row's stored facts re-export
+ * (`import public`), into `names`; 0, -1 when the row has no facts ("is"),
+ * -2 when they cannot be read. */
+static int closure_scope_row(CBMArena *a, const cbm_lsp_surface_row_t *row, CBMHashTable *names) {
+    cbm_lsp_scope_facts_t facts;
+    int rc = cbm_lsp_surface_scope_from_json(a, row ? row->defs_json : NULL, &facts);
+    if (rc == 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (rc != SKIP_ONE) {
+        return -PAIR_LEN;
+    }
+    for (int i = 0; i < facts.event_count; i++) {
+        const CBMScopeEvent *e = &facts.events[i];
+        if (names && e->kind == CBM_SCOPE_INCLUDE && (e->flags & CBM_SCOPE_REEXPORT) &&
+            e->index >= 0 && e->index < facts.module_count) {
+            const char *slash = strrchr(facts.modules[e->index], '/');
+            cbm_ht_set(names, slash ? slash + SKIP_ONE : facts.modules[e->index], (void *)1);
+        }
+    }
+    return 0;
+}
+
+/* Whether a file may be what some re-export names (by its last path
+ * component: never fewer than the path rule would resolve). */
+static bool closure_scope_reexported(CBMHashTable *names, const char *rel) {
+    const char *slash = strrchr(rel, '/');
+    return cbm_ht_get(names, slash ? slash + SKIP_ONE : rel) != NULL;
+}
+
+/* The shared layer's scope (site_bind.h) on a repair reads every file of a
+ * row language the repair leaves alone from its stored facts: a row without
+ * them (an older binary wrote it) or with unreadable ones declines. A file's
+ * changed facts reach the files with an edge into it (its includers re-resolve
+ * as dependents); when it is re-exported (`import public`) they also reach
+ * the re-exporter's includers, which have no edge into it: a surface change
+ * (or deletion) of a file some re-export may name declines too. NULL: the
+ * repair may go on. */
+static const char *closure_scope_decline(const cbm_lsp_surface_row_t *stored, int stored_count,
+                                         CBMHashTable *rows_by_path,
+                                         const cbm_lsp_surface_row_t *fresh, int fresh_count,
+                                         CBMHashTable *files_by_path, char **changed, int n_changed,
+                                         int n_deleted) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *why = NULL;
+    CBMHashTable *reexported = cbm_ht_create(CBM_SZ_16);
+    if (!reexported) {
+        cbm_arena_destroy(&a);
+        return "alloc";
+    }
+    for (int i = 0; i < stored_count && !why; i++) {
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, stored[i].rel_path);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        int rc = closure_scope_row(&a, &stored[i], reexported);
+        why = rc == CBM_NOT_FOUND ? "scope_facts_missing" : rc < 0 ? "scope_facts_malformed" : NULL;
+    }
+    for (int i = 0; i < fresh_count && !why; i++) {
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, fresh[i].rel_path);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        int rc = closure_scope_row(&a, &fresh[i], reexported);
+        why = rc < 0 ? "scope_facts_malformed" : NULL;
+    }
+    bool changed_scope = false;
+    bool any = cbm_ht_count(reexported) > 0;
+    for (int i = 0; i < n_changed + n_deleted && !why && any && !changed_scope; i++) {
+        if (!closure_scope_reexported(reexported, changed[i])) {
+            continue;
+        }
+        const cbm_lsp_surface_row_t *old_row = cbm_ht_get(rows_by_path, changed[i]);
+        if (i >= n_changed) {
+            /* a deleted file whose row holds facts is of a row language */
+            changed_scope = old_row && closure_scope_row(&a, old_row, NULL) != CBM_NOT_FOUND;
+            continue;
+        }
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, changed[i]);
+        if (!info || !cbm_closure_lang(info->language)) {
+            continue;
+        }
+        const cbm_lsp_surface_row_t *new_row = NULL;
+        for (int j = 0; j < fresh_count; j++) {
+            if (strcmp(fresh[j].rel_path, changed[i]) == 0) {
+                new_row = &fresh[j];
+                break;
+            }
+        }
+        changed_scope = old_row && (!new_row || !old_row->surface_sha || !new_row->surface_sha ||
+                                    strcmp(old_row->surface_sha, new_row->surface_sha) != 0);
+    }
+    if (!why && changed_scope) {
+        why = "scope_reexport_changed";
+    }
+    cbm_ht_free(reexported); /* keys borrowed from the arena */
+    cbm_arena_destroy(&a);
+    return why;
+}
+
 static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
                             cbm_file_info_t *files, int file_count, const cbm_file_hash_t *stored,
                             int stored_count, const cbm_file_hash_t *fresh, int fresh_count,
@@ -3249,6 +3544,15 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     if (decline) {
         goto done;
     }
+    decline = closure_docker_context_decline(files, file_count, files_by_path,
+                                             changed_paths + n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_local_action_decline(files_by_path, changed_paths + n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
     decline = closure_terraform_decline(changed_paths, n_changed + n_deleted);
     if (decline) {
         goto done;
@@ -3337,6 +3641,13 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             plan->fatal_rc = probe_rc;
         }
         decline = "probe_failed";
+        goto done;
+    }
+    decline =
+        closure_scope_decline(plan->stored_rows, plan->stored_count, rows_by_path, probe_rows,
+                              probe_count, files_by_path, changed_paths, n_changed, n_deleted);
+    if (decline) {
+        cbm_ht_free(rows_by_path);
         goto done;
     }
 
@@ -3701,6 +4012,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_gbuf_t *gbuf = NULL;
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_include_universe_t *include_universe = NULL;
     CBMHashTable *indexed_files = NULL;
     CBMHashTable *stale_surface_set = NULL;
     closure_resolve_t cr = {0};
@@ -3805,6 +4117,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     }
     cbm_arena_init(&cr.arena);
     cr_arena_live = true;
+    cr.all_files = files;
+    cr.all_count = file_count;
+    cr.stored_rows = plan->stored_rows;
+    cr.stored_count = plan->stored_count;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     {
         /* Eligible rows first (skip everything being re-parsed or deleted),
@@ -3929,7 +4245,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         cbm_log_error("delta.err", "phase", "stored_namespaces");
         goto out;
     }
+    include_universe = cbm_include_universe_new(files, file_count);
     cbm_pipeline_ctx_t ctx = {
+        .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
         .indexed_files = indexed_files,
@@ -4275,6 +4593,7 @@ out:
         cbm_registry_free(registry);
     }
     cbm_path_alias_collection_free(path_aliases);
+    cbm_include_universe_free(include_universe);
     cbm_ht_free(indexed_files); /* keys borrowed from files */
     if (gbuf) {
         cbm_gbuf_free(gbuf);
@@ -4689,9 +5008,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_path_alias_collection_t *path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
+    cbm_include_universe_t *include_universe = cbm_include_universe_new(files, file_count);
     CBMHashTable *indexed_files = cbm_pipeline_indexed_files_new(files, file_count);
 
     cbm_pipeline_ctx_t ctx = {
+        .include_universe = include_universe,
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
         .indexed_files = indexed_files,
@@ -4782,6 +5103,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free(changed_files);
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
+        cbm_include_universe_free(include_universe);
         cbm_ht_free(indexed_files); /* keys borrowed from files */
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
@@ -4882,6 +5204,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free(changed_files);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
+    cbm_include_universe_free(include_universe);
     cbm_ht_free(indexed_files); /* keys borrowed from files */
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after

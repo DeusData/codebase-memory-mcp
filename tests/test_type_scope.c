@@ -402,7 +402,7 @@ TEST(type_scope_engine_table_rows) {
     static const CBMLanguage served[] = {
         CBM_LANG_GO,         CBM_LANG_C,          CBM_LANG_CPP, CBM_LANG_CUDA, CBM_LANG_PYTHON,
         CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT, CBM_LANG_TSX, CBM_LANG_PHP,  CBM_LANG_CSHARP,
-        CBM_LANG_JAVA,       CBM_LANG_KOTLIN,     CBM_LANG_RUST};
+        CBM_LANG_JAVA,       CBM_LANG_KOTLIN,     CBM_LANG_RUST, CBM_LANG_RUBY};
     int served_count = 0;
     for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
         bool expect = false;
@@ -415,7 +415,7 @@ TEST(type_scope_engine_table_rows) {
         ASSERT_EQ(cbm_pxc_wants_identities((CBMLanguage)lang),
                   cbm_type_scope_lang((CBMLanguage)lang) != NULL);
     }
-    ASSERT_EQ(served_count, 13);
+    ASSERT_EQ(served_count, 14);
     ASSERT(cbm_pxc_wants_identities(CBM_LANG_GO));
     ASSERT(cbm_pxc_wants_identities(CBM_LANG_PYTHON));
     /* One row, one registry: C, C++ and CUDA share one, as do JavaScript,
@@ -443,13 +443,15 @@ TEST(type_scope_engine_table_rows) {
             ASSERT_NULL(regs.by_engine[e]);
         }
     }
-    ASSERT_STR_EQ(built, "go python c cs ts java");
+    ASSERT_STR_EQ(built, "go python c cs ts java ruby");
     ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_CUDA) == regs.by_engine[c_row]);
     ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_TSX) == regs.by_engine[js_row]);
     ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUST)); /* lazy */
     ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_KOTLIN));
     ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_PHP));
-    ASSERT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUBY));
+    ASSERT(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUBY) ==
+           regs.by_engine[cbm_pxc_engine_of_lang(CBM_LANG_RUBY)]);
+    ASSERT_NOT_NULL(cbm_pxc_registry_for_lang(&regs, CBM_LANG_RUBY));
     ASSERT_NULL(cbm_pxc_registry_for_lang(NULL, CBM_LANG_GO));
     cbm_arena_destroy(&arena);
     PASS();
@@ -1055,19 +1057,19 @@ static uint64_t ts_decline_work(int n, const char **reason) {
     for (int i = 0; i < n; i++) {
         char *json = (char *)malloc(256);
         snprintf(json, 256,
-                 "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
+                 "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.f%d.New\",\"sn\":\"New\",\"lb\":"
                  "\"Function\",\"lg\":%d,\"ty\":\"store.T%d=p.store.T%d\"}],\"reg\":[],\"py\":null}",
                  (int)CBM_LANG_GO, i, (int)CBM_LANG_GO, i, i);
         rows[i].defs_json = json;
     }
     char before_row[256];
     snprintf(before_row, sizeof(before_row),
-             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":\"Impl\"}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     char after_row[256];
     snprintf(after_row, sizeof(after_row),
-             "{\"v\":5,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
+             "{\"v\":6,\"lang\":%d,\"lsp\":[{\"qn\":\"p.store.T%d\",\"sn\":\"T%d\",\"lb\":\"Struct\","
              "\"lg\":%d,\"al\":null}],\"reg\":[],\"py\":null}",
              (int)CBM_LANG_GO, n - 1, n - 1, (int)CBM_LANG_GO);
     const char *old_rows[] = {before_row};

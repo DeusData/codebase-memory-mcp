@@ -48,12 +48,33 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang);
 // Returns a null node if none found.
 TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 
-// Get the QN of an enclosing function, or module_qn if none.
+// Get the QN of an enclosing function, or module_qn if none. test_macro_names:
+// a GoogleTest macro head is named as the def walk names it
+// (cbm_cpp_test_macro_name; cbm_cpp_test_macro_names_on gives the value).
+// pp_test_spans: the preprocessed view's map to the raw tests
+// (cbm_test_span_owner_qn), NULL in a raw view. scala_ctx: the extraction
+// context whose companion answers fence a Scala companion object in the class
+// chain (Owner#object.m, as the def walk names it); NULL names bare chains.
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
-                                  const char *project, const char *rel_path, const char *module_qn);
+                                  const char *project, const char *rel_path, const char *module_qn,
+                                  bool test_macro_names, const CBMTestSpanMap *pp_test_spans,
+                                  CBMExtractCtx *scala_ctx);
 
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
+
+// Scala: true for an object_definition with a class, trait or enum of the same
+// name in the same scope (its companion). `scope` is the node's parent when the
+// caller holds it, else a null node. An answered object costs O(1): a scope's
+// children are read once, with a cursor, and every object among them answered
+// (the first query reads ctx->root; cbm_scala_prime_scope reads others ahead).
+bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node, TSNode scope);
+void cbm_scala_prime_scope(CBMExtractCtx *ctx, TSNode scope);
+
+// Scala: `plain_qn` + CBM_SCALA_OBJECT_QN_SUFFIX for a companion object, else
+// `plain_qn` unchanged (every other node and language).
+const char *cbm_scala_object_qn(CBMExtractCtx *ctx, TSNode node, TSNode scope,
+                                const char *plain_qn);
 
 // Max declarator-chain descent depth for C/C++/CUDA/GLSL function-name
 // resolution. Single source of truth — extract_defs.c's DECLARATOR_DEPTH_LIMIT
@@ -209,6 +230,12 @@ bool cbm_csharp_is_extension_block(TSNode node, TSNode class_node, const char *s
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// ObjectScript `Do obj.M()` / `Job obj.M()`: grammar v1.9.15+ hides the old
+// `method_call` wrapper, so its receiver and `oref_method` sit directly under
+// `do_parameter` / `job_argument`. True for `method_call` itself or for one of
+// those parents carrying a direct `oref_method` child.
+bool cbm_objectscript_is_instance_call(TSNode node);
+
 // Find every child node matching `kind` (unlike cbm_find_child_by_kind,
 // which stops at the first match). Writes up to `max` nodes into `out`;
 // returns how many were found. Repeated sibling nodes of the same kind are
@@ -248,6 +275,11 @@ bool cbm_chialisp_is_def_head(const char *t);
 
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
+
+// cbm_kind_in_set over a language's call_node_types, plus the ObjectScript UDL
+// `Do obj.M()` sites that no longer have a dedicated node kind (see
+// cbm_objectscript_is_instance_call).
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types);
 
 /* Namespace/module declarations that extend a qualified-name scope without
  * turning their children into class methods. Shared by definition and unified
