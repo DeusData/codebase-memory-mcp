@@ -467,7 +467,9 @@ typedef struct {
                                      // C++ operator). Never fall back to textual resolution.
     bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
                                      // parameter of an enclosing function, so it cannot be the
-                                     // module-level foo. Python only today. Read by the
+                                     // module-level foo. Python: parameters. JS/TS/TSX: also a
+                                     // local that names no definition (const f = wrap(...),
+                                     // an array-pattern element). Read by the
                                      // weak-local-binding guard. Default false.
     bool receiver_is_amd_dependency; // JS/TS member call x.foo() whose receiver root x is a
                                      // parameter the factory of an enclosing AMD

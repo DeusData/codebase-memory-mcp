@@ -4023,8 +4023,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     /* Swift initializer calls only — see pass_calls.c */
                                     lang == CBM_LANG_SWIFT;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
-         * This gate MUST stay identical to the one there. */
-        bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+         * The shared helper keeps this gate identical to the one there. */
+        bool suppress_weak_local_binding = cbm_weak_local_binding_guard_lang(lang);
         /* The member guard's one exemption — MUST match pass_calls.c exactly. */
         /* #1355: same guard as pass_calls.c, and joined to drop_plain_call for
          * the same reason — a `continue` here would also skip route/HTTP/CONFIG
