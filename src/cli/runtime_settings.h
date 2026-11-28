@@ -29,6 +29,8 @@ void cbm_runtime_settings_note_http_port(int port);
  * failing on its lock. Logs config_db.busy_wait once per busy wait. */
 struct sqlite3;
 void cbm_runtime_settings_wait_for_writers(struct sqlite3 *db);
+/* Open the configuration database with a Windows long-path capable VFS. */
+int cbm_runtime_settings_open_db(const char *path, struct sqlite3 **db, int flags);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Single-threaded test teardown only; never exposed in production builds. */
