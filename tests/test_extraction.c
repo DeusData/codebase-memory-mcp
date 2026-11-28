@@ -9379,6 +9379,101 @@ TEST(extract_ts_url_fold_no_fabrication_issue1147) {
     PASS();
 }
 
+/* The URL projection of the first argument of `callee` inside `func`, or NULL. */
+static const char *first_arg_url_value(CBMFileResult *r, const char *callee, const char *func) {
+    const CBMCall *c = find_call_in_func(r, callee, func);
+    return (c && c->arg_count > 0) ? c->args[0].url_value : NULL;
+}
+
+/* Issue #3115: a Rust client that joins each path onto a runtime base URL
+ * names the path only in an allowlisted helper's argument, behind `?`. The
+ * path is read from the root and lands in url_value only: value and
+ * first_string_arg stay empty, so the route-registration reader never sees it
+ * (#3114). */
+TEST(extract_rust_url_helper_fold_issue3115) {
+    CBMFileResult *r = extract(
+        "impl C {\n"
+        "    pub fn create_target(&self) -> Result<(), E> {\n"
+        "        let _r = self.client.post(self.make_url(\"v2/actions/targets\")?).build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn lock_user(&self, user_id: &str) -> Result<(), E> {\n"
+        "        let _r = self.client.post(self.make_url(&format!(\"v2/users/{user_id}/lock\"))?)"
+        ".build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn my_org(&self) -> Result<(), E> {\n"
+        "        let _r = self.client.get(self.make_url(\"/management/v1/orgs/me\")?).build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn project(&self, id: u64) -> Result<(), E> {\n"
+        "        let _r = self.client.get(urls::build_url(&format!(\"v2/projects/{}/{{x}}\", "
+        "id))?).build()?;\n"
+        "        Ok(())\n"
+        "    }\n"
+        "    pub fn raw(&self) -> R { self.client.get(self.make_url(r\"v2/orgs/raw\")?) }\n"
+        "}\n",
+        CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *c = find_call_in_func(r, "self.client.post", "create_target");
+    ASSERT_NOT_NULL(c);
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].url_value, "/v2/actions/targets");
+    ASSERT_NULL(c->args[0].value);
+    ASSERT_NULL(c->first_string_arg);
+
+    ASSERT_STR_EQ(first_arg_url_value(r, "self.client.post", "lock_user"), "/v2/users/{}/lock");
+    ASSERT_STR_EQ(first_arg_url_value(r, "self.client.get", "my_org"), "/management/v1/orgs/me");
+    /* Scoped helper path; `{{x}}` is a literal brace pair, not a placeholder. */
+    ASSERT_STR_EQ(first_arg_url_value(r, "self.client.get", "project"), "/v2/projects/{}/{x}");
+    ASSERT_STR_EQ(first_arg_url_value(r, "self.client.get", "raw"), "/v2/orgs/raw");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: nothing is folded unless the helper is allowlisted, its
+ * argument is a literal or a literal format string, and the result is a
+ * multi-segment path. Other languages are untouched by the Rust rule. */
+TEST(extract_rust_url_helper_no_fabrication_issue3115) {
+    CBMFileResult *r = extract(
+        "impl C {\n"
+        "    fn other(&self) -> R { self.client.get(self.find_path(\"v2/users\")?) }\n"
+        "    fn generic(&self) -> R { self.client.get(self.path_for(\"static/css/app\")?) }\n"
+        "    fn single(&self) -> R { self.client.get(self.make_url(\"users\")?) }\n"
+        "    fn based(&self, base: &str) -> R {\n"
+        "        self.client.get(self.make_url(&format!(\"{}/v2/x\", base))?)\n"
+        "    }\n"
+        "    fn dynamic(&self, path: &str) -> R { self.client.get(self.make_url(path)?) }\n"
+        "    fn absolute(&self) -> R { self.client.get(self.make_url(\"https://h/v2/x\")?) }\n"
+        "    fn joined(&self, id: &str) -> R {\n"
+        "        self.client.get(self.make_url(\"v2/actions/targets/\")?.join(id)?)\n"
+        "    }\n"
+        "}\n",
+        CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *const funcs[] = {"other",   "generic",  "single", "based",
+                                        "dynamic", "absolute", "joined"};
+    for (size_t i = 0; i < sizeof(funcs) / sizeof(funcs[0]); i++) {
+        ASSERT_NOT_NULL(find_call_in_func(r, "self.client.get", funcs[i]));
+        ASSERT_NULL(first_arg_url_value(r, "self.client.get", funcs[i]));
+    }
+    cbm_free_result(r);
+
+    r = extract("export function createTarget() {\n"
+                "  return client.post(make_url('v2/actions/targets'));\n"
+                "}\n",
+                CBM_LANG_TYPESCRIPT, "t", "c.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_call_in_func(r, "client.post", "createTarget"));
+    ASSERT_NULL(first_arg_url_value(r, "client.post", "createTarget"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Shared folding must preserve topic/string identity before service resolution. */
 TEST(extract_ts_folded_topics_keep_raw_identity) {
     CBMFileResult *r = extract(
@@ -17493,6 +17588,8 @@ SUITE(extraction) {
     RUN_TEST(extract_py_prefixed_string_url_controls_issue523);
     RUN_TEST(extract_ts_const_template_url_issue1147);
     RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
+    RUN_TEST(extract_rust_url_helper_fold_issue3115);
+    RUN_TEST(extract_rust_url_helper_no_fabrication_issue3115);
     RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
     RUN_TEST(extract_py_folded_topic_keywords_keep_raw_identity);
     RUN_TEST(extract_ts_folded_config_url_and_exclusions);
