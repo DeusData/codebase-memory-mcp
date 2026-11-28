@@ -1868,8 +1868,14 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      <Owner>#object and its members <Owner>#object.<m> (extract_defs.c,
  *      helpers.c cbm_scala_object_qn). An index built before holds one merged
  *      node for the type and its companion, so it rebuilds once on upgrade.
+ *  16: a Terragrunt stack (terragrunt.stack.hcl) IMPORTS {via:
+ *      terragrunt-stack} the Folder each unit / stack block's local source
+ *      names and the file each include names, its locals resolving
+ *      local.X; its reads IMPORTS {via: terragrunt} as a unit's
+ *      (pass_terraform.c). An index built before holds none of them, so it
+ *      rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 15 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 16 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
